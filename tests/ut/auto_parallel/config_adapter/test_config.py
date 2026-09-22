@@ -609,14 +609,20 @@ class TestHpYamlReader(unittest.TestCase):
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_offline_falls_back_to_overrides(self, mock_get_hf_config) -> None:
-        """An unreachable Transformers config falls back to config_overrides."""
+        """An unreachable Transformers config falls back to config_overrides.
+
+        The overrides are the whole spec on this path, with no resolved
+        config to complete them, so they carry every required field.
+        """
         mock_get_hf_config.side_effect = OSError("no network")
         content = _auto_models_hp_yaml_content().replace(
             "  local_files_only: true",
             "  local_files_only: true\n"
             "  config_overrides:\n"
             "    hidden_size: 1024\n"
-            "    num_hidden_layers: 4",
+            "    num_hidden_layers: 4\n"
+            "    num_attention_heads: 16\n"
+            "    vocab_size: 32000",
         )
         path = os.path.join(self.tmpdir, "auto_models_offline.yaml")
         _write_yaml(path, content)
@@ -625,6 +631,28 @@ class TestHpYamlReader(unittest.TestCase):
 
         self.assertEqual(config.model_spec["hidden_size"], 1024)
         self.assertEqual(config.model_spec["num_hidden_layers"], 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_offline_partial_overrides_raise(self, mock_get_hf_config) -> None:
+        """A fallback that cannot supply the model is refused, not carried.
+
+        Without the resolved config there is nothing to complete a partial
+        override set, so letting one through is how a missing dimension
+        reaches the cost model as a zero.
+        """
+        mock_get_hf_config.side_effect = OSError("no network")
+        content = _auto_models_hp_yaml_content().replace(
+            "  local_files_only: true",
+            "  local_files_only: true\n"
+            "  config_overrides:\n"
+            "    hidden_size: 1024\n"
+            "    num_hidden_layers: 4",
+        )
+        path = os.path.join(self.tmpdir, "auto_models_partial_offline.yaml")
+        _write_yaml(path, content)
+
+        with self.assertRaisesRegex(ValueError, "num_attention_heads"):
+            read_hp_yaml_config(path)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_offline_without_overrides_raises(self, mock_get_hf_config) -> None:

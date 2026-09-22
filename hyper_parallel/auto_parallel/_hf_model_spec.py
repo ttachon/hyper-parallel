@@ -27,6 +27,8 @@ cost-model backends must keep working without it.
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from hyper_parallel.auto_parallel._model_spec import ModelSpec
+
 logger = logging.getLogger(__name__)
 
 # AutoModels root sections that identify the current Trainer schema.
@@ -194,6 +196,16 @@ def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(overrides) if isinstance(overrides, Mapping) else {}
 
 
+def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Check *spec* against the model IR before any consumer reads it.
+
+    Parsing and re-serialising is what makes the schema load-bearing rather
+    than advisory: a field the model declares but the IR does not know would
+    be dropped here, and an incoherent one raises by name.
+    """
+    return ModelSpec.from_dict(spec).to_dict()
+
+
 def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
@@ -227,7 +239,7 @@ def resolve_hf_model_spec(
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            return explicit
+            return _validated(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path "
             "or model.config_overrides for Auto Parallel search"
@@ -242,7 +254,7 @@ def resolve_hf_model_spec(
                 "falling back to model.config_overrides", exc,
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            return explicit
+            return _validated(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "
@@ -261,4 +273,28 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    return spec
+    return _validated(spec)
+
+
+def resolve_model_spec(
+    model_raw: Mapping[str, Any],
+    visual_seq_len: Optional[int] = None,
+) -> ModelSpec:
+    """Return the typed :class:`ModelSpec` for a Trainer ``model`` section.
+
+    The typed entry point behind :func:`resolve_hf_model_spec`, which returns
+    the same facts as a plain mapping for callers that still read one.
+
+    Args:
+        model_raw: The ``model`` section, as a plain mapping.
+        visual_seq_len: Optional override for the encoder sequence length.
+
+    Returns:
+        A validated spec.
+
+    Raises:
+        ModelSpecError: If the resolved fields are incomplete or incoherent.
+        ValueError: If neither a pretrained path nor overrides can supply
+            the model dimensions.
+    """
+    return ModelSpec.from_dict(resolve_hf_model_spec(model_raw, visual_seq_len))

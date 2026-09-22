@@ -1,0 +1,290 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Tests for the model IR schema."""
+import unittest
+
+import yaml
+
+from hyper_parallel.auto_parallel._model_spec import (
+    ModelSpec,
+    ModelSpecError,
+    VisionSpec,
+)
+
+
+def _dense() -> dict:
+    """A plain dense decoder, the smallest spec that validates."""
+    return {
+        "name": "llama2",
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 11008,
+        "vocab_size": 32000,
+        "max_position_embeddings": 4096,
+    }
+
+
+def _qwen35() -> dict:
+    """Qwen3.5-35B-A3B: all-MoE, explicit head_dim, one shared expert, MTP."""
+    return {
+        "name": "qwen3_5_moe",
+        "hidden_size": 2048,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "vocab_size": 248320,
+        "max_position_embeddings": 262144,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "num_shared_experts": 1,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+        "mtp_depth": 1,
+    }
+
+
+class TestRequiredFields(unittest.TestCase):
+    """A required fact that nobody supplied is an error, not a zero."""
+
+    def test_missing_field_raises_by_name(self):
+        """The message names the field a producer failed to supply."""
+        data = _dense()
+        del data["vocab_size"]
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("vocab_size", str(ctx.exception))
+
+    def test_zero_is_rejected_like_absence(self):
+        """A required field declared as zero is refused, not carried."""
+        data = _dense()
+        data["hidden_size"] = 0
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("hidden_size", str(ctx.exception))
+
+    def test_non_integer_raises_by_name(self):
+        """A field that cannot be an integer names itself."""
+        data = _dense()
+        data["num_hidden_layers"] = "many"
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("num_hidden_layers", str(ctx.exception))
+
+    def test_name_defaults_when_absent(self):
+        """Only the name has a default; every other required field does not."""
+        data = _dense()
+        del data["name"]
+        self.assertEqual(ModelSpec.from_dict(data).name, "custom")
+
+
+class TestAbsentIsNotZero(unittest.TestCase):
+    """Optional fields distinguish 'not declared' from 'declared as zero'."""
+
+    def test_dense_model_has_no_expert_count(self):
+        """A dense model's expert count is None, so no consumer reads 0."""
+        spec = ModelSpec.from_dict(_dense())
+        self.assertIsNone(spec.num_experts)
+        self.assertFalse(spec.is_moe)
+
+    def test_absent_optional_is_omitted_from_dump(self):
+        """An unset field does not appear as null in the serialised form."""
+        dumped = ModelSpec.from_dict(_dense()).to_dict()
+        self.assertNotIn("num_experts", dumped)
+        self.assertNotIn("mtp_depth", dumped)
+
+
+class TestDerivedReads(unittest.TestCase):
+    """The reads that were wrong for Qwen3.5 before the spec existed."""
+
+    def test_head_dim_explicit_beats_derived(self):
+        """An explicit head_dim is used, not hidden_size / heads."""
+        spec = ModelSpec.from_dict(_qwen35())
+        self.assertEqual(spec.effective_head_dim, 256)
+        self.assertEqual(spec.attention_width, 16 * 256)
+
+    def test_head_dim_derived_when_absent(self):
+        """Without an explicit head_dim the classic ratio still holds."""
+        spec = ModelSpec.from_dict(_dense())
+        self.assertEqual(spec.effective_head_dim, 128)
+        self.assertEqual(spec.attention_width, 4096)
+
+    def test_shared_expert_width_from_its_own_field(self):
+        """An all-MoE config resolves the shared expert to a real width."""
+        self.assertEqual(ModelSpec.from_dict(_qwen35()).shared_expert_width, 512)
+
+    def test_shared_expert_width_falls_back_to_routed(self):
+        """A config declaring only the routed width shares it."""
+        data = _qwen35()
+        del data["shared_expert_intermediate_size"]
+        self.assertEqual(ModelSpec.from_dict(data).shared_expert_width, 512)
+
+    def test_no_shared_expert_is_zero_width(self):
+        """No shared expert genuinely is no width, and says so."""
+        data = _qwen35()
+        del data["num_shared_experts"]
+        self.assertEqual(ModelSpec.from_dict(data).shared_expert_width, 0)
+
+
+class TestCoherence(unittest.TestCase):
+    """Fields that contradict each other are refused at parse time."""
+
+    def test_moe_with_no_resolvable_width_raises(self):
+        """Routed experts nothing can size are refused, not priced at zero."""
+        data = _qwen35()
+        del data["moe_intermediate_size"]
+        del data["shared_expert_intermediate_size"]
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("routed", str(ctx.exception))
+
+    def test_moe_falls_back_to_the_dense_width(self):
+        """Mixtral runs its experts at the dense width and declares no other."""
+        data = _dense()
+        data.update(num_experts=8, num_experts_per_tok=2)
+        spec = ModelSpec.from_dict(data)
+        self.assertTrue(spec.is_moe)
+        self.assertEqual(spec.routed_expert_width, 11008)
+
+    def test_shared_expert_without_any_width_raises(self):
+        """A shared expert nothing can size is refused, not priced at zero."""
+        data = _dense()
+        del data["intermediate_size"]
+        data["num_shared_experts"] = 1
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("num_shared_experts", str(ctx.exception))
+
+    def test_all_moe_config_still_sizes_its_shared_expert(self):
+        """Qwen3.5 declares no dense width; the shared expert still resolves.
+
+        This is the regression the schema exists for: the old path read
+        intermediate_size, found nothing, and priced the shared expert at
+        width zero without saying so.
+        """
+        data = _qwen35()
+        self.assertNotIn("intermediate_size", data)
+        self.assertEqual(ModelSpec.from_dict(data).shared_expert_width, 512)
+
+    def test_kv_heads_must_divide_attention_heads(self):
+        """Grouped-query attention that does not group is a typo, not a model."""
+        data = _dense()
+        data["num_key_value_heads"] = 7
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("num_key_value_heads", str(ctx.exception))
+
+    def test_single_expert_is_not_moe(self):
+        """num_experts of 1 is a dense feed-forward, so MoE rules do not bind."""
+        data = _dense()
+        data["num_experts"] = 1
+        self.assertFalse(ModelSpec.from_dict(data).is_moe)
+
+
+class TestRoundTrip(unittest.TestCase):
+    """The serialised form is the interface, so it has to survive a round trip."""
+
+    def test_dense_round_trip(self):
+        """from_dict(to_dict(spec)) reproduces the spec exactly."""
+        spec = ModelSpec.from_dict(_dense())
+        self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+
+    def test_moe_round_trip(self):
+        """A MoE spec with MTP and an explicit head_dim survives unchanged."""
+        spec = ModelSpec.from_dict(_qwen35())
+        self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+
+    def test_round_trip_through_yaml_text(self):
+        """The round trip holds through real YAML, not just a dict."""
+        spec = ModelSpec.from_dict(_qwen35())
+        text = yaml.safe_dump(spec.to_dict(), sort_keys=True)
+        self.assertEqual(ModelSpec.from_dict(yaml.safe_load(text)), spec)
+
+    def test_dump_is_stable(self):
+        """Dumping twice gives the same text, so a spec can be diffed."""
+        spec = ModelSpec.from_dict(_qwen35())
+        first = yaml.safe_dump(spec.to_dict(), sort_keys=True)
+        second = yaml.safe_dump(ModelSpec.from_dict(yaml.safe_load(first)).to_dict(),
+                                sort_keys=True)
+        self.assertEqual(first, second)
+
+
+class TestExtraPassthrough(unittest.TestCase):
+    """Strategy and runtime keys ride along untouched until the exec IR exists."""
+
+    def test_unknown_keys_land_in_extra(self):
+        """A key that is not model shape is kept, not dropped or rejected."""
+        data = _dense()
+        data["compute_dtype"] = "bfloat16"
+        data["local_batch_size"] = 1
+        spec = ModelSpec.from_dict(data)
+        self.assertEqual(spec.extra["compute_dtype"], "bfloat16")
+        self.assertEqual(spec.extra["local_batch_size"], 1)
+
+    def test_extra_survives_the_round_trip(self):
+        """Nothing a producer supplied is lost by passing through the spec."""
+        data = _dense()
+        data["compute_dtype"] = "bfloat16"
+        spec = ModelSpec.from_dict(data)
+        self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+        self.assertEqual(spec.to_dict()["compute_dtype"], "bfloat16")
+
+
+class TestVisionTower(unittest.TestCase):
+    """A multimodal spec nests its tower rather than flattening it."""
+
+    def _vl(self) -> dict:
+        data = _qwen35()
+        data["vision"] = {
+            "hidden_size": 1152,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 16,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "num_position_embeddings": 2304,
+            "max_position_embeddings": 576,
+        }
+        return data
+
+    def test_vision_is_parsed_and_typed(self):
+        """The tower arrives as a VisionSpec, not a nested dict."""
+        spec = ModelSpec.from_dict(self._vl())
+        self.assertIsInstance(spec.vision, VisionSpec)
+        self.assertEqual(spec.vision.num_hidden_layers, 27)
+
+    def test_vision_round_trip(self):
+        """A nested tower survives the round trip with its parent."""
+        spec = ModelSpec.from_dict(self._vl())
+        self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+
+    def test_vision_missing_field_raises(self):
+        """The tower is held to the same standard as the parent."""
+        data = self._vl()
+        del data["vision"]["num_hidden_layers"]
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(data)
+        self.assertIn("num_hidden_layers", str(ctx.exception))
+
+    def test_plain_model_has_no_tower(self):
+        """A text-only spec leaves vision absent rather than empty."""
+        spec = ModelSpec.from_dict(_dense())
+        self.assertIsNone(spec.vision)
+        self.assertNotIn("vision", spec.to_dict())
+
+
+if __name__ == "__main__":
+    unittest.main()
