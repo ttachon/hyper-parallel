@@ -12,23 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the per-op compute loads the performance path prices.
+"""Tests for the performance estimate: its entry point, and the per-op compute
+loads it prices.
 
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/perf_estimation/test_estimate.py -v
 """
+import os
 import unittest
 from types import SimpleNamespace
+from typing import Any, Dict
 
 # The package has an import cycle that only the memory estimator's import order
 # settles; perf_estimation.estimate cannot be the first module a process loads.
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import op_table
+import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance, op_table
+
+DEEPSEEK_YAML = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
+)
+
+
+def _plain_values(ccfg: CostModelConfig) -> Dict[str, Any]:
+    """The config's plain fields, the ones layer hooks overwrite."""
+    return {name: value for name, value in vars(ccfg).items()
+            if isinstance(value, (bool, int, float, str))}
 
 
 def _cfg(s: int) -> SimpleNamespace:
     """A dense, non-MLA config at sequence length *s*."""
-    return SimpleNamespace(a=8, n_kv=8, b=1, s=s, h=512, hff=1024, t=2, sp=2, cp=1, dc_kv=0, bytes_p=2)
+    return SimpleNamespace(a=8, n_kv=8, dh=0, b=1, s=s, h=512, hff=1024, t=2, sp=2, cp=1, dc_kv=0, bytes_p=2)
+
+
+class TestEstimatePerformance(unittest.TestCase):
+    """The estimate leaves the caller's config as it found it."""
+
+    def test_estimating_twice_gives_the_same_score(self):
+        """
+        Feature: estimate_performance.
+        Description: DeepSeek's dense and MoE layers are two groups, and the
+            estimate applies their hooks to its config in place.  Estimate
+            the same config twice.
+        Expectation: The caller's config comes back unchanged, and the
+            second score equals the first.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        before = _plain_values(ccfg)
+        first = estimate_performance(ccfg, device_type=Hard.Device_A2)
+        self.assertEqual(_plain_values(ccfg), before)
+        self.assertEqual(estimate_performance(ccfg, device_type=Hard.Device_A2), first)
 
 
 class TestOpTable(unittest.TestCase):

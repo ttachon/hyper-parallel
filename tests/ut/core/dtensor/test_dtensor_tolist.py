@@ -19,8 +19,8 @@ from unittest.mock import Mock
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
-# Pull the Python function directly from DTensor.__dict__ to bypass
-# C-level Tensor descriptor checks on MindSpore.
+# Pull the Python function directly from DTensor.__dict__ to bypass the
+# C-level Tensor descriptor that DTensorBase inherits from.
 _tolist_fn = DTensor.__dict__["tolist"]
 
 

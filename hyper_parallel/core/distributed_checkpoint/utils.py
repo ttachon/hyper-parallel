@@ -119,7 +119,7 @@ def narrow_tensor_by_index(tensor: Any, offsets: tuple, lengths: tuple) -> Any:
     Narrow the tensor by (offsets, lengths) per dimension.
 
     Used for resharding operations to extract a slice from a tensor.
-    Compatible with both torch and mindspore (uses slice indexing).
+    Uses plain slice indexing so any tensor-like object works.
 
     Args:
         tensor (Any): The tensor to narrow (tensor-like object supporting indexing).

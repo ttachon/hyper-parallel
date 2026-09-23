@@ -30,7 +30,6 @@ from ..pass_config import PassConfig
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..pass_plan import PassPlan
 
 
 class GraphPass(ABC):

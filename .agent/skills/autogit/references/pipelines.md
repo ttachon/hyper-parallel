@@ -30,7 +30,7 @@ UT(scope?) → ST(scope?) → PR title+body preview → create PR
 ```
 
 - **UT / ST gates:** `skip` / `changed` / `full`. Defaults when user hits Enter: UT=`changed`, ST=`skip`.
-- `changed` = test files in this PR's diff; `full` = whole suite (`tests/ut` or torch+mindspore ST).
+- `changed` = test files in this PR's diff; `full` = whole suite (`tests/ut` or torch ST).
 - ST missing dirs / launcher / single-card → hard error (re-run with `--st skip`).
 - `pr --to N` (append): UT only; `changed` inspects local working tree before branch ops.
 - Content preview last — written content must match what passed gates.

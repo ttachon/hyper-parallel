@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Child-process entry: this file is launched by torchrun/msrun via pytest.
+"""Child-process entry: this file is launched by torchrun via pytest.
 
 Pytest collects ``test_suite_entry`` and runs it once per rank. The function
 reads the group config from environment variables (set by the parent
@@ -76,13 +76,13 @@ def _select_cases(cases_pkg: str, names: List[str]) -> List[OpShardCase]:
 
 
 def _rank() -> int:
-    """Best-effort rank lookup that works for torchrun and msrun.
+    """Best-effort rank lookup for torchrun-style launchers.
 
-    torchrun exports ``RANK``; msrun exports ``RANK_ID`` (and several other
+    torchrun exports ``RANK``; some launchers export ``RANK_ID`` (and several other
     aliases depending on the launcher version). Fall back to 0 on local
     plain-pytest runs.
     """
-    for key in ("RANK", "RANK_ID", "MS_NODE_ID", "OMPI_COMM_WORLD_RANK"):
+    for key in ("RANK", "RANK_ID", "OMPI_COMM_WORLD_RANK"):
         val = os.environ.get(key)
         if val is not None and val.strip() != "":
             try:

@@ -181,9 +181,9 @@ class FSDP2Manager:
             "float32": torch.float32,
         }
         return fully_shard_utils.MixedPrecisionPolicy(
-            param_dtype=dtype_by_name[mix_precision.param_dtype],
-            reduce_dtype=dtype_by_name[mix_precision.reduce_dtype],
-            output_dtype=dtype_by_name[mix_precision.output_dtype],
+            param_dtype=dtype_by_name.get(mix_precision.param_dtype),
+            reduce_dtype=dtype_by_name.get(mix_precision.reduce_dtype),
+            output_dtype=dtype_by_name.get(mix_precision.output_dtype),
             cast_forward_inputs=mix_precision.cast_forward_inputs,
             apply_grad_on_fp32_main_grad=self.fp32_main_params,
         )
@@ -309,14 +309,13 @@ class FSDP2Manager:
 
         owner_by_parameter = {}
         for parameter, parameter_fqns in aliases_by_parameter.items():
-            common_wrap_modules = [
-                wrap_module
-                for wrap_module in wrap_modules
+            common_wrap_modules = []
+            for wrap_module in wrap_modules:
                 if all(
                     parameter_fqn.startswith(f"{wrap_module.fqn}.")
                     for parameter_fqn in parameter_fqns
-                )
-            ]
+                ):
+                    common_wrap_modules.append(wrap_module)
             if common_wrap_modules:
                 owner_by_parameter[parameter] = max(
                     common_wrap_modules,

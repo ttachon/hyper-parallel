@@ -398,6 +398,32 @@ class TestMPipeTransposeRunWithDataIterator(unittest.TestCase):
         assert not schedule.fwd_handle_cache and not schedule.bwd_handle_cache, \
             "the finally drain must pop every cached handle"
 
+    def test_error_path_releases_executor_caches_and_allows_retry(self):
+        """
+        Feature: run_with_dataiterator error-path executor cleanup.
+        Description: A mid-run error (iterator exhausted before every DATA_LOAD)
+            can strand micro-batches in the executor's per-micro caches, which
+            nothing else frees -- the scheduler's drain covers only the P2P
+            handles -- so the run must hand them to ``abort`` on the way out.
+        Expectation: the error propagates, ``abort`` runs, the caches are empty,
+            and a retry in the same process completes instead of dying in reset.
+        """
+        schedule, _, _, _, _ = self._build_run_setup(3)
+        executor = schedule._executor  # pylint: disable=protected-access
+
+        with patch.object(executor, "abort", wraps=executor.abort) as abort:
+            with self.assertRaises(StopIteration):
+                schedule.run_with_dataiterator(iter(_micro_batches(1)),
+                                               pp_fsdp_composed=False)
+            abort.assert_called_once()
+        assert not (executor._inputs_for_explicit_forward or executor._outputs_for_stage0
+                    or executor._outputs_for_bwd or executor._keep_grad), \
+            "the aborted run must not strand micro-batches in the executor caches"
+
+        losses = schedule.run_with_dataiterator(iter(_micro_batches(3)),
+                                                pp_fsdp_composed=False)
+        assert len(losses) == 3, f"retry after an aborted run must complete, got {losses}"
+
 
 if __name__ == "__main__":
     unittest.main()

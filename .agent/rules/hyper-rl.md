@@ -74,8 +74,7 @@ plans, temporary validation results, or facts already owned elsewhere.
 - UT lives in `tests/ut/rl/`; NPU ST and its launch helpers live in `hyper_parallel/rl/tests/st/`.
   Shared recipe data and configuration construction live in `tests/common/rl_st_cases.py` so UT can run without the ST
   archive. Do not introduce a UT dependency on the standalone ST directory. The UT conftest also collects `agentic_ut.py`.
-- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch,
-  MindSpore, or HyperParallel during collection. Use the [UT guide](../../hyper_parallel/rl/docs/hyper_rl_ut.md) and
+- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch or HyperParallel during collection. Use the [UT guide](../../hyper_parallel/rl/docs/hyper_rl_ut.md) and
   [ST guide](../../hyper_parallel/rl/README.md#系统测试) for execution commands and resources.
 - For docs and agent rules, run `python3 .agent/scripts/check_agents_catalog.py`, Markdown lint, and checks for changed
   relative links and referenced paths. The catalog script only compares Skills/Agents tables against disk; it does not

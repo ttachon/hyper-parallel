@@ -47,7 +47,7 @@ pytest tests/ut/core/activation_memory/
 
 1. **新增功能必须配套 UT**：覆盖率目标 ≥ 80%
 2. **分布式测试覆盖真实的通信路径**：UT 用 mock 校验调用契约，ST 用多进程校验数值
-3. **使用项目封装的分布式启动函数**：`torchrun_case()` 和 `msrun_case()`
+3. **使用项目封装的分布式启动函数**：`torchrun_case()`
 4. **优先使用 Gloo CPU backend 进行 UT**：减少 NPU 资源占用，`tests/common/` 中提供了 Gloo 适配器
 
 ## 测试覆盖率目标

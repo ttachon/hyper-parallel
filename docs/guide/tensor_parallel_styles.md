@@ -134,7 +134,6 @@ The implementation is framework-agnostic.  Module type detection uses
 | Platform | Linear type | Embedding type |
 |----------|-------------|----------------|
 | PyTorch | `torch.nn.Linear` | `torch.nn.Embedding` |
-| MindSpore | `mindspore.nn.Dense` | `mindspore.nn.Embedding` |
 
 ## Migration from PyTorch
 

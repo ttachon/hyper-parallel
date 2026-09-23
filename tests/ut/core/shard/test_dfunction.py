@@ -218,7 +218,7 @@ class TestLocalCallable(unittest.TestCase):
             f"__name__ mismatch: expected 'TestOp', got {lc.__name__}"
         )
         assert not hasattr(lc, "name"), (
-            f"Torch-only callable should not expose the MindSpore name attribute, got {vars(lc)}"
+            f"Torch-only callable should not expose a bare `name` attribute, got {vars(lc)}"
         )
 
     def test_local_callable_invocation(self):

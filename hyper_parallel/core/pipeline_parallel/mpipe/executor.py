@@ -96,6 +96,23 @@ class MPipeTransposeExecutor:
         if self._owner_backward:
             self._grad_snapshot = self._snapshot_tower_grads()
 
+    def abort(self) -> None:
+        """Drop the per-micro caches after a run that raised.
+
+        Each entry is erased by the step that consumes it, so a step raising
+        mid-run strands whole micro-batches of device tensors -- including the
+        graph-connected tower output, which pins the autograd graph -- and the
+        next run's :meth:`reset` then refuses to start. The schedule calls this
+        on the error path only: on the normal path the caches must already be
+        empty, and ``reset`` still checks that.
+        """
+        self._inputs_for_explicit_forward.clear()
+        self._outputs_for_stage0.clear()
+        self._outputs_for_bwd.clear()
+        self._keep_grad.clear()
+        self._fwd_received.clear()
+        self._grad_snapshot = None
+
     def _send_meta(self, tensor, dst) -> None:
         """Send a tensor's ``(shape, dtype)`` to ``dst``.
 
@@ -413,6 +430,10 @@ class MPipeTransposeExecutor:
         micro = step.micro_index
         dst = self._global_rank(self._schedule.owner_of(micro))
         if dst == self._global_rank(0):
+            # Nothing to ship, but the entry still has to go: no later step
+            # erases it, so leaving it would strand the feature tensors and
+            # make the next run's reset() refuse to start.
+            self._keep_grad.pop(micro, None)
             return
         for tensor in self._keep_grad[micro]:
             grad = getattr(tensor, "grad", None)
@@ -464,6 +485,9 @@ class MPipeTransposeExecutor:
             ctx (PipelineContext): The pipeline run context (unused).
         """
         self._reduce_grads(self._mpipe_group, self._grad_snapshot)
+        # Dead once the delta is reduced: drop the clone rather than hold it
+        # across the optimizer step; the next reset() takes a fresh one.
+        self._grad_snapshot = None
 
     def transpose_backward(self, step: "MetaStep", ctx: "PipelineContext") -> None:
         """Recompute the preprocess forward on stage 0 and backprop dL/dfeatures.

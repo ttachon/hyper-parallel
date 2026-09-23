@@ -29,51 +29,21 @@ Steps 3 and 4 are standard for any PR and are not specific to distributed operat
 The user provides any combination of:
 
 - PyTorch interface (e.g. `torch.nn.functional.linear`)
-- MindSpore mint interface (e.g. `mint.sort`)
-- MindSpore Primitive name (e.g. `SortExt`)
+- The distributed-operator class name already registered for it (optional)
 
 ## Output Language
 
 **Write the plan in Chinese.** All section headings, descriptions, constraint rules, test case names and their descriptions in the plan file must be in Chinese. Code identifiers, file paths, and YAML snippets remain in their original form.
 
-## Step 1: Confirm Platform Scope
+## Step 1: Confirm the Operator
 
-Determine the target platform(s) from the provided interfaces and **state them explicitly in the plan**:
+Identify the target torch interface from the user's request and **state it explicitly in the plan** (e.g. `torch.nn.functional.linear`, `torch.sort`). If the request is ambiguous — several torch entries map onto the same distributed class — name the candidates and ask the user to pick one before continuing.
 
-| User provides | Platform | Confirmation needed |
-|--------------|----------|-------------------|
-| torch interface only | PyTorch only | Confirm MindSpore is out of scope? |
-| mint interface only / Primitive only | MindSpore only | Confirm PyTorch is out of scope? |
-| torch + mint / torch + Primitive | Both platforms | No extra confirmation needed |
+## Step 2: Interface Analysis
 
-**If only a single-platform interface is provided, the plan must explicitly state the platform scope and ask the user to confirm.**
+Refer to the official PyTorch documentation for the interface signature, parameter semantics, and constraints. Extract: parameter names and order, which parameters are keyword-only (declared after `*`), dtypes, shape constraints, and known limitations.
 
-## Step 2: MindSpore Interface Analysis
-
-### 2.1 mint Interface → Primitive Mapping
-
-Check `mindspore/mindspore/ops/api_def/{op_name}.yaml`:
-
-- **`kwonlyargs` field present** → mint interface supports keyword arguments (functional_overload mode), behaves like PyTorch. Parameters listed in `kwonlyargs` go into `kwargs` in `_normalize_*_args`.
-- **`kwonlyargs` field absent** → mint interface is all-positional (Primitive mode); `kwargs` is empty in `_normalize_*_args`.
-
-If `api_def/{op_name}.yaml` does not exist, trace the import path in `mindspore/python/mindspore/mint/__init__.py` to locate the underlying Primitive name (PascalCase), and treat as all-positional.
-
-**The plan must state**: the mint interface → Primitive name mapping and whether `kwonlyargs` exists (with the specific parameter names).
-
-### 2.2 Primitive Interface Details
-
-Read the Primitive definition from:
-
-- Structure: `mindspore/mindspore/ops/op_def/yaml/{primitive_snake_case}_op.yaml` (args/returns/dtypes)
-- Python kwonlyargs: `mindspore/mindspore/ops/api_def/{op_name}.yaml` (if `kwonlyargs` field exists)
-- Docs: `mindspore/mindspore/ops/op_def/yaml/doc/{primitive_snake_case}_doc.yaml`
-
-Extract: parameter names, dtypes, shape constraints, hardware support (Atlas A2/A3/950, etc.), known limitations.
-
-### 2.3 PyTorch Interface Details
-
-Refer to the official PyTorch documentation for the interface signature, parameter semantics, and constraints.
+**The plan must state** which parameters are keyword-only — they stay in `local_kwargs` — and which are positional.
 
 ## Step 3: Distributed Layout Derivation Analysis
 
@@ -97,7 +67,7 @@ Design file paths and content skeletons following `templates/plan-template.md`:
 Evaluate in order and explicitly state the choice and rationale in the plan:
 
 1. **YAML-only registration** (no new Python file): operator has purely element-wise semantics (output shape = broadcast of inputs, any dimension can be independently sharded) — add an entry to an existing YAML file, reusing `ElementWiseDistributedOp` or `ElementWiseWithPartialDistributedOp`.
-2. **Inherit an existing base class**: operator semantics are close to an existing base class but need minor customization (e.g. adding `_MS_PRIMITIVE_OP_NAMES` routing, extra validation) — subclass the nearest base class and override only what differs.
+2. **Inherit an existing base class**: operator semantics are close to an existing base class but need minor customization (e.g. adding per-op dtype routing, extra validation) — subclass the nearest base class and override only what differs.
    - `ElementWiseDistributedOp` / `ElementWiseWithPartialDistributedOp` — element-wise
    - `TupleElementWiseDistributedOp` — element-wise with tuple inputs/outputs
    - `ReshapeDistributedOp` — changes shape without rearranging data

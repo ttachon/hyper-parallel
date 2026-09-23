@@ -580,11 +580,13 @@ def estimate_from_mem_comm(*args, **kwargs):
         param["debugger"].info[PerfParts.EP_COMM] = comms[Dim.EP]
         param["debugger"].info[PerfParts.CP_COMM] = comms[Dim.CP]
         if param["cfg"].cp > 1:
+            # Logged, not stored: debugger.info must hold only numeric PerfParts,
+            # which the debug CSV and the score table are built from.
             cp_comm_details = cp_comm_layer_detailed(param["cfg"], param["ctx"])
-            param["debugger"].info["CP_KV_VOLUME"] = cp_comm_details.total_kv_volume
-            param["debugger"].info["CP_EXPOSED_TIME"] = cp_comm_details.exposed_comm_time
-            param["debugger"].info["CP_TOPOLOGY"] = cp_comm_details.topology
-            param["debugger"].info["CP_BANDWIDTH"] = cp_comm_details.effective_bandwidth
+            logger.info("CP_KV_VOLUME = %s", cp_comm_details.total_kv_volume)
+            logger.info("CP_EXPOSED_TIME = %s", cp_comm_details.exposed_comm_time)
+            logger.info("CP_TOPOLOGY = %s", cp_comm_details.topology)
+            logger.info("CP_BANDWIDTH = %s", cp_comm_details.effective_bandwidth)
 
     res = []
     for i, c in enumerate(comms[Dim.TP]):

@@ -160,13 +160,11 @@ HyperParallel/
 │   │   ├── expert_parallel/            # Expert Parallel
 │   │   ├── pipeline_parallel/          # Pipeline stage 与调度
 │   │   └── distributed_checkpoint/     # 分布式保存、加载与 reshard
-│   ├── collectives/                    # 集合通信接口与实现
-│   └── platform/                       # PyTorch、MindSpore 与设备后端适配
+│   └── collectives/                    # 集合通信接口与实现
 ├── examples/
 │   ├── training_demo/                  # 训练示例（数据准备、离线/在线 YAML）
 │   ├── data/                           # 数据准备脚本
 │   ├── generate/                       # 生成与精度对齐校验脚本
-│   ├── mindspore/                      # MindSpore 后端示例
 │   └── torch/                          # PyTorch 后端 Core API 组合示例
 ├── docs/
 │   ├── guide/                          # 使用指南

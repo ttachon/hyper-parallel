@@ -19,27 +19,10 @@ from typing import Optional, Tuple
 from .parallel_ops import DistributedOp
 
 
-def _normalize_rpe_args(x, cos, sin, mode=0):
-    """Normalize positional and keyword arguments into a canonical positional tuple.
-
-    Args:
-        x: Input tensor.
-        cos: Cosine position encoding tensor.
-        sin: Sine position encoding tensor.
-        mode: Rotation mode. 0=rotate_half, 1=rotate_interleaved, 2=quarter,
-            3=interleave-half. Defaults to 0.
-
-    Returns:
-        tuple: (positional_args_tuple, empty_kwargs_dict)
-    """
-    return (x, cos, sin, mode), {}
-
-
 def _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode=None):
     """Normalize npu_rotary_mul args to canonical positional form.
 
-    Maps ``rotary_mode`` (string, keyword-only) to ``mode`` (int, positional),
-    matching the canonical form produced by :func:`_normalize_rpe_args`.
+    Maps ``rotary_mode`` (string, keyword-only) to ``mode`` (int, positional).
 
     Mapping:
       - ``None`` / not specified / ``"half"`` → mode=0 (rotate_half)
@@ -70,7 +53,7 @@ def _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode=None):
 
 
 class RotaryPositionEmbeddingDistributedOp(DistributedOp):
-    """Distributed operator for RotaryPositionEmbedding and npu_rotary_mul.
+    """Distributed operator for npu_rotary_mul.
 
     Computes rotary position embedding element-wise:
         y = x * cos + x_rotate * sin
@@ -78,9 +61,7 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
     where x_rotate is obtained by rotating within the last (D) dimension.
     Output shape equals x shape exactly.
 
-    Serves both:
-      - MindSpore Primitive ``RotaryPositionEmbedding`` (mode positional)
-      - PyTorch ``torch_npu.npu_rotary_mul`` (rotary_mode keyword-only)
+    Serves ``torch_npu.npu_rotary_mul`` (rotary_mode keyword-only).
 
     Sharding constraints:
       - D (last dim) must be replicated for x, cos, and sin: the kernel rotates
@@ -97,8 +78,6 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
     Output:
       Single tensor with the same shape and layout as x.
     """
-
-    _MS_PRIMITIVE_OP_NAMES = frozenset({'RotaryPositionEmbedding'})
 
     def _validate_input_layouts(self, x_layout, cos_layout, sin_layout) -> None:
         """Validate sharding constraints for all input tensors.
@@ -144,13 +123,9 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
     def preprocess(self, args: tuple, kwargs: dict) -> Optional[tuple]:
         """Extract local tensors and build the layout cache.
 
-        Cross-platform routing via ``_MS_PRIMITIVE_OP_NAMES``:
-          - Primitive (RotaryPositionEmbedding): normalize with
-            _normalize_rpe_args, mode → local_args (all positional),
-            local_kwargs = {}.
-          - PyTorch (npu_rotary_mul): normalize with
-            _normalize_npu_rotary_mul_args, rotary_mode → local_kwargs
-            (keyword-only).
+        Normalizes with ``_normalize_npu_rotary_mul_args``, mapping the
+        ``rotary_mode`` keyword onto ``mode``; ``rotary_mode`` (keyword-only)
+        stays in ``local_kwargs``.
 
         Args:
             args: Positional arguments, may include DTensors.
@@ -160,26 +135,17 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
             tuple: (local_args, local_kwargs, cache_values) where
                 cache_values = [x_layout, cos_layout, sin_layout].
         """
-        # Step 1: normalize — both functions return canonical
-        # (x, cos, sin, mode_int), {}.
-        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
-            norm_args, _ = _normalize_rpe_args(*args, **kwargs)
-        else:
-            norm_args, _ = _normalize_npu_rotary_mul_args(*args, **kwargs)
+        # Step 1: normalize to canonical (x, cos, sin, mode_int), {}.
+        norm_args, _ = _normalize_npu_rotary_mul_args(*args, **kwargs)
 
         x, cos, sin, mode = norm_args
 
-        # Step 2: assemble local_args / local_kwargs by platform convention.
-        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
-            # MindSpore Primitive: all positional, no kwargs.
-            local_args = (x.to_local(), cos.to_local(), sin.to_local(), mode)
-            local_kwargs = {}
-        else:
-            # PyTorch: keyword-only params go in kwargs.
-            local_args = (x.to_local(), cos.to_local(), sin.to_local())
-            local_kwargs = {}
-            if mode == 1:
-                local_kwargs['rotary_mode'] = 'interleave'
+        # Step 2: assemble local_args / local_kwargs; keyword-only params go
+        # in kwargs.
+        local_args = (x.to_local(), cos.to_local(), sin.to_local())
+        local_kwargs = {}
+        if mode == 1:
+            local_kwargs['rotary_mode'] = 'interleave'
 
         cache_values = [x.layout, cos.layout, sin.layout]
         return local_args, local_kwargs, cache_values

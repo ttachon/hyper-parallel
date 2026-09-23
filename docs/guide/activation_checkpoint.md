@@ -117,7 +117,7 @@ model.layers[1] = checkpoint_wrapper(model.layers[1], policy_fn=recompute_policy
 model.expensive_a = checkpoint_exclude_wrapper(model.expensive_a, save_output=False)
 model.expensive_b = checkpoint_exclude_wrapper(model.expensive_b)
 
-# PyTorch eager 和 MindSpore PyNative 使用相同的配置及边界语义。
+# PyTorch eager 使用该配置及边界语义。
 
 # 用 swap_wrapper 替换模块：模块 forward 中保存的中间激活会按策略 offload 到 CPU
 def tensor_swap_policy(tensor):

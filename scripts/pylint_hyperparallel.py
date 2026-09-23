@@ -28,7 +28,7 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "Licensed under the Apache License, Version 2.0",
     "limitations under the License.",
 )
-BACKEND_IMPORTS = {"torch", "mindspore"}
+BACKEND_IMPORTS = {"torch"}
 PLATFORM_ALLOWED_PARTS = ("tests/", "scripts/", ".agent/")
 TORCH_ONLY_CORE_PARTS = (
     "hyper_parallel/core/distributed_checkpoint/",
@@ -135,7 +135,7 @@ class HyperParallelChecker(BaseChecker):
         "C9002": (
             "Direct backend import '%s' is forbidden in platform-agnostic code",
             "forbidden-backend-import",
-            "Used when torch or mindspore is imported outside approved platform-specific modules.",
+            "Used when torch is imported outside approved platform-specific modules.",
         ),
         "C9004": (
             "Avoid mutating sys.path with insert(0, ...)",

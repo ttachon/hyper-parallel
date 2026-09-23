@@ -82,7 +82,7 @@ _STEPS = int(os.environ.get("HSDP_VPP_STEPS", "5"))
 
 
 class MLPModule(nn.Module):
-    """Two-layer MLP block (mirrors the MindSpore composite reference)."""
+    """Two-layer MLP block (mirrors the composite reference)."""
 
     def __init__(self, d_hid: int) -> None:
         super().__init__()
@@ -151,7 +151,7 @@ def _wrap_stage_with_hsdp(stage_model: StageModel, hsdp_mesh) -> StageModel:
 
     Single-layer virtual stages (the VPP loop layout) skip a per-layer wrap to avoid
     nesting an FSDP root inside another FSDP root with the same single child -- matching
-    ``_wrap_stage_with_fsdp`` in the MindSpore composite reference.
+    ``_wrap_stage_with_fsdp`` in the composite reference.
     """
     if len(stage_model.layers) > 1:
         for layer in stage_model.layers:

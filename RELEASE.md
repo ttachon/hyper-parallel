@@ -36,5 +36,5 @@ HyperParallel is a distributed parallel acceleration library for Ascend SuperNod
 
 ## Platform Support
 
-- Supports PyTorch 2.6 / 2.7 / 2.9 and MindSpore backends.
+- Supports PyTorch 2.6 / 2.7 / 2.9 backends.
 - Supports pip installation and source build with configurable Multicore native extensions.

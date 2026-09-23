@@ -1119,25 +1119,21 @@ def _distribute_module_iter_buffers(module: Any) -> list:
 
 
 def _distribute_module_named_modules(module: Any):
-    """``nn.Module.named_modules`` or MindSpore ``Cell.cells_and_names`` (submodule FQNs)."""
+    """``nn.Module.named_modules`` (submodule FQNs)."""
     if hasattr(module, "named_modules"):
         return module.named_modules()
-    if hasattr(module, "cells_and_names"):
-        return module.cells_and_names()
     raise TypeError(
-        f"distribute_module expects module-like objects with named_modules or cells_and_names; "
+        f"distribute_module expects a module-like object with named_modules; "
         f"got {type(module)}."
     )
 
 
 def _distribute_module_named_parameters(module: Any):
-    """``nn.Module.named_parameters(recurse=False)`` or MindSpore ``Cell.parameters_and_names(expand=False)``."""
+    """``nn.Module.named_parameters(recurse=False)``."""
     if hasattr(module, "named_parameters"):
         return module.named_parameters(recurse=False)
-    if hasattr(module, "parameters_and_names"):
-        return module.parameters_and_names(expand=False)
     raise TypeError(
-        f"distribute_module expects module-like objects with named_parameters or parameters_and_names; "
+        f"distribute_module expects a module-like object with named_parameters; "
         f"got {type(module)}."
     )
 
@@ -1247,7 +1243,7 @@ def distribute_module(
     ``partition_fn``. ``input_fn`` / ``output_fn`` attach only to the root *module*.
 
     Args:
-        module: Root ``nn.Module`` or MindSpore ``Cell`` with compatible APIs.
+        module: Root ``nn.Module``.
         device_mesh: Placement mesh; if ``None``, uses ``_mesh_resources.get_current_mesh()``.
         partition_fn: Per ``named_modules`` callback before replicate pass; ``None`` replicates all.
         input_fn: ``(module, inputs, mesh)`` or deprecated ``(inputs, mesh)`` pre-hook.

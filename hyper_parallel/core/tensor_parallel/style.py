@@ -161,7 +161,7 @@ class ColwiseParallel(ParallelStyle):
             input_tensor = input_tensor.redistribute(
                 device_mesh, desired_input_layouts,
             )
-        # MindSpore requires tuple return from pre-hook
+        # Pre-hook contract: return the possibly-redistributed input as a tuple.
         return (input_tensor,)
 
     def _partition_linear_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
@@ -336,7 +336,7 @@ class RowwiseParallel(ParallelStyle):
             input_tensor = input_tensor.redistribute(
                 device_mesh, desired_input_layouts,
             )
-        # MindSpore requires tuple return from pre-hook
+        # Pre-hook contract: return the possibly-redistributed input as a tuple.
         return (input_tensor,)
 
     def _partition_linear_fn(self, module: Any, device_mesh: DeviceMesh) -> None:

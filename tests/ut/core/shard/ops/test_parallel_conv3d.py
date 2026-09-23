@@ -101,7 +101,7 @@ class TestParallelConv3D(unittest.TestCase):
         """
         Feature: New dispatch preprocessing
         Description: Conv3d preprocess converts DTensors to local tensors and builds cache_values.
-        Expectation: MindSpore-compatible positional args are returned and cache_values carries layouts.
+        Expectation: positional args are returned and cache_values carries layouts.
         """
         mesh = self._make_1d_mesh(mock_platform, world_size=4, mesh_dim_names=("dp",))
         in_layout = _build_layout(mesh, (Replicate(),), 5)

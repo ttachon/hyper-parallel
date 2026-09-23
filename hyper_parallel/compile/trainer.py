@@ -35,7 +35,7 @@ import torch.distributed as dist
 
 from .compiler import GraphCompiler
 from .pass_config import PassConfig
-from .pass_plan import PassPlan
+from .graph_parallel_plan import GraphParallelPlan
 
 _LOG = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class GraphTrainer:
         model: torch.nn.Module,
         train_fn: Callable,
         pass_config: PassConfig,
-        pass_plan: Optional[PassPlan] = None,
+        parallel_plan: Optional[GraphParallelPlan] = None,
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
@@ -66,8 +66,8 @@ class GraphTrainer:
             model: Model to train
             train_fn: Training function signature: (model, input, label) -> loss
             pass_config: Parallel configuration
-            pass_plan: PassPlan declaring which modules to shard (optional;
-                enables declarative sharding)
+            parallel_plan: GraphParallelPlan declaring which modules to shard
+                (optional; enables declarative sharding)
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
@@ -84,7 +84,7 @@ class GraphTrainer:
             model=model,
             train_fn=train_fn,
             pass_config=pass_config,
-            pass_plan=pass_plan,
+            parallel_plan=parallel_plan,
             device=device,
             mesh_context=mesh_context,
         )

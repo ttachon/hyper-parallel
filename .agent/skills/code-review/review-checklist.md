@@ -178,7 +178,7 @@ When a change introduces new API patterns, evaluate broader implications:
 ### Test Patterns
 
 - [ ] **Proper markers** — `@arg_mark(plat_marks=..., level_mark=..., card_mark=..., essential_mark=...)`
-- [ ] **Distributed tests use helpers** — `torchrun_case()` for PyTorch, `msrun_case()` for MindSpore
+- [ ] **Distributed tests use helpers** — `torchrun_case()` for distributed test launch
 - [ ] **Graceful hardware skip** — Tests skip cleanly when required hardware unavailable
 - [ ] **Self-contained** — No shared mutable state between tests
 

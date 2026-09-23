@@ -21,7 +21,7 @@ nodes.
 
 Responsibilities:
 1. Identify parameter placeholders belonging to FSDP-wrapped modules
-   (via PassPlan, exact FQN or pattern)
+   (via GraphParallelPlan, exact FQN or pattern)
 2. Insert AllGather after each such placeholder (Shard -> Replicate), so the
    computation body operates on full parameters while the graph input stays
    sharded
@@ -52,7 +52,7 @@ from torch.ops import _c10d_functional
 
 from ...pass_config import PassConfig
 from ..base import GraphPass
-from ...pass_plan import PassPlan
+from ...graph_parallel_plan import GraphParallelPlan
 
 _LOG = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class FSDPPass(GraphPass):
     def __init__(
         self,
         fsdp_group_name: Optional[str] = None,
-        pass_plan: Optional[PassPlan] = None,
+        parallel_plan: Optional[GraphParallelPlan] = None,
     ) -> None:
         """Initialize FSDP pass state.
 
@@ -89,12 +89,12 @@ class FSDPPass(GraphPass):
             fsdp_group_name: Process-group name registered for FSDP
                 collectives. Defaults to ``"fsdp"``. May be overridden
                 per-run via the ``fsdp_group_name`` kwarg in ``run``.
-            pass_plan: Declarative plan identifying which modules to
+            parallel_plan: Declarative plan identifying which modules to
                 shard. When ``None``, all parameters are sharded.
         """
         super().__init__()
         self._fsdp_group_name = fsdp_group_name or "fsdp"
-        self._pass_plan = pass_plan
+        self._parallel_plan = parallel_plan
         # Resolved from ``pass_config.fsdp_degree`` (or world_size) at
         # ``run`` entry; left as ``None`` here so a stray access before
         # ``run`` fails loudly instead of silently using a wrong default.
@@ -117,7 +117,7 @@ class FSDPPass(GraphPass):
                 FSDP-only path). A ``TypeError`` here means a non-Protocol
                 config was passed — fix at the caller, do not paper over.
             **kwargs: Must include ``model`` (the live ``nn.Module``) and
-                ``fsdp_group_name`` / ``pass_plan`` as needed.
+                ``fsdp_group_name`` / ``parallel_plan`` as needed.
 
         Returns:
             The transformed graph module.
@@ -133,7 +133,7 @@ class FSDPPass(GraphPass):
         configured = pass_config.fsdp_degree
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
-        self._pass_plan = kwargs.get("pass_plan", self._pass_plan)
+        self._parallel_plan = kwargs.get("parallel_plan", self._parallel_plan)
         model = kwargs.get("model")
         if model is None:
             raise ValueError(
@@ -171,7 +171,9 @@ class FSDPPass(GraphPass):
         )
 
         if not param_nodes:
-            _LOG.warning("No FSDP parameters found, check PassPlan or model structure")
+            _LOG.warning(
+                "No FSDP parameters found, check GraphParallelPlan or model structure"
+            )
             return graph_module
 
         graph_module = self._insert_all_gather_for_params(graph_module, param_nodes)
@@ -212,7 +214,7 @@ class FSDPPass(GraphPass):
         Parameters are the leading ``num_state_inputs`` placeholders of the
         joint graph, in ``state_fqns`` order. A parameter is FSDP-sharded when
         any ancestor module FQN (e.g. ``layers.0.attention.wq`` for
-        ``layers.0.attention.wq.weight``) is marked in the PassPlan —
+        ``layers.0.attention.wq.weight``) is marked in the GraphParallelPlan —
         either exactly or via pattern (e.g. ``layers.*``).
 
         Only parameters are sharded. Buffers (e.g. RoPE's non-persistent
@@ -253,8 +255,9 @@ class FSDPPass(GraphPass):
 
             fqn = state_fqns[idx]
 
-            if self._pass_plan is not None and not self._param_belongs_to_fsdp_module(
-                fqn
+            if (
+                self._parallel_plan is not None
+                and not self._param_belongs_to_fsdp_module(fqn)
             ):
                 continue
 
@@ -306,8 +309,9 @@ class FSDPPass(GraphPass):
             # gate here would shard params the graph still expects full-rank
             # (no AllGather inserted), causing a shape mismatch at
             # ``run_traced_graph`` time on any non-``*`` plan.
-            if self._pass_plan is not None and not self._param_belongs_to_fsdp_module(
-                name
+            if (
+                self._parallel_plan is not None
+                and not self._param_belongs_to_fsdp_module(name)
             ):
                 _LOG.info(
                     "Skip %s: not in an FSDP-wrapped module",
@@ -343,20 +347,20 @@ class FSDPPass(GraphPass):
 
         The parameter's own module FQN (``layers.0.attention.wq.weight`` ->
         ``layers.0.attention.wq``) plus every ancestor (``layers.0``, ...) is
-        tested, so both ``fsdp_wrap("layers.0.attention.wq")`` and
-        ``fsdp_wrap_pattern("layers.*")`` match.
+        tested, so both ``fsdp_mark("layers.0.attention.wq")`` and
+        ``fsdp_mark_pattern("layers.*")`` match.
 
         A parameter directly on the root (``weight``) has no module ancestor;
-        its own FQN is still tested first so it can be wrapped by its name
-        (``fsdp_wrap("weight")``) or by a ``*`` pattern.
+        its own FQN is still tested first so it can be marked by its name
+        (``fsdp_mark("weight")``) or by a ``*`` pattern.
         """
-        if self._pass_plan.is_fsdp_module(param_fqn):
+        if self._parallel_plan.is_marked_for_fsdp(param_fqn):
             return True
 
         parts = param_fqn.split(".")
         for i in range(len(parts) - 1, 0, -1):
             module_fqn = ".".join(parts[:i])
-            if self._pass_plan.is_fsdp_module(module_fqn):
+            if self._parallel_plan.is_marked_for_fsdp(module_fqn):
                 return True
         return False
 

@@ -72,8 +72,8 @@ pp:
     - [layers.2, layers.3, norm, lm_head]
 ```
 
-Both come from `PassPlan.pp_stage(stage_idx, fqns)` /
-`create_pass_plan_from_yaml`.
+Both come from `GraphParallelPlan.pp_stage(stage_idx, fqns)` /
+`create_plan_from_yaml`.
 
 ## Configuration reference (`parallel:` section)
 

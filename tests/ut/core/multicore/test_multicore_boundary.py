@@ -50,12 +50,12 @@ class TestMulticoreBoundary(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_runtime_sources_do_not_import_platform_or_mindspore(self):
+    def test_runtime_sources_import_no_platform_layer(self):
         """Verify production sources stay Torch-only.
 
         Feature: Multicore runtime convergence.
         Description: Parse imports in the converged production Python tree.
-        Expectation: Runtime sources import neither MindSpore nor a HyperParallel Platform layer.
+        Expectation: Runtime sources import no HyperParallel Platform layer.
         """
         root = Path(multicore.__file__).parent
         for path in root.rglob("*.py"):
@@ -72,4 +72,4 @@ class TestMulticoreBoundary(unittest.TestCase):
                     continue
                 for module in modules:
                     with self.subTest(path=path, module=module):
-                        self.assertFalse(module.startswith(("mindspore", "hyper_parallel.platform")))
+                        self.assertFalse(module.startswith("hyper_parallel.platform"))

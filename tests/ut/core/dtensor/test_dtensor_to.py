@@ -24,8 +24,8 @@ import hyper_parallel.core.dtensor.dtensor as dtensor_mod
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
 
-# DTensor inherits from DTensorBase which inherits from a C extension Tensor.
-# On MindSpore the C-level descriptor enforces isinstance(self, Tensor).
+# DTensor inherits from DTensorBase which inherits from a C extension Tensor,
+# whose descriptor enforces isinstance(self, Tensor) on these methods.
 # Bypass it by pulling the Python function directly from DTensor.__dict__.
 _to_fn = DTensor.__dict__["to"]
 _float_fn = DTensor.__dict__["float"]

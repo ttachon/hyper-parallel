@@ -7,7 +7,7 @@ paths:
 
 # Test Assertion Style Rules
 
-Common assertion style rules that apply to all test files (UT, ST, MindSpore, PyTorch).
+Common assertion style rules that apply to all test files (UT, ST).
 
 ## F-String Rules
 

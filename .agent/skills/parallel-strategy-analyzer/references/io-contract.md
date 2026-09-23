@@ -30,7 +30,7 @@ Load with `SKILL.md` when collecting inputs or formatting the final report.
 | KV heads | GQA | n_kv=8 |
 | FFN dim | Intermediate | d_ff=28672 |
 | MoE config | Experts, top-k | 8 experts, top-2 |
-| Framework | Backend | PyTorch / MindSpore |
+| Framework | Backend | PyTorch |
 
 Known models (LLaMA, GPT, Mixtral, …) auto-fill from `known-models.md`.
 

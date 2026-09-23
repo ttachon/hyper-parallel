@@ -187,7 +187,7 @@ overlap_b_f 支持不同 PP stage 包含不同层数，并支持混合重计算�
 2. **overlap_b_f**：PP+EP 场景下开启 overlap_b_f 可显著减少通算串行等待
 3. **overlap_p2p**：配合 overlap_b_f 开启 overlap_p2p 可进一步减少 P2P 通信延迟
 4. **PP+FSDP**：stage 内部使用 FSDP 切分参数可大幅降低单卡内存占用
-5. **batch size 整除**：MindSpore 后端要求 batch size 必须整除 micro_batch_num
+5. **batch size 整除**：batch size 必须整除 micro_batch_num
 
 ---
 

@@ -28,7 +28,6 @@ from hyper_parallel.core.dtensor.device_mesh import (
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 op = CumsumDistributedOp("cumsum")
-op_ms = CumsumDistributedOp("CumsumExt")
 
 
 class TestParallelCumsum(unittest.TestCase):
@@ -271,11 +270,11 @@ class TestParallelCumsum(unittest.TestCase):
         assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_cumsum_preprocess_mindspore_primitive_in_args(self, mock_platform):
+    def test_cumsum_preprocess_default_dtype(self, mock_platform):
         """
-        Feature: Cumsum preprocess for MindSpore Primitive
-        Description: CumsumExt does not accept kwargs
-        Expectation: dim and dtype are routed to positional args, including dtype=None
+        Feature: Cumsum preprocess with an unspecified dtype
+        Description: dtype defaults to None
+        Expectation: dim is a positional arg; dtype is omitted from kwargs rather than passed as None
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -284,19 +283,19 @@ class TestParallelCumsum(unittest.TestCase):
         mock_tensor.layout = x_layout
         mock_tensor.to_local.return_value = MagicMock()
 
-        local_args, local_kwargs, cache_values = op_ms.preprocess(
+        local_args, local_kwargs, cache_values = op.preprocess(
             (mock_tensor,),
             {'dim': -1}
         )
 
         assert not local_kwargs, (
-            f"For MindSpore 'CumsumExt', local_kwargs should be empty, got {local_kwargs}"
+            f"For 'cumsum', local_kwargs should be empty when dtype is None, got {local_kwargs}"
         )
-        assert len(local_args) == 3, (
-            f"For MindSpore 'CumsumExt', local_args should be (tensor, dim, dtype), got {local_args}"
+        assert len(local_args) == 2, (
+            f"For 'cumsum', local_args should be (tensor, dim), got {local_args}"
         )
-        assert local_args[1:] == (-1, None), (
-            f"MindSpore positional dim/dtype mismatch, got {local_args[1:]}"
+        assert local_args[1] == -1, (
+            f"dim should be -1, got {local_args[1]}"
         )
         assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
 

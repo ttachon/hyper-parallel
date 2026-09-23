@@ -38,4 +38,5 @@ hyper_parallel/
 └── distributed/     # 分布式模型构建、并行计划应用与激活管理
 ```
 
-模型族的替换工厂、CP/EP 规则和训练入口收敛在 `models/<family>/` 下（当前交付 `models/qwen3_moe/recipes/train.yaml`）。
+模型族的替换工厂、CP/EP 规则和训练入口收敛在 `models/<family>/` 下；当前交付
+`models/qwen3_moe/recipes/train.yaml` 与 `models/deepseek_v32/recipes/train.yaml`。

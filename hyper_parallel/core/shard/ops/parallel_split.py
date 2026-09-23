@@ -174,7 +174,7 @@ class SplitWithSizeViewDistributedOp(DistributedOp):
 
 
 class SplitDistributedOp(DistributedOp):
-    """Distributed implementation for Split operator (MindSpore Split and torch.split)."""
+    """Distributed implementation for the Split operator (torch.split)."""
 
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """

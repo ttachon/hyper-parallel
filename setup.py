@@ -44,11 +44,6 @@ TORCH29_REQUIRES = [
     "torch-npu==2.9.1",
 ]
 
-MINDSPORE_REQUIRES = [
-    "mindspore>=2.10",
-]
-
-
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
     with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:
@@ -111,8 +106,7 @@ def get_extra_requires() -> dict[str, list[str]]:
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
         "torch29": list(TORCH29_REQUIRES),
-        "mindspore": list(MINDSPORE_REQUIRES),
-        "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES,
+        "all": list(TORCH29_REQUIRES),
     }
 
 
@@ -236,7 +230,6 @@ if __name__ == '__main__':
         name='hyper_parallel',
         version='0.1.0',
         author='The MindSpore Authors',
-        author_email='contact@mindspore.cn',
         url='https://www.mindspore.cn',
         download_url='https://gitcode.com/mindspore/hyper-parallel/tags',
         project_urls={

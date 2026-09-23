@@ -7,7 +7,7 @@ Loaded from `SKILL.md` Steps 2–6. Constraints:
 
 | File | Demonstrates |
 |------|----------------|
-| `parallel_sort.py` | `preprocess` + `infer_layout(cache_values)` + `_MS_PRIMITIVE_OP_NAMES` |
+| `parallel_sort.py` | `preprocess` + `infer_layout(cache_values)`, minimal new-flow example |
 | `parallel_rotary_position_embedding.py` | + `_validate_input_layouts` — most complete new-flow example |
 | `parallel_matmul.py` | `preprocess` + `get_expand_impl` |
 

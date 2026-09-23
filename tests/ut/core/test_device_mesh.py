@@ -181,7 +181,7 @@ def test_device_mesh_view_cache_keeps_root_mesh_when_view_matches_root_key(mock_
     assert rebuilt_layout.mesh is root_mesh
 
 
-@unittest.skip("Skipped: all TestDeviceMesh cases (full UT session may hit MindSpore/Ascend init on some hosts).")
+@unittest.skip("Skipped: all TestDeviceMesh cases (full UT session may hit Ascend init on some hosts).")
 class TestDeviceMesh(unittest.TestCase):
     """Unit tests for DeviceMesh class and related functions."""
 

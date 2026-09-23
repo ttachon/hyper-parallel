@@ -1337,7 +1337,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
                 f"TND layout with context parallelism (s1_split_num={s1_split_num} > 1) "
                 f"requires sparse_mode={SPARSE_RIGHT_DOWN_CAUSAL} (rightDownCausal), "
                 f"but got sparse_mode={sparse_mode}.\n"
-                f"This is required by MindSpore for correct attention mask partitioning."
+                f"This is required for correct attention mask partitioning."
             )
 
         if query_global_shape[0] != key_global_shape[0]:

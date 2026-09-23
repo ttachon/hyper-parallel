@@ -2,26 +2,7 @@
 
 ## 1. 接口分析
 
-### 接入平台
-
-- 平台范围：PyTorch / MindSpore / 双平台
-- （若单平台）已与用户确认，不接入另一侧。
-
-### MindSpore 接口（如适用）
-
-- mint 接口：`mint.{op_name}`
-- functional_overload：是 / 否
-- mint → Primitive 映射：`mint.{op_name}` → `{PrimitiveName}`（YAML 注册名）
-- Primitive 参数表：
-
-| 参数 | dtype | shape 约束 | kwonlyarg |
-|------|-------|-----------|-----------|
-| x | float16/bf16/float32 | ... | 否 |
-| ... | ... | ... | ... |
-
-- 硬件约束：...
-
-### PyTorch 接口（如适用）
+### 接入接口
 
 - 接口：`torch.{op_name}`
 - 参数表：
@@ -69,14 +50,13 @@
 **基类选择：**
 
 - 选择：`{BaseClass}`（例：`ElementWiseDistributedOp` / `ReshapeDistributedOp` / 新类继承 `DistributedOp`）
-- 理由：{选择理由，如"纯逐元素，无需自定义 infer_layout" / "需要_MS_PRIMITIVE_OP_NAMES 路由" / "输出 layout 非逐元素映射"}
+- 理由：{选择理由，如"纯逐元素，无需自定义 infer_layout" / "需要按 op 名区分 dtype 传参方式" / "输出 layout 非逐元素映射"}
 - 若选择纯 YAML 注册（无新 Python 文件），在此注明，并跳过模块结构部分。
 
 **模块结构（仅三阶段 dispatch 新类需要）：**
 
-- `_normalize_{op_name}_args(...)` — 模块级函数，统一 torch/mint/Primitive 接口差异，返回 `(args_tuple, kwargs_dict)`
+- `_normalize_{op_name}_args(...)` — 模块级函数，统一前端接口差异，返回 `(args_tuple, kwargs_dict)`
 - `{OpName}DistributedOp({BaseClass})` 类：
-  - `_MS_PRIMITIVE_OP_NAMES = frozenset({'{PrimitiveName}'})` （双平台时填入 MindSpore 侧 YAML 注册名）
   - `preprocess(args, kwargs)` — 调用 `_normalize_{op_name}_args`，提取 local tensors，构建 cache_values
   - `@staticmethod _validate_input_layouts(...)` — layout 合法性校验（被 `infer_layout` 调用）
   - `infer_layout(cache_values)` — 调用 `_check_partial_inputs` → `_validate_input_layouts` → 推导输出 layout
@@ -91,11 +71,7 @@
 ### 文件二：`hyper_parallel/core/shard/ops/yaml/{op_name}_ops.yaml`
 
 ```yaml
-{PrimitiveName}:                    # MindSpore Primitive（如适用）
-  distributed_op_class: {OpName}DistributedOp
-  distributed_op_file: parallel_{op_name}
-
-{torch_op_name}:                    # PyTorch（如适用）
+{torch_op_name}:
   distributed_op_class: {OpName}DistributedOp
   distributed_op_file: parallel_{op_name}
 ```

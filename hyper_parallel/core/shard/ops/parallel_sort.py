@@ -27,7 +27,6 @@ def _normalize_sort_args(x, dim=-1, descending=False, stable=False):
 
 class SortDistributedOp(DistributedOp):
     """Distributed implementation for Sort operator."""
-    _MS_PRIMITIVE_OP_NAMES = frozenset({'SortExt'})
 
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
@@ -46,12 +45,8 @@ class SortDistributedOp(DistributedOp):
         descending = kwargs['descending']
         stable = kwargs['stable']
 
-        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
-            local_args = (input_tensor.to_local(), dim, descending, stable)
-            local_kwargs = {}
-        else:
-            local_args = (input_tensor.to_local(),)
-            local_kwargs = {'dim': dim, 'descending': descending, 'stable': stable}
+        local_args = (input_tensor.to_local(),)
+        local_kwargs = {'dim': dim, 'descending': descending, 'stable': stable}
 
         cache_values = [input_tensor.layout, dim]
         return local_args, local_kwargs, cache_values

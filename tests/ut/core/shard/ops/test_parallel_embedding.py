@@ -27,10 +27,9 @@ from hyper_parallel.core.dtensor.device_mesh import (
 )
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
-# Initialize distributed ops for both 'embedding' and 'Embedding'
+# Initialize distributed op for 'embedding'
 embedding_ops = [
     EmbeddingDistributedOp("embedding"),
-    EmbeddingDistributedOp("Embedding")
 ]
 
 
@@ -292,11 +291,11 @@ class TestParallelEmbedding(unittest.TestCase):
             # Expected map: (1, 0, -1)
             self.assertEqual(output_layout.tensor_map, (1, 0, -1))
 
-    def test_embedding_preprocess_routes_platform_args(self):
+    def test_embedding_preprocess_routes_args(self):
         """
         Feature: New dispatch preprocessing.
         Description: Convert DTensor inputs to local tensors and cache layouts.
-        Expectation: PyTorch embedding keeps sparse while MindSpore Embedding drops it.
+        Expectation: local_args carries the seven normalized embedding arguments and empty kwargs.
         """
         input_layout = MagicMock()
         weight_layout = MagicMock()
@@ -311,13 +310,6 @@ class TestParallelEmbedding(unittest.TestCase):
             (input_tensor, weight_tensor), {}
         )
         self.assertEqual(local_args, ("local_input", "local_weight", None, None, 2.0, False, False))
-        self.assertEqual(local_kwargs, {})
-        self.assertEqual(cache_values, [input_layout, weight_layout])
-
-        local_args, local_kwargs, cache_values = EmbeddingDistributedOp("Embedding").preprocess(
-            (input_tensor, weight_tensor), {}
-        )
-        self.assertEqual(local_args, ("local_input", "local_weight", None, None, 2.0, False))
         self.assertEqual(local_kwargs, {})
         self.assertEqual(cache_values, [input_layout, weight_layout])
 

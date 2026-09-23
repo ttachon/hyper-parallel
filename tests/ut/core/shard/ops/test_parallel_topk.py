@@ -268,10 +268,10 @@ class TestParallelTopK(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_topk_preprocess_mindspore(self, mock_platform):
+    def test_topk_preprocess_all_positional(self, mock_platform):
         """
-        Feature: TopKDistributedOp preprocess for MindSpore Primitive path.
-        Description: MindSpore TopkExt Primitive takes all positional args.
+        Feature: TopKDistributedOp preprocess with fully positional arguments.
+        Description: All of k, dim, largest and sorted are supplied positionally.
         Expectation: local_kwargs is empty; local_args has 5 elements (tensor, k, dim, largest, sorted).
         """
         mesh = self._make_2x2_mesh(mock_platform)
@@ -285,10 +285,10 @@ class TestParallelTopK(unittest.TestCase):
         local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, 5, 0), {})
 
         assert not local_kwargs, (
-            f"For MindSpore 'TopkExt', local_kwargs should be empty, got {local_kwargs}"
+            f"For 'TopK', local_kwargs should be empty, got {local_kwargs}"
         )
         assert len(local_args) == 5, (
-            f"For MindSpore 'TopkExt', local_args should have 5 elements "
+            f"For 'TopK', local_args should have 5 elements "
             f"(tensor, k, dim, largest, sorted), got {len(local_args)}"
         )
         assert local_args[1] == 5, (
@@ -317,8 +317,5 @@ class TestParallelTopK(unittest.TestCase):
             torch_op.infer_layout(cache_values)
 
 
-
-
 if __name__ == "__main__":
     unittest.main()
-

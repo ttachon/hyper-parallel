@@ -66,7 +66,7 @@ from torch import fx, nn
 
 from ...pass_config import PassConfig
 from ..base import GraphPass
-from ...pass_plan import PassPlan
+from ...graph_parallel_plan import GraphParallelPlan
 from .pp_schedule import ScheduleGPipe
 
 _LOG = logging.getLogger(__name__)
@@ -172,7 +172,7 @@ def _auto_stage_split(model: nn.Module, pp_degree: int) -> List[List[str]]:
             raise ValueError(
                 f"Cannot split {len(children)} top-level children across "
                 f"{pp_degree} PP stages; provide a manual stage plan via "
-                f"PassPlan.pp_stage()"
+                f"GraphParallelPlan.pp_stage()"
             )
         return _even_split(children, pp_degree)
 
@@ -278,16 +278,16 @@ class PpPass(GraphPass):
 
     name = "pp_parallel"
 
-    def __init__(self, pass_plan: Optional[PassPlan] = None) -> None:
+    def __init__(self, parallel_plan: Optional[GraphParallelPlan] = None) -> None:
         """Initialize PP pass state.
 
         Args:
-            pass_plan: Declarative plan; ``pp_module_fqns_per_stage`` (from
+            parallel_plan: Declarative plan; ``pp_module_fqns_per_stage`` (from
                 ``pp_stage()``) overrides the automatic even-by-layers
                 split.
         """
         super().__init__()
-        self._pass_plan = pass_plan
+        self._parallel_plan = parallel_plan
 
     def run(
         self,
@@ -303,7 +303,7 @@ class PpPass(GraphPass):
                 resolves to ``world_size``) and ``pp_microbatch_size`` are
                 read directly.
             **kwargs: Must include ``model`` (the live ``nn.Module``); may
-                include ``pass_plan``.
+                include ``parallel_plan``.
 
         Returns:
             The same graph module, rewritten into a stage stub whose
@@ -348,7 +348,7 @@ class PpPass(GraphPass):
                 "PpPass requires the live model via kwargs (model=...) so it "
                 "can resolve the stage plan and prune foreign-stage modules"
             )
-        self._pass_plan = kwargs.get("pass_plan", self._pass_plan)
+        self._parallel_plan = kwargs.get("parallel_plan", self._parallel_plan)
 
         # Skip BEFORE _resolve_group_and_stage so a disabled pass does not
         # execute the collective dist.new_group.
@@ -596,8 +596,8 @@ class PpPass(GraphPass):
     def _resolve_stage_plan(self, model: nn.Module, pp_degree: int) -> List[List[str]]:
         """Resolve the per-stage module FQN lists (manual plan or auto split)."""
         manual = (
-            self._pass_plan.pp_module_fqns_per_stage
-            if self._pass_plan is not None
+            self._parallel_plan.pp_module_fqns_per_stage
+            if self._parallel_plan is not None
             else None
         )
         if manual is not None:
@@ -658,7 +658,7 @@ class PpPass(GraphPass):
         _LOG.warning(
             "No PP stage declares modules %s — their nodes ride with the "
             "dataflow attribution (consumer stage, then last stage). "
-            "Declare them via PassPlan.pp_stage() if that is not intended.",
+            "Declare them via GraphParallelPlan.pp_stage() if that is not intended.",
             shown,
         )
 
@@ -1135,7 +1135,7 @@ class PpPass(GraphPass):
                     f"values between neighbouring stages only. A skip "
                     f"connection spanning 2+ stages or a stage plan that "
                     f"leaves modules unattributed produces this — adjust "
-                    f"PassPlan.pp_stage() so the dataflow crosses one cut "
+                    f"GraphParallelPlan.pp_stage() so the dataflow crosses one cut "
                     f"at a time."
                 )
 

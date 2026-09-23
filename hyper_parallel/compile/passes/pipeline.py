@@ -47,7 +47,7 @@ from .parallel.pp_pass import PpPass
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..pass_plan import PassPlan
+    from ..graph_parallel_plan import GraphParallelPlan
 
 
 class PassPipeline:
@@ -59,17 +59,17 @@ class PassPipeline:
     def __init__(
         self,
         pass_config: PassConfig,
-        pass_plan: Optional["PassPlan"] = None,
+        parallel_plan: Optional["GraphParallelPlan"] = None,
     ) -> None:
         """Initialize the pipeline with a parallel config and optional plan.
 
         Args:
             pass_config: Parallel configuration driving pass selection.
-            pass_plan: Optional sharding plan forwarded to partitioning
+            parallel_plan: Optional sharding plan forwarded to partitioning
                 passes (e.g. ``FSDPPass``).
         """
         self.config: PassConfig = pass_config
-        self.pass_plan = pass_plan
+        self.parallel_plan = parallel_plan
         self.passes: List[GraphPass] = []
 
     def build(self) -> "PassPipeline":
@@ -80,9 +80,9 @@ class PassPipeline:
 
         # 2. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
-            self.passes.append(FSDPPass(pass_plan=self.pass_plan))
+            self.passes.append(FSDPPass(parallel_plan=self.parallel_plan))
         if getattr(self.config, "pp_enabled", False):
-            self.passes.append(PpPass(pass_plan=self.pass_plan))
+            self.passes.append(PpPass(parallel_plan=self.parallel_plan))
 
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
@@ -105,17 +105,17 @@ class PassPipeline:
         Args:
             graph_module: The FX GraphModule to transform.
             **kwargs: Extra keyword arguments forwarded to every pass
-                (e.g. ``model`` / ``fsdp_group_name``). ``pass_plan``
+                (e.g. ``model`` / ``fsdp_group_name``). ``parallel_plan``
                 is auto-filled from the pipeline's plan when omitted.
 
         Returns:
             The transformed graph module.
         """
-        # Ensure the pass_plan is always available to passes that need
+        # Ensure the parallel_plan is always available to passes that need
         # it (FSDPPass reads it from kwargs), even if the caller did not
         # pass it explicitly.
-        if "pass_plan" not in kwargs and self.pass_plan is not None:
-            kwargs["pass_plan"] = self.pass_plan
+        if "parallel_plan" not in kwargs and self.parallel_plan is not None:
+            kwargs["parallel_plan"] = self.parallel_plan
 
         config = self.config
         for graph_pass in self.passes:
@@ -126,10 +126,10 @@ class PassPipeline:
     def from_config(
         cls,
         config: PassConfig,
-        pass_plan: Optional["PassPlan"] = None,
+        parallel_plan: Optional["GraphParallelPlan"] = None,
     ) -> "PassPipeline":
         """Create Pipeline from configuration."""
-        return cls(config, pass_plan).build()
+        return cls(config, parallel_plan).build()
 
 
 class DeadCodeEliminationPass(GraphPass):

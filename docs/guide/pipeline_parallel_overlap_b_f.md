@@ -273,7 +273,7 @@ COMM/COMPUTE role 并调用 `coordinator.rendezvous`；反向时角色对称翻�
 `D_LAST` 保留最后一层的通知语义并跳过边界 rendezvous。
 
 `CommComputeOverlap` 直接调用此钩子；每个 overlap window 新建并等待一个
-反向线程。PP 不再经过 Platform，也不提供 MindSpore 实现。
+反向线程。PP 不再经过 Platform 抽象层。
 
 ---
 

@@ -38,7 +38,6 @@ class EmbeddingDistributedOp(DistributedOp):
     Distributed implementation for embedding operators.
     Supports Column Parallelism (CP) and Row Parallelism (RP).
     """
-    _MS_PRIMITIVE_OP_NAMES = frozenset({'Embedding'})
 
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
@@ -54,10 +53,7 @@ class EmbeddingDistributedOp(DistributedOp):
         """
         args, _ = _normalize_embedding_args(*args, **kwargs)
         input_tensor, weight_tensor = args[0], args[1]
-        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
-            local_args = (input_tensor.to_local(), weight_tensor.to_local()) + args[2:6]
-        else:
-            local_args = (input_tensor.to_local(), weight_tensor.to_local()) + args[2:]
+        local_args = (input_tensor.to_local(), weight_tensor.to_local()) + args[2:]
         local_kwargs = {}
         cache_values = [input_tensor.layout, weight_tensor.layout]
         return local_args, local_kwargs, cache_values

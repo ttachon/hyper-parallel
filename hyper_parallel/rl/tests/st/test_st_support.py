@@ -318,7 +318,7 @@ def test_launcher_is_framework_free() -> None:
     """The pytest launcher must remain importable without training backends."""
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).parent.parent) + os.pathsep + str(ROOT))
     code = ("import sys; import st.test_rl_st; import st._launch; "
-            "assert not {'torch','torch_npu','hyper_parallel','mindspore'} & sys.modules.keys()")
+            "assert not {'torch','torch_npu','hyper_parallel'} & sys.modules.keys()")
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=ROOT,
                             capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr

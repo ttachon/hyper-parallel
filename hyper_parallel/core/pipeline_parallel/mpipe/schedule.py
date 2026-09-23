@@ -306,6 +306,12 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
     def run_microbatches(self, arg_mbs: list, kwarg_mbs: list, losses: list) -> None:
         """Reset the executor's per-step caches, then run the schedule.
 
+        A step raising mid-run leaves its micro-batches in those caches, so the
+        error path drops them (:meth:`MPipeTransposeExecutor.abort`) -- the
+        counterpart of the scheduler's in-flight P2P drain, which covers only
+        the comm handles. The normal path leaves the caches empty, which the
+        next run's reset still verifies.
+
         Args:
             arg_mbs (list): Per-micro-batch positional args.
             kwarg_mbs (list): Per-micro-batch keyword args.
@@ -313,7 +319,12 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         """
         if self._executor is not None:
             self._executor.reset()
-        super().run_microbatches(arg_mbs, kwarg_mbs, losses)
+        try:
+            super().run_microbatches(arg_mbs, kwarg_mbs, losses)
+        except BaseException:
+            if self._executor is not None:
+                self._executor.abort()
+            raise
 
     def construct_exec_order(self) -> None:
         """Build the body Interleaved 1F1B order, then layer the preprocess

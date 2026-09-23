@@ -8,7 +8,7 @@
 - GCC/G++（支持 C++17）、GNU Make、binutils、coreutils、tar、sed、awk
 - CANN >= 9.1.0 的完整 toolkit/ops 开发环境（Ascend NPU 开发需要）
 - CMake ≥ 3.18
-- Ninja（MindSpore native target 需要）
+- Ninja（native target 需要）
 
 ## 克隆仓库
 

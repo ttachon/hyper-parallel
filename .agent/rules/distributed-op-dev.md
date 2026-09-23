@@ -24,7 +24,7 @@ Before creating a new class, check the following in order:
    | `TupleElementWiseDistributedOp` | Inputs/outputs are both tuples, element-wise semantics |
    | `ReshapeDistributedOp` | Changes shape without rearranging data (reshape, view, flatten) |
 
-2. **Inherit from an existing class** — If the operator is semantically similar but needs small customizations (e.g., additional validation, `_MS_PRIMITIVE_OP_NAMES` routing), subclass the closest existing base class and override only what differs.
+2. **Inherit from an existing class** — If the operator is semantically similar but needs small customizations (e.g., additional validation, extra dtype or keyword routing), subclass the closest existing base class and override only what differs.
 
 3. **New class with three-phase dispatch** — Only when no existing class fits. New classes must follow the three-phase dispatch model: `preprocess → infer_layout(cache_values) → get_expand_impl`.
 
@@ -35,30 +35,27 @@ Before creating a new class, check the following in order:
 ## YAML Registration
 
 **Must:**
-- Register the Primitive class name (PascalCase) for MindSpore side; register the torch function name for PyTorch side.
+- Register the torch function name as the YAML key.
 - Place the entry in the appropriate `yaml/*.yaml` file under `core/shard/ops/yaml/`.
 
 **Must NOT:**
 - Set `infer_layout_suffix` — suffix logic (WithShape, WithTupleExpand, etc.) must be handled inside `preprocess`.
-- Register `mint.*` interface names — `mint` calls resolve to Primitives; register the Primitive name only.
 
 ---
 
 ## `_normalize_*_args` Function
 
-**Purpose:** Unified entry point for every frontend call site (torch / mint / Primitive). Resolves interface differences so that `preprocess` always receives a consistent argument shape regardless of which frontend invoked the operator.
+**Purpose:** Unified entry point for every call site. Resolves interface differences so that `preprocess` always receives a consistent argument shape regardless of how the operator was invoked.
 
 Every operator must define a module-level `_normalize_*_args` function to unify interface differences before `preprocess` processes arguments.
 
 **Must:**
 - Return `(args_tuple, kwargs_dict)`.
 - Default: return all parameters as positional args, `kwargs = {}`.
-- Keyword-only parameters (declared after `*` in the torch interface) must stay in `kwargs`. MindSpore `mint.*` functional_overload interfaces follow the same rule as PyTorch.
-- MindSpore mint interfaces with `kwonlyargs` declared in `mindspore/ops/api_def/{op_name}.yaml` behave like functional_overload: those parameters must stay in `kwargs`. Interfaces without `kwonlyargs` are all-positional. (Note: `ops/op_def/yaml/` defines Primitive structure — args/returns/dtypes; `ops/api_def/` declares the Python-level `kwonlyargs`.)
+- Keyword-only parameters (declared after `*` in the torch interface) must stay in `kwargs`.
 
 **Must NOT:**
 - Put keyword-only parameters in `args` — they cannot be passed positionally.
-- Put non-keyword-only parameters in `kwargs` for MindSpore Primitives that do not declare `kwonlyargs`.
 
 ---
 
@@ -77,10 +74,9 @@ def preprocess(self, args: tuple, kwargs: dict) -> tuple:
 - Call `.to_local()` on every DTensor input; pass raw local tensors in `local_args` / `local_kwargs`.
 - Build `cache_values` containing only information that affects layout inference or must be validated: Layout objects first, then scalar parameters (int, bool, tuple, etc.). Absent optional tensors use `None` as a placeholder.
 - Route `local_args` / `local_kwargs` by `self.op_name`:
-  - `self.op_name in _MS_PRIMITIVE_OP_NAMES` and the op has **no** `kwonlyargs` in `mindspore/ops/api_def/{op_name}.yaml` → all positional, `local_kwargs = {}`.
-  - `self.op_name in _MS_PRIMITIVE_OP_NAMES` and the op **has** `kwonlyargs` → those listed params go in `local_kwargs`.
-  - Otherwise (PyTorch function) → keyword-only parameters (declared after `*`) in `local_kwargs`.
-- Declare `_MS_PRIMITIVE_OP_NAMES` as a class-level `frozenset`; derive its members from the YAML registration file (MindSpore-side entries only).
+  - Keyword-only parameters (declared after `*` in the torch interface) go in `local_kwargs`.
+  - Every other parameter is positional and goes in `local_args`.
+  - op-name sets (e.g. `_TORCH_DTYPE_OP_NAMES`) exist only for genuine per-interface differences, such as a trailing `dtype` slot that some entries pass positionally; declare them as a class-level `frozenset`.
 
 **Must NOT:**
 - Contain any validation or error-raising logic — all validation belongs in `infer_layout`.

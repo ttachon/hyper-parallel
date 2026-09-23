@@ -36,5 +36,5 @@ HyperParallel 是面向昇腾超节点的分布式并行加速库，解耦模型
 
 ## 平台支持
 
-- 支持 PyTorch 2.6 / 2.7 / 2.9 及 MindSpore 后端。
+- 支持 PyTorch 2.6 / 2.7 / 2.9 后端。
 - 支持 pip 安装与源码编译，可配置 Multicore 原生扩展。

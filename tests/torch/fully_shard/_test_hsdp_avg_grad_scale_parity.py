@@ -194,7 +194,7 @@ def _assert_avg_sum_ratio(
 def test_torch_hsdp_avg_grad_scale_parity():
     """
     Feature: HSDP AVG gradient scaling with comm_fusion=False (Torch).
-    Description: Same 8-card HSDP setup as the MindSpore ST; compare fusion paths
+    Description: Same 8-card HSDP setup as the baseline ST; compare fusion paths
         and AVG vs SUM ratio.
     Expectation: Run success.
     """

@@ -37,7 +37,7 @@ from torch import nn
 
 from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.pass_plan import PassPlan
+from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph
 
 
@@ -94,16 +94,16 @@ class TestFsdpDegreeResolution(unittest.TestCase):
         mock_resolve_pg.return_value = MagicMock()
 
         config = PassConfig(fsdp_degree=2, tp_size=2)
-        plan = PassPlan()
-        plan.fsdp_wrap_pattern("*")
+        plan = GraphParallelPlan()
+        plan.fsdp_mark_pattern("*")
 
-        pass_obj = FSDPPass(pass_plan=plan)
+        pass_obj = FSDPPass(parallel_plan=plan)
         pass_obj.run(
             self.joint.graph_module,
             config,
             model=self.model,
             fsdp_group_name="fsdp",
-            pass_plan=plan,
+            parallel_plan=plan,
         )
 
         self.assertEqual(pass_obj._fsdp_degree, 2)
@@ -140,16 +140,16 @@ class TestShardLiveModelParamsRank(unittest.TestCase):
         mock_resolve_pg.return_value = MagicMock()
 
         config = PassConfig(fsdp_degree=2, tp_size=2)
-        plan = PassPlan()
-        plan.fsdp_wrap_pattern("*")
+        plan = GraphParallelPlan()
+        plan.fsdp_mark_pattern("*")
 
-        pass_obj = FSDPPass(pass_plan=plan)
+        pass_obj = FSDPPass(parallel_plan=plan)
         pass_obj.run(
             self.joint.graph_module,
             config,
             model=self.model,
             fsdp_group_name="fsdp",
-            pass_plan=plan,
+            parallel_plan=plan,
         )
 
         # weight dim 0 should be halved (4 -> 2)

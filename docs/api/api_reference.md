@@ -35,7 +35,7 @@ fully_shard(
 | `mixed_precision` | `MixedPrecisionPolicy` | `None` | 混合精度策略 |
 | `offload_policy` | `OffloadPolicy` | `None` | Offload 策略 |
 | `comm_fusion` | `bool` | `True` | 通信融合 |
-| `comm_fusion_zero_copy` | `bool` | `None` | 通信融合零拷贝（PyTorch 默认 True，MindSpore 默认 False） |
+| `comm_fusion_zero_copy` | `bool` | `None` | 通信融合零拷贝（默认 True） |
 
 **返回值：** 切分后的模块（原地修改，返回同一对象）。
 
@@ -761,7 +761,7 @@ get_hyper_optimizer(
 
 ## Activation Checkpoint / Swap
 
-> PyTorch 与 MindSpore 后端均已实现。公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
+> 公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
 
 ### `checkpoint`
 
@@ -844,7 +844,7 @@ checkpoint_exclude_wrapper(
 ) -> CheckpointExcludeWrapper
 ```
 
-支持 PyTorch eager 和 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
+支持 PyTorch eager 模式，并且需要在 HyperParallel 的 `checkpoint` 或
 `checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 Module/Cell 和普通 callable。
 
 `save_output=False` 用于连续 SAVE 区域的中间节点：该区域内部通过 saved-tensor hooks 保存的反向激活

@@ -87,6 +87,47 @@ def infer_ceil_chunk_range(
     return chunk_start, chunk_end
 
 
+def _calculate_mesh_coordinate_for_rank(
+    mesh_shape: Sequence[int], rank_id: int
+) -> list[int]:
+    """Calculate the device-mesh coordinate for a linear rank."""
+    coordinate = [0] * len(mesh_shape)
+    remaining_rank = rank_id
+    for mesh_dim in range(len(mesh_shape) - 1, -1, -1):
+        coordinate[mesh_dim] = remaining_rank % mesh_shape[mesh_dim]
+        remaining_rank //= mesh_shape[mesh_dim]
+    return coordinate
+
+
+def _infer_tensor_dimension_slice(
+    global_size: int,
+    tensor_mapping: int | Sequence[int],
+    mesh_shape: Sequence[int],
+    mesh_coordinate: Sequence[int],
+    uneven_shard_mesh_dims: set[int],
+) -> tuple[int, int]:
+    """Infer the half-open slice for one tensor dimension."""
+    mapped_dims = (tensor_mapping,) if isinstance(tensor_mapping, int) else tensor_mapping
+    slice_start, slice_end = 0, global_size
+    for mapped_mesh_dim in mapped_dims:
+        if mapped_mesh_dim == -1:
+            continue
+        mesh_dim = len(mesh_shape) - mapped_mesh_dim - 1
+        infer_chunk_range = (
+            infer_ceil_chunk_range
+            if mesh_dim in uneven_shard_mesh_dims
+            else infer_balanced_chunk_range
+        )
+        chunk_start, chunk_end = infer_chunk_range(
+            slice_end - slice_start,
+            mesh_shape[mesh_dim],
+            mesh_coordinate[mesh_dim],
+        )
+        slice_start += chunk_start
+        slice_end = slice_start + chunk_end - chunk_start
+    return slice_start, slice_end
+
+
 def _infer_slice_area_by_rank(
     mesh_shape: tuple[int, ...],
     tensor_map: Sequence,
@@ -95,41 +136,17 @@ def _infer_slice_area_by_rank(
     uneven_shard_mesh_dims: set[int],
 ) -> tuple[tuple[int, int], ...]:
     """Return one rank's slice using placement-specific shard geometry."""
-    mesh_coordinate = [0] * len(mesh_shape)
-    remaining_rank = rank_id
-    for mesh_dim in range(len(mesh_shape) - 1, -1, -1):
-        mesh_coordinate[mesh_dim] = remaining_rank % mesh_shape[mesh_dim]
-        remaining_rank //= mesh_shape[mesh_dim]
-
-    slice_area = []
-    for tensor_dim, global_size in enumerate(full_shape):
-        tensor_mapping = tensor_map[tensor_dim]
-        if isinstance(tensor_mapping, int):
-            tensor_mapping = (tensor_mapping,)
-
-        slice_start = 0
-        slice_end = global_size
-        for mapped_mesh_dim in tensor_mapping:
-            if mapped_mesh_dim == -1:
-                continue
-            mesh_dim = len(mesh_shape) - mapped_mesh_dim - 1
-            shard_count = mesh_shape[mesh_dim]
-            shard_rank = mesh_coordinate[mesh_dim]
-            current_size = slice_end - slice_start
-            infer_chunk_range = (
-                infer_ceil_chunk_range
-                if mesh_dim in uneven_shard_mesh_dims
-                else infer_balanced_chunk_range
-            )
-            chunk_start, chunk_end = infer_chunk_range(
-                current_size,
-                shard_count,
-                shard_rank,
-            )
-            slice_end = slice_start + chunk_end
-            slice_start += chunk_start
-        slice_area.append((slice_start, slice_end))
-    return tuple(slice_area)
+    mesh_coordinate = _calculate_mesh_coordinate_for_rank(mesh_shape, rank_id)
+    return tuple(
+        _infer_tensor_dimension_slice(
+            global_size,
+            tensor_map[tensor_dim],
+            mesh_shape,
+            mesh_coordinate,
+            uneven_shard_mesh_dims,
+        )
+        for tensor_dim, global_size in enumerate(full_shape)
+    )
 
 
 def infer_slice_area_by_rank(
@@ -219,7 +236,6 @@ class Layout:
         ``Ascend``
 
     Examples:
-        >>> from mindspore.parallel import Layout
         >>> layout = Layout((2, 2, 2), ("dp", "sp", "mp"))
         >>> layout0 = layout("dp", "mp")
         >>> print(layout0.to_dict())

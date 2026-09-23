@@ -36,7 +36,7 @@ from tests.shard_ops.framework.suite import GroupSpec, build_suite_groups
 CASES_PKG = "tests.torch.shard.ops.cases"
 
 # Pack everything into a single launcher per level by default. Each
-# launcher pays ~25-50s of hccl/CANN/msrun init, which dwarfs the
+# launcher pays ~25-50s of hccl/CANN init, which dwarfs the
 # typical case exec (ms scale), so amortising one startup across many
 # cases is the dominant win. ``RUNNER.run_groups`` still runs multiple
 # groups concurrently when they exist — useful once individual cases

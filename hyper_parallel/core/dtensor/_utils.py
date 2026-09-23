@@ -433,12 +433,12 @@ def create_sub_groups(
 # ---------------------------------------------------------------------------
 
 def get_tensor_transform():
-    """Legacy MindSpore-side tensor transform hook — not available on torch."""
+    """Legacy tensor transform hook — not available on torch."""
     raise NotImplementedError("Unsupported get_tensor_transform for torch platform")
 
 
 def construct_strided_slice(x, begin, end, stride):
-    """Legacy MindSpore-side strided-slice hook — not available on torch."""
+    """Legacy strided-slice hook — not available on torch."""
     raise NotImplementedError("Unsupported construct_strided_slice for torch platform")
 
 

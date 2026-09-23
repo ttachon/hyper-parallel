@@ -34,8 +34,6 @@ def _normalize_argsort_args(x, dim=-1, descending=False, stable=False):
 class ArgsortDistributedOp(DistributedOp):
     """Distributed implementation for torch.argsort."""
 
-    _MS_PRIMITIVE_OP_NAMES = frozenset({'ArgSort'})
-
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
         Preprocess arguments for Argsort operator.
@@ -53,12 +51,8 @@ class ArgsortDistributedOp(DistributedOp):
         descending = args[2]
         stable = kwargs['stable']
 
-        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
-            local_args = (input_tensor.to_local(), dim, descending, stable)
-            local_kwargs = {}
-        else:
-            local_args = (input_tensor.to_local(),)
-            local_kwargs = {'dim': dim, 'descending': descending, 'stable': stable}
+        local_args = (input_tensor.to_local(),)
+        local_kwargs = {'dim': dim, 'descending': descending, 'stable': stable}
 
         cache_values = [input_tensor.layout, dim]
         return local_args, local_kwargs, cache_values

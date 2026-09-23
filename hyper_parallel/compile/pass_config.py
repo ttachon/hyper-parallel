@@ -59,7 +59,7 @@ class PassConfig:
         loss_parallel: Enable loss parallel (LP) on the TP axis.
         pp_enabled: Drive ``PpPass`` (pipeline-parallel graph split). When
             ``True`` the joint fwd+bwd graph is sliced to this rank's stage
-            along module-FQN boundaries declared in ``PassPlan``, cross-stage
+            along module-FQN boundaries declared in ``GraphParallelPlan``, cross-stage
             activations are exchanged via P2P ``isend``/``irecv``, and a
             self-contained GPipe schedule is installed as a ``call_module``
             stub inside the rewritten graph, so the trainer needs no PP

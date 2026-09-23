@@ -39,8 +39,7 @@ performance. For instance, capabilities such as compute-communication concurrenc
 sequence orchestration based on static graphs can effectively optimise performance, which are not easily achievable in
 dynamic graph mode. However, dynamic-to-static compilation support is extremely challenging, and complete
 dynamic-to-static conversion is not yet achievable. HyperParallel will support partial dynamic-to-static conversion
-through certain syntax constraints, utilising MindSpore's advanced graph optimisation capabilities to further enhance
-performance.
+through certain syntax constraints, utilising advanced graph optimisation capabilities to further enhance performance.
 
 ## Architecture Overview
 
@@ -222,12 +221,11 @@ customize native extension build options, build from source.
 | Command                                   | Installed dependencies                                          | Use case                                                                          |
 |-------------------------------------------|-----------------------------------------------------------------|-----------------------------------------------------------------------------------|
 | `pip install hyper-parallel`              | Common dependencies only, no deep learning framework            | You manage framework versions yourself or only use framework-independent features |
-| `pip install 'hyper-parallel[mindspore]'` | Common dependencies + `mindspore>=2.10`                         | Use a supported MindSpore backend                                                 |
 | `pip install 'hyper-parallel[torch]'`     | Common dependencies + `torch==2.9.1` + `torch-npu==2.9.1`       | Use the default PyTorch 2.9 backend                                               |
 | `pip install 'hyper-parallel[torch26]'`   | Common dependencies + `torch==2.6.0` + `torch-npu==2.6.0.post3` | Use the PyTorch 2.6 backend                                                       |
 | `pip install 'hyper-parallel[torch27]'`   | Common dependencies + `torch==2.7.1` + `torch-npu==2.7.1`       | Use the PyTorch 2.7 backend                                                       |
 | `pip install 'hyper-parallel[torch29]'`   | Common dependencies + `torch==2.9.1` + `torch-npu==2.9.1`       | Explicitly use the PyTorch 2.9 backend                                            |
-| `pip install 'hyper-parallel[all]'`       | Common dependencies + MindSpore + default PyTorch 2.9           | Use both backends in the same environment                                         |
+| `pip install 'hyper-parallel[all]'`       | Common dependencies + default PyTorch 2.9                       | Use the default PyTorch backend                                                   |
 
 In shells such as zsh, quote package names with extras so `[]` is not treated as a glob pattern.
 

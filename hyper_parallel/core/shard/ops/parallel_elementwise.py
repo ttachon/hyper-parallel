@@ -123,11 +123,6 @@ class ElementWiseDistributedOp(DistributedOp):
         """
         Preprocess arguments for element-wise operators.
 
-        NOTE: aclop packed-args normalization (for MindSpore aclop operators
-        like Mod, StopGradient that pack args as ``(prim, name, (real_args...))``)
-        is handled upstream in ``OpDispatcher._dispatch_layout_infer`` via
-        ``_normalize_aclop_args``. This method receives clean unpacked args.
-
         Args:
             args (tuple): Positional arguments passed to the operator.
             kwargs (dict): Keyword arguments passed to the operator.

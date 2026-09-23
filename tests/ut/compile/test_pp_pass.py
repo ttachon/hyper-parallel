@@ -37,7 +37,7 @@ Auto split:
    input/output-side weighting, too-few-children error.
 
 Plan / YAML:
-8. ``PassPlan.pp_stage`` wildcard + negative-index rejection; manual plan
+8. ``GraphParallelPlan.pp_stage`` wildcard + negative-index rejection; manual plan
    length validation; YAML ``pp:`` section parsing.
 
 Schedule driver (mocked subgraphs + mocked dist):
@@ -77,7 +77,7 @@ from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=
 from hyper_parallel.compile.passes.parallel.pp_schedule import (  # pylint: disable=C0413
     ScheduleGPipe,
 )
-from hyper_parallel.compile.pass_plan import PassPlan  # pylint: disable=C0413
+from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan  # pylint: disable=C0413
 from hyper_parallel.compile.tracer.graph_tracer import (  # pylint: disable=C0413
     run_traced_graph,
     trace_model_graph,
@@ -287,7 +287,7 @@ def _skip_stage_joint_graph() -> fx.GraphModule:
     x = g.placeholder("x")
     g.placeholder("y")
 
-    def fwd(target, args, module):  # pylint: disable=C9006
+    def fwd(target, args, module):  # pylint: disable=C9006,C9007
         node = g.call_function(target, args)
         node.meta["nn_module_stack"] = _stack(module)
         node.meta["val"] = torch.empty(4, 4)
@@ -307,9 +307,9 @@ def _skip_stage_joint_graph() -> fx.GraphModule:
     return gm
 
 
-def _manual_plan() -> PassPlan:
+def _manual_plan() -> GraphParallelPlan:
     """Manual 2-stage plan: (embed, lin0) | (lin1, head)."""
-    plan = PassPlan()
+    plan = GraphParallelPlan()
     plan.pp_stage(0, ["embed", "lin0"])
     plan.pp_stage(1, ["lin1", "head"])
     return plan
@@ -319,7 +319,7 @@ def _run_pp(gm, model, rank, cfg=None, plan=None):
     cfg = cfg or PassConfig(
         fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=1
     )
-    pas = PpPass(pass_plan=plan if plan is not None else _manual_plan())
+    pas = PpPass(parallel_plan=plan if plan is not None else _manual_plan())
     with _patch_dist(world_size=2, rank=rank):
         return pas.run(gm, cfg, model=model), gm, model, pas
 
@@ -537,7 +537,7 @@ class TestPpPassErrors(unittest.TestCase):
 
     def test_manual_plan_wrong_stage_count_rejected(self):
         """Test a plan declaring fewer stages than pp_degree fails."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["embed", "lin0"])
         gm = _mini_llm_joint_graph()
         with self.assertRaises(ValueError) as ctx:
@@ -553,14 +553,14 @@ class TestPpPassErrors(unittest.TestCase):
         failing later inside the slice copy with a generic message.
         """
         gm = _skip_stage_joint_graph()
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["m0"])
         plan.pp_stage(1, ["m1"])
         plan.pp_stage(2, ["m2"])
         cfg = PassConfig(fsdp_enabled=False, pp_enabled=True, pp_degree=3)
         with _patch_dist(world_size=3, rank=2):
             with self.assertRaises(ValueError) as ctx:
-                PpPass(pass_plan=plan).run(gm, cfg, model=ThreeModule())
+                PpPass(parallel_plan=plan).run(gm, cfg, model=ThreeModule())
         self.assertIn("neighbouring stages", str(ctx.exception))
         self.assertIn("stage 0", str(ctx.exception))
         self.assertIn("stage 2", str(ctx.exception))
@@ -652,44 +652,44 @@ class TestAutoStageSplit(unittest.TestCase):
             _auto_stage_split(MiniLLM(), 1)
 
 
-class TestPassPlanPpStage(unittest.TestCase):
-    """``PassPlan.pp_stage`` builder validation."""
+class TestGraphParallelPlanPpStage(unittest.TestCase):
+    """``GraphParallelPlan.pp_stage`` builder validation."""
 
     def test_wildcard_rejected(self):
         """Test stage cuts must be exact FQNs (no wildcards)."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         with self.assertRaises(ValueError) as ctx:
             plan.pp_stage(0, ["layers.*"])
         self.assertIn("wildcard", str(ctx.exception))
 
     def test_negative_stage_rejected(self):
         """Test a negative stage index is rejected."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         with self.assertRaises(ValueError):
             plan.pp_stage(-1, ["embed"])
 
     def test_manual_plan_resolves(self):
         """Test a complete manual plan passes plan resolution."""
-        pas = PpPass(pass_plan=_manual_plan())
+        pas = PpPass(parallel_plan=_manual_plan())
         stages = pas._resolve_stage_plan(MiniLLM(), 2)  # pylint: disable=protected-access
         self.assertEqual(stages, [["embed", "lin0"], ["lin1", "head"]])
 
     def test_unknown_module_rejected(self):
         """Test stage FQNs must exist in the model."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["embed", "lin0"])
         plan.pp_stage(1, ["lin1", "nope"])
-        pas = PpPass(pass_plan=plan)
+        pas = PpPass(parallel_plan=plan)
         with self.assertRaises(ValueError) as ctx:
             pas._resolve_stage_plan(MiniLLM(), 2)  # pylint: disable=protected-access
         self.assertIn("nope", str(ctx.exception))
 
     def test_partial_plan_warns_on_unassigned_modules(self):
         """Test modules no stage declares are named in a warning."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["embed", "lin0"])
         plan.pp_stage(1, ["lin1"])
-        pas = PpPass(pass_plan=plan)
+        pas = PpPass(parallel_plan=plan)
         with self.assertLogs(
             "hyper_parallel.compile.passes.parallel.pp_pass", level="WARNING"
         ) as logs:
@@ -698,10 +698,10 @@ class TestPassPlanPpStage(unittest.TestCase):
 
     def test_container_ancestors_do_not_warn(self):
         """Test ancestor containers of declared elements warn nothing."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["tok_embeddings", "layers.0", "layers.1"])
         plan.pp_stage(1, ["layers.2", "norm", "lm_head"])
-        pas = PpPass(pass_plan=plan)
+        pas = PpPass(parallel_plan=plan)
         logger = logging.getLogger("hyper_parallel.compile.passes.parallel.pp_pass")
         with patch.object(logger, "warning") as warn:
             stages = pas._resolve_stage_plan(  # pylint: disable=protected-access
@@ -792,7 +792,7 @@ def _tiny_lm_joint_graph(batch: int = 4):
     Seed the RNG before calling for reproducible weights.
     """
 
-    class TinyLM(nn.Module):
+    class _TracedTinyLM(nn.Module):
         """embed -> lin0 -> relu -> lin1 -> head, next-token CE loss."""
 
         def __init__(self) -> None:
@@ -817,7 +817,7 @@ def _tiny_lm_joint_graph(batch: int = 4):
         )
 
     torch.manual_seed(0)
-    model = TinyLM().to(torch.float64)  # keep the allclose tolerance tight
+    model = _TracedTinyLM().to(torch.float64)  # keep the allclose tolerance tight
     x = torch.randint(0, 16, (batch, 5))
     y = torch.randint(0, 16, (batch, 5))
     with warnings.catch_warnings():
@@ -874,7 +874,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
         torch.manual_seed(0)
 
         class _LM(nn.Module):
-            """Same layout/init as ``_tiny_lm_joint_graph``'s TinyLM."""
+            """Same layout/init as ``_tiny_lm_joint_graph``'s _TracedTinyLM."""
 
             def __init__(self) -> None:
                 """Initialize embed/lin0/lin1/head."""
@@ -888,7 +888,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
 
     def test_pp_grads_match_full_batch_mean(self):
         """Test 2-stage PP grads match the reference full-batch grads."""
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["embed", "lin0"])
         plan.pp_stage(1, ["lin1", "head"])
         cfg = PassConfig(
@@ -911,7 +911,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
             jg, _, _, _ = _tiny_lm_joint_graph(batch=2)
             model = self._stage_model()
             with _patch_dist(world_size=2, rank=rank):
-                PpPass(pass_plan=plan).run(jg.graph_module, cfg, model=model)
+                PpPass(parallel_plan=plan).run(jg.graph_module, cfg, model=model)
             models[rank] = model
             scheds[rank] = jg.graph_module.pp_schedule
 
@@ -964,7 +964,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
         Expectation: PP parameter gradients match the non-PP full-batch
             mean-loss gradients within tolerance.
         """
-        plan = PassPlan()
+        plan = GraphParallelPlan()
         plan.pp_stage(0, ["embed", "gate", "lin0"])
         plan.pp_stage(1, ["lin1", "head"])
         cfg = PassConfig(
@@ -981,7 +981,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
             jg, _, _, _, _ = _tiny_gated_joint_graph(batch=2)
             model = self._gated_stage_model()
             with _patch_dist(world_size=2, rank=rank):
-                PpPass(pass_plan=plan).run(jg.graph_module, cfg, model=model)
+                PpPass(parallel_plan=plan).run(jg.graph_module, cfg, model=model)
             models[rank] = model
             scheds[rank] = jg.graph_module.pp_schedule
 
@@ -1017,7 +1017,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
 class TestUserInputRouting(unittest.TestCase):
     """Dataflow routing of user inputs to their consuming stage."""
 
-    _GATED_PLAN = PassPlan()
+    _GATED_PLAN = GraphParallelPlan()
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1098,7 +1098,9 @@ class TestUserInputRouting(unittest.TestCase):
             jg2 = trace_model_graph(m, train_fn, {"x": x, "y": y})
         with _patch_dist(world_size=2, rank=0):
             with self.assertRaises(ValueError) as ctx:
-                PpPass(pass_plan=_manual_plan()).run(jg2.graph_module, cfg, model=model)
+                PpPass(parallel_plan=_manual_plan()).run(
+                    jg2.graph_module, cfg, model=model
+                )
         self.assertIn("consumed on stages", str(ctx.exception))
 
     def test_unconsumed_input_warns_and_rides_last_stage(self):
@@ -1152,8 +1154,8 @@ class TestYamlPpSection(unittest.TestCase):
         """Test the mapping and list YAML shapes both parse."""
         import tempfile  # pylint: disable=C0415
 
-        from hyper_parallel.compile.pass_plan import (  # pylint: disable=C0415
-            create_pass_plan_from_yaml,
+        from hyper_parallel.compile.graph_parallel_plan import (  # pylint: disable=C0415
+            create_plan_from_yaml,
         )
 
         yaml_text = """
@@ -1167,7 +1169,7 @@ pp:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(yaml_text)
             path = f.name
-        plan = create_pass_plan_from_yaml(config_path=path)
+        plan = create_plan_from_yaml(config_path=path)
         self.assertEqual(
             plan.pp_module_fqns_per_stage,
             [

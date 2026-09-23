@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lightweight helpers to spawn ``torchrun`` / ``msrun`` workers.
+"""Lightweight helpers to spawn ``torchrun`` workers.
 
-These helpers must **not** import ``torch``, ``torch_npu``, or ``mindspore``.
-Pytest launchers and ``parallel_case`` run in a parent / wrapper process that
-only needs to exec the distributed runner; pulling heavy frameworks into that
-process pays startup cost twice (parent + workers) and can inflate ST wall time.
+These helpers must **not** import ``torch``, ``torch_npu``, or any training
+framework. Pytest launchers and ``parallel_case`` run in a parent / wrapper
+process that only needs to exec the distributed runner; pulling heavy
+frameworks into that process pays startup cost twice (parent + workers) and
+can inflate ST wall time.
 """
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from typing import Optional
@@ -72,27 +72,3 @@ def torchrun_case(
         if attempt == max_attempts - 1:
             print(combined, file=sys.stderr)
             assert False, f"Port {master_port} still in use after {max_attempts} attempts"
-
-
-def msrun_case(
-    glog_v,
-    file_name,
-    case_name,
-    master_port,
-    worker_num=8,
-    local_worker_num=8,
-) -> None:
-    """Spawn MindSpore distributed workers via ``msrun`` + pytest."""
-    filename = file_name.split(".py")[0]
-    log_path = f"./logs/{filename}/{case_name}"
-    if os.path.exists(log_path):
-        shutil.rmtree(log_path)
-    cmd = (
-        f"export GLOG_v={glog_v} && msrun --worker_num={worker_num} "
-        f"--local_worker_num={local_worker_num} "
-        f"--master_addr=127.0.0.1 --master_port={master_port} "
-        f"--join=True --log_dir={log_path} pytest -s -v "
-        f"{file_name}::{case_name}"
-    )
-    ret = os.system(cmd)
-    assert ret == 0

@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Licensed under the CANN Open Software License Agreement Version 2.0.
 # -----------------------------------------------------------------------------------------------------------
-# Shared host GCC version policy, aligned with mindspore/CMakeLists.txt:
+# Shared host GCC version policy:
 #   - require GCC >= 7.3.0 (fatal on lower)
 #   - warn if GCC >  11.3.0 (non-fatal)
 # Source this file from build scripts (do NOT execute), e.g.:
@@ -31,7 +31,7 @@ check_gcc_version() {
     local num=$((major * 10000 + minor * 100 + patch))
 
     if [ "${num}" -lt 70300 ]; then
-        echo "ERROR: GCC version ${ver} < 7.3.0. Install GCC >= 7.3.0 (mindspore-compatible)." >&2
+        echo "ERROR: GCC version ${ver} < 7.3.0. Install GCC >= 7.3.0 ." >&2
         return 1
     fi
     if [ "${num}" -gt 110300 ]; then

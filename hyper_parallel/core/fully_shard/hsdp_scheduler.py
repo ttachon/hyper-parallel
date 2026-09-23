@@ -65,7 +65,6 @@ class ParamGroupCommCtx:
     def __init__(self) -> None:
         self.pre_param_group = None
         self.all_reduce_param_group = None
-        # MindSpore keeps the reduce-scatter handle outside the parameter group.
         self.comm_handle = None
 
 

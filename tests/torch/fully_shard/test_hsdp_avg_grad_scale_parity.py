@@ -23,7 +23,7 @@ _FILE_NAME = "_test_hsdp_avg_grad_scale_parity.py"
 def test_torch_hsdp_avg_grad_scale_parity():
     """
     Feature: HSDP AVG gradient scaling correctness (Torch, comm_fusion=False vs True).
-    Description: Launch an 8-card torchrun case mirroring the MindSpore ST.
+    Description: Launch an 8-card torchrun case mirroring the baseline ST.
     Expectation: Run success.
     """
     torchrun_case(_FILE_NAME, "test_torch_hsdp_avg_grad_scale_parity", num_proc=8)

@@ -31,8 +31,8 @@ kernel 的开始、结束和总耗时，但无法直接回答以下问题：
 
 ### 1.3 范围
 
-当前实现包含 Torch 独立前端、MegaMoe 正反向自动接入、Chrome Trace schema v1 导出和离线 merge。
-不实现 MindSpore 前端，也不在 `mega_kernel_profile()` 内启动或包装 `torch.profiler`。采集、独立导出和
+当前实现包含 Torch 独立前端、MegaMoe 正反向自动接入、Chrome Trace schema v1 导出和离线 merge，
+且不在 `mega_kernel_profile()` 内启动或包装 `torch.profiler`。采集、独立导出和
 融合是三个彼此独立的阶段。
 
 ---

@@ -360,4 +360,3 @@ dispatch(local_callable, args, kwargs)
 
 `DFunction` is Torch-only. It inherits directly from `torch.autograd.Function`
 and its `forward` / `backward` methods operate on `torch.Tensor` local shards.
-MindSpore is not supported.

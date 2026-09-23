@@ -17,25 +17,26 @@
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/perf_estimation/test_getters.py -v
 """
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, List
 from unittest.mock import patch
 
+import yaml
+
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-from hyper_parallel.auto_parallel._model_spec import OpCounts
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
-    check_and_apply_custom_hook,
-    layer_hook,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_comp
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_configs_by_position,
     get_model_order,
@@ -45,6 +46,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
 EMB, OUT, LAY = LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER, LayerType.NOT_REC_LAYER
+FULL, LINEAR = "full_attention", "linear_attention"
 
 
 def _marking(kind: str):
@@ -67,6 +69,36 @@ def _kinds_in_model_order(cfg, stages):
     """The group each regular layer is priced with, in model order."""
     by_position = get_layer_configs_by_position(cfg, stages)
     return [by_position[position].kind for position in get_model_order(cfg, stages)]
+
+
+def _hybrid_config(folder: str, layer_types: List[str], pp: int = 1, vp: int = 1,
+                   sched: str = "1f1b") -> CostModelConfig:
+    """A Qwen3.5-style stack of *layer_types*, parsed by the hyper_v2 front end."""
+    hf_config = SimpleNamespace(
+        model_type="qwen3_5_moe", hidden_size=1024, num_hidden_layers=len(layer_types),
+        num_attention_heads=8, num_key_value_heads=2, head_dim=128, vocab_size=32000,
+        max_position_embeddings=8192, num_experts=16, num_experts_per_tok=4,
+        moe_intermediate_size=256, shared_expert_intermediate_size=256,
+        attn_output_gate=True, layer_types=list(layer_types),
+        linear_num_key_heads=8, linear_key_head_dim=64, linear_num_value_heads=16,
+        linear_value_head_dim=64, linear_conv_kernel_dim=4,
+    )
+    train = {
+        "model": {"pretrained_model_name_or_path": "local/unit", "torch_dtype": "bfloat16"},
+        "training": {"global_batch_size": 8, "micro_batch_size": 1},
+        "accelerator": {"tp_size": 1, "pp_size": pp, "pp_interleave_num": vp,
+                        "pipeline_scheduler": sched},
+        "fsdp_config": {"dp_shard_size": 2},
+        "dataset": {"data_transform": {"max_seq_len": 2048}},
+        "context": {"max_device_memory": "64GB", "device_num": 2 * pp},
+    }
+    path = os.path.join(folder, f"hybrid_{len(os.listdir(folder))}.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(train, handle)
+    with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config", return_value=hf_config):
+        ccfg = CostModelConfig(path, framework="hyper_v2")
+    check_and_apply_custom_hook(ccfg)
+    return ccfg
 
 
 class TestModelOrder(unittest.TestCase):
@@ -142,36 +174,38 @@ class TestGroupBoundaries(unittest.TestCase):
         cfg = _config([(1, "A"), (1, "B")])
         self.assertEqual(_kinds_in_model_order(cfg, stages), ["A", "B", "B"])
 
+    def test_a_two_group_stack_costs_the_mean_of_its_groups(self):
+        """
+        Feature: layer groups on the compute path.
+        Description: Two full then two linear layers on one stage, against
+            four full and four linear layers.  Embedding and output cost the
+            same in all three, so the mixed stack costs exactly the mean of
+            the other two when each group covers its own two layers.
+        Expectation: The mean; the early boundary priced one full layer
+            and three linear ones.
+        """
+        stages = [[[EMB, LAY, LAY, LAY, LAY, OUT]]]
+        with tempfile.TemporaryDirectory() as folder:
+            mixed, full, linear = (
+                estimate_comp(_hybrid_config(folder, kinds), CustomConfig(), stages)[0]
+                for kinds in ([FULL, FULL, LINEAR, LINEAR], [FULL] * 4, [LINEAR] * 4)
+            )
+        self.assertNotAlmostEqual(full / linear, 1.0, places=3)
+        self.assertAlmostEqual(mixed / ((full + linear) / 2), 1.0, places=9)
+
 
 class TestPerformanceAgreesWithMemory(unittest.TestCase):
     """Both estimators give every layer the same kind."""
 
-    @staticmethod
-    def _stack(sched: str) -> CostModelConfig:
+    def setUp(self) -> None:
+        """A scratch folder for the stacks' config files."""
+        folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.addCleanup(folder.cleanup)
+        self.folder = folder.name
+
+    def _stack(self, sched: str) -> CostModelConfig:
         """Eight layers on two stages of two chunks, alternating kinds by pairs."""
-        overrides = {
-            "hidden_size": 1024, "num_hidden_layers": 8, "num_attention_heads": 8,
-            "num_key_value_heads": 8, "intermediate_size": 2816, "vocab_size": 32000,
-            "max_position_embeddings": 2048, "arch": "default",
-        }
-        ccfg = CostModelConfig({
-            "model": {"name": "unit", "config_overrides": overrides},
-            "training": {"global_batch_size": 8, "micro_batch_size": 1},
-            "accelerator": {"tp_size": 1, "pp_size": 2, "pp_interleave_num": 2,
-                            "pipeline_scheduler": sched},
-            "fsdp_config": {"dp_shard_size": 2},
-            "dataset": {"data_transform": {"max_seq_len": 2048}},
-            "context": {"max_device_memory": "64GB", "device_num": 4},
-        }, framework="hyper_v2")
-        counts = {"attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1,
-                  "dropout": 0, "normOp": 2, "gather": 4, "headCast": 1, "ffAct": 1}
-        ccfg.op_counts = {
-            "decoder": OpCounts.from_dict(counts),
-            "linear_attention": OpCounts.from_dict(dict(counts, attBMM=0, softmax=0, headCast=0)),
-        }
-        full, linear = layer_hook("default", "decoder"), layer_hook("default", "linear_attention")
-        ccfg.layer_custom_config = [(2, full), (2, linear), (2, full), (2, linear)]
-        return ccfg
+        return _hybrid_config(self.folder, [FULL, FULL, LINEAR, LINEAR] * 2, pp=2, vp=2, sched=sched)
 
     def _check(self, sched: str) -> None:
         ccfg = self._stack(sched)
@@ -213,7 +247,6 @@ class TestPerformanceAgreesWithMemory(unittest.TestCase):
             pairs; stage 1 holds the two linear pairs.
         """
         ccfg = self._stack("1f1b")
-        check_and_apply_custom_hook(ccfg)
         stages = ccfg.generate_partitions_vpp()
         seen = []
         real = EvalLayerComm.dp_comm_layer

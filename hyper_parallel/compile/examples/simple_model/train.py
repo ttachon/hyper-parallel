@@ -35,9 +35,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413
+    GraphParallelPlan,
     GraphTrainer,
     PassConfig,
-    PassPlan,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -80,11 +80,11 @@ def build_pass_config(config: dict) -> PassConfig:
     )
 
 
-def build_pass_plan(config: dict) -> PassPlan:
-    """Build PassPlan from YAML config"""
+def build_parallel_plan(config: dict) -> GraphParallelPlan:
+    """Build GraphParallelPlan from YAML config"""
     if "sharding" in config:
         # Use YAML configuration
-        from hyper_parallel.compile import create_pass_plan_from_yaml  # pylint: disable=C0415
+        from hyper_parallel.compile import create_plan_from_yaml  # pylint: disable=C0415
         import tempfile  # pylint: disable=C0415
 
         # Write sharding config to temp file
@@ -92,7 +92,7 @@ def build_pass_plan(config: dict) -> PassPlan:
             yaml.dump(config["sharding"], f)
             temp_path = f.name
 
-        plan = create_pass_plan_from_yaml(config_path=temp_path)
+        plan = create_plan_from_yaml(config_path=temp_path)
 
         # Clean up temp file
         import os  # pylint: disable=C0415
@@ -102,8 +102,8 @@ def build_pass_plan(config: dict) -> PassPlan:
         return plan
 
     # Default: FSDP all modules
-    plan = PassPlan()
-    plan.fsdp_wrap_pattern("*")
+    plan = GraphParallelPlan()
+    plan.fsdp_mark_pattern("*")
     return plan
 
 
@@ -160,13 +160,13 @@ def main() -> None:  # pylint: disable=too-many-locals
     model = DummyModel(config["model"]["vocab_size"], config["model"]["dim"]).to(device)
 
     pass_config = build_pass_config(config)
-    pass_plan = build_pass_plan(config)
+    parallel_plan = build_parallel_plan(config)
 
     trainer = GraphTrainer(
         model=model,
         train_fn=train_fn,
         pass_config=pass_config,
-        pass_plan=pass_plan,
+        parallel_plan=parallel_plan,
         optimizer_config={
             "lr": config["train"]["optimizer"]["lr"],
             "grad_clip": config["train"]["grad_clip"],

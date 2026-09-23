@@ -25,7 +25,7 @@ from .parallel_ops import DistributedOp
 def _normalize_rmsnorm_args(x, gamma, epsilon=1e-6):
     """Normalize RmsNorm args to positional form.
 
-    MindSpore Primitive RmsNorm receives (x, gamma, epsilon) as positional arguments.
+    RmsNorm takes (x, gamma, epsilon) as positional arguments.
     """
     return (x, gamma, epsilon), {}
 

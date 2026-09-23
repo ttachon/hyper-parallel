@@ -354,7 +354,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [x_layout, 1]
 
-softmax_ms_op = ActivationWithAxisDistributedOp("Softmax")
+softmax_pascal_op = ActivationWithAxisDistributedOp("Softmax")
 softmax_torch_op = ActivationWithAxisDistributedOp("softmax")
 
 
@@ -417,7 +417,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         cache_values = [x_layout, -1]
-        output_layout = self._infer_single_layout(softmax_ms_op, cache_values)
+        output_layout = self._infer_single_layout(softmax_pascal_op, cache_values)
         expected_map = (0, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map},"
@@ -426,9 +426,9 @@ class TestParallelSoftmax(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
+        assert softmax_pascal_op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
+            f"got {softmax_pascal_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
@@ -444,7 +444,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaises(ValueError):
-            _ = softmax_ms_op.infer_layout([x_layout, 0])
+            _ = softmax_pascal_op.infer_layout([x_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_data_parallel_success(self, mock_platform):

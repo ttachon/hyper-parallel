@@ -13,34 +13,33 @@
 # limitations under the License.
 # ============================================================================
 """
-Pass Plan - declarative module selection for graph-mode passes.
+Graph Parallel Plan - declarative module selection for graph-mode passes.
 
-Declares which modules the graph-mode ``FSDPPass`` should shard. ``FSDPPass``
-itself owns all the actual sharding logic (all_gather on parameter
-placeholders, reduce_scatter on gradient outputs, in-place live-model
-sharding), so this is purely a *which modules* lookup.
+Declares which modules the graph-mode ``FSDPPass`` should shard and which
+modules each pipeline stage owns. ``FSDPPass`` itself owns all the actual
+sharding logic (all_gather on parameter placeholders, reduce_scatter on
+gradient outputs, in-place live-model sharding), so this is purely a *which
+modules* lookup.
 
 Note:
-    ``FSDPModuleConfig`` previously carried ``reshard_after_forward``,
-    ``use_cpu_offload`` and ``wrap_separately`` fields. None of them were
-    read by ``FSDPPass`` — graph-mode owns reshard as a future pass, CPU
-    offload lives elsewhere, and per-module separate-wrapping is implicit
-    (every marked module is sharded individually). They are removed as dead
-    surface; when a real reshard/offload pass lands it can re-add fields
-    with a real consumer.
+    Earlier revisions stored an ``FSDPModuleConfig`` dataclass per entry and
+    exposed ``get_fsdp_config`` / ``merge``. The dataclass carried no field
+    beyond the FQN that already keys it, and neither helper had a production
+    consumer. They were removed as dead surface; when a real per-module
+    option (reshard, CPU offload) lands it can re-add a value type with a
+    real consumer.
 """
 
 __all__ = [
-    "PassPlan",
-    "FSDPModuleConfig",
-    "create_pass_plan_from_yaml",
-    "create_simple_pass_plan",
+    "GraphParallelPlan",
+    "create_plan_from_yaml",
+    "create_all_fsdp_plan",
 ]
 
 import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional, Set
 
 import yaml
 
@@ -48,26 +47,12 @@ DEFAULT_CONFIG_DIR = Path(__file__).parent / "examples"
 
 
 @dataclass
-class FSDPModuleConfig:
-    """Marker that a single module FQN is FSDP-wrapped.
+class GraphParallelPlan:
+    """Declare the graph-mode parallel assignment of modules.
 
-    Attributes:
-        module_fqn: Module fully qualified name (or wildcard pattern). The
-            same value is also the dict key in ``PassPlan.fsdp_modules``
-            / ``fsdp_patterns``; it is kept on the dataclass so iterating
-            ``plan.fsdp_modules.values()`` stays self-describing.
-    """
-
-    module_fqn: str
-
-
-@dataclass
-class PassPlan:
-    """Declare which modules ``FSDPPass`` should shard.
-
-    Two registries (exact FQN match + wildcard patterns) are checked in
-    order: exact wins first, then patterns in insertion order (first match
-    wins when patterns overlap).
+    ``fsdp_modules`` holds exact module FQNs to FSDP-shard and
+    ``fsdp_patterns`` holds ``fnmatch`` wildcards; :meth:`is_marked_for_fsdp`
+    checks the exact set first, then the patterns.
 
     Pipeline-parallel stage assignment lives in
     ``pp_module_fqns_per_stage``: a list whose i-th entry is the list of
@@ -76,40 +61,19 @@ class PassPlan:
     model's layer-like children (see ``pp_pass._auto_stage_split``).
 
     Example:
-        plan = PassPlan()
-        plan.fsdp_wrap("tok_embeddings")
-        plan.fsdp_wrap_pattern("layers.*")
+        plan = GraphParallelPlan()
+        plan.fsdp_mark("tok_embeddings")
+        plan.fsdp_mark_pattern("layers.*")
         plan.pp_stage(0, ["tok_embeddings", "layers.0"])
         plan.pp_stage(1, ["layers.1", "norm", "lm_head"])
     """
 
-    fsdp_modules: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
-    fsdp_patterns: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
+    fsdp_modules: Set[str] = field(default_factory=set)
+    fsdp_patterns: Set[str] = field(default_factory=set)
     pp_module_fqns_per_stage: Optional[List[List[str]]] = None
 
-    def merge(self, other: "PassPlan") -> "PassPlan":
-        """Return a new plan with both registries merged (other wins on key conflict).
-
-        Args:
-            other: Plan to merge in. Entries in ``other`` overwrite entries
-                with the same FQN / pattern in ``self``; a PP stage plan on
-                ``other`` replaces ``self``'s wholesale (per-stage merges
-                are ambiguous and unsupported).
-
-        Returns:
-            A new ``PassPlan``; ``self`` and ``other`` are not mutated.
-        """
-        merged = PassPlan()
-        merged.fsdp_modules = {**self.fsdp_modules, **other.fsdp_modules}
-        merged.fsdp_patterns = {**self.fsdp_patterns, **other.fsdp_patterns}
-        if other.pp_module_fqns_per_stage is not None:
-            merged.pp_module_fqns_per_stage = other.pp_module_fqns_per_stage
-        elif self.pp_module_fqns_per_stage is not None:
-            merged.pp_module_fqns_per_stage = self.pp_module_fqns_per_stage
-        return merged
-
-    def fsdp_wrap(self, module_fqn: str) -> "PassPlan":
-        """Mark a specific module for FSDP wrapping (exact match).
+    def fsdp_mark(self, module_fqn: str) -> "GraphParallelPlan":
+        """Mark a specific module for FSDP sharding (exact match).
 
         Args:
             module_fqn: Module fully qualified name.
@@ -118,13 +82,13 @@ class PassPlan:
             ``self`` (chainable).
 
         Example:
-            plan.fsdp_wrap("tok_embeddings")
+            plan.fsdp_mark("tok_embeddings")
         """
-        self.fsdp_modules[module_fqn] = FSDPModuleConfig(module_fqn=module_fqn)
+        self.fsdp_modules.add(module_fqn)
         return self
 
-    def fsdp_wrap_pattern(self, pattern: str) -> "PassPlan":
-        """Mark modules for FSDP wrapping (wildcard match).
+    def fsdp_mark_pattern(self, pattern: str) -> "GraphParallelPlan":
+        """Mark modules for FSDP sharding (wildcard match).
 
         Args:
             pattern: Module FQN pattern (``fnmatch`` wildcards, e.g. ``*``,
@@ -134,34 +98,27 @@ class PassPlan:
             ``self`` (chainable).
 
         Example:
-            plan.fsdp_wrap_pattern("layers.*")
+            plan.fsdp_mark_pattern("layers.*")
         """
-        self.fsdp_patterns[pattern] = FSDPModuleConfig(module_fqn=pattern)
+        self.fsdp_patterns.add(pattern)
         return self
 
-    def is_fsdp_module(self, module_fqn: str) -> bool:
-        """Check if a module should be wrapped with FSDP."""
+    def is_marked_for_fsdp(self, module_fqn: str) -> bool:
+        """Whether ``module_fqn`` is marked for FSDP sharding.
+
+        Pure exact/pattern lookup: an exact mark or any matching pattern
+        returns ``True``. Ancestor matching (a mark on ``layers.0`` covering
+        ``layers.0.attention.weight``) is NOT done here — callers such as
+        ``FSDPPass`` walk a parameter's ancestors and query each level.
+        """
         if module_fqn in self.fsdp_modules:
             return True
 
-        for pattern in self.fsdp_patterns:
-            if fnmatch.fnmatch(module_fqn, pattern):
-                return True
+        return any(
+            fnmatch.fnmatch(module_fqn, pattern) for pattern in self.fsdp_patterns
+        )
 
-        return False
-
-    def get_fsdp_config(self, module_fqn: str) -> Optional[FSDPModuleConfig]:
-        """Get FSDP configuration for a module, or ``None`` if not wrapped."""
-        if module_fqn in self.fsdp_modules:
-            return self.fsdp_modules[module_fqn]
-
-        for pattern, config in self.fsdp_patterns.items():
-            if fnmatch.fnmatch(module_fqn, pattern):
-                return config
-
-        return None
-
-    def pp_stage(self, stage_idx: int, module_fqns: List[str]) -> "PassPlan":
+    def pp_stage(self, stage_idx: int, module_fqns: List[str]) -> "GraphParallelPlan":
         """Declare the module FQNs of one pipeline stage (exact match).
 
         Args:
@@ -200,18 +157,18 @@ class PassPlan:
         return self
 
 
-def create_pass_plan_from_yaml(
+def create_plan_from_yaml(
     config_path: Optional[str] = None,
     model_name: Optional[str] = None,
-) -> PassPlan:
-    """Create PassPlan from a YAML configuration file.
+) -> GraphParallelPlan:
+    """Create a ``GraphParallelPlan`` from a YAML configuration file.
 
     Args:
         config_path: Path to YAML config file.
         model_name: Model name (looks up in ``examples/{model_name}/config.yaml``).
 
     Returns:
-        PassPlan object.
+        GraphParallelPlan object.
 
     Raises:
         ValueError: When neither argument is given, ``model_name`` is empty
@@ -219,8 +176,8 @@ def create_pass_plan_from_yaml(
         FileNotFoundError: When the resolved config file does not exist.
 
     Example:
-        plan = create_pass_plan_from_yaml(model_name="llama3")
-        plan = create_pass_plan_from_yaml(config_path="path/to/config.yaml")
+        plan = create_plan_from_yaml(model_name="llama3")
+        plan = create_plan_from_yaml(config_path="path/to/config.yaml")
     """
     if config_path is None and model_name is None:
         raise ValueError("Must provide either config_path or model_name")
@@ -251,7 +208,7 @@ def create_pass_plan_from_yaml(
             f"got {type(config).__name__}: {config_path}"
         )
 
-    plan = PassPlan()
+    plan = GraphParallelPlan()
 
     fsdp_config = _yaml_section(config, "fsdp", config_path)
     _maybe_process_fsdp(plan, fsdp_config)
@@ -281,7 +238,7 @@ def _yaml_section(config: dict, key: str, config_path: Path) -> dict:
     return section
 
 
-def _maybe_process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
+def _maybe_process_fsdp(plan: GraphParallelPlan, fsdp_config: dict) -> None:
     """Run the FSDP processor when the section is enabled.
 
     Enabled defaults to True when explicit modules/patterns are declared.
@@ -291,16 +248,16 @@ def _maybe_process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
         _process_fsdp(plan, fsdp_config)
 
 
-def _process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
+def _process_fsdp(plan: GraphParallelPlan, fsdp_config: dict) -> None:
     """Process FSDP configuration (modules + patterns) into the plan."""
     for module_config in fsdp_config.get("modules", []):
-        plan.fsdp_wrap(module_config["name"])
+        plan.fsdp_mark(module_config["name"])
 
     for pattern_config in fsdp_config.get("patterns", []):
-        plan.fsdp_wrap_pattern(pattern_config["pattern"])
+        plan.fsdp_mark_pattern(pattern_config["pattern"])
 
 
-def _process_pp(plan: PassPlan, pp_config: dict) -> None:
+def _process_pp(plan: GraphParallelPlan, pp_config: dict) -> None:
     """Process PP configuration (explicit per-stage FQN lists) into the plan.
 
     YAML shape::
@@ -328,11 +285,11 @@ def _process_pp(plan: PassPlan, pp_config: dict) -> None:
         plan.pp_stage(stage_idx, module_fqns)
 
 
-def create_simple_pass_plan() -> PassPlan:
-    """Create a plan that FSDP-wraps every module (``*`` pattern).
+def create_all_fsdp_plan() -> GraphParallelPlan:
+    """Create a plan that FSDP-marks every module (``*`` pattern).
 
     Convenience for tests / quick demos.
     """
-    plan = PassPlan()
-    plan.fsdp_wrap_pattern("*")
+    plan = GraphParallelPlan()
+    plan.fsdp_mark_pattern("*")
     return plan

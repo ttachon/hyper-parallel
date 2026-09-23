@@ -33,7 +33,7 @@ from hyper_parallel.core.tensor_parallel.loss_parallel import (
 )
 
 # MC2 fused kernels import torch at module load; keep them off the eager path so
-# MindSpore-only environments can import this package without torch installed.
+# importing this package does not require torch.
 _LAZY_EXPORTS = {
     "MC2Linear": ".mc2",
     "MC2ColwiseParallel": ".mc2_style",

@@ -71,7 +71,7 @@ const-rgx=([A-Z_][A-Z0-9_]*)|(__[a-z0-9_]+__)$
 inlinevar-rgx=[a-z_][a-z0-9_]*$
 
 [TYPECHECK]
-generated-members=numpy.*,torch.*,mindspore.*
+generated-members=numpy.*,torch.*
 
 [DESIGN]
 max-args=8

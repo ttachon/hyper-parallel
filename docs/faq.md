@@ -73,7 +73,7 @@ python -c "import torch; print(torch.__version__); print(torch.compiled_with_cxx
 
 1. 检查 `PipelineStage(submodule, stage_index, stage_num)` 参数是否正确
 2. 确保所有 stage 的 `stage_num` 一致
-3. MindSpore 后端确保 batch_size 整除 micro_batch_num
+3. 确保 batch_size 整除 micro_batch_num
 
 ### Q: overlap_b_f 导致死锁
 
@@ -102,14 +102,6 @@ def swap_policy(tensor):
 for i in range(len(model.layers) - 1):
     SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
-
-### Q: Context Parallel 在 MindSpore 上不工作
-
-**原因**：DSA 系列 async CP 目前仅 PyTorch 后端支持。
-
-**解决**：MindSpore 后端使用基础 `ContextParallel`，DSA 系列为 noop 占位。
-
----
 
 ## 通信问题
 

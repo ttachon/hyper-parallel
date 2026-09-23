@@ -167,7 +167,7 @@ def build_suite_groups(
             continue
         shape, names, nproc = key[0], key[1], key[2]
         # Order cases by source module then name so adjacent cases from
-        # the same file (same op) hit the JIT graph cache (notably MindSpore:
+        # the same file (same op) hit the JIT graph cache (notably with traced frameworks:
         # first invocation compiles, subsequent reuse the cached graph).
         # Pure-eager torch is unaffected; this also stabilises pytest ids.
         bucket.sort(key=lambda c: (c.source_module, c.name))

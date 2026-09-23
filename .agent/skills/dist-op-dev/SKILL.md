@@ -25,7 +25,7 @@ Reports (Chinese): `.agent/skills/dist-op-dev/reports/{OpName}_report.md` (gitig
    Must comply with `.agent/rules/distributed-op-dev.md`.
 3. **UT** — `tests/ut/core/shard/ops/test_parallel_{op}.py` per
    `.agent/rules/distributed-op-testing.md`.
-4. **ST** (if plan requires) — MindSpore and/or Torch `cases/case_{op}.py`
+4. **ST** (if plan requires) — Torch `cases/case_{op}.py`
    (details + commands in implement-and-test).
 5. **Run & fix** until all **executable** tests pass; log to report.
 6. **Complete** — list files, per-suite status, remind Ascend ST if skipped;

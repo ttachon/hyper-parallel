@@ -17,8 +17,8 @@
 # Build-time defaults follow the CANN base image and docs/installation.md:
 #   Python 3.12, torch 2.10, torch-npu 2.10, CANN 9.1.
 #
-# The native extensions are disabled by default because the MindSpore
-# dependency is only needed for selected native build combinations.
+# The native extensions are disabled by default; enable them for the torch
+# build when the corresponding sources are present.
 
 ARG CANN_QUAY_URL="quay.io/ascend/cann"
 ARG CANN_VERSION="9.1.0"
@@ -92,11 +92,6 @@ RUN if [ -f /usr/local/Ascend/cann/set_env.sh ]; then \
     && case "${HP_EXTRA}" in \
         "") \
             python3 -m pip install --no-cache-dir -e . --no-build-isolation ;; \
-        mindspore) \
-            python3 -m pip install --no-cache-dir \
-                --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
-                -e ".[mindspore]" \
-                --no-build-isolation ;; \
         torch26|torch27|torch29|torch) \
             python3 -m pip install --no-cache-dir \
                 --extra-index-url https://download.pytorch.org/whl/cpu \

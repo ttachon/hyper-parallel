@@ -62,6 +62,8 @@ class NoAcceleratorGuard:
         return _blocked
 
     def _check_init_process_group(self, real_init):
+        """Wrap ``init_process_group`` so forbidden backends fail fast."""
+
         def _guarded(*args, **kwargs):
             backend = kwargs.get("backend")
             if backend is None and args:
@@ -117,10 +119,10 @@ def no_accelerator():
 
 
 def _preload_libgomp_early_for_static_tls() -> None:
-    """Preload ``libgomp`` so torch then MindSpore do not exhaust static TLS.
+    """Preload ``libgomp`` so later OpenMP consumers do not exhaust static TLS.
 
     ``pytest_configure`` imports PyTorch first; without an early global load of
-    OpenMP, a later ``import mindspore`` can fail with:
+    OpenMP, a later native extension that links OpenMP can fail with:
 
         ImportError: libgomp.so.1: cannot allocate memory in static TLS block
 

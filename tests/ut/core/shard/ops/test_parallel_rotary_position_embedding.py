@@ -24,50 +24,10 @@ from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_rotary_position_embedding import (
     RotaryPositionEmbeddingDistributedOp,
     _normalize_npu_rotary_mul_args,
-    _normalize_rpe_args,
 )
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-
-
-class TestNormalizeRpeArgs(unittest.TestCase):
-    """Unit tests for _normalize_rpe_args."""
-
-    def test_three_positional_args_mode_defaults_to_zero_1(self):
-        """
-        Feature: _normalize_rpe_args fills in default mode=0.
-        Description: Call with only x, cos, sin positional args.
-        Expectation: args == (x, cos, sin, 0), kwargs == {}.
-        """
-        x, cos, sin = object(), object(), object()
-        args, kwargs = _normalize_rpe_args(x, cos, sin)
-        self.assertIs(args[0], x, msg=f"args[0] should be x, got {args[0]}")
-        self.assertIs(args[1], cos, msg=f"args[1] should be cos, got {args[1]}")
-        self.assertIs(args[2], sin, msg=f"args[2] should be sin, got {args[2]}")
-        self.assertEqual(args[3], 0, msg=f"default mode should be 0, got {args[3]}")
-        self.assertEqual(kwargs, {}, msg=f"kwargs should be empty, got {kwargs}")
-
-    def test_mode_keyword_arg_2(self):
-        """
-        Feature: _normalize_rpe_args accepts mode as keyword argument.
-        Description: Call with mode=1 as kwarg.
-        Expectation: args[3] == 1.
-        """
-        x, cos, sin = object(), object(), object()
-        args, _ = _normalize_rpe_args(x, cos, sin, mode=1)
-        self.assertEqual(args[3], 1, msg=f"mode kwarg should be 1, got {args[3]}")
-
-    def test_mode_positional_arg_3(self):
-        """
-        Feature: _normalize_rpe_args accepts mode as positional argument.
-        Description: Call with mode=2 as positional arg.
-        Expectation: args[3] == 2.
-        """
-        x, cos, sin = object(), object(), object()
-        args, kwargs = _normalize_rpe_args(x, cos, sin, 2)
-        self.assertEqual(args[3], 2, msg=f"mode positional should be 2, got {args[3]}")
-        self.assertEqual(kwargs, {}, msg=f"kwargs should be empty, got {kwargs}")
 
 
 class TestYamlRegistration(unittest.TestCase):
@@ -624,32 +584,7 @@ class TestPreprocessRouting(unittest.TestCase):
         return dt
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_preprocess_primitive_mode_in_local_args(self, mock_platform):
-        """
-        Feature: Primitive preprocess puts mode in local_args, local_kwargs empty.
-        Description: op_name="RotaryPositionEmbedding", mode=2 passed as kwarg.
-        Expectation: local_args[3] == 2, local_kwargs == {}.
-        """
-        self._setup_mock_platform(mock_platform)
-        mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
-        x_dt = self._make_dtensor_mock(mesh, 4)
-        cos_dt = self._make_dtensor_mock(mesh, 4)
-        sin_dt = self._make_dtensor_mock(mesh, 4)
-
-        op = RotaryPositionEmbeddingDistributedOp("RotaryPositionEmbedding")
-        local_args, local_kwargs, cv = op.preprocess(
-            (x_dt, cos_dt, sin_dt), {"mode": 2}
-        )
-
-        self.assertEqual(len(local_args), 4,
-                         msg=f"Primitive: local_args should have 4 entries, got {len(local_args)}")
-        self.assertEqual(local_kwargs, {},
-                         msg=f"Primitive: local_kwargs should be empty, got {local_kwargs}")
-        self.assertEqual(len(cv), 3,
-                         msg=f"cache_values should have 3 entries, got {len(cv)}")
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_preprocess_pytorch_rotary_mode_in_local_kwargs(self, mock_platform):
+    def test_preprocess_torch_rotary_mode_in_local_kwargs(self, mock_platform):
         """
         Feature: PyTorch preprocess puts rotary_mode in local_kwargs.
         Description: op_name="npu_rotary_mul", rotary_mode="interleave".
@@ -680,7 +615,7 @@ class TestPreprocessRouting(unittest.TestCase):
                          msg=f"cache_values should have 3 entries, got {len(cv)}")
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_preprocess_pytorch_no_rotary_mode_empty_kwargs(self, mock_platform):
+    def test_preprocess_torch_no_rotary_mode_empty_kwargs(self, mock_platform):
         """
         Feature: PyTorch preprocess with no rotary_mode → empty local_kwargs.
         Description: op_name="npu_rotary_mul", no rotary_mode kwarg.

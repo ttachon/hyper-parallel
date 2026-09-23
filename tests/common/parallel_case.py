@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Cross-platform wrappers that spawn ``torchrun`` / ``msrun`` ST workers.
+"""Wrappers that spawn ``torchrun`` ST workers.
 
 Like :mod:`tests.common.distributed_launcher`, this module must stay free of
-``torch`` / ``mindspore`` / ``hyper_parallel`` imports so pytest parent
-launchers only pay the cost of forking the distributed runner. Worker bodies
-live in non-launcher modules and import frameworks as usual.
+``torch`` / ``hyper_parallel`` imports so pytest parent launchers only pay the
+cost of forking the distributed runner. Worker bodies live in non-launcher
+modules and import frameworks as usual.
 """
 import os
 import signal
 import multiprocessing as mp
-from typing import Optional, Union
+from typing import Optional
 
 from tests.common.port_utils import allocate_port
 
@@ -38,20 +38,6 @@ class TorchCase:
         self.num_proc = num_proc
 
 
-class MindSporeCase:
-    """mindspore case messages"""
-
-    def __init__(self, file_name: str, case_name: str, master_port: Optional[int] = None, worker_num: int = 1,
-                 local_worker_num: int = 1, glog_v: int = 3) -> None:
-        """Initialize MindSporeCase with file path, case name, optional port, worker counts, and log level."""
-        self.glog_v = glog_v
-        self.file_name = file_name
-        self.case_name = case_name
-        self.master_port = master_port
-        self.num_proc = worker_num
-        self.local_worker_num = local_worker_num
-
-
 def _parallel_run_context():
     """Use spawn for CPU shards to avoid inheriting fork-only state."""
     device_type = os.environ.get("HYPER_PARALLEL_TEST_DEVICE_TYPE", "").strip().lower()
@@ -60,31 +46,26 @@ def _parallel_run_context():
     return mp.get_context()
 
 
-def run_case(visible_devices: list, case: Union[TorchCase, MindSporeCase]) -> None:
+def run_case(visible_devices: list, case: TorchCase) -> None:
     """Run a single test case in a child process with device visibility set.
 
     Args:
         visible_devices: List of device indices to expose via ASCEND_RT_VISIBLE_DEVICES.
-        case: The test case descriptor (TorchCase or MindSporeCase).
+        case: The test case descriptor.
     """
     # become the leader of a new process group so that os.killpg on timeout
-    # kills torchrun/msrun worker sub-processes as well as this wrapper
+    # kills torchrun worker sub-processes as well as this wrapper
     os.setsid()
     if os.environ.get("HYPER_PARALLEL_TEST_DEVICE_TYPE", "").strip().lower() == "cpu":
         os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
     else:
         # set visible devices for current case
         os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, visible_devices))
-    if isinstance(case, TorchCase):
-        # Import the thin launcher only — never tests.torch.utils (imports torch /
-        # torch_npu) in this wrapper process.
-        # pylint: disable=C0415
-        from tests.common.distributed_launcher import torchrun_case
-        torchrun_case(case.file_name, case.case_name, case.master_port, case.num_proc)
-    elif isinstance(case, MindSporeCase):
-        # pylint: disable=C0415
-        from tests.common.distributed_launcher import msrun_case
-        msrun_case(case.glog_v, case.file_name, case.case_name, case.master_port, case.num_proc, case.local_worker_num)
+    # Import the thin launcher only — never tests.torch.utils (imports torch /
+    # torch_npu) in this wrapper process.
+    # pylint: disable=C0415
+    from tests.common.distributed_launcher import torchrun_case
+    torchrun_case(case.file_name, case.case_name, case.master_port, case.num_proc)
 
 
 def _auto_assign_ports(cases: list) -> None:
@@ -98,11 +79,11 @@ def _auto_assign_ports(cases: list) -> None:
             case.master_port = allocate_port()
 
 
-def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_proc: int = 8) -> None:
+def parallel_run(cases: list[TorchCase], global_num_proc: int = 8) -> None:
     """Run a group of test cases in parallel, assigning disjoint device slices to each.
 
     Args:
-        cases: List of TorchCase or MindSporeCase descriptors to run concurrently.
+        cases: List of TorchCase descriptors to run concurrently.
             The sum of all ``num_proc`` values must not exceed ``global_num_proc``.
         global_num_proc: Total device budget for this group. Defaults to 8.
 
@@ -130,7 +111,7 @@ def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_
                                              f"global_num_proc {global_num_proc}")
 
     # create child process (run_case calls os.setsid to own a process group,
-    # so os.killpg on timeout kills torchrun/msrun workers too)
+    # so os.killpg on timeout kills torchrun workers too)
     processes = []
     ctx = _parallel_run_context()
     for _, (case, devices) in enumerate(zip(cases, assignments)):

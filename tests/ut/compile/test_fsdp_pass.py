@@ -57,10 +57,12 @@ from torch import fx, nn
 
 from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.pass_plan import PassPlan
+from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
-_RESOLVE_PG_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass._resolve_process_group"
+_RESOLVE_PG_PATH = (
+    "hyper_parallel.compile.passes.parallel.fsdp_pass._resolve_process_group"
+)
 
 
 @contextmanager
@@ -154,7 +156,7 @@ class _MixedState(nn.Module):
 class _WrappedPlusRootParam(nn.Module):
     """Model with a wrap-eligible submodule plus a root-level param.
 
-    ``lin`` is a named submodule (so a partial ``fsdp_wrap("lin")`` plan
+    ``lin`` is a named submodule (so a partial ``fsdp_mark("lin")`` plan
     matches it via its module FQN); ``extra`` sits directly on the root, where
     it has no module ancestor. A partial plan wrapping only ``lin`` must shard
     ``lin``'s params and leave ``extra`` full-size on BOTH the graph side and
@@ -416,14 +418,14 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         (no AllGather) would mismatch at ``run_traced_graph`` time.
         """
         cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
-        plan = PassPlan().fsdp_wrap("lin")
-        pas = FSDPPass(pass_plan=plan)
+        plan = GraphParallelPlan().fsdp_mark("lin")
+        pas = FSDPPass(parallel_plan=plan)
         gm = _lin_bias_extra_joint_graph()
         model = _WrappedPlusRootParam()
         before_extra = tuple(model.extra.shape)
 
         with _patch_dist(world_size=2, rank=0, initialized=True):
-            # pass_plan auto-filled from the pass (not kwargs), as the
+            # parallel_plan auto-filled from the pass (not kwargs), as the
             # pipeline would do.
             result = pas.run(gm, cfg, model=model, fsdp_group_name="fsdp")
 
@@ -475,17 +477,19 @@ class TestFSDPPassHelpers(unittest.TestCase):
 
     def test_param_belongs_to_fsdp_module_exact_and_pattern(self):
         """Test exact-FQN and wildcard-pattern matching of ancestor modules."""
-        exact = FSDPPass(pass_plan=PassPlan().fsdp_wrap("lin"))
+        exact = FSDPPass(parallel_plan=GraphParallelPlan().fsdp_mark("lin"))
         self.assertTrue(
             exact._param_belongs_to_fsdp_module("lin.weight"),  # pylint: disable=protected-access
-            "exact fsdp_wrap('lin') should match a param under module 'lin'",
+            "exact fsdp_mark('lin') should match a param under module 'lin'",
         )
         self.assertFalse(
             exact._param_belongs_to_fsdp_module("other.weight"),  # pylint: disable=protected-access
             "exact wrap must not match an unrelated module",
         )
 
-        pattern = FSDPPass(pass_plan=PassPlan().fsdp_wrap_pattern("layers.*"))
+        pattern = FSDPPass(
+            parallel_plan=GraphParallelPlan().fsdp_mark_pattern("layers.*")
+        )
         self.assertTrue(
             pattern._param_belongs_to_fsdp_module("layers.0.lin.weight"),  # pylint: disable=protected-access
             "pattern 'layers.*' should match an ancestor like 'layers.0.lin'",
@@ -500,9 +504,9 @@ class TestFSDPPassHelpers(unittest.TestCase):
 
         ``_param_belongs_to_fsdp_module`` tests the param FQN itself before
         walking ancestors, so a param directly on the root (``weight``) matches
-        a ``*`` plan or an explicit ``fsdp_wrap("weight")``.
+        a ``*`` plan or an explicit ``fsdp_mark("weight")``.
         """
-        pas = FSDPPass(pass_plan=PassPlan().fsdp_wrap_pattern("*"))
+        pas = FSDPPass(parallel_plan=GraphParallelPlan().fsdp_mark_pattern("*"))
         self.assertTrue(
             pas._param_belongs_to_fsdp_module("weight"),  # pylint: disable=protected-access
             "top-level param 'weight' should match a '*' plan via its own FQN",

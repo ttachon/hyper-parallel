@@ -1,7 +1,7 @@
 # Pipeline Parallel example configuration.
 #
 # NOTE: fsdp / pp are TOP-LEVEL keys here so the whole file can be fed
-# directly to create_pass_plan_from_yaml(); model / train / logging keys
+# directly to create_plan_from_yaml(); model / train / logging keys
 # are ignored by the plan parser.
 
 model:
@@ -21,7 +21,7 @@ logging:
   log_interval: 5
 
 # ============================================================================
-# Stage split plan (parsed by create_pass_plan_from_yaml)
+# Stage split plan (parsed by create_plan_from_yaml)
 # ============================================================================
 # Pipeline-parallel (v1): pure PP — FSDP must stay disabled, and
 # world_size must equal pp_degree (one stage per rank).

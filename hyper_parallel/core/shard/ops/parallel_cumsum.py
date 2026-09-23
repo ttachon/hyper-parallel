@@ -28,7 +28,6 @@ def _normalize_cumsum_args(x, dim, dtype=None):
 
 class CumsumDistributedOp(DistributedOp):
     """Distributed implementation for torch.cumsum."""
-    _MS_PRIMITIVE_OP_NAMES = frozenset({'CumsumExt'})
 
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
@@ -47,14 +46,10 @@ class CumsumDistributedOp(DistributedOp):
         dtype = kwargs['dtype']
 
         local_input = input_tensor.to_local()
-        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
-            local_args = (local_input, dim, dtype)
-            local_kwargs = {}
-        else:
-            local_args = (local_input, dim)
-            local_kwargs = {}
-            if dtype is not None:
-                local_kwargs['dtype'] = dtype
+        local_args = (local_input, dim)
+        local_kwargs = {}
+        if dtype is not None:
+            local_kwargs['dtype'] = dtype
 
         cache_values = [input_tensor.layout, dim]
         return local_args, local_kwargs, cache_values

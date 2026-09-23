@@ -1176,10 +1176,9 @@ class ExpertParallel(BaseExpertParallel):
                 "or the context was already consumed by a previous combine call."
             )
 
-        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
-        # are captured by autograd graph and don't need the attribute. But in
-        # MindSpore PyNative mode, deleting the attribute may break backward.
-        # The context will be overwritten on the next forward call.
+        # Note: Do NOT delete the context here. The tensors in ctx are
+        # captured by the autograd graph, so the attribute is not needed for
+        # backward and is simply overwritten on the next forward call.
 
         if self.async_combine:
             handle = self._token_dispatcher.combine_start(
@@ -1394,10 +1393,9 @@ class ExpertTensorParallel(ExpertParallel):
                 "or the context was already consumed by a previous combine call."
             )
 
-        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
-        # are captured by autograd graph and don't need the attribute. But in
-        # MindSpore PyNative mode, deleting the attribute may break backward.
-        # The context will be overwritten on the next forward call.
+        # Note: Do NOT delete the context here. The tensors in ctx are
+        # captured by the autograd graph, so the attribute is not needed for
+        # backward and is simply overwritten on the next forward call.
 
         dispatch_mesh = self._dispatch_mesh(device_mesh)
 

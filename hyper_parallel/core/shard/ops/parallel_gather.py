@@ -386,11 +386,6 @@ class GatherNdDistributedOp(DistributedOp):
         """
         Preprocess arguments for GatherNd operator.
 
-        NOTE: aclop packed-args normalization (for MindSpore aclop operators
-        that pack args as ``(prim, name, (real_args...))``) is handled
-        upstream in ``OpDispatcher._dispatch_layout_infer`` via
-        ``_normalize_aclop_args``. This method receives clean unpacked args.
-
         Args:
             args (tuple): Input arguments (input, indices).
             kwargs (dict): Keyword arguments.

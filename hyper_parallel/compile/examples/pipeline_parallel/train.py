@@ -48,10 +48,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413,C0415,E0611
+    GraphParallelPlan,
     GraphTrainer,
     PassConfig,
-    PassPlan,
-    create_pass_plan_from_yaml,
+    create_plan_from_yaml,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -146,13 +146,13 @@ def build_pass_config(config: dict) -> PassConfig:
     )
 
 
-def build_pass_plan(config_path: str) -> PassPlan:
+def build_parallel_plan(config_path: str) -> GraphParallelPlan:
     """Parse the YAML plan (fsdp + pp sections; extra keys are ignored).
 
     With ``pp.stages`` declared the plan is manual; without it ``PpPass``
     falls back to the automatic even-by-layers split.
     """
-    return create_pass_plan_from_yaml(config_path=config_path)
+    return create_plan_from_yaml(config_path=config_path)
 
 
 def main() -> None:  # pylint: disable=too-many-locals
@@ -174,10 +174,10 @@ def main() -> None:  # pylint: disable=too-many-locals
     ).to(device)
 
     pass_config = build_pass_config(config)
-    pass_plan = build_pass_plan(args.config)
+    parallel_plan = build_parallel_plan(args.config)
 
     if rank == 0:
-        stages = pass_plan.pp_module_fqns_per_stage or "auto (even by layers)"
+        stages = parallel_plan.pp_module_fqns_per_stage or "auto (even by layers)"
         _LOG.info("=" * 72)
         _LOG.info(
             "PP demo: world_size=%s (stages), microbatch=%s",
@@ -191,7 +191,7 @@ def main() -> None:  # pylint: disable=too-many-locals
         model=model,
         train_fn=train_fn,
         pass_config=pass_config,
-        pass_plan=pass_plan,
+        parallel_plan=parallel_plan,
         optimizer_config={
             "lr": config["train"]["optimizer"]["lr"],
             "grad_clip": config["train"].get("grad_clip"),

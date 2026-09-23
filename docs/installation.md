@@ -14,12 +14,11 @@ HyperParallel 提供两种安装方式：
 | 命令                                        | 安装内容                                             | 适用场景                          |
 |-------------------------------------------|--------------------------------------------------|-------------------------------|
 | `pip install hyper-parallel`              | 仅安装通用依赖，不安装深度学习框架                                | 已自行管理框架版本，或只使用不依赖框架的能力        |
-| `pip install 'hyper-parallel[mindspore]'` | 通用依赖 + `mindspore>=2.10`                         | 使用受支持的 MindSpore 后端          |
 | `pip install 'hyper-parallel[torch]'`     | 通用依赖 + `torch==2.9.1` + `torch-npu==2.9.1`       | 使用默认 PyTorch 2.9 后端           |
 | `pip install 'hyper-parallel[torch26]'`   | 通用依赖 + `torch==2.6.0` + `torch-npu==2.6.0.post3` | 使用 PyTorch 2.6 后端             |
 | `pip install 'hyper-parallel[torch27]'`   | 通用依赖 + `torch==2.7.1` + `torch-npu==2.7.1`       | 使用 PyTorch 2.7 后端             |
 | `pip install 'hyper-parallel[torch29]'`   | 通用依赖 + `torch==2.9.1` + `torch-npu==2.9.1`       | 显式使用 PyTorch 2.9 后端           |
-| `pip install 'hyper-parallel[all]'`       | 通用依赖 + MindSpore + 默认 PyTorch 2.9                  | 同一环境需要同时使用两种后端             |
+| `pip install 'hyper-parallel[all]'`       | 通用依赖 + 默认 PyTorch 2.9                            | 使用默认 PyTorch 后端                |
 
 zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释为通配符。
 

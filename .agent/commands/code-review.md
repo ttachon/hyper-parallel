@@ -21,7 +21,6 @@ The review covers:
 - **Stream synchronization** — async collectives, non_blocking, cross-stream deps
 - **Memory lifecycle** — storage free, buffer cleanup, grad nulling
 - **DTensor correctness** — layout, placement, redistribution invariants
-- **Cross-platform consistency** — torch/mindspore parity
 - **Code quality** — conventions, patterns, design
 - **Style compliance** — mandatory enforcement of `.agent/rules/code-style.md`
 - **Testing** — coverage, distributed test patterns

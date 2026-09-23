@@ -527,7 +527,7 @@ def _push_pr_branch(pr_branch: str) -> None:
 
 _GATE_LABELS = {
     "ut": "UT (pytest, default scope=changed)",
-    "st": "ST (pytest tests/{torch,mindspore}/st, default scope=skip)",
+    "st": "ST (pytest tests/{torch}/st, default scope=skip)",
 }
 
 _GATE_DEFAULTS = {"ut": "changed", "st": "skip"}
@@ -857,7 +857,7 @@ def _run_pr_st_gate(scope: str, diff_range: Optional[str]) -> None:
     if result.returncode != 0:
         raise AutoGitError(
             "ST gate failed. Common causes:\n"
-            "  - missing torchrun / msrun launcher\n"
+            "  - missing torchrun launcher\n"
             "  - single-card env (ST typically needs multi-card)\n"
             "  - real test failure\n"
             "If the env cannot run ST, re-run with --st skip."

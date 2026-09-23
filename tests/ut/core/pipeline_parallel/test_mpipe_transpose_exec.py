@@ -545,6 +545,8 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         executor._keep_grad[0] = (feat,)
         executor.grad_send(_step(0), ctx)  # stage 0 owns micro 0 -> local no-op
         assert mock_dist.send_object_list.call_count == before
+        assert 0 not in executor._keep_grad, \
+            "the local no-op branch must still drop its cache entry, not strand it"
 
     @patch.object(mpipe_base, "dist")
     def test_grad_recv_with_backward_runs_owner_backward(self, mock_dist):
@@ -617,6 +619,50 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
             diff = (param.grad - expected).abs().max().item()
             assert torch.allclose(param.grad, expected, atol=1e-5), \
                 f"delta-reduce wrong (re-reduced the accumulated total?): max abs diff {diff}"
+
+    @patch.object(mpipe_base, "dist")
+    def test_reduce_tower_grads_releases_snapshot(self, mock_dist):
+        """
+        Feature: MPipe owner-backward grad-snapshot lifetime.
+        Description: The snapshot taken by ``reset`` is dead once ``reduce_tower_grads``
+            has reduced the delta; holding it would keep a clone of every tower grad
+            shard alive across the optimizer step until the next reset.
+        Expectation: ``_grad_snapshot`` is None once the reduce has consumed it.
+        """
+        mock_dist.all_reduce.side_effect = lambda data, group: data
+        preprocess = torch.nn.Linear(4, 4)
+        executor = _make_executor(preprocess, num_transpose=2, has_trainable=True, owner_backward=True)
+        # pylint: disable=protected-access
+        for param in preprocess.parameters():
+            param.grad = torch.ones_like(param)
+        executor._grad_snapshot = [torch.zeros_like(p) for p in preprocess.parameters()]
+        executor.reduce_tower_grads(_step(0), _Ctx(arg_mbs=[]))
+        assert executor._grad_snapshot is None, \
+            "the consumed snapshot must be released, not held across the optimizer step"
+
+    def test_abort_drops_stranded_caches(self):
+        """
+        Feature: MPipe executor error-path cleanup.
+        Description: A step raising mid-run leaves micro-batches in the per-micro
+            caches; ``abort`` is the error path's release valve.
+        Expectation: every cache is emptied and the grad snapshot dropped, so a
+            later ``reset`` starts cleanly.
+        """
+        executor = _make_executor(torch.nn.Linear(4, 4), num_transpose=2,
+                                  has_trainable=True, owner_backward=True)
+        # pylint: disable=protected-access
+        executor._inputs_for_explicit_forward[0] = (torch.randn(2, 4),)
+        executor._outputs_for_stage0[1] = (torch.randn(2, 4),)
+        executor._outputs_for_bwd[1] = (torch.randn(2, 4),)
+        executor._keep_grad[1] = (torch.randn(2, 4),)
+        executor._fwd_received.add(1)
+        executor._grad_snapshot = [torch.zeros(4, 4)]
+        executor.abort()
+        assert not (executor._inputs_for_explicit_forward or executor._outputs_for_stage0
+                    or executor._outputs_for_bwd or executor._keep_grad
+                    or executor._fwd_received)
+        assert executor._grad_snapshot is None
+        executor.reset()  # the next run must be able to start
 
     @patch.object(mpipe_base, "dist")
     def test_reduce_grads_dtensor_reduces_local_shard_in_place(self, mock_dist):

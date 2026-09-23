@@ -50,7 +50,7 @@ PYLINT_DISABLE = ",".join([
     "C0209",  # consider-using-f-string
     "C0302",  # too-many-lines
     "C0325",  # superfluous-parens
-    "E0401",  # import-error (no local torch/mindspore deps)
+    "E0401",  # import-error (no local torch deps)
     "E0611",  # no-name-in-module (cascaded from import-error)
     "R0801",  # duplicate-code (similarities across files)
     "R0901",  # too-many-ancestors
@@ -807,7 +807,7 @@ def _derive_test_paths(src_path: str) -> List[str]:
     test_name = f"test_{filename}"
     impl_name = f"_test_{filename}"
     candidates = []
-    for framework in ("torch", "mindspore"):
+    for framework in ("torch",):
         if module_path:
             candidates.append(f"tests/{framework}/{module_path}/{test_name}")
             candidates.append(f"tests/{framework}/{module_path}/{impl_name}")

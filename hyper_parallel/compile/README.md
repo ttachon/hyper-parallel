@@ -18,12 +18,12 @@ Graph-mode architecture for automatic parallelization with FSDP.
 ### Layer 1: Configuration
 
 ```python
-from hyper_parallel.compile import PassPlan, PassConfig
+from hyper_parallel.compile import GraphParallelPlan, PassConfig
 
-# Configure which modules to wrap with FSDP
-pass_plan = PassPlan()
-pass_plan.fsdp_wrap("tok_embeddings")
-pass_plan.fsdp_wrap_pattern("layers.*")
+# Configure which modules to mark for FSDP
+parallel_plan = GraphParallelPlan()
+parallel_plan.fsdp_mark("tok_embeddings")
+parallel_plan.fsdp_mark_pattern("layers.*")
 
 # Parallel configuration
 pass_config = PassConfig(enable_overlap=True)
@@ -45,7 +45,7 @@ DeadCodeElimination → CanonicalizeGraph → FSDPPass → AutoOverlapPass
 
 **FSDPPass**:
 
-- Identifies FSDP parameter placeholders via PassPlan
+- Identifies FSDP parameter placeholders via GraphParallelPlan
 - Inserts `all_gather` after each FSDP parameter (Shard → Replicate)
 - Inserts `reduce_scatter` on gradient outputs (Replicate → Shard)
 - Physically shards live model parameters (dim 0) so optimizer is FSDP-agnostic
@@ -63,7 +63,7 @@ trainer = GraphTrainer(
     model=model,
     train_fn=train_fn,
     pass_config=pass_config,
-    pass_plan=pass_plan,
+    parallel_plan=parallel_plan,
 )
 
 # Compile on first batch, then run forward + backward + optimizer
@@ -81,21 +81,21 @@ The compiled graph is a `GraphModule` that:
 ## Usage
 
 ```python
-from hyper_parallel.compile import GraphTrainer, PassConfig, PassPlan
+from hyper_parallel.compile import GraphParallelPlan, GraphTrainer, PassConfig
 
 # 1. Model
 model = Llama3Model(config)
 
-# 2. Sharding plan
-pass_plan = PassPlan()
-pass_plan.fsdp_wrap_pattern("layers.*")
+# 2. Parallel plan
+parallel_plan = GraphParallelPlan()
+parallel_plan.fsdp_mark_pattern("layers.*")
 
 # 3. Trainer
 trainer = GraphTrainer(
     model=model,
     train_fn=lambda m, x, y: m(x).loss(y),
     pass_config=PassConfig(enable_overlap=True),
-    pass_plan=pass_plan,
+    parallel_plan=parallel_plan,
 )
 
 # 4. Training
@@ -110,7 +110,7 @@ trainer.train(dataloader, max_steps=1000)
 
 3. **FSDP-Agnostic Optimizer**: FSDPPass shards the live model's parameters in place. `model.parameters()` returns shards, so optimizer needs no FSDP awareness.
 
-4. **Declarative Sharding**: PassPlan uses FQN patterns (`layers.*`) instead of imperative module wrapping.
+4. **Declarative Sharding**: GraphParallelPlan uses FQN patterns (`layers.*`) instead of imperative module wrapping.
 
 ## Limitations
 

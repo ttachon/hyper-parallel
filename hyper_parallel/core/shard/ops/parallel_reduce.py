@@ -29,11 +29,10 @@ StrOrTuple = Union[str, Tuple["StrOrTuple", ...], List["StrOrTuple"]]
 def _normalize_reduce_args(input_tensor, dim=None, keepdim=False, dtype=None):
     """Normalize reduce-family arguments to consistent positional form.
 
-    Handles torch.sum / torch.mean / torch.prod / torch.all and MindSpore
-    SumExt / MeanExt / ReduceMax / MaxDim where *dim* and *keepdim* are
-    ordinary positional parameters. SumExt and MeanExt also pass a trailing
-    dtype slot positionally; normalize it here while keeping layout inference
-    based only on ``input_layout``, ``dim``, and ``keepdim``.
+    Handles torch.sum / torch.mean / torch.prod / torch.all, where *dim* and
+    *keepdim* are ordinary positional parameters. SumExt and MeanExt also pass
+    a trailing dtype slot positionally; normalize it here while keeping layout
+    inference based only on ``input_layout``, ``dim``, and ``keepdim``.
 
     Args:
         input_tensor: The input tensor (DTensor or Tensor).
@@ -70,9 +69,8 @@ class ReduceExtDistributedOpBase(DistributedOp):
         """
         Preprocess arguments for reduce operators.
 
-        Normalizes ``(input, dim, keepdim)`` across torch and MindSpore call
-        sites, converts DTensor inputs to local tensors, and builds
-        ``cache_values`` for layout inference.
+        Normalizes ``(input, dim, keepdim)``, converts DTensor inputs to local
+        tensors, and builds ``cache_values`` for layout inference.
 
         Args:
             args (tuple): Positional arguments passed to the operator call.
@@ -343,7 +341,7 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
 
         Routes between element-wise mode (two DTensor inputs) and reduction
         mode (input, dim, keepdim).  All parameters are positional with empty
-        kwargs for MindSpore Primitive compatibility.
+        kwargs.
 
         Args:
             args (tuple): Positional arguments passed to the operator call.

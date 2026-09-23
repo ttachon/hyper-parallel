@@ -39,7 +39,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
 from .pass_config import PassConfig
-from .pass_plan import PassPlan
+from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
@@ -60,7 +60,7 @@ class GraphCompiler:
         model: torch.nn.Module,
         train_fn: Callable,
         pass_config: PassConfig,
-        pass_plan: Optional[PassPlan] = None,
+        parallel_plan: Optional[GraphParallelPlan] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
     ) -> None:
@@ -69,8 +69,8 @@ class GraphCompiler:
             model: Model to compile
             train_fn: Training function signature: (model, input, label) -> loss
             pass_config: Parallel configuration
-            pass_plan: PassPlan declaring which modules to shard (optional;
-                enables declarative sharding)
+            parallel_plan: GraphParallelPlan declaring which modules to shard
+                (optional; enables declarative sharding)
             device: Device to place the model and run the graph on. Defaults
                 to the NPU device when available, otherwise CPU.
             mesh_context: Optional automodel ``MeshContext`` carrying a
@@ -83,7 +83,7 @@ class GraphCompiler:
         self.model = model
         self.train_fn = train_fn
         self.pass_config = pass_config
-        self.pass_plan = pass_plan
+        self.parallel_plan = parallel_plan
         self._mesh_context = mesh_context
         self.device = device or (
             torch.device("npu")
@@ -120,7 +120,7 @@ class GraphCompiler:
 
         joint_graph = trace_model_graph(self.model, self.train_fn, inputs)
 
-        pipeline = PassPipeline.from_config(self.pass_config, self.pass_plan)
+        pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
 

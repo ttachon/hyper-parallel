@@ -51,7 +51,6 @@ Environment:
 
 Example:
   $(basename "$0") hyper-parallel:npu
-  HP_EXTRA=mindspore DOCKERFILE=docker/Dockerfile.mindspore $(basename "$0") hyper-parallel:mindspore
 EOF
 }
 

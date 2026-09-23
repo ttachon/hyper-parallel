@@ -592,7 +592,7 @@ class TestDeviceMeshFromGroup:
             DeviceMesh.from_group([g1], "npu", mesh=[[0, 1], [2, 3]])
 
     def test_1d_string_group(self, mock_utils):
-        """MindSpore-style string group names."""
+        """String group names accepted in place of a ProcessGroup object."""
         _ = mock_utils
         mock_dist.get_process_group_ranks.return_value = [0, 1]
 
