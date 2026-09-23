@@ -172,9 +172,17 @@ To add a parser for a new input format:
 2. Define a parser class that inherits `_CostModelParser`.
 3. Register the parser in `framework_parsers/mapping.yaml`.
 4. Implement `parse()` and assign normalized values to `self.ccfg`.
-5. Run the common post-processing helpers after parsing strategy fields:
+5. Settle the op profile with `config_op_counts()`: pass the arch when the
+   input declares one, and let it be inferred from `model_name` otherwise.
+6. Run the common post-processing helpers after parsing strategy fields:
    `config_dp_tp_exp()`, `config_optimizer_shard()`, and
    `config_comm_flag()`.
+
+The op counts of each architecture family (how many attention projections,
+softmaxes, norms and so on one layer runs, per layer kind) are data, in
+`hyper_parallel/auto_parallel/op_profiles/<arch>.yaml`. The arch hooks read
+them from `ccfg.op_counts` and are chosen by `ccfg.arch`, never by matching the
+model name. A model spec can declare its own counts under `ops`.
 
 The parser is responsible for validating user input before it reaches memory
 formulas. At minimum, it should normalize model metadata, model hyperparameters,
@@ -193,6 +201,7 @@ class CostModelParserNewFramework(_CostModelParser):
 
         ccfg.config_format = "new_framework"
         ccfg.model_name = cfg.model_name
+        self.config_op_counts(ccfg, cfg.arch)
         ccfg.d = cfg.parallel.dp
         ccfg.t = cfg.parallel.tp
         ccfg.p = cfg.parallel.pp
@@ -207,6 +216,7 @@ class CostModelParserNewFramework(_CostModelParser):
 | Area | Required output |
 | --- | --- |
 | Model metadata | `model_name`, `device_capacity`, `config_format`, optional multimodal metadata |
+| Op profile | `arch`, `op_counts` |
 | Parallel strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `pp_sched` |
 | Pipeline layout | `offset`, `pp_partition`, `full_rec`, `sel_rec`, `rec_op` |
 | Model size | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh` |
@@ -225,6 +235,7 @@ and the memory module.
 | --- | --- | --- |
 | Input | `config`, `config_format`, `parser` | Original config object, normalized source format, and active parser instance |
 | Model | `model_name`, `device_capacity` | Model identifier and per-device memory capacity |
+| Op profile | `arch`, `op_counts` | Architecture family that selects the arch hook, and its op counts per layer kind |
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order` | Used when one config is split into multiple model components |
 | Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |

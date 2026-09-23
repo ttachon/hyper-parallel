@@ -134,6 +134,7 @@ class CostModelParserHyperparallel(_CostModelParser):
     def __parse_toml(self):
         """main parsing order"""
         self.ccfg.model_name = self.config.model.name
+        self.config_op_counts(self.ccfg)
         self.ccfg.config_format = "toml"
         self.ccfg.multimodal = False
         self.ccfg.device_capacity = Memory.from_string("56GB")  # important

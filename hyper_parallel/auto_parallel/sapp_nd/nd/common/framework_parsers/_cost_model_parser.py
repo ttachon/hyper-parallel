@@ -20,7 +20,11 @@ import math
 from abc import ABC
 from abc import abstractmethod
 
+from hyper_parallel.auto_parallel._op_profiles import infer_arch, resolve_ops
+
 if TYPE_CHECKING:
+    from typing import Mapping, Optional
+    from hyper_parallel.auto_parallel._model_spec import OpCounts
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
 
 
@@ -38,6 +42,21 @@ class _CostModelParser(ABC):
         Subclasses must implement this method to read framework-specific
         configuration values into the shared _CostModVar instance.
         """
+
+    def config_op_counts(
+        self,
+        ccfg: _CostModVar,
+        arch: Optional[str] = None,
+        ops: Optional[Mapping[str, OpCounts]] = None,
+    ) -> None:
+        """Settle the op profile the arch hooks price the model with.
+
+        A parser that reads a declared arch passes it, with any op counts the
+        spec declares; one that has only a model name leaves the family to
+        :func:`infer_arch`.
+        """
+        ccfg.arch = arch or infer_arch(ccfg.model_name)
+        ccfg.op_counts = resolve_ops(ccfg.arch, ops)
 
     def config_optimizer_shard(self, ccfg):
         """OP related variables"""

@@ -12,8 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Custom variables per model (expert knowledge)"""
+"""Custom variables per model (expert knowledge)
+
+A family's op counts are data: its profile in ``auto_parallel/op_profiles``,
+or the counts its model spec declares.  What the hooks below still set is
+what a profile cannot express yet: byte widths, activation sharding, and the
+dense/MoE layer stack.  A hook is chosen by ``ccfg.arch``, which the parser
+settles, and never by matching the model name.
+"""
 import math
+from typing import Any, Callable, Optional
+from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
+from hyper_parallel.auto_parallel._op_profiles import load_op_profile
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -51,141 +61,120 @@ class CWrap:
         return self.ccfg.get_strategy()
 
 
+def layer_op_counts(ccfg: Any, arch: str, kind: str) -> OpCounts:
+    """Return the op counts of one layer kind.
+
+    The counts the parser recorded from the model spec when there are any,
+    else the family's own profile, which is what a config assembled without
+    a parser gets.
+
+    Raises:
+        ModelSpecError: If the recorded counts have no such kind.
+    """
+    table = getattr(ccfg, "op_counts", None)
+    if not table:
+        return load_op_profile(arch).counts(kind)
+    if kind not in table:
+        raise ModelSpecError(
+            f"{ccfg.model_name}: no op counts for layer kind {kind!r}, "
+            f"the spec declares {sorted(table)}"
+        )
+    return table[kind]
+
+
+def apply_op_counts(ccfg: Any, counts: OpCounts) -> None:
+    """Set one layer kind's op counts on *ccfg*, each as ``n_<op>``."""
+    for name, count in counts.to_dict().items():
+        setattr(ccfg, "n_" + name, count)
+    # Parameters are cast when the optimizer does not shard them.
+    ccfg.n_attParamCast = ccfg.n_attMM if not ccfg.has_op else 0
+    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
+
+
+def layer_hook(
+    arch: str, kind: str, extra: Optional[Callable[[Any], None]] = None
+) -> Callable[[Any], None]:
+    """Return the hook that makes a group of layers one kind.
+
+    Same contract as every layer hook: the memory backbone calls it with an
+    evaluator, the performance path with a bare config.
+
+    Args:
+        arch: The family whose profile holds the counts when the config
+            carries none of its own.
+        kind: The layer kind to apply.
+        extra: Sets what the kind carries beyond its op counts.
+    """
+
+    def apply(c: Any) -> None:
+        """Give config *c* the kind's counts, then its extra fields."""
+        apply_op_counts(c, layer_op_counts(c, arch, kind))
+        if extra is not None:
+            extra(c)
+
+    def hook(e: Any) -> None:
+        """Apply the kind to an evaluator, or to a bare config."""
+        if isinstance(e, CostModelConfig):
+            e = CWrap(e)
+        e.set_ccfg(apply)
+
+    hook.__name__ = f"hook_{kind}"
+    return hook
+
+
+def _set_bytes(ccfg: Any, grad: int = 4, dropout: int = 0) -> None:
+    """Byte widths a family sets alongside its op counts."""
+    ccfg.bytes_grad = grad if ccfg.p > 1 else 0  # gradients
+    ccfg.bytes_os = 4  # optimizer states
+    ccfg.bytes_dropout = dropout  # dropout mask
+    ccfg.bytes_norm = 4  # normalization input
+
+
+def _decoder(ccfg: Any, arch: str) -> None:
+    """Op counts and byte widths of a decoder shaped like the default one."""
+    apply_op_counts(ccfg, layer_op_counts(ccfg, arch, "decoder"))
+    _set_bytes(ccfg)
+
+
 def custom_default_transformer(ccfg):
     """base"""
-    ccfg.n_attMM = 4  # num attention matmul
-    ccfg.n_attBMM = 2  # num attention batch matmul
-    ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
-    )  # num attention parameters cast
-    ccfg.n_ffMM = 3  # num feedforward matmul
-    ccfg.n_ffBMM = 0  # num feedforward batch matmul
-    ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
-    )  # num feedforward parameters cast
-    ccfg.n_softmax = 1  # num softmax
-    ccfg.n_dropout = 0  # num dropout
-    ccfg.n_normOp = 2  # num normalization
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
-    ccfg.bytes_dropout = 0  # dropout mask
-    ccfg.bytes_norm = 4  # normalization input
+    _decoder(ccfg, "default")
 
 
 def custom_llama2(ccfg):
     """llama2"""
-    custom_default_transformer(ccfg)
-    ccfg.n_gather = 4  # num gather (TP)
+    _decoder(ccfg, "llama2")
     ccfg.bytes_grad = 2  # gradients
 
 
 def custom_mixtral(ccfg):
     """mixtral"""
-    ccfg.n_attMM = 4  # num attention matmul
-    ccfg.n_attBMM = 2  # num attention batch matmul
-    ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
-    )  # num attention parameters cast
-    ccfg.n_ffMM = 0  # num feedforward matmul
-    ccfg.n_ffBMM = 3  # num feedforward batch matmul
-    ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
-    )  # num feedforward parameters cast
-    ccfg.n_softmax = 2  # num softmax
-    ccfg.n_dropout = 0  # num dropout
-    ccfg.n_normOp = 5  # num normalization
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
-    ccfg.bytes_dropout = 0  # dropout mask
-    ccfg.bytes_norm = 4  # normalization input
+    apply_op_counts(ccfg, layer_op_counts(ccfg, "mixtral", "decoder"))
+    _set_bytes(ccfg, grad=2)
     ccfg.hff = ccfg.hff_exp
 
 
 def custom_t5(ccfg):
     """t5"""
 
+    def t5_bytes(c: Any) -> None:
+        """Both stacks store a one-byte dropout mask."""
+        _set_bytes(c, dropout=1)
+
     # Encoder + Decoder
-    def encode(c):
-        c.n_attMM = 4  # num attention matmul
-        c.n_attBMM = 1  # num attention batch matmul
-        c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
-        )  # num attention parameters cast
-        c.n_ffMM = 2  # num feedforward matmul
-        c.n_ffBMM = 0  # num feedforward batch matmul
-        c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
-        )  # num feedforward parameters cast
-        c.n_softmax = 2  # num softmax
-        c.n_dropout = 5  # num dropout
-        c.n_normOp = 2  # num normalization
-        c.n_gather = 4  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
-        c.bytes_os = 4  # optimizer states
-        c.bytes_dropout = 1  # dropout mask
-        c.bytes_norm = 4  # normalization input
-
-    def decode(c):
-        c.n_attMM = 8  # num attention matmul
-        c.n_attBMM = 2  # num attention batch matmul
-        c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
-        )  # num attention parameters cast
-        c.n_ffMM = 2  # num feedforward matmul
-        c.n_ffBMM = 0  # num feedforward batch matmul
-        c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
-        )  # num feedforward parameters cast
-        c.n_softmax = 4  # num softmax
-        c.n_dropout = 7  # num dropout
-        c.n_normOp = 3  # num normalization
-        c.n_gather = 6  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
-        c.bytes_os = 4  # optimizer states
-        c.bytes_dropout = 1  # dropout mask
-        c.bytes_norm = 4  # normalization input
-
-    def hook_encode(e):
-        if isinstance(e, CostModelConfig):
-            e = CWrap(e)
-        e.set_ccfg(encode)
-
-    def hook_decode(e):
-        if isinstance(e, CostModelConfig):
-            e = CWrap(e)
-        e.set_ccfg(decode)
-
     ccfg.layer_custom_config = [
-        (ccfg.n_lay // 2, hook_encode),
-        (ccfg.n_lay // 2, hook_decode),
+        (ccfg.n_lay // 2, layer_hook("t5", "encoder", t5_bytes)),
+        (ccfg.n_lay // 2, layer_hook("t5", "decoder", t5_bytes)),
     ]
 
 
 def custom_pangualpha(ccfg):
     """pangualpha"""
-    ccfg.n_attMM = 4  # num attention matmul
-    ccfg.n_attBMM = 1  # num attention batch matmul
-    ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
-    )  # num attention parameters cast
-    ccfg.n_ffMM = 2  # num feedforward matmul
-    ccfg.n_ffBMM = 0  # num feedforward batch matmul
-    ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
-    )  # num feedforward parameters cast
-    ccfg.n_softmax = 2  # num softmax
-    ccfg.n_dropout = 5  # num dropout
-    ccfg.n_normOp = 4  # num normalization
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
-    ccfg.bytes_dropout = 1  # dropout mask
-    ccfg.bytes_norm = 4  # normalization input
+    apply_op_counts(ccfg, layer_op_counts(ccfg, "pangualpha", "decoder"))
+    _set_bytes(ccfg, dropout=1)
 
 
-def custom_deepseek3(ccfg):
+def custom_deepseek3(ccfg, arch="deepseek"):
     """deepseekv3"""
     saved = Config({})
     if ccfg.config_format == "yaml":
@@ -202,7 +191,7 @@ def custom_deepseek3(ccfg):
     saved.n_exp = ccfg.n_exp
     saved.n_shared_exp = ccfg.n_shared_exp
     saved.ep = ccfg.ep
-    custom_default_transformer(ccfg)
+    _decoder(ccfg, arch)
     ccfg.dh = 128
 
     def dense(c):
@@ -243,7 +232,7 @@ def custom_deepseek3(ccfg):
 
 def custom_qwen(ccfg):
     """qwen2"""
-    custom_default_transformer(ccfg)
+    _decoder(ccfg, "qwen")
     # if "72b" in ccfg.model_name :
     #     ccfg.s = ccfg.s * 3/4
     ccfg.shard_recompute_input = ccfg.t
@@ -256,7 +245,7 @@ def custom_cm(ccfg):
     shard_p_os_exp = ccfg.shard_p_os_exp_partial
     shard_p_os_non_exp_partial = math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp)
     shard_embed = ccfg.t
-    custom_deepseek3(ccfg)
+    custom_deepseek3(ccfg, arch="cm")
 
     def custom_shard(c):
         c.shard_p_os_exp = shard_p_os_exp
@@ -279,24 +268,39 @@ def custom_cm(ccfg):
     ccfg.overwrite_eval_functions["num_params_norm"] = num_params_norm_cm
 
 
-def check_and_apply_custom_hook(e):
-    """routing hooks"""
+def custom_vision_tower(ccfg: Any) -> None:
+    """Vision tower of a multimodal model.
+
+    Always priced with the vision profile.  A tower's config carries the arch
+    of its language model, whose hook the evaluator applies to it first.
+    """
+    apply_op_counts(ccfg, load_op_profile("vision").counts("encoder"))
+    _set_bytes(ccfg)
+
+
+ARCH_HOOKS = {
+    "default": custom_default_transformer,
+    "llama2": custom_llama2,
+    "mixtral": custom_mixtral,
+    "t5": custom_t5,
+    "pangualpha": custom_pangualpha,
+    "deepseek": custom_deepseek3,
+    "qwen": custom_qwen,
+    "cm": custom_cm,
+    "vision": custom_vision_tower,
+}
+
+
+def check_and_apply_custom_hook(e: Any) -> None:
+    """Apply the hook of the family the config declares in ``ccfg.arch``."""
     if isinstance(e, CostModelConfig):
         e = CWrap(e)
-    map_modelname_custom = {
-        "llama2": custom_llama2,
-        "mixtral": custom_mixtral,
-        "t5": custom_t5,
-        "pangualpha": custom_pangualpha,
-        "deepseek": custom_deepseek3,
-        "qwen": custom_qwen,
-        "cm": custom_cm,
-    }
-    for k, v in map_modelname_custom.items():
-        if k in e.get_model_name().lower():
-            e.set_ccfg(v)
-            return
-    logger.warning(
-        "Hook not defined for: %s. Default one is chosen", e.get_model_name()
-    )
-    e.set_ccfg(custom_default_transformer)
+    arch = getattr(e.ccfg, "arch", None)
+    hook = ARCH_HOOKS.get(arch)
+    if hook is None:
+        logger.warning(
+            "Hook not defined for: %s (arch %r). Default one is chosen",
+            e.get_model_name(), arch,
+        )
+        hook = custom_default_transformer
+    e.set_ccfg(hook)

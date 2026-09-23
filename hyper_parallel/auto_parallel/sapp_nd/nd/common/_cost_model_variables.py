@@ -39,6 +39,10 @@ class _CostModVar:
     config_format: str = None
     multimodal: bool = False
     model_name: str = None
+    # Op profile the arch hooks price the model with, and its op counts per
+    # layer kind; both settled by the parser, never matched from model_name.
+    arch: str = None
+    op_counts: dict = None
     device_capacity: Memory = Memory.zero()  # float = 0
     mm_ccfgs: any = None
     mm_order: list = None

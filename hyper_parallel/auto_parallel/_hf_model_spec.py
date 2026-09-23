@@ -24,10 +24,12 @@ function-local because ``transformers`` is not a hard dependency of
 ``hyper_parallel`` (``requirements.txt`` only pins numpy) and the non-Hyper
 cost-model backends must keep working without it.
 """
+import dataclasses
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel._op_profiles import infer_arch, resolve_ops
 
 logger = logging.getLogger(__name__)
 
@@ -201,9 +203,14 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     Parsing and re-serialising is what makes the schema load-bearing rather
     than advisory: a field the model declares but the IR does not know would
-    be dropped here, and an incoherent one raises by name.
+    be dropped here, and an incoherent one raises by name.  The op profile is
+    settled here too, so the serialised spec states what it will be priced
+    with even when the family was only inferred from the model name.
     """
-    return ModelSpec.from_dict(spec).to_dict()
+    typed = ModelSpec.from_dict(spec)
+    arch = typed.arch or infer_arch(typed.name)
+    resolve_ops(arch, typed.ops)
+    return dataclasses.replace(typed, arch=arch).to_dict()
 
 
 def resolve_hf_model_spec(

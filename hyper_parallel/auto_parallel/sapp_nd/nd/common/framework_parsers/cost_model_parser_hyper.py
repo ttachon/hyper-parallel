@@ -53,29 +53,16 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
-    custom_default_transformer,
+    custom_vision_tower,
 )
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._model_spec import ops_from_dict
 
 logger = logging.getLogger(__name__)
 
-
-
-def custom_vision_tower(ccfg: Any) -> None:
-    """Operation profile of a vision-transformer tower.
-
-    Lives here rather than in ``arch_hooks`` because it is only ever used by
-    the multimodal split below.
-    """
-    custom_default_transformer(ccfg)
-    # ViT blocks use a plain two-matmul MLP, not the LLM's gated triple.
-    ccfg.n_ffMM = 2
-    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
-    ccfg.n_normOp = 2
-    ccfg.n_gather = 4
 
 
 def custom_vision_tower_hook(evaluator: Any) -> None:
@@ -157,6 +144,10 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         self._vision_spec = spec.pop("vision", None)
         self._apply_spec(self.ccfg, spec)
+        ops = spec.get("ops")
+        self.config_op_counts(
+            self.ccfg, spec["arch"], None if ops is None else ops_from_dict(ops)
+        )
         self._resolve_device_capacity()
 
     def _model_section(self) -> Dict[str, Any]:
@@ -314,6 +305,9 @@ class CostModelParserHyperV2(_CostModelParser):
         """
         cc = self._clone_submodule(str(vision_spec.get("name", "vision")))
         self._apply_spec(cc, vision_spec)
+        # The tower's name carries the language model's type, so its inferred
+        # arch is the language model's: that family's hook runs on it first.
+        self.config_op_counts(cc)
         cc.v = 0  # patch embedding, not a vocabulary table
         cc.vocab_emb_dp = False
         cc.n_mtp = 0

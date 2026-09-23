@@ -421,9 +421,6 @@ def estimate_layer_perf(*args, **kwargs):
 
     cfg.n = cfg.d * cfg.t * cfg.p
 
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
-
     logger.info(str(cfg))
     logger.info(stages)
     logger.info(ccfg)
@@ -595,8 +592,6 @@ def estimate_performance(*args, **kwargs):
         stages = cfg.generate_partitions_vpp()
 
     cfg.n = cfg.d * cfg.t * cfg.p
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
 
     logger.debug(
         "perf_model: DP = %d, TP = %d, EP = %d, PP = %d, MB = %d",

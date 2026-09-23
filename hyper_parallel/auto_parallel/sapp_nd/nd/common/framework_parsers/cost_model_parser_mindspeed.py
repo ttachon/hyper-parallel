@@ -30,6 +30,7 @@ class CostModelParserMindspeed(_CostModelParser):
         """MindSpeed format for multimodal"""
         self.ccfg.device_capacity = Memory.from_gb(55)  # 55 * 1024 * 1024 * 1024
         self.ccfg.model_name = self.config.model_id
+        self.config_op_counts(self.ccfg)
         # Assume it exists a hook module with the same name as model_name
         self.ccfg.n_lay = 0  # SUM ALL
         self.ccfg.pp_sched = "1f1b"
@@ -219,6 +220,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.parser = self
         cc.config_format = "json"
         cc.model_name = mod.model_id
+        self.config_op_counts(cc)
         cc.freeze = mod.freeze  # for later
         cc.has_fa = True
         cc.has_op = True  # mod.use_distributed_optimizer

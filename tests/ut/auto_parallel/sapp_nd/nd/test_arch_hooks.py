@@ -1,0 +1,351 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Tests for the arch hooks reading their op counts from data.
+
+How to run this:
+    pytest tests/ut/auto_parallel/sapp_nd/nd/test_arch_hooks.py -v
+"""
+import copy
+import os
+import unittest
+from types import SimpleNamespace
+from typing import Any
+
+import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+from hyper_parallel.auto_parallel._model_spec import OpCounts
+from hyper_parallel.auto_parallel._op_profiles import known_archs, resolve_ops
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    ARCH_HOOKS,
+    CWrap,
+    check_and_apply_custom_hook,
+    custom_vision_tower,
+    layer_hook,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_custom_configs
+
+_SAPP_ND = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    *[os.pardir] * 5, "hyper_parallel", "auto_parallel", "sapp_nd",
+)
+
+_OPS = ("attMM", "attBMM", "ffMM", "ffBMM", "softmax", "dropout", "normOp", "gather")
+
+# The literal op counts each arch hook assigned before the counts became
+# profiles, in _OPS order.  headCast and ffAct were pinned to 1 by the
+# estimator for every family.
+_LEGACY_OPS = {
+    "default": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
+    "llama2": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
+    "qwen": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
+    "deepseek": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
+    "cm": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
+    "mixtral": {"decoder": (4, 2, 0, 3, 2, 0, 5, 4)},
+    "pangualpha": {"decoder": (4, 1, 2, 0, 2, 5, 4, 4)},
+    "t5": {"encoder": (4, 1, 2, 0, 2, 5, 2, 4), "decoder": (8, 2, 2, 0, 4, 7, 3, 6)},
+    "vision": {"encoder": (4, 2, 2, 0, 1, 0, 2, 4)},
+}
+
+# The byte widths the same hooks set: (bytes_grad at p > 1, at p == 1, bytes_dropout).
+_LEGACY_BYTES = {
+    "default": (4, 0, 0), "llama2": (2, 2, 0), "qwen": (4, 0, 0),
+    "deepseek": (4, 0, 0), "cm": (4, 0, 0), "mixtral": (2, 0, 0),
+    "pangualpha": (4, 0, 1), "t5": (4, 0, 1), "vision": (4, 0, 0),
+}
+
+
+def _counts(**overrides) -> dict:
+    """The default decoder's op counts, with *overrides* applied."""
+    counts = dict(zip(_OPS, _LEGACY_OPS["default"]["decoder"]), headCast=1, ffAct=1)
+    counts.update(overrides)
+    return counts
+
+
+def _hyper_config(name: str = "unit", **model) -> dict:
+    """A small dense AutoModels config the hyper_v2 parser reads offline."""
+    overrides = {
+        "hidden_size": 1024,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2816,
+        "vocab_size": 32000,
+        "max_position_embeddings": 2048,
+    }
+    overrides.update(model)
+    return {
+        "model": {"name": name, "config_overrides": overrides},
+        "training": {"global_batch_size": 8, "micro_batch_size": 1},
+        "accelerator": {"tp_size": 2, "pp_size": 1},
+        "fsdp_config": {"dp_shard_size": 4},
+        "dataset": {"data_transform": {"max_seq_len": 2048}},
+        "context": {"max_device_memory": "64GB", "device_num": 8},
+    }
+
+
+def _ccfg(name: str = "unit", **model) -> CostModelConfig:
+    """Parse :func:`_hyper_config` into a cost-model config."""
+    return CostModelConfig(_hyper_config(name, **model), framework="hyper_v2")
+
+
+def _bare(arch: str, op_counts=None, **fields) -> SimpleNamespace:
+    """A config with just what the hooks read, as a test double would build."""
+    cfg = SimpleNamespace(
+        model_name="unit", arch=arch, op_counts=op_counts, has_op=False, p=2,
+        t=2, h=16, dh=4, hff=32, hff_exp=64, n_lay=4, n_mtp=1, n_chosen_exp=2,
+        n_exp=4, n_shared_exp=1, ep=2, k_1st_dense=2, config_format="yaml",
+        shard_p_os_exp_partial=2, shard_p_os_non_exp=2, shard_embed=1,
+        overwrite_eval_functions={},
+    )
+    for key, value in fields.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def _state(cfg) -> dict:
+    """The op counts and byte widths a hook leaves on *cfg*."""
+    names = [f"n_{op}" for op in _OPS] + [
+        "n_headCast", "n_ffAct", "n_attParamCast", "n_ffParamCast",
+        "bytes_grad", "bytes_os", "bytes_dropout", "bytes_norm",
+    ]
+    return {name: getattr(cfg, name) for name in names}
+
+
+def _legacy_state(arch: str, kind: str, has_op: bool, p: int) -> dict:
+    """What the literal callback of *arch* left for one layer kind."""
+    counts = dict(zip(_OPS, _LEGACY_OPS[arch][kind]))
+    grad_pp, grad_no_pp, dropout = _LEGACY_BYTES[arch]
+    state = {f"n_{op}": count for op, count in counts.items()}
+    state.update(
+        n_headCast=1, n_ffAct=1,
+        n_attParamCast=0 if has_op else counts["attMM"],
+        n_ffParamCast=0 if has_op else counts["ffMM"],
+        bytes_grad=grad_pp if p > 1 else grad_no_pp,
+        bytes_os=4, bytes_dropout=dropout, bytes_norm=4,
+    )
+    return state
+
+
+class TestDispatchReadsTheArch(unittest.TestCase):
+    """The hook is chosen by the declared arch, never by the model name."""
+
+    def test_every_profile_has_a_hook(self):
+        """
+        Feature: arch hook registry.
+        Description: A profile without a hook could never be applied, and a
+            hook without a profile would have no counts to read.
+        Expectation: The registry and the profile files name the same archs.
+        """
+        self.assertEqual(set(ARCH_HOOKS), set(known_archs()))
+
+    def test_the_model_name_is_not_read(self):
+        """
+        Feature: dispatch on ccfg.arch.
+        Description: A config named like a Qwen model but declaring the
+            default arch must not get the Qwen hook's activation sharding.
+        Expectation: shard_output_activ stays 1 under tp=2.
+        """
+        ccfg = _ccfg("qwen2_72b", arch="default")
+        check_and_apply_custom_hook(ccfg)
+        self.assertEqual(ccfg.arch, "default")
+        self.assertEqual(ccfg.shard_output_activ, 1)
+
+    def test_the_declared_arch_is_read(self):
+        """
+        Feature: dispatch on ccfg.arch.
+        Description: A config with a neutral name declaring the qwen arch gets
+            the qwen hook.
+        Expectation: shard_output_activ follows tp=2.
+        """
+        ccfg = _ccfg("unit", arch="qwen")
+        check_and_apply_custom_hook(ccfg)
+        self.assertEqual(ccfg.shard_output_activ, 2)
+
+    def test_a_config_with_no_arch_gets_the_default_counts(self):
+        """
+        Feature: dispatch fallback.
+        Description: A config assembled without a parser carries no arch.
+        Expectation: It is priced with the default decoder's counts.
+        """
+        cfg = _bare(arch=None)
+        check_and_apply_custom_hook(CWrap(cfg))
+        self.assertEqual(_state(cfg), _legacy_state("default", "decoder", False, 2))
+
+
+class TestHooksMatchTheirLiterals(unittest.TestCase):
+    """Reading counts from profiles leaves each config as the literals did."""
+
+    def _check(self, arch: str, with_table: bool) -> None:
+        for has_op in (False, True):
+            for p in (1, 2):
+                with self.subTest(arch=arch, table=with_table, has_op=has_op, p=p):
+                    table = resolve_ops(arch) if with_table else None
+                    cfg = _bare(arch, table, has_op=has_op, p=p)
+                    check_and_apply_custom_hook(CWrap(cfg))
+                    if arch != "t5":
+                        kind = next(iter(_LEGACY_OPS[arch]))
+                        self.assertEqual(_state(cfg), _legacy_state(arch, kind, has_op, p))
+                        continue
+                    # t5 sets its counts per layer group, not on the model.
+                    for kind, (count, hook) in zip(("encoder", "decoder"), cfg.layer_custom_config):
+                        layer = copy.deepcopy(cfg)
+                        hook(CWrap(layer))
+                        self.assertEqual(count, cfg.n_lay // 2)
+                        self.assertEqual(_state(layer), _legacy_state(arch, kind, has_op, p))
+
+    def test_counts_from_the_parser(self):
+        """
+        Feature: hooks read the counts the parser recorded.
+        Description: Apply every family's hook to a config carrying its
+            resolved profile, for each optimizer-sharding and pipeline case.
+        Expectation: Counts and byte widths equal the old literals.
+        """
+        for arch in known_archs():
+            self._check(arch, with_table=True)
+
+    def test_counts_without_a_parser(self):
+        """
+        Feature: hooks fall back on their own profile.
+        Description: Same, on a config that carries no counts at all.
+        Expectation: Counts and byte widths equal the old literals.
+        """
+        for arch in known_archs():
+            self._check(arch, with_table=False)
+
+    def test_the_vision_tower_uses_its_own_profile(self):
+        """
+        Feature: vision tower counts.
+        Description: A tower's config carries its language model's arch and
+            counts; the tower hook must not price it as that decoder.
+        Expectation: The tower's two-projection feed-forward, not three.
+        """
+        cfg = _bare("qwen", resolve_ops("qwen"))
+        custom_vision_tower(cfg)
+        self.assertEqual(cfg.n_ffMM, 2)
+
+
+class TestDeclaredCountsReachTheEstimate(unittest.TestCase):
+    """A count the spec declares is the count the estimators price."""
+
+    def _perf(self, ccfg) -> float:
+        return estimate_performance(copy.deepcopy(ccfg), device_type=Hard.Device_A2)
+
+    def test_a_declared_count_is_applied(self):
+        """
+        Feature: counts from the spec.
+        Description: Declare a decoder with no softmax in config_overrides.
+        Expectation: The hook applies 0, and the FLOP estimate drops.
+        """
+        base = _ccfg(arch="default")
+        declared = _ccfg(arch="default", ops={"decoder": _counts(softmax=0)})
+        check_and_apply_custom_hook(declared)
+        self.assertEqual(declared.n_softmax, 0)
+        self.assertLess(self._perf(declared), self._perf(base))
+
+    def test_head_cast_is_no_longer_pinned(self):
+        """
+        Feature: no hardcoded op counts in the estimator.
+        Description: The estimator used to pin headCast and ffAct to 1 for
+            every model; they now come from the vector like every other op.
+        Expectation: Declaring headCast 0 lowers the FLOP estimate.
+        """
+        base = _ccfg(arch="default")
+        declared = _ccfg(arch="default", ops={"decoder": _counts(headCast=0)})
+        self.assertLess(self._perf(declared), self._perf(base))
+
+
+class TestTwoKindStack(unittest.TestCase):
+    """Each layer of a mixed stack is priced from its own kind's vector."""
+
+    _LINEAR = {"attBMM": 0, "softmax": 0, "headCast": 0}
+
+    def _stack(self, linear_layers: int = 2) -> CostModelConfig:
+        """Four layers: full attention, then *linear_layers* without scores."""
+        ccfg = _ccfg(arch="default")
+        ccfg.op_counts = {
+            "decoder": OpCounts.from_dict(_counts()),
+            "linear_attention": OpCounts.from_dict(_counts(**self._LINEAR)),
+        }
+        ccfg.layer_custom_config = [
+            (4 - linear_layers, layer_hook("default", "decoder")),
+            (linear_layers, layer_hook("default", "linear_attention")),
+        ]
+        return ccfg
+
+    def test_each_group_gets_its_vector(self):
+        """
+        Feature: per-kind op counts on the performance path.
+        Description: The performance path prices a copy of the config per
+            layer group.
+        Expectation: The groups carry their own kind's counts.
+        """
+        groups = get_layer_custom_configs(self._stack())
+        self.assertEqual([count for _, count in groups], [2, 2])
+        full, linear = groups[0][0], groups[1][0]
+        self.assertEqual((full.n_attBMM, full.n_softmax, full.n_headCast), (2, 1, 1))
+        self.assertEqual((linear.n_attBMM, linear.n_softmax, linear.n_headCast), (0, 0, 0))
+
+    def test_memory_path_prices_each_layer_from_its_kind(self):
+        """
+        Feature: per-kind op counts on the memory path.
+        Description: The memory backbone applies each group's hook to the
+            layers it covers.  Record the softmax count the attention score
+            formula sees at every layer.
+        Expectation: Two layers with the full kind's 1, then two with 0.
+        """
+        seen = {}
+
+        def spy(ccfg: CostModelConfig, ctx: Any) -> float:
+            """The real score formula, recording the counts it was given."""
+            seen.setdefault(ctx.current_lay_id, set()).add(ccfg.n_softmax)
+            return EvalAttn.attn_score_activations(ccfg, ctx)
+
+        evaluator = EvaluatorV2(None, ccfg=self._stack())
+        evaluator.set_attn_eval_fun(score=spy)
+        evaluator.estimate_peak()
+        per_layer = [seen[lay_id] for lay_id in sorted(seen)]
+        self.assertEqual(per_layer, [{1}, {1}, {0}, {0}])
+
+
+class TestParsersRecordTheArch(unittest.TestCase):
+    """Every parser settles the arch before any hook runs."""
+
+    def test_mindformers_infers_from_the_model_name(self):
+        """
+        Feature: MindFormers parser.
+        Description: MindFormers configs name the model in free text only.
+        Expectation: deepseekV3 resolves to the deepseek profile.
+        """
+        ccfg = CostModelConfig(os.path.join(_SAPP_ND, "nd", "yamls", "deepseek.yaml"))
+        self.assertEqual(ccfg.arch, "deepseek")
+        self.assertEqual(ccfg.op_counts, resolve_ops("deepseek"))
+
+    def test_hyper_reads_the_spec(self):
+        """
+        Feature: hyper_v2 parser.
+        Description: The resolved spec states its arch, inferred or declared.
+        Expectation: The config carries it, with the declared counts if any.
+        """
+        self.assertEqual(_ccfg("qwen3_moe").arch, "qwen")
+        declared = _ccfg("qwen3_moe", arch="default", ops={"decoder": _counts(gather=6)})
+        self.assertEqual(declared.arch, "default")
+        self.assertEqual(declared.op_counts["decoder"].gather, 6)
+
+
+if __name__ == "__main__":
+    unittest.main()

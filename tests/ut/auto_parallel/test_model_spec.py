@@ -20,6 +20,7 @@ import yaml
 from hyper_parallel.auto_parallel._model_spec import (
     ModelSpec,
     ModelSpecError,
+    OpCounts,
     VisionSpec,
 )
 
@@ -56,6 +57,16 @@ def _qwen35() -> dict:
         "shared_expert_intermediate_size": 512,
         "mtp_depth": 1,
     }
+
+
+def _counts(**overrides) -> dict:
+    """The default decoder's op counts, with *overrides* applied."""
+    counts = {
+        "attMM": 4, "attBMM": 2, "ffMM": 3, "ffBMM": 0, "softmax": 1,
+        "dropout": 0, "normOp": 2, "gather": 4, "headCast": 1, "ffAct": 1,
+    }
+    counts.update(overrides)
+    return counts
 
 
 class TestRequiredFields(unittest.TestCase):
@@ -284,6 +295,87 @@ class TestVisionTower(unittest.TestCase):
         spec = ModelSpec.from_dict(_dense())
         self.assertIsNone(spec.vision)
         self.assertNotIn("vision", spec.to_dict())
+
+
+class TestOpCounts(unittest.TestCase):
+    """An op vector names every op the cost model prices, and nothing else."""
+
+    def test_round_trip(self):
+        """The mapping form comes back exactly, in declaration order."""
+        counts = OpCounts.from_dict(_counts())
+        self.assertEqual(counts.to_dict(), _counts())
+        self.assertEqual(list(counts.to_dict()), list(_counts()))
+
+    def test_missing_op_raises_by_name(self):
+        """An op left out would be priced at zero, so it is refused."""
+        data = _counts()
+        del data["softmax"]
+        with self.assertRaises(ModelSpecError) as ctx:
+            OpCounts.from_dict(data, "ops.decoder")
+        self.assertIn("softmax", str(ctx.exception))
+        self.assertIn("ops.decoder", str(ctx.exception))
+
+    def test_unknown_op_raises_by_name(self):
+        """A misspelt op is refused rather than silently ignored."""
+        data = _counts()
+        data["sofmax"] = data.pop("softmax")
+        with self.assertRaises(ModelSpecError) as ctx:
+            OpCounts.from_dict(data)
+        self.assertIn("sofmax", str(ctx.exception))
+
+    def test_count_must_be_a_whole_non_negative_number(self):
+        """Negative, fractional and boolean counts all raise by op name."""
+        for bad in (-1, 1.5, True, "four"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ModelSpecError) as ctx:
+                    OpCounts.from_dict(_counts(gather=bad))
+                self.assertIn("gather", str(ctx.exception))
+
+    def test_zero_is_a_declared_count(self):
+        """An op the layer does not run is declared as 0 and kept as 0."""
+        self.assertEqual(OpCounts.from_dict(_counts(dropout=0)).dropout, 0)
+
+
+class TestOpsOnTheSpec(unittest.TestCase):
+    """A spec may name its op profile and declare counts of its own."""
+
+    def _with_ops(self) -> dict:
+        data = _dense()
+        data["arch"] = "default"
+        data["ops"] = {"decoder": _counts(softmax=0)}
+        return data
+
+    def test_absent_by_default(self):
+        """A spec that says nothing about ops carries neither field."""
+        spec = ModelSpec.from_dict(_dense())
+        self.assertIsNone(spec.arch)
+        self.assertIsNone(spec.ops)
+        self.assertNotIn("ops", spec.to_dict())
+        self.assertNotIn("arch", spec.to_dict())
+
+    def test_ops_are_parsed_and_typed(self):
+        """Each layer kind arrives as an OpCounts, not a nested dict."""
+        spec = ModelSpec.from_dict(self._with_ops())
+        self.assertEqual(spec.arch, "default")
+        self.assertIsInstance(spec.ops["decoder"], OpCounts)
+        self.assertEqual(spec.ops["decoder"].softmax, 0)
+        self.assertNotIn("ops", spec.extra)
+
+    def test_ops_round_trip_through_yaml_text(self):
+        """Declared counts survive a dump and a reload through real YAML."""
+        spec = ModelSpec.from_dict(self._with_ops())
+        text = yaml.safe_dump(spec.to_dict(), sort_keys=True)
+        self.assertEqual(ModelSpec.from_dict(yaml.safe_load(text)), spec)
+        self.assertEqual(spec.to_dict()["ops"], {"decoder": _counts(softmax=0)})
+
+    def test_malformed_ops_raise(self):
+        """Ops must map at least one kind to a complete vector."""
+        for bad in ({}, {"decoder": 4}, [_counts()]):
+            with self.subTest(bad=bad):
+                data = _dense()
+                data["ops"] = bad
+                with self.assertRaises(ModelSpecError):
+                    ModelSpec.from_dict(data)
 
 
 class TestNormalizedConfigAccessor(unittest.TestCase):

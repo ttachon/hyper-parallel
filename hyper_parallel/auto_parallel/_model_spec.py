@@ -65,6 +65,83 @@ def _as_int(value: Any, name: str) -> Optional[int]:
         raise ModelSpecError(f"{name} must be an integer, got {value!r}") from exc
 
 
+def _as_count(value: Any, name: str) -> int:
+    """Coerce *value* to a non-negative whole number, or raise naming it."""
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise ModelSpecError(f"{name} must be a whole number, got {value!r}")
+    count = _as_int(value, name)
+    if count is None or count < 0:
+        raise ModelSpecError(f"{name} must be a non-negative count, got {value!r}")
+    return count
+
+
+@dataclass(frozen=True)
+class OpCounts:
+    """How many times one layer kind runs each op the cost model prices.
+
+    The estimators already price a layer as a count times a per-op cost
+    (``perf_estimation/getters.py``); this is the count half, declared as data
+    instead of assigned by a per-family callback.  It belongs to a layer
+    *kind*, not to a model: an encoder-decoder, or a stack mixing linear and
+    full attention, runs different ops in different layers.
+
+    Every op is required.  A count left out would be priced as zero, which is
+    exactly the silent failure the model IR exists to refuse, so a layer that
+    does not run an op declares ``0``.  The parameter-cast counts are absent on
+    purpose: whether parameters are cast depends on optimizer sharding, which
+    is strategy, so the consumer derives them from ``attMM`` and ``ffMM``.
+    """
+
+    attMM: int     # attention projections: q, k, v, o
+    attBMM: int    # attention batched matmuls: QK^T and AV
+    ffMM: int      # feed-forward projections, e.g. 3 for a gated MLP
+    ffBMM: int     # feed-forward projections run as batched matmuls
+    softmax: int
+    dropout: int
+    normOp: int
+    gather: int    # tensor-parallel gathers
+    headCast: int  # casts of the per-head score tensor
+    ffAct: int     # feed-forward activation functions
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], where: str = "ops") -> "OpCounts":
+        """Build the vector from a mapping, refusing a missing or unknown op.
+
+        Args:
+            data: ``{op name: count}``, one entry per op.
+            where: Where the mapping came from, for the error message.
+
+        Raises:
+            ModelSpecError: If an op is missing, unknown, or not a count.
+        """
+        if not isinstance(data, Mapping):
+            raise ModelSpecError(f"{where} must map op names to counts, got {data!r}")
+        names = [f.name for f in fields(cls)]
+        unknown = sorted(set(data) - set(names))
+        if unknown:
+            raise ModelSpecError(f"{where} declares unknown ops {unknown}; the ops are {names}")
+        missing = [name for name in names if name not in data]
+        if missing:
+            raise ModelSpecError(
+                f"{where} is missing counts for {missing}; declare 0 for an op "
+                "the layer does not run"
+            )
+        return cls(**{name: _as_count(data[name], f"{where}.{name}") for name in names})
+
+    def to_dict(self) -> Dict[str, int]:
+        """Return the vector as ``{op name: count}``, in declaration order."""
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+def ops_from_dict(data: Any) -> Dict[str, OpCounts]:
+    """Parse ``{layer kind: {op: count}}``, the serialised form of ``ModelSpec.ops``."""
+    if not isinstance(data, Mapping) or not data:
+        raise ModelSpecError(
+            f"ops must map at least one layer kind to its op counts, got {data!r}"
+        )
+    return {str(kind): OpCounts.from_dict(counts, f"ops.{kind}") for kind, counts in data.items()}
+
+
 @dataclass(frozen=True)
 class VisionSpec:
     """The vision tower of a multimodal model.
@@ -106,6 +183,12 @@ class ModelSpec:
     no expert count, and ``None`` says so without claiming the count is zero.
 
     Attributes:
+        arch: The op profile the model is priced with, one of the files in
+            ``auto_parallel/op_profiles``.  A producer that knows the family
+            declares it; otherwise it is inferred from ``name`` when the spec
+            is resolved.
+        ops: Per-layer-kind op counts that replace the profile's own, for a
+            model no profile describes.  Its kinds must be the profile's.
         extra: Producer-supplied keys that are not model shape (precision,
             batch, runtime knobs).  Carried verbatim so nothing is lost while
             the execution IR does not yet exist to receive it.
@@ -137,6 +220,9 @@ class ModelSpec:
     q_lora_rank: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
+
+    arch: Optional[str] = None
+    ops: Optional[Dict[str, OpCounts]] = None
 
     vision: Optional[VisionSpec] = None
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -240,11 +326,13 @@ class ModelSpec:
         """
         out: Dict[str, Any] = {}
         for spec_field in fields(self):
-            if spec_field.name in ("vision", "extra"):
+            if spec_field.name in ("vision", "extra", "ops"):
                 continue
             value = getattr(self, spec_field.name)
             if value is not None:
                 out[spec_field.name] = value
+        if self.ops is not None:
+            out["ops"] = {kind: counts.to_dict() for kind, counts in self.ops.items()}
         if self.vision is not None:
             vision: Dict[str, Any] = {}
             for vision_field in fields(self.vision):
@@ -269,20 +357,15 @@ class ModelSpec:
                 integer, or the declared fields contradict each other.
         """
         known = {f.name for f in fields(cls)} - {"vision", "extra"}
-        float_fields = {"ffn_dim_multiplier"}
         kwargs: Dict[str, Any] = {}
         extra: Dict[str, Any] = {}
         for key, value in data.items():
             if key == "vision":
                 continue
-            if key not in known:
-                extra[key] = value
-            elif key == "name":
-                kwargs[key] = str(value)
-            elif key in float_fields:
-                kwargs[key] = None if value is None else float(value)
+            if key in known:
+                kwargs[key] = cls._field_value(key, value)
             else:
-                kwargs[key] = _as_int(value, key)
+                extra[key] = value
 
         for name in cls._REQUIRED:
             if name not in kwargs:
@@ -298,6 +381,21 @@ class ModelSpec:
 
         spec = cls(extra=extra, **kwargs)
         return spec.validate() if strict else spec
+
+    @staticmethod
+    def _field_value(key: str, value: Any) -> Any:
+        """Coerce one declared field to the type the schema gives it."""
+        if key == "name":
+            return str(value)
+        if value is None:
+            return None
+        if key == "arch":
+            return str(value)
+        if key == "ops":
+            return ops_from_dict(value)
+        if key == "ffn_dim_multiplier":
+            return float(value)
+        return _as_int(value, key)
 
     @staticmethod
     def _vision_from_dict(data: Mapping[str, Any]) -> VisionSpec:

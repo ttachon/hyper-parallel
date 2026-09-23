@@ -260,6 +260,7 @@ class CostModelParserMindformers(_CostModelParser):
         """MindFormer format for unimodal"""
         self.ccfg.config_format = "yaml"
         self.ccfg.model_name = self.config.trainer.model_name
+        self.config_op_counts(self.ccfg)
         self.ccfg.device_capacity = Memory.from_string(
             self.config.context.max_device_memory
         )
