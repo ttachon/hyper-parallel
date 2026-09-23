@@ -286,5 +286,29 @@ class TestVisionTower(unittest.TestCase):
         self.assertNotIn("vision", spec.to_dict())
 
 
+class TestNormalizedConfigAccessor(unittest.TestCase):
+    """NormalizedConfig stores the mapping and hands out the typed spec."""
+
+    @staticmethod
+    def _config(**model):
+        from hyper_parallel.auto_parallel.config_adapter._normalized_config import (
+            NormalizedConfig,
+        )
+        return NormalizedConfig(model_spec=model)
+
+    def test_model_returns_the_typed_spec(self):
+        """The mapping a caller filled comes back validated and typed."""
+        spec = self._config(**_qwen35()).model()
+        self.assertIsInstance(spec, ModelSpec)
+        self.assertEqual(spec.effective_head_dim, 256)
+
+    def test_model_raises_on_an_incomplete_section(self):
+        """A section the cost model cannot use fails here, by name."""
+        data = _dense()
+        del data["vocab_size"]
+        with self.assertRaises(ModelSpecError) as ctx:
+            self._config(**data).model()
+        self.assertIn("vocab_size", str(ctx.exception))
+
 if __name__ == "__main__":
     unittest.main()

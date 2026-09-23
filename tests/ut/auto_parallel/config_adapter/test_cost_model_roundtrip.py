@@ -21,9 +21,13 @@ alone, so these tests pin the contract between them.
 How to run this:
     pytest tests/ut/auto_parallel/config_adapter/test_cost_model_roundtrip.py -v
 """
+import os
+import tempfile
 import unittest
 from typing import Any
 from unittest.mock import patch
+
+import yaml
 
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 from hyper_parallel.auto_parallel.config_adapter._search_runner import _build_hp_yaml_dict
@@ -180,6 +184,69 @@ class TestCostModelRoundTrip(unittest.TestCase):
         ccfg = _parse(yaml_dict)
         self.assertEqual(ccfg.shard_recompute_input, ccfg.t)
 
+
+class TestNoDiskRoundTrip(unittest.TestCase):
+    """The config ND parses is the one the adapter built, not a copy of it.
+
+    The search used to write this mapping to a temporary yaml so the parser
+    could read it back, which is the model interface being simulated through
+    the filesystem. These tests pin that the detour changed nothing.
+    """
+
+    @staticmethod
+    def _cost_model_config():
+        """Import CostModelConfig in package order, avoiding the import cycle."""
+        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation  # noqa: F401  pylint: disable=C0415,W0611
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (  # pylint: disable=C0415
+            CostModelConfig,
+        )
+        return CostModelConfig
+
+    @staticmethod
+    def _scalars(ccfg):
+        """Every plain-valued field the parser populated."""
+        return {
+            name: value for name, value in vars(ccfg).items()
+            if isinstance(value, (int, float, str, bool)) and not name.startswith("_")
+        }
+
+    def test_in_memory_config_matches_the_temp_file(self) -> None:
+        """
+        Feature: the cost-model config as a mapping rather than a file.
+        Description: Parse the same generated config twice, once from a temp
+            yaml the way the search used to, once in memory the way it does
+            now.
+        Expectation: Both select CostModelParserHyperV2 and populate every
+            scalar field identically.
+        """
+        cost_model_config = self._cost_model_config()
+        yaml_dict = _build_hp_yaml_dict(_normalized_config())
+
+        handle, path = tempfile.mkstemp(suffix=".yaml", prefix="roundtrip_")
+        os.close(handle)
+        try:
+            with open(path, "w", encoding="utf-8") as stream:
+                yaml.dump(yaml_dict, stream, default_flow_style=False, sort_keys=False)
+            via_disk = cost_model_config(path, None, "hyper_v2", None)
+        finally:
+            os.remove(path)
+        via_memory = cost_model_config(yaml_dict, None, "hyper_v2", None)
+
+        self.assertIs(type(via_memory.parser), type(via_disk.parser))
+        self.assertEqual(self._scalars(via_memory), self._scalars(via_disk))
+
+    def test_framework_is_honoured_without_a_path(self) -> None:
+        """
+        Feature: parser selection for an in-memory config.
+        Description: A mapping used to fall through to the MindFormers
+            parser whatever framework the caller named, because only a path
+            string reached the framework lookup.
+        Expectation: The named framework selects the parser either way.
+        """
+        cost_model_config = self._cost_model_config()
+        ccfg = cost_model_config(_build_hp_yaml_dict(_normalized_config()),
+                                 None, "hyper_v2", None)
+        self.assertIsInstance(ccfg.parser, CostModelParserHyperV2)
 
 if __name__ == "__main__":
     unittest.main()

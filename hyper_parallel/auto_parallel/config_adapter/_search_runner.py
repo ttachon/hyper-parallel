@@ -14,31 +14,19 @@
 # ============================================================================
 """Search runner -- bridges NormalizedConfig to the ND search engine.
 
-Converts a :class:`NormalizedConfig` into a temporary HyperParallel
-``train.yaml``, runs the ND search via :class:`Parallelize`,
-post-filters by user candidate lists, and returns the optimal strategy.
+Hands a :class:`NormalizedConfig` to the ND search as the mapping
+``Parallelize`` parses directly, post-filters by user candidate lists,
+and returns the optimal strategy.
 """
 
 import logging
-import os
-import tempfile
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-import yaml  # type: ignore[import-untyped]
-
+from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 
-CONFIG_OVERRIDE_FIELDS = [
-    "hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size",
-    "intermediate_size", "num_key_value_heads", "max_position_embeddings",
-    "num_experts", "num_experts_per_tok", "num_shared_experts",
-    "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
-    "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
-    "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
-    "head_dim", "vision",
-    "param_init_type", "compute_dtype", "softmax_compute_type",
-]
+
 
 if TYPE_CHECKING:
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
@@ -118,17 +106,10 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         A dict suitable for the ``model`` key of a HP ``train.yaml``.
     """
-    model_dict: Dict[str, Any] = {
-        "name": model.get("name", "custom"),
-        "config_overrides": {},
-    }
-    overrides = model_dict["config_overrides"]
-    for key in CONFIG_OVERRIDE_FIELDS:
-        val = model.get(key)
-        if val is not None:
-            overrides[key] = val
-
-    return model_dict
+    spec = ModelSpec.from_dict(model)
+    overrides = spec.to_dict()
+    overrides.pop("name", None)
+    return {"name": spec.name, "config_overrides": overrides}
 
 
 def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
@@ -226,16 +207,6 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
 
     return hp_yaml
 
-
-def _write_temp_hp_yaml(config: NormalizedConfig) -> str:
-    """Write a temp ``train.yaml`` and return its absolute path."""
-    data = _build_hp_yaml_dict(config)
-    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="hp_search_")
-    os.close(fd)
-    with open(path, "w", encoding="utf-8") as fh:
-        yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
-    logger.debug("Temp HP YAML written to %s", path)
-    return path
 
 
 def _build_machine(config: NormalizedConfig) -> Any:
@@ -376,8 +347,8 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     This is the main entry point for end-to-end strategy search:
 
     1. Validates required model fields.
-    2. Converts the ``NormalizedConfig`` to a temporary HyperParallel
-       ``train.yaml`` and writes it to disk.
+    2. Shapes the ``NormalizedConfig`` into the cost-model config ND
+       parses, as a mapping rather than a file.
     3. Launches the ND search engine (:class:`Parallelize`).
     4. Post-filters results against the user's candidate lists.
     5. Returns the best strategy as a flat dictionary.
@@ -392,33 +363,26 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
 
     Raises:
         ValueError: If required fields are missing or no strategy is found.
-        ImportError: If PyYAML is not installed.
     """
     _validate_before_search(config)
 
-    yaml_path = _write_temp_hp_yaml(config)
+    hp_config = _build_hp_yaml_dict(config)
     machine = _build_machine(config)
     dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
-    try:
-        nd_runner = _Par.Parallelize(
-            "hyper_v2",
-            yaml_path,
-            machine,
-            global_batch_size=config.constraint.get("global_batch_size", 0),
-            dimensions=dims,
-        )
-        scored_space = nd_runner.run_generation_to_ordering(
-            yaml_folder=None,
-            threads_num=None,
-            top_num=None,
-        )
-    finally:
-        try:
-            os.remove(yaml_path)
-        except OSError:
-            pass
+    nd_runner = _Par.Parallelize(
+        "hyper_v2",
+        hp_config,
+        machine,
+        global_batch_size=config.constraint.get("global_batch_size", 0),
+        dimensions=dims,
+    )
+    scored_space = nd_runner.run_generation_to_ordering(
+        yaml_folder=None,
+        threads_num=None,
+        top_num=None,
+    )
 
     if not scored_space:
         raise ValueError("ND search returned no valid strategies.")

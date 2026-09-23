@@ -360,23 +360,57 @@ class TestPostFilter(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
 
 
-class TestWriteTempHpYaml(unittest.TestCase):
-    """Tests for _write_temp_hp_yaml."""
+class TestModelSectionIsTheSpec(unittest.TestCase):
+    """The model section a search hands ND is the model IR, serialised."""
 
     def _get_runner(self):
         return sr
 
-    def test_temp_file_created(self):
-        """Temp file is created and contains valid YAML."""
+    def test_config_is_a_mapping_not_a_path(self):
+        """The search passes ND a config, not a temp file to parse back."""
+        runner = self._get_runner()
+        self.assertFalse(hasattr(runner, "_write_temp_hp_yaml"))
+        self.assertFalse(hasattr(runner, "CONFIG_OVERRIDE_FIELDS"))
+        data = runner._build_hp_yaml_dict(_make_full_config())
+        self.assertIsInstance(data, dict)
+        self.assertIn("model", data)
+        self.assertIn("training", data)
+
+    def test_overrides_come_from_the_spec(self):
+        """Every declared field reaches ND without a hand-kept field list."""
+        runner = self._get_runner()
+        data = runner._build_hp_yaml_dict(_make_full_config())
+        overrides = data["model"]["config_overrides"]
+        self.assertEqual(overrides["hidden_size"], 4096)
+        self.assertEqual(overrides["num_key_value_heads"], 8)
+        self.assertNotIn("name", overrides)
+        self.assertEqual(data["model"]["name"], "test-dense")
+
+    def test_a_field_the_old_whitelist_omitted_now_survives(self):
+        """shared_expert_intermediate_size is a spec field, so it carries.
+
+        The hand-kept list did not name it, which is how an all-MoE model
+        reached the cost model with its shared expert unsized.
+        """
         runner = self._get_runner()
         config = _make_full_config()
-        path = runner._write_temp_hp_yaml(config)
-        self.assertTrue(os.path.isfile(path))
-        with open(path, "r", encoding="utf-8") as fh:
-            data = fh.read()
-        self.assertIn("model:", data)
-        self.assertIn("training:", data)
-        os.remove(path)
+        config.model_spec.update(
+            num_experts=256,
+            num_experts_per_tok=8,
+            num_shared_experts=1,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        )
+        overrides = runner._build_hp_yaml_dict(config)["model"]["config_overrides"]
+        self.assertEqual(overrides["shared_expert_intermediate_size"], 512)
+
+    def test_an_incoherent_model_section_raises(self):
+        """A model ND cannot cost is refused here, not priced as a zero."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.model_spec["num_key_value_heads"] = 7
+        with self.assertRaises(ValueError):
+            runner._build_hp_yaml_dict(config)
 
 
 class TestSearchStrategies(unittest.TestCase):
