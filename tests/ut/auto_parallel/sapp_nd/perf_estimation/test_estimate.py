@@ -36,7 +36,7 @@ DEEPSEEK_YAML = os.path.join(
 
 
 def _plain_values(ccfg: CostModelConfig) -> Dict[str, Any]:
-    """The config's plain fields, the ones layer hooks overwrite."""
+    """The config's plain fields, the ones layer kinds overwrite."""
     return {name: value for name, value in vars(ccfg).items()
             if isinstance(value, (bool, int, float, str))}
 

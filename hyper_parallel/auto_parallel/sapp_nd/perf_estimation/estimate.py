@@ -481,7 +481,7 @@ def _resolve_estimate_args(args, kwargs):
         device_type, memory).
     """
     cfg_input = args[0]
-    # A copy: the estimate applies layer hooks to its config in place, and the
+    # A copy: the estimate applies layer kinds to its config in place, and the
     # caller's config is the one the next estimate starts from.
     cfg = (
         deepcopy(cfg_input)

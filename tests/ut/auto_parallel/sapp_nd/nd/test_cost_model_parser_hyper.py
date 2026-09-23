@@ -651,7 +651,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertTrue(ccfg.has_fa)
         self.assertAlmostEqual(ccfg.s_fa, ccfg.s / ccfg.a)
 
-    # ---- L0: Layer custom config / offset --------------------------------
+    # ---- L0: Layer stack / offset ----------------------------------------
 
     def test_layer_groups(self):
         """

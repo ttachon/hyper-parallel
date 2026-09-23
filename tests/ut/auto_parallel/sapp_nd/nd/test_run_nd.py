@@ -1274,7 +1274,7 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: TestSappNDRunND.
         Description: Cover predefined architecture hooks using tiny fake configs.
-        Expectation: Hooks update model-specific attributes and layer custom hooks.
+        Expectation: Hooks update model-specific attributes, and each stack kind applies per layer.
         """
         cfg = _make_arch_cfg(model_name="llama2")
         ArchHooks.custom_default_transformer(cfg)

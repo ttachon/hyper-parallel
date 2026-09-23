@@ -196,9 +196,9 @@ def bind_layer_stack(ccfg: Any) -> None:
 def apply_layer_kind(e: Any, kind: LayerKind) -> None:
     """Make the layer about to be priced one of *kind*.
 
-    Same contract as every layer hook: the memory backbone calls it with an
-    evaluator, the performance path with a bare config.  A config without a
-    stack gives the kind its op counts only.
+    The memory backbone calls it with an evaluator, the performance path
+    with a bare config.  A config without a stack gives the kind its op
+    counts only.
     """
     if isinstance(e, CostModelConfig):
         e = CWrap(e)
