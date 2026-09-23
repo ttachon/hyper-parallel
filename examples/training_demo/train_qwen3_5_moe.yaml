@@ -2,12 +2,15 @@
 # Offline Indexed Dataset input; nothing in this config reaches the network.
 #
 # Defaults target ONE node of 16 dies. The rule when scaling out is:
-#   ep_size        divides num_experts (256) and world_size
-#   dp_shard_size  = world_size
-#   edp_shard_size = world_size / ep_size   (must divide it; 1 leaves expert
-#                                            optimizer state unsharded)
+#   ep_size            divides num_experts (256) and world_size
+#   dp_shard_size      = world_size
+#   edp_shard_size     = world_size / ep_size   (must divide it; 1 leaves expert
+#                                                optimizer state unsharded)
+#   global_batch_size  a multiple of micro_batch_size x dp_world_size, which is
+#                      world_size here, so it must grow with the device count
 # 4 nodes of 16 dies, keeping ep_size 8:
-#   --fsdp_config.dp_shard_size=64 --fsdp_config.edp_shard_size=8
+#   --fsdp_config.dp_shard_size=64 --fsdp_config.edp_shard_size=8 \
+#   --training.global_batch_size=64
 #
 # Needs the qwen3_5_moe adapter: without it the planner leaves the Gated DeltaNet
 # projections and every shared_expert_gate unclassified and refuses any ep_size > 1.
