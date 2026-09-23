@@ -562,7 +562,8 @@ class ParallelizeLayer:
         """Write the pipeline balancer's layer description of the k-th configuration.
 
         Every layer carries its forward time and the backward time of each of
-        its recompute options, priced by the estimate the search scores with.
+        its recompute options, priced by the estimate the search scores with,
+        in units of the forward time of a plain layer of the first body.
 
         Args:
             scored_space: The ordered search space.

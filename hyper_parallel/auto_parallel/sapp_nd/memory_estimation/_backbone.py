@@ -519,12 +519,11 @@ class _Backbone:
         )
         # PPB Input
         ppb_input = None
-        if compute_ppb == 1:
+        if compute_ppb:
+            self._ppb_obj.ppb_withdraw_dominated(ppb_lay_desc)
+            self._ppb_obj.ppb_scale_times(ppb_lay_desc)
             self._ppb_obj.ppb_combine_bodies(ppb_lay_desc)
             ppb_input = {"layers_description": ppb_lay_desc}
-        elif compute_ppb == 2:
-            self._ppb_obj.ppb_combine_bodies_new(ppb_lay_desc)
-            ppb_input = {"layers_description_new": ppb_lay_desc}
         if args[4]:  # Plot
             self.__plot_stages(stages, stage_misc["stat"], stage_misc["dyn"])
         return insights, ppb_input
@@ -622,19 +621,12 @@ class _Backbone:
                     if verbose:
                         logger.info("pp micro factor for dynamic: %s",self._ctx.micro_factor)
                     # PPB Purpose
-                    if compute_ppb == 1:
+                    if compute_ppb:
                         desc = self._ppb_obj.lay_ppb(
                             self._ccfg,
                             self._ctx,
                             sm["stat"][stage_id][chunk_id][lay_id],
                             record_lay_types[(stage_id, chunk_id, lay_id)][2],
-                        )
-                        self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
-                    elif compute_ppb == 2:
-                        desc = self._ppb_obj.lay_ppb_new(
-                            self._ccfg,
-                            self._ctx,
-                            sm["stat"][stage_id][chunk_id][lay_id],
                         )
                         self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
                 self.__update_stage_logs(sm["logs"], stage_id)

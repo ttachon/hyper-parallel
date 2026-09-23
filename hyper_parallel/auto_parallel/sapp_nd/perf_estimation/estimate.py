@@ -15,10 +15,11 @@
 """performance estimation"""
 import json
 from copy import deepcopy
-from typing import Any, Callable, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 import numpy as np
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
@@ -428,6 +429,7 @@ def estimate_layer_times(
     layer_type: LayerType,
     device_type: Any,
     ccfg: Optional[CustomConfig] = None,
+    switches: Optional[Dict[str, int]] = None,
 ) -> Tuple[float, float]:
     """Forward and backward time of one layer, priced as a stage prices it.
 
@@ -448,6 +450,8 @@ def estimate_layer_times(
             embedding or output.
         device_type: The device the communication is priced on.
         ccfg: Estimator options; the search's defaults when omitted.
+        switches: The recompute switches a selective layer runs with, 1 to
+            keep an op and 0 to recompute it; the config's own when omitted.
 
     Returns:
         ``(forward, backward)``, *backward* including the layer's recompute.
@@ -458,6 +462,8 @@ def estimate_layer_times(
         # A fresh copy each time: the communication estimate applies the
         # layer's hook to the config it is given.
         single = deepcopy(cfg)
+        if switches is not None:
+            single.rec_op = Config(dict(switches))
         single.layer_custom_config = [(1, hook)]
         single.n = single.d * single.t * single.p
         stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]
@@ -491,7 +497,7 @@ class LayerTimes:
     The memory backbone calls it for every layer it describes, with the config
     it walks and the layer's hook. A config is copied the first time it is
     seen, at its embedding layer, before the walk runs any layer hook on it,
-    and each hook and layer type is priced once.
+    and each hook, layer type and set of switches is priced once.
     """
 
     def __init__(self, device_type: Any, ccfg: Optional[CustomConfig] = None) -> None:
@@ -502,15 +508,19 @@ class LayerTimes:
         self._times = {}
 
     def __call__(
-        self, cfg: CostModelConfig, hook: Optional[Callable], layer_type: LayerType
+        self,
+        cfg: CostModelConfig,
+        hook: Optional[Callable],
+        layer_type: LayerType,
+        switches: Optional[Dict[str, int]] = None,
     ) -> Tuple[float, float]:
-        """``(forward, backward)`` of a *layer_type* layer of *hook*'s group."""
+        """``(forward, backward)`` of a *layer_type* layer of *hook*'s group, run with *switches*."""
         if id(cfg) not in self._base:
             self._base[id(cfg)] = deepcopy(cfg)
-        key = (id(cfg), hook, layer_type)
+        key = (id(cfg), hook, layer_type, None if switches is None else tuple(sorted(switches.items())))
         if key not in self._times:
             self._times[key] = estimate_layer_times(
-                self._base[id(cfg)], hook, layer_type, self._device_type, self._ccfg
+                self._base[id(cfg)], hook, layer_type, self._device_type, self._ccfg, switches
             )
         return self._times[key]
 

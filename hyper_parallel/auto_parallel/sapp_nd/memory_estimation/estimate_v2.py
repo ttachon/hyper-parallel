@@ -104,7 +104,6 @@ class EvaluatorV2(_Utils, _HookManager):
     def estimate_layer_memory(
         self,
         stages: list = None,
-        ppb_format=1,
         device_type=Hard.Device_A2,
         layer_times: Optional[Callable] = None,
     ) -> Dict:
@@ -112,21 +111,23 @@ class EvaluatorV2(_Utils, _HookManager):
 
         Args:
             layer_times: Prices a layer as ``(forward, backward)`` from its
-                config, hook and layer type, such as
+                config, hook, layer type and recompute switches, such as
                 ``perf_estimation.estimate.LayerTimes``. With it, every layer
-                description carries its times instead of a placeholder, and
-                the result is not cached.
+                description carries its times, in units of the first body's
+                forward time, instead of a placeholder and offers the
+                selective recompute options worth pricing, and the result is
+                not cached.
         """
         logger.info(device_type)
         if layer_times is not None:
             self._ppb_obj.layer_times = layer_times
             try:
-                return self._estimate_on_copy(stages, False, ppb_format, -1, False)[1]
+                return self._estimate_on_copy(stages, False, True, -1, False)[1]
             finally:
                 self._ppb_obj.layer_times = None
         if self.ppb:
             return self.ppb
-        res = self._estimate_on_copy(stages, False, ppb_format, -1, False)
+        res = self._estimate_on_copy(stages, False, True, -1, False)
         _, ppb = res
         self.ppb = ppb
         return ppb
@@ -274,11 +275,6 @@ def main():
         help="Generate pipeline balancing layers description",
     )
     parser.add_argument(
-        "--ppb-new",
-        action="store_true",
-        help="Generate pipeline balancing layers description (New format)",
-    )
-    parser.add_argument(
         "--ctx", action="store_true", help="Show ctx variables"
     )
     parser.add_argument(
@@ -309,9 +305,6 @@ def main():
         e.print_ccfg()
     if args.ppb:
         ppb = e.estimate_layer_memory()
-        print(json.dumps(ppb, indent=2))
-    elif args.ppb_new:
-        ppb = e.estimate_layer_memory(ppb_format=2)
         print(json.dumps(ppb, indent=2))
     else:
         peak_mem = e.estimate_peak(

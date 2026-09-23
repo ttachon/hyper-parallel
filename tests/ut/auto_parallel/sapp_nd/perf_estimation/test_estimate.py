@@ -163,6 +163,21 @@ class TestLayerTimes(unittest.TestCase):
         self.assertEqual(self._times(LayerType.SEL_REC_LAYER), plain)
         self.assertGreater(self._times(LayerType.SEL_REC_LAYER, softmax=0)[1], plain[1])
 
+    def test_switches_price_a_selective_layer_as_a_config_that_sets_them(self):
+        """
+        Feature: estimate_layer_times switches.
+        Description: Price a selective MoE layer of a config that keeps every
+            op, with switches that recompute its softmax.
+        Expectation: It costs what the layer of a config that recomputes its
+            softmax costs, and the config keeps its own switches.
+        """
+        cfg = copy.deepcopy(self.ccfg)
+        cfg.rec_op = Config(dict.fromkeys(_SWITCHES, 1))
+        switched = estimate_layer_times(cfg, self.groups[1], LayerType.SEL_REC_LAYER, Hard.Device_A2,
+                                        switches=dict(dict.fromkeys(_SWITCHES, 1), softmax=0))
+        self.assertEqual(switched, self._times(LayerType.SEL_REC_LAYER, softmax=0))
+        self.assertEqual(vars(cfg.rec_op), dict.fromkeys(_SWITCHES, 1))
+
     def test_pricing_leaves_the_config_alone(self):
         """
         Feature: estimate_layer_times.
@@ -191,6 +206,24 @@ class TestLayerTimes(unittest.TestCase):
             full = times(cfg, self.groups[1], LayerType.FULL_REC_LAYER)
         self.assertEqual(spy.call_count, 1)
         self.assertEqual(full, LayerTimes(Hard.Device_A2)(self.ccfg, self.groups[1], LayerType.FULL_REC_LAYER))
+
+    def test_each_set_of_switches_is_priced_once(self):
+        """
+        Feature: LayerTimes switches.
+        Description: Price a selective layer with the same switches twice,
+            listed in another order the second time, then with other ones.
+        Expectation: Two estimates; the switches decide the time.
+        """
+        times = LayerTimes(Hard.Device_A2)
+        softmax = dict(dict.fromkeys(_SWITCHES, 1), softmax=0)
+        with patch.object(Estimate, "estimate_layer_times", wraps=Estimate.estimate_layer_times) as spy:
+            first = times(self.ccfg, self.groups[1], LayerType.SEL_REC_LAYER, softmax)
+            again = times(self.ccfg, self.groups[1], LayerType.SEL_REC_LAYER, dict(reversed(list(softmax.items()))))
+            gather = times(self.ccfg, self.groups[1], LayerType.SEL_REC_LAYER,
+                           dict(dict.fromkeys(_SWITCHES, 1), gather=0))
+        self.assertEqual(spy.call_count, 2)
+        self.assertEqual(again, first)
+        self.assertNotEqual(gather, first)
 
 
 if __name__ == "__main__":
