@@ -36,7 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     apply_layer_kind,
     check_and_apply_custom_hook,
     custom_vision_tower,
-    stack_layer_groups,
+    layer_groups,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -45,7 +45,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
     estimate_performance,
     op_table,
 )
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_custom_configs
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_group_configs
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
 _SAPP_ND = os.path.join(
@@ -216,11 +216,11 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
                         self.assertEqual(_state(cfg), _legacy_state(arch, kind, has_op, p))
                         continue
                     # t5 sets its counts and byte widths per layer, from its stack's kinds.
-                    for kind, (count, hook) in zip(("encoder", "decoder"), stack_layer_groups(cfg.layer_stack, 4)):
+                    for name, (kind, count) in zip(("encoder", "decoder"), layer_groups(cfg)):
                         layer = copy.deepcopy(cfg)
-                        hook(CWrap(layer))
-                        self.assertEqual(count, cfg.n_lay // 2)
-                        self.assertEqual(_state(layer), _legacy_state(arch, kind, has_op, p))
+                        apply_layer_kind(CWrap(layer), kind)
+                        self.assertEqual((kind.name, count), (name, cfg.n_lay // 2))
+                        self.assertEqual(_state(layer), _legacy_state(arch, name, has_op, p))
 
     def test_counts_from_the_parser(self):
         """
@@ -296,7 +296,6 @@ class TestTwoKindStack(unittest.TestCase):
             StackGroup(LayerKind("scoreless", OpCounts.from_dict(_counts(**self._LINEAR))), linear_layers),
         )
         ccfg.layer_stack = LayerStack("default", tuple(group for group in groups if group.count))
-        ccfg.layer_custom_config = stack_layer_groups(ccfg.layer_stack, 4)
         return ccfg
 
     def test_each_group_gets_its_vector(self):
@@ -306,7 +305,7 @@ class TestTwoKindStack(unittest.TestCase):
             layer group.
         Expectation: The groups carry their own kind's counts.
         """
-        groups = get_layer_custom_configs(self._stack())
+        groups = get_layer_group_configs(self._stack())
         self.assertEqual([count for _, count in groups], [2, 2])
         full, linear = groups[0][0], groups[1][0]
         self.assertEqual((full.n_attBMM, full.n_softmax, full.n_headCast), (2, 1, 1))
@@ -378,13 +377,14 @@ class TestStackAsData(unittest.TestCase):
         """
         Feature: Qwen3.5 layer stack.
         Description: layer_types lists [L, L, F, L, F].
-        Expectation: The qwen3_5 profile, one group per run, one hook per group.
+        Expectation: The qwen3_5 profile, one group per run, each priced by its kind.
         """
         ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _L, _F, _L, _F]))
         self.assertEqual(ccfg.arch, "qwen3_5")
         self.assertEqual([(group.kind.name, group.count) for group in ccfg.layer_stack.groups],
                          [(_L, 2), (_F, 1), (_L, 1), (_F, 1)])
-        self.assertEqual([count for count, _ in ccfg.layer_custom_config], [2, 1, 1, 1])
+        self.assertEqual([(kind.name, count) for kind, count in layer_groups(ccfg)],
+                         [(_L, 2), (_F, 1), (_L, 1), (_F, 1)])
 
     def test_a_full_layer_restores_the_models_own_attention(self):
         """
@@ -421,13 +421,14 @@ class TestStackAsData(unittest.TestCase):
             ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16),
         )
 
-    def test_a_one_kind_stack_needs_no_hook(self):
+    def test_a_one_kind_stack_needs_no_kind(self):
         """
         Feature: layer groups.
         Description: A dense model with one MTP layer.
-        Expectation: One group covering all five layers, with no hook.
+        Expectation: One group covering all five layers, priced on the
+            config as the family hook leaves it.
         """
-        self.assertEqual(_ccfg("qwen3_moe", mtp_depth=1).layer_custom_config, [(5, None)])
+        self.assertEqual(layer_groups(_ccfg("qwen3_moe", mtp_depth=1)), [(None, 5)])
 
     def test_a_linear_kind_without_dimensions_is_refused(self):
         """
@@ -485,12 +486,14 @@ class TestDenseThenMoE(unittest.TestCase):
         """
         Feature: DeepSeek layer stack.
         Description: One dense layer, three MoE layers and one MTP layer.
-        Expectation: Three groups, the MTP one repeating the MoE kind, one hook each.
+        Expectation: Three groups, the MTP one repeating the MoE kind, each
+            priced by its kind.
         """
         ccfg = _deepseek()
         self.assertEqual([(group.kind.name, group.count, group.mtp) for group in ccfg.layer_stack.groups],
                          [("dense", 1, False), ("moe", 3, False), ("moe", 1, True)])
-        self.assertEqual([count for count, _ in ccfg.layer_custom_config], [1, 3, 1])
+        self.assertEqual([(kind.name, count) for kind, count in layer_groups(ccfg)],
+                         [("dense", 1), ("moe", 3), ("moe", 1)])
 
     def test_each_kind_assigns_the_whole_feed_forward(self):
         """
@@ -588,7 +591,7 @@ class TestParsersRecordTheArch(unittest.TestCase):
         self.assertEqual(groups, [("dense", ccfg.k_1st_dense, False),
                                   ("moe", ccfg.n_lay - ccfg.k_1st_dense, False),
                                   ("moe", ccfg.n_mtp, True)])
-        self.assertEqual([count for count, _ in ccfg.layer_custom_config], [count for _, count, _ in groups])
+        self.assertEqual([count for _, count in layer_groups(ccfg)], [count for _, count, _ in groups])
 
     def test_hyper_reads_the_spec(self):
         """

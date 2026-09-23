@@ -25,6 +25,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
+from hyper_parallel.auto_parallel._model_spec import OpCounts
+from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
     Context,
     MemType,
@@ -45,7 +48,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.score import mape, r
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory, Unit
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_group_configs,
     get_recomp_factor,
     get_table_quantity,
 )
@@ -71,9 +74,15 @@ def _micro_factor(ccfg: Any, ctx: Context) -> int:
     return ccfg.m + ctx.current_stage_id + ctx.current_chunk_id
 
 
-def _mark_custom_config(cfg: Any) -> None:
-    """Mark a copied custom config so deepcopy behavior can be asserted."""
-    cfg.marker = "custom"
+def _two_kind_stack() -> LayerStack:
+    """Two layers of a kind with one gather, then one with two."""
+    counts = {
+        "attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1, "dropout": 0, "normOp": 2,
+        "gather": 1, "headCast": 1, "ffAct": 1, "linrec": 0,
+    }
+    first = LayerKind("first", OpCounts.from_dict(counts))
+    second = LayerKind("second", OpCounts.from_dict(dict(counts, gather=2)))
+    return LayerStack("unit", (StackGroup(first, 2), StackGroup(second, 1)))
 
 
 def _trace_sample(value: int, holder: Any) -> int:
@@ -340,14 +349,14 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         )
         self.assertIn("RatioType.STATIC", str(custom))
 
-        cfg = SimpleNamespace(layer_custom_config=None, n_lay=3)
-        self.assertEqual(get_layer_custom_configs(cfg), [(cfg, 3)])
+        cfg = SimpleNamespace(layer_stack=None, n_lay=3, n_mtp=0)
+        self.assertEqual(get_layer_group_configs(cfg), [(cfg, 3)])
 
-        cfg_with_hooks = SimpleNamespace(layer_custom_config=[(2, _mark_custom_config)], n_lay=3)
-        custom_layers = get_layer_custom_configs(cfg_with_hooks)
-        self.assertEqual(custom_layers[0][1], 2)
-        self.assertEqual(custom_layers[0][0].marker, "custom")
-        self.assertFalse(hasattr(cfg_with_hooks, "marker"))
+        cfg_with_kinds = SimpleNamespace(layer_stack=_two_kind_stack(), n_lay=3, n_mtp=0, has_op=False, n_gather=0)
+        custom_layers = get_layer_group_configs(cfg_with_kinds)
+        self.assertEqual([count for _, count in custom_layers], [2, 1])
+        self.assertEqual([layer.n_gather for layer, _ in custom_layers], [1, 2])
+        self.assertEqual(cfg_with_kinds.n_gather, 0)
 
         lccfg = SimpleNamespace(opfoo=5, rec_op=SimpleNamespace(foo=0, bar=1))
         self.assertEqual(get_recomp_factor(lccfg, LayerType.FULL_REC_LAYER, "foo"), 1)
@@ -504,7 +513,6 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
             vp=2,
             m=3,
             pp_sched="1f1b",
-            layer_custom_config=None,
             get_strategy=lambda: {"dp": 2, "tp": 1},
             print_stages=lambda stages, spec_stage_id=-1: (stages, spec_stage_id),
         )
@@ -517,10 +525,6 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertEqual(utils.get_strategy(), {"dp": 2, "tp": 1})
         self.assertEqual(utils.get_max_device_memory(), 2048)
         self.assertEqual(utils.get_num_layers(), 5)
-        utils.set_layer_custom()
-        self.assertEqual(fake_cfg.layer_custom_config, [(4, None)])
-        utils.set_layer_custom([(1, _mark_custom_config)])
-        self.assertEqual(fake_cfg.layer_custom_config[0][0], 1)
         utils.all_stage_micro_factors()
         self.assertEqual(utils.print_node_eval(), {})
         self.assertIsNone(utils.print_stages([[LayerType.NOT_REC_LAYER]], 0))
@@ -685,13 +689,13 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         Expectation: 1F1B and ZBV schedules produce deterministic overhead values.
         """
         ctx = Context()
-        backbone = SimpleNamespace(apply_hook=lambda hook, ccfg=None, ctx=None: hook(backbone))
+        backbone = SimpleNamespace(apply_kind=lambda kind, ccfg=None, ctx=None: None)
         ccfg = SimpleNamespace(pp_sched="1f1b", vp=1, m=4, p=2, n_mtp=1)
         overhead = _BackwardOverhead(backbone, ccfg, ctx, _dynamic_mem_for_overhead)
         stages = [[[LayerType.FULL_REC_LAYER, LayerType.OUTPUT_LAYER]]]
         record = {
-            (0, 0, 0): (ccfg, ctx, lambda _: None),
-            (0, 0, 1): (ccfg, ctx, lambda _: None),
+            (0, 0, 0): (ccfg, ctx, None),
+            (0, 0, 1): (ccfg, ctx, None),
         }
 
         self.assertEqual(overhead.estimate(stages, 0, record), 48)
@@ -707,8 +711,8 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         ccfg.vp = 2
         stages_zbv = [[[LayerType.NOT_REC_LAYER], [LayerType.FULL_REC_LAYER]]]
         record_zbv = {
-            (0, 0, 0): (ccfg, ctx, lambda _: None),
-            (0, 1, 0): (ccfg, ctx, lambda _: None),
+            (0, 0, 0): (ccfg, ctx, None),
+            (0, 1, 0): (ccfg, ctx, None),
         }
         self.assertEqual(overhead.estimate(stages_zbv, 0, record_zbv), 48)
 

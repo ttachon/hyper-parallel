@@ -29,6 +29,7 @@ import yaml
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
@@ -304,8 +305,8 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         ))
         self.assertEqual(ccfg.n_mtp, 1)
         self.assertTrue(ccfg.is_mtp_in_offset)
-        # layer_custom_config includes MTP layers
-        self.assertEqual(ccfg.layer_custom_config, [(9, None)])
+        # The one plain group includes the MTP layer
+        self.assertEqual(layer_groups(ccfg), [(None, 9)])
 
     def test_overrides_seq_len_priority(self):
         """
@@ -649,16 +650,16 @@ class TestCostModelParserHyperV2(unittest.TestCase):
 
     # ---- L0: Layer custom config / offset --------------------------------
 
-    def test_layer_custom_config(self):
+    def test_layer_groups(self):
         """
-        Feature: Post-parse layer_custom_config.
-        Description: Set to [(n_lay + n_mtp, None)]; offset defaults to
-            [0]*pp (uniform balancing) via _init_offset.
+        Feature: Post-parse layer stack.
+        Description: One plain group of n_lay + n_mtp layers; offset
+            defaults to [0]*pp (uniform balancing) via _init_offset.
         Expectation: Values correct.
         """
         ccfg = _make_ccfg(_dense_overrides())
-        expected = [(ccfg.n_lay + ccfg.n_mtp, None)]
-        self.assertEqual(ccfg.layer_custom_config, expected)
+        expected = [(None, ccfg.n_lay + ccfg.n_mtp)]
+        self.assertEqual(layer_groups(ccfg), expected)
         self.assertEqual(ccfg.offset, [0] * ccfg.p)
 
     # ---- L0: config_format -----------------------------------------------

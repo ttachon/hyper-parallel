@@ -23,7 +23,6 @@ from abc import abstractmethod
 from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
 from hyper_parallel.auto_parallel._op_profiles import infer_arch, load_op_profile, resolve_ops
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import stack_layer_groups
 
 if TYPE_CHECKING:
     from typing import Mapping, Optional
@@ -79,13 +78,11 @@ class _CostModelParser(ABC):
         ccfg.op_counts = resolve_ops(ccfg.arch, ops)
 
     @staticmethod
-    def config_layer_stack(ccfg: _CostModVar, total: int, stack: Optional[LayerStack] = None) -> None:
-        """Settle the layer stack, and hand it to the estimators as layer groups.
+    def config_layer_stack(ccfg: _CostModVar, stack: Optional[LayerStack] = None) -> None:
+        """Settle the layer stack the estimators price.
 
         Args:
             ccfg: The config, with its arch, op counts and layer counts parsed.
-            total: How many layers this parser counts for a stack whose one
-                kind is what the family hook already sets.
             stack: The stack the model states.  By default, the one its layer
                 counts imply: dense layers first, two halves, or one kind.
         """
@@ -96,8 +93,7 @@ class _CostModelParser(ABC):
             )
             stack = resolve_layers(ccfg.arch, layers, ccfg.op_counts)
         ccfg.layer_stack = stack
-        ccfg.layer_custom_config = stack_layer_groups(stack, int(total))
-        if len(ccfg.layer_custom_config) > 1:
+        if len(stack.groups) > 1:
             logger.info(
                 "%s layer stack: %s", ccfg.model_name,
                 ", ".join(f"{group.count}x{group.kind.name}" for group in stack.groups),

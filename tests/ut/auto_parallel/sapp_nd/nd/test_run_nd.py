@@ -265,7 +265,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "comm_ep": 1.0,
         "comm_dp_overlap": 0.9,
         "comm_tp_overlap": 0.5,
-        "layer_custom_config": [(2, None)],
         "n_lay": 2,
         "n_mtp": 1,
         "gbs": 8,
@@ -1293,12 +1292,12 @@ class TestSappNDRunND(unittest.TestCase):
         t5_cfg.layer_stack = resolve_layers("t5", derive_layers(load_op_profile("t5"), 4))
         ArchHooks.custom_t5(t5_cfg)
         ArchHooks.bind_layer_stack(t5_cfg)
-        t5_groups = ArchHooks.stack_layer_groups(t5_cfg.layer_stack, 4)
+        t5_groups = ArchHooks.layer_groups(t5_cfg)
         self.assertEqual(len(t5_groups), 2)
         t5_wrap = ArchHooks.CWrap(t5_cfg)
-        t5_groups[0][1](t5_wrap)
+        ArchHooks.apply_layer_kind(t5_wrap, t5_groups[0][0])
         self.assertEqual(t5_cfg.n_attBMM, 1)
-        t5_groups[1][1](t5_wrap)
+        ArchHooks.apply_layer_kind(t5_wrap, t5_groups[1][0])
         self.assertEqual(t5_cfg.n_attMM, 8)
 
         deepseek_cfg = _make_arch_cfg(model_name="deepseek")
@@ -1307,12 +1306,12 @@ class TestSappNDRunND(unittest.TestCase):
         )
         ArchHooks.custom_deepseek3(deepseek_cfg)
         ArchHooks.bind_layer_stack(deepseek_cfg)
-        deepseek_groups = ArchHooks.stack_layer_groups(deepseek_cfg.layer_stack, 5)
+        deepseek_groups = ArchHooks.layer_groups(deepseek_cfg)
         self.assertEqual(len(deepseek_groups), 3)
         deepseek_wrap = ArchHooks.CWrap(deepseek_cfg)
-        deepseek_groups[0][1](deepseek_wrap)
+        ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[0][0])
         self.assertEqual(deepseek_cfg.n_exp, 1)
-        deepseek_groups[1][1](deepseek_wrap)
+        ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[1][0])
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
         cm_cfg = _make_arch_cfg(model_name="cm")
@@ -1655,7 +1654,7 @@ class TestSappNDRunND(unittest.TestCase):
             CostModelParserHyperparallel(hp_ccfg).parse()
             self.assertEqual(hp_ccfg.model_name, "llama-unit")
             self.assertEqual(hp_ccfg.vp, 2)
-            self.assertEqual(hp_ccfg.layer_custom_config, [(2, None)])
+            self.assertEqual(ArchHooks.layer_groups(hp_ccfg), [(None, 2)])
             self.assertEqual(vars(hp_ccfg.rec_op), dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1))
 
             hp_config.activation_checkpoint.mode = "selective"
@@ -1752,7 +1751,6 @@ class TestSappNDRunND(unittest.TestCase):
             shard_embed=1,
             shard_output_activ=1,
             shard_recompute_input=1,
-            layer_custom_config=[],
         )
 
         self.assertIn("model_name", str(cost_cfg))
@@ -1797,25 +1795,6 @@ class TestSappNDRunND(unittest.TestCase):
         cost_cfg.offset = [[0, 0], [0, 0]]
 
         self._test_multimodal_strategy(cost_cfg)
-
-        hook_calls = []
-
-        def original_hook(target: Any) -> None:
-            """Record execution of the original layer hook."""
-            hook_calls.append(("original", target))
-
-        def custom_hook(target: Any) -> None:
-            """Record execution of the injected cost-model hook."""
-            hook_calls.append(("custom", target))
-
-        cost_cfg.layer_custom_config = [(1, original_hook)]
-        cost_cfg.layer_custom_config_callback(custom_hook)
-        wrapped_hook = cost_cfg.layer_custom_config[0][1]
-        wrapped_hook(cost_cfg)
-        evaluator = SimpleNamespace(set_ccfg=lambda hook: hook_calls.append(("set_ccfg", hook)))
-        wrapped_hook(evaluator)
-        self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
-        self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""

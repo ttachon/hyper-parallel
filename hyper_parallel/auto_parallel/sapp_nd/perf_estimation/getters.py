@@ -16,28 +16,27 @@
 
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, apply_layer_kind, layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 
 
-# Configs are updated depending on the type of the transformer layer
-def get_layer_custom_configs(cfg):
-    """Stores each configuration along with how many layers are affected by it
-    in ascending order of execution in a forward pass
+def get_layer_group_configs(cfg):
+    """Return each group of layers' config and layer count, in model order.
+
+    A config whose layers run on it as it stands is one group, priced with
+    ``cfg`` itself.  Otherwise each kind is applied once, to a copy of
+    ``cfg`` that every group of that kind shares.
     """
-
-    if cfg.layer_custom_config is None or any(
-        func is None for (_, func) in cfg.layer_custom_config
-    ):
+    groups = layer_groups(cfg)
+    if all(kind is None for kind, _ in groups):
         return [(cfg, cfg.n_lay)]
-
-    lccfgs = []
-    for nb_layers, func in cfg.layer_custom_config:
-        lccfg = deepcopy(cfg)
-        func(lccfg)
-        lccfgs.append((lccfg, nb_layers))
-
-    return lccfgs
+    configs = {}
+    for kind, _ in groups:
+        if kind.name not in configs:
+            configs[kind.name] = deepcopy(cfg)
+            apply_layer_kind(CWrap(configs[kind.name]), kind)
+    return [(configs[kind.name], count) for kind, count in groups]
 
 
 def get_model_order(cfg: Any, stages: List) -> List[Tuple[int, int, int]]:
@@ -65,11 +64,11 @@ def get_model_order(cfg: Any, stages: List) -> List[Tuple[int, int, int]]:
 def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int, int], Any]:
     """Map each regular layer's position to the config it is priced with.
 
-    Each group of ``layer_custom_config`` covers exactly its own count of
-    layers in model order; layers past the declared counts keep the last
-    group, as a configuration with no custom groups keeps ``cfg``.
+    Each group of the layer stack covers exactly its own count of layers in
+    model order; layers past the stack's count keep the last group, as a
+    config whose layers need no kind keeps ``cfg``.
     """
-    lccfgs = get_layer_custom_configs(cfg)
+    lccfgs = get_layer_group_configs(cfg)
     per_layer = [lccfg for lccfg, count in lccfgs for _ in range(count)]
     last = lccfgs[-1][0]
     return {

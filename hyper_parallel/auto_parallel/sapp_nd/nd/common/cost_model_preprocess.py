@@ -16,7 +16,6 @@
 import inspect
 from typing import Any
 import re
-import weakref
 from copy import deepcopy
 from enum import Enum
 from pprint import pformat
@@ -360,27 +359,3 @@ class CostModelConfig(PartitionGenerator):
         if self.multimodal:
             return {mm.model_name: strategy(mm) for mm in self.mm_ccfgs.values()}
         return strategy(self)
-
-    def layer_custom_config_callback(self, fun: Any) -> None:
-        """
-        Use input fun as callback for layer_custom_config
-        Only for overwriting cost model variables
-        """
-        config_ref = weakref.ref(self)
-        for idx, f in enumerate(self.layer_custom_config):
-
-            def wrap(e: Any, hook: Any = f[1]) -> None:
-                """Apply the extra callback after the layer's own hook."""
-                hook(e)
-                if isinstance(e, CostModelConfig):
-                    config = config_ref()
-                    if config is None:
-                        raise ReferenceError(
-                            "CostModelConfig has already been released"
-                        )
-                    fun(config)
-                else:
-                    e.set_ccfg(fun)
-
-            wrap.__name__ = f"{f[1].__name__}_{fun.__name__}"
-            self.layer_custom_config[idx] = (f[0], wrap)

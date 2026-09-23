@@ -37,7 +37,7 @@ class _BackwardOverhead:
             chunk_id = len(stages[stage_id]) + chunk_id
         if lay_id < 0:
             lay_id = len(stages[stage_id][chunk_id]) + lay_id
-        ccfg, ctx, hook = record_lay_types[(stage_id, chunk_id, lay_id)]
+        ccfg, ctx, kind = record_lay_types[(stage_id, chunk_id, lay_id)]
         # print("here-",id(ccfg))
         # print("here0",id(self._ccfg))
         # print("here00",id(self.backbone._ccfg))
@@ -47,7 +47,7 @@ class _BackwardOverhead:
         self._ctx.current_chunk_id = chunk_id
         self._ctx.current_lay_id = lay_id
         # print("here1",id(self._ccfg))
-        self.backbone.apply_hook(hook, ccfg=self._ccfg, ctx=self._ctx)
+        self.backbone.apply_kind(kind, ccfg=self._ccfg, ctx=self._ctx)
         # print("here11",id(self.backbone._ccfg))
         return stages[stage_id][chunk_id][lay_id]
 

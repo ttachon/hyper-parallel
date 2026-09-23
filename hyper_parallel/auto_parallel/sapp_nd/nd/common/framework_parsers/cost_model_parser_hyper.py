@@ -141,7 +141,6 @@ class CostModelParserHyperV2(_CostModelParser):
         self.config_optimizer_shard(self.ccfg)
         self.config_comm_flag(self.ccfg)
         self._init_shard()
-        self.config_layer_stack(self.ccfg, self.ccfg.n_lay + self.ccfg.n_mtp, self.ccfg.layer_stack)
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
 
@@ -164,10 +163,10 @@ class CostModelParserHyperV2(_CostModelParser):
         self._apply_spec(self.ccfg, spec)
         ops = None if spec.get("ops") is None else ops_from_dict(spec["ops"])
         self.config_op_counts(self.ccfg, spec["arch"], ops)
-        self.ccfg.layer_stack = resolve_layers(
+        self.config_layer_stack(self.ccfg, resolve_layers(
             spec["arch"], layers_from_list(spec["layers"]), ops,
             LinearAttentionDims.from_fields(spec),
-        )
+        ))
         self._resolve_device_capacity()
 
     def _model_section(self) -> Dict[str, Any]:
@@ -286,7 +285,7 @@ class CostModelParserHyperV2(_CostModelParser):
             "text": check_and_apply_custom_hook,
         }
         self.ccfg.n_lay = 0
-        self.ccfg.layer_custom_config = []
+        self.ccfg.layer_stack = None
         logger.info(
             "Multimodal cost model: vision %s (%d layers, s=%d) + text %s "
             "(%d layers, s=%d)",
@@ -313,7 +312,6 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.model_name = name
         cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
         cc.overwrite_eval_functions = dict(self.ccfg.overwrite_eval_functions)
-        self.config_layer_stack(cc, cc.n_lay + cc.n_mtp, cc.layer_stack)
         cc.offset = self._even_offset()
         return cc
 
@@ -337,7 +335,6 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
         cc.layer_stack = None
         cc.layer_binding = None
-        cc.layer_custom_config = [(cc.n_lay, None)]
         cc.offset = self._front_loaded_offset(cc.n_lay)
         return cc
 

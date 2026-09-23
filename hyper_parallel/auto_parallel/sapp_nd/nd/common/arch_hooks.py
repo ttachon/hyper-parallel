@@ -21,7 +21,8 @@ hook is chosen by ``ccfg.arch``, which the parser settles, and never by
 matching the model name.
 
 The layer stack is data too (``ccfg.layer_stack``), and needs no hook of its
-own: :func:`apply_layer_kind` gives a layer its kind from the fields
+own.  The estimators read each layer's kind from :func:`layer_groups`, and
+:func:`apply_layer_kind` gives a layer its kind from the fields
 :func:`bind_layer_stack` recorded when the family hook ran.  A family whose
 layers take some fields per layer rather than on the model, such as t5's
 byte widths, leaves them in ``ccfg.layer_fields`` for every kind to assign.
@@ -227,38 +228,30 @@ def apply_layer_kind(e: Any, kind: LayerKind) -> None:
             setattr(e.ccfg, name, fields[name])
 
 
-class KindHook:
-    """A layer kind in the callable form a layer-group list still takes."""
-
-    def __init__(self, kind: LayerKind) -> None:
-        self.kind = kind
-        self.__name__ = f"hook_{kind.name}"
-
-    def __call__(self, e: Any) -> None:
-        """Apply the kind to an evaluator or a bare config."""
-        apply_layer_kind(e, self.kind)
-
-
 def _needs_kinds(stack: LayerStack) -> bool:
     """Whether a stack's layers differ from the config the family hook leaves."""
     kinds = stack.distinct_kinds()
     return len(kinds) > 1 or any(kind.attention != "full" or kind.ffn is not None for kind in kinds)
 
 
-def stack_layer_groups(stack: Optional[LayerStack], total: int) -> List[Tuple[int, Any]]:
-    """Return the layer-group list of a stack: one hook per group, or none.
-
-    Args:
-        stack: The stack the parser settled, if any.
-        total: The number of layers a stack without kinds of its own covers.
+def layer_groups(ccfg: Any) -> List[Tuple[Optional[LayerKind], int]]:
+    """Return the groups of layers the estimators price alike, in model order.
 
     Returns:
-        ``(count, hook)`` pairs in model order.  A stack whose one kind is
-        what the family hook already set needs no hook, as before.
+        ``(kind, count)`` per group of the config's stack.  A config without
+        a stack, or whose stack's one kind is the config the family hook
+        leaves, is one group of all its layers, MTP included, with no kind:
+        they are priced on the config as it stands.
     """
+    stack = getattr(ccfg, "layer_stack", None)
     if stack is None or not _needs_kinds(stack):
-        return [(total, None)]
-    return [(group.count, KindHook(group.kind)) for group in stack.groups]
+        return [(None, int(ccfg.n_lay + ccfg.n_mtp))]
+    return [(group.kind, group.count) for group in stack.groups]
+
+
+def layer_kinds(ccfg: Any) -> List[Optional[LayerKind]]:
+    """Return the kind of every layer in model order, as :func:`layer_groups` groups them."""
+    return [kind for kind, count in layer_groups(ccfg) for _ in range(count)]
 
 
 def _byte_widths(ccfg: Any, grad: int = 4, dropout: int = 0) -> Dict[str, int]:

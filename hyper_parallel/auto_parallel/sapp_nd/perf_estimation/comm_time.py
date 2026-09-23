@@ -32,7 +32,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_blo
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import NetworkLevel, PerformanceType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_group_configs,
     get_model_order,
     get_table_quantity,
 )
@@ -41,6 +41,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
     CPAlgo,
     _resolve_cp_algo,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import apply_layer_kind, layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     detect_attention_type,
     AttentionType,
@@ -329,7 +330,7 @@ def estimate_op_bulk_comm(*args, **kwargs):
     fill_tp_table(param["cfg"], param["tables"])
     fill_ep_table(param["cfg"], param["tables"], param["device_type"])
 
-    lccfgs = get_layer_custom_configs(param["cfg"])
+    lccfgs = get_layer_group_configs(param["cfg"])
     logger.info(lccfgs)
     param["layer_count"] = 0
     param["idx_lccfg"] = 0
@@ -480,11 +481,11 @@ def _accumulate_stage_comm(param, stage, stage_id):
             if (
                 layer
                 not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
-                and position in param["hooks"]
+                and position in param["kinds"]
             ):
-                custom_fun = param["hooks"][position]
-                if custom_fun:
-                    custom_fun(param["cfg"])
+                kind = param["kinds"][position]
+                if kind is not None:
+                    apply_layer_kind(param["cfg"], kind)
                 logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
                 param["ctx"].current_node = LayerType.NOT_REC_LAYER
                 logger.info("param ctx %s", param["ctx"])
@@ -519,12 +520,9 @@ def estimate_from_mem_comm(*args, **kwargs):
     )
     param["ctx"] = prepare_context()
 
-    # Each layer's group hook, in model order; layers past the declared
-    # counts get no entry, so no hook and no DP term.
-    flatten = sum(
-        [[f[1]] * f[0] for f in param["cfg"].layer_custom_config], []
-    )
-    param["hooks"] = dict(zip(get_model_order(param["cfg"], param["stages"]), flatten))
+    # Each layer's kind, in model order; layers past the stack get no entry,
+    # so no kind and no DP term.
+    param["kinds"] = dict(zip(get_model_order(param["cfg"], param["stages"]), layer_kinds(param["cfg"])))
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
     for stage_id, stage in enumerate(param["stages"]):
         comm = _accumulate_stage_comm(param, stage, stage_id)

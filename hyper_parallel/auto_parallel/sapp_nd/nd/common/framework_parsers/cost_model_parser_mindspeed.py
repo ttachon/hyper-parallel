@@ -58,7 +58,7 @@ class CostModelParserMindspeed(_CostModelParser):
             self.ccfg.mm_ccfgs = ccfgs
             self.ccfg.mm_order = list(ccfgs.keys())
 
-            # Update each mod's offset, layer_custom_config, pp_partition
+            # Update each mod's offset and pp_partition
             for m in self.ccfg.mm_ccfgs:
                 cc = self.ccfg.mm_ccfgs[m]
                 num_layer_per_stage = max(1, cc.n_lay // self.ccfg.p // self.ccfg.vp)
@@ -298,6 +298,6 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation
         self.__config_parse_json_op_recompute(cc)
-        self.config_layer_stack(cc, cc.n_lay)
+        self.config_layer_stack(cc)
         cc.overwrite_eval_functions = {}
         return cc  # mod_hook

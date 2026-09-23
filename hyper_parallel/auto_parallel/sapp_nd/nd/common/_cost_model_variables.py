@@ -46,7 +46,6 @@ class _CostModVar:
     device_capacity: Memory = Memory.zero()  # float = 0
     mm_ccfgs: any = None
     mm_order: list = None
-    layer_custom_config: list = None
     # The layer stack the parser settled (an auto_parallel LayerStack), and
     # the fields each of its kinds assigns, bound per candidate by the arch
     # hook from the config it is applied to.
