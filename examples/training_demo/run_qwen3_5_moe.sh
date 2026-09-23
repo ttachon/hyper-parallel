@@ -22,14 +22,21 @@ OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo"
 DATA_ROOT="${OUTPUT_DIR}/data"
 NPROC_PER_NODE="${NPROC_PER_NODE:-16}"
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 /path/to/Qwen3.5-35B-A3B-Base [trainer overrides...]" >&2
-    exit 1
+# Shared cluster layout: every node mounts the assets at the same path, so the
+# default needs no argument. Pass a directory as the first argument, or set
+# MODEL_PATH, to run against another copy.
+DEFAULT_MODEL_PATH="/home/tt/models/Qwen3.5-35B-A3B-Base"
+
+# A leading argument is the model directory unless it is a trainer override.
+if [[ $# -ge 1 && "$1" != --* ]]; then
+    MODEL_PATH=$1
+    shift
 fi
-MODEL_PATH=$1
-shift
+MODEL_PATH="${MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
+
 MODEL_PATH=$(cd "${MODEL_PATH}" 2>/dev/null && pwd) || {
     echo "Model directory does not exist: ${MODEL_PATH}" >&2
+    echo "Pass one as the first argument or set MODEL_PATH." >&2
     exit 1
 }
 if [[ ! -s "${MODEL_PATH}/config.json" ]]; then
