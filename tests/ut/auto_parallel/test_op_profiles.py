@@ -58,10 +58,10 @@ class TestProfiles(unittest.TestCase):
     """Every family's op counts are a file, and every file is a valid vector."""
 
     def test_the_families(self):
-        """The seven families the arch hooks knew, the default and the tower."""
+        """The seven families the arch hooks knew, Qwen3.5, the default and the tower."""
         self.assertEqual(set(known_archs()), {
             "default", "llama2", "mixtral", "t5", "pangualpha",
-            "deepseek", "qwen", "cm", "vision",
+            "deepseek", "qwen", "qwen3_5", "cm", "vision",
         })
 
     def test_every_profile_loads(self):
@@ -71,9 +71,10 @@ class TestProfiles(unittest.TestCase):
                 profile = load_op_profile(arch)
                 self.assertEqual(profile.arch, arch)
                 self.assertTrue(profile.kinds)
-                for counts in profile.kinds.values():
-                    self.assertIsInstance(counts, OpCounts)
-                    self.assertEqual(counts.linrec, 0)
+                for kind in profile.layer_kinds.values():
+                    self.assertIsInstance(kind.ops, OpCounts)
+                    # Only a linear-attention layer runs the delta rule's state update.
+                    self.assertEqual(kind.ops.linrec, int(kind.attention == "linear"))
 
     def test_unknown_arch_raises_naming_the_profiles(self):
         """A misspelt arch is refused, and the message lists the real ones."""
@@ -121,16 +122,32 @@ class TestKindsAndFlavours(unittest.TestCase):
     def test_attention_is_full_unless_stated(self):
         """
         Feature: attention flavour.
-        Description: No existing family declares linear attention.
-        Expectation: Every kind is full attention and keeps the model's feed-forward
-            unless it says otherwise.
+        Description: Only Qwen3.5's linear-attention kind declares linear attention.
+        Expectation: Every other kind is full attention, and every kind but
+            DeepSeek's and cm's keeps the model's feed-forward.
         """
         for arch in known_archs():
             for kind in load_op_profile(arch).layer_kinds.values():
                 with self.subTest(arch=arch, kind=kind.name):
-                    self.assertEqual(kind.attention, "full")
+                    linear = (arch, kind.name) == ("qwen3_5", "linear_attention")
+                    self.assertEqual(kind.attention, "linear" if linear else "full")
                     if arch not in ("deepseek", "cm"):
                         self.assertIsNone(kind.ffn)
+
+    def test_qwen3_5_linear_layers_keep_no_score_matrix(self):
+        """
+        Feature: Qwen3.5 profile.
+        Description: A linear-attention layer against a full one.
+        Expectation: No score matmuls, softmax or score casts, one state
+            update, and every other op as in full attention.
+        """
+        profile = load_op_profile("qwen3_5")
+        full, linear = profile.counts("full_attention"), profile.counts("linear_attention")
+        self.assertEqual(profile.default, "full_attention")
+        self.assertEqual((linear.attBMM, linear.softmax, linear.headCast, linear.linrec), (0, 0, 0, 1))
+        self.assertEqual(full, load_op_profile("qwen").counts("decoder"))
+        for name in ("attMM", "ffMM", "dropout", "normOp", "gather", "ffAct"):
+            self.assertEqual(getattr(linear, name), getattr(full, name), name)
 
     def test_a_single_kind_is_its_own_default(self):
         """
@@ -178,6 +195,9 @@ class TestInferArch(unittest.TestCase):
             "Qwen3": "qwen",
             "qwen3_moe": "qwen",
             "qwen3_vl_moe": "qwen",
+            "qwen3_5_moe": "qwen3_5",
+            "qwen3_5_moe_text": "qwen3_5",
+            "Qwen3.5-35B-A3B": "qwen3_5",
             "mixtral-8x7b": "mixtral",
             "llama2_7b": "llama2",
             "pangualpha_2_6b": "pangualpha",

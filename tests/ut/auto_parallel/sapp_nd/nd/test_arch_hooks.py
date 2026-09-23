@@ -24,13 +24,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-from hyper_parallel.auto_parallel._model_spec import OpCounts
+from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import known_archs, resolve_ops
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     ARCH_HOOKS,
     CWrap,
+    apply_layer_kind,
     check_and_apply_custom_hook,
     custom_vision_tower,
     layer_hook,
@@ -60,6 +61,8 @@ _LEGACY_OPS = {
     "default": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "llama2": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "qwen": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
+    # Qwen3.5 was priced with the qwen hook; its full-attention kind keeps those counts.
+    "qwen3_5": {"full_attention": (4, 2, 3, 1, 0, 2, 4)},
     "deepseek": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "cm": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "mixtral": {"decoder": (4, 2, 3, 2, 0, 5, 4)},
@@ -70,7 +73,7 @@ _LEGACY_OPS = {
 
 # The byte widths the same hooks set: (bytes_grad at p > 1, at p == 1, bytes_dropout).
 _LEGACY_BYTES = {
-    "default": (4, 0, 0), "llama2": (2, 2, 0), "qwen": (4, 0, 0),
+    "default": (4, 0, 0), "llama2": (2, 2, 0), "qwen": (4, 0, 0), "qwen3_5": (4, 0, 0),
     "deepseek": (4, 0, 0), "cm": (4, 0, 0), "mixtral": (2, 0, 0),
     "pangualpha": (4, 0, 1), "t5": (4, 0, 1), "vision": (4, 0, 0),
 }
@@ -198,6 +201,7 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
     """Reading counts from profiles leaves each config as the literals did."""
 
     def _check(self, arch: str, with_table: bool) -> None:
+        """Assert *arch*'s hook leaves every layer kind as its literals did."""
         for has_op in (False, True):
             for p in (1, 2):
                 with self.subTest(arch=arch, table=with_table, has_op=has_op, p=p):
@@ -348,6 +352,115 @@ class TestTwoKindStack(unittest.TestCase):
         evaluator.estimate_peak()
         per_layer = [seen[lay_id] for lay_id in sorted(seen)]
         self.assertEqual(per_layer, [{1}, {1}, {0}, {0}])
+
+
+_LINEAR_DIMS = {
+    "linear_num_key_heads": 8, "linear_key_head_dim": 64, "linear_num_value_heads": 16,
+    "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4,
+}
+_L, _F = "linear_attention", "full_attention"
+
+
+def _qwen35_model(layer_types, **model) -> dict:
+    """The config_overrides of a small Qwen3.5-shaped model with *layer_types*."""
+    fields = {
+        "num_hidden_layers": len(layer_types), "layer_types": list(layer_types), "head_dim": 128,
+        "num_key_value_heads": 2, "attn_output_gate": True, **_LINEAR_DIMS,
+    }
+    fields.update(model)
+    return fields
+
+
+class TestStackAsData(unittest.TestCase):
+    """A stack the parser settled as data prices each layer by its kind."""
+
+    def test_the_stack_comes_from_layer_types(self):
+        """
+        Feature: Qwen3.5 layer stack.
+        Description: layer_types lists [L, L, F, L, F].
+        Expectation: The qwen3_5 profile, one group per run, one hook per group.
+        """
+        ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _L, _F, _L, _F]))
+        self.assertEqual(ccfg.arch, "qwen3_5")
+        self.assertEqual([(group.kind.name, group.count) for group in ccfg.layer_stack.groups],
+                         [(_L, 2), (_F, 1), (_L, 1), (_F, 1)])
+        self.assertEqual([count for count, _ in ccfg.layer_custom_config], [2, 1, 1, 1])
+
+    def test_a_full_layer_restores_the_models_own_attention(self):
+        """
+        Feature: complete assignments.
+        Description: Apply a linear kind then a full one in place, as the
+            memory backbone does layer after layer.
+        Expectation: Exactly the attention the family hook left.
+        """
+        ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _F]))
+        check_and_apply_custom_hook(ccfg)
+        kinds = {kind.name: kind for kind in ccfg.layer_stack.distinct_kinds()}
+        names = ("attn_kind", "a", "dh", "n_kv", "attn_output_gate", "attn_extra_p",
+                 "n_attBMM", "n_softmax", "n_headCast", "n_linrec", "lin_n_v")
+        before = {name: getattr(ccfg, name) for name in names}
+        layer = copy.deepcopy(ccfg)
+        apply_layer_kind(layer, kinds[_L])
+        apply_layer_kind(layer, kinds[_F])
+        self.assertEqual({name: getattr(layer, name) for name in names}, before)
+
+    def test_a_linear_layer_is_priced_on_the_linear_dimensions(self):
+        """
+        Feature: linear attention.
+        Description: Apply the linear kind of a model with 16 value heads of 64.
+        Expectation: The value heads carry the q side, the key heads the kv
+            side, no score ops, one state update, and the convolution and
+            gates as extra parameters.
+        """
+        ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _F]))
+        check_and_apply_custom_hook(ccfg)
+        apply_layer_kind(ccfg, ccfg.layer_stack.groups[0].kind)
+        self.assertEqual(
+            (ccfg.attn_kind, ccfg.a, ccfg.dh, ccfg.n_kv, ccfg.attn_output_gate,
+             ccfg.n_softmax, ccfg.n_linrec, ccfg.attn_extra_p),
+            ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16),
+        )
+
+    def test_a_one_kind_stack_needs_no_hook(self):
+        """
+        Feature: layer groups.
+        Description: A dense model with one MTP layer.
+        Expectation: One group covering all five layers, with no hook.
+        """
+        self.assertEqual(_ccfg("qwen3_moe", mtp_depth=1).layer_custom_config, [(5, None)])
+
+    def test_a_linear_kind_without_dimensions_is_refused(self):
+        """
+        Feature: linear attention.
+        Description: layer_types names linear layers, but no linear dimension
+            is declared.
+        Expectation: Refused at parse time rather than priced as full attention.
+        """
+        with self.assertRaises(ModelSpecError) as ctx:
+            _ccfg("qwen3_5_moe", num_hidden_layers=4, layer_types=[_L, _F, _L, _F])
+        self.assertIn("linear_num_value_heads", str(ctx.exception))
+
+    def test_a_stated_stack_prices_as_the_derived_one(self):
+        """
+        Feature: layers in the serialised spec.
+        Description: The same model three ways: layer_types, the equivalent
+            stated layers, and a stack of full attention only.
+        Expectation: The first two give the same peak memory and FLOP score,
+            and the third does not.
+        """
+        derived = _qwen35_model([_L, _L, _L, _F])
+        stated = dict(derived, arch="qwen3_5", layers=[{"kind": _L, "count": 3}, {"kind": _F, "count": 1}])
+        del stated["layer_types"]
+        full = dict(stated, layers=[{"kind": _F, "count": 4}])
+        results = []
+        for model in (derived, stated, full):
+            config = _hyper_config("qwen3_5_moe", **model)
+            peak = EvaluatorV2(config, framework="hyper_v2", log_level=0).estimate_peak()
+            score = estimate_performance(CostModelConfig(config, framework="hyper_v2"),
+                                         device_type=Hard.Device_A2)
+            results.append((peak, score))
+        self.assertEqual(results[0], results[1])
+        self.assertNotEqual(results[0][1], results[2][1])
 
 
 class TestParsersRecordTheArch(unittest.TestCase):

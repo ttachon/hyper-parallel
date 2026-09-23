@@ -69,46 +69,20 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
     custom_vision_tower,
+    stack_layer_groups,
 )
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
-from hyper_parallel.auto_parallel._model_spec import ops_from_dict
+from hyper_parallel.auto_parallel._layer_stack import LinearAttentionDims, resolve_layers
+from hyper_parallel.auto_parallel._model_spec import layers_from_list, ops_from_dict
 
 logger = logging.getLogger(__name__)
-
-# Every field a linear-attention group sets. A full-attention group restores
-# them, because the memory and communication estimates apply layer hooks in
-# place, one layer after another, rather than on a copy per group.
-_LINEAR_ATTN_FIELDS = (
-    "a", "dh", "n_kv", "attn_output_gate", "n_attBMM", "n_softmax",
-    "n_headCast", "n_linrec", "attn_extra_p",
-    "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
-)
-
-
-def _declared(ccfg: Any, name: str) -> Any:
-    """Return *name* as set on *ccfg*, else its class default, else 0.
-
-    Reading through ``CostModelConfig.__getattr__`` would return the same 0
-    for an unset field, but with a warning for every layer.
-    """
-    held = vars(ccfg)
-    return held[name] if name in held else getattr(type(ccfg), name, 0)
-
-
-def _restore_full_attention(ccfg: Any) -> None:
-    """Put back the attention fields a linear group displaced, if any."""
-    ccfg.attn_kind = "full"
-    for name, value in (getattr(ccfg, "full_attn", None) or {}).items():
-        setattr(ccfg, name, value)
-
 
 def custom_vision_tower_hook(evaluator: Any) -> None:
     """Apply the vision-tower profile to an evaluator or a config."""
@@ -188,18 +162,12 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override()
         )
         self._vision_spec = spec.pop("vision", None)
-        self._layer_types = spec.get("layer_types") or []
-        self._linear_attn = {
-            "n_k": self._spec_int(spec, "linear_num_key_heads"),
-            "d_k": self._spec_int(spec, "linear_key_head_dim"),
-            "n_v": self._spec_int(spec, "linear_num_value_heads"),
-            "d_v": self._spec_int(spec, "linear_value_head_dim"),
-            "conv": self._spec_int(spec, "linear_conv_kernel_dim"),
-        }
         self._apply_spec(self.ccfg, spec)
-        ops = spec.get("ops")
-        self.config_op_counts(
-            self.ccfg, spec["arch"], None if ops is None else ops_from_dict(ops)
+        ops = None if spec.get("ops") is None else ops_from_dict(spec["ops"])
+        self.config_op_counts(self.ccfg, spec["arch"], ops)
+        self.ccfg.layer_stack = resolve_layers(
+            spec["arch"], layers_from_list(spec["layers"]), ops,
+            LinearAttentionDims.from_fields(spec),
         )
         self._resolve_device_capacity()
 
@@ -295,90 +263,20 @@ class CostModelParserHyperV2(_CostModelParser):
     # -- Layer stack ----------------------------------------------------
 
     def _init_layer_stack(self, ccfg: Any = None) -> None:
-        """Group the body layers by attention flavour.
+        """Hand the layer stack to the estimators as layer groups.
 
-        A hybrid model (Qwen3.5) states its stack in ``layer_types``. Without
-        it every layer is priced as full attention, which charges the
-        quadratic score term on layers that have no score matrix at all.
-        The MTP layers inherit the flavour of the last body group.
+        The stack is data the spec states or implies: a hybrid model
+        (Qwen3.5) names each layer's kind in ``layer_types``, so its
+        linear-attention layers are priced as such rather than charged the
+        quadratic score term of full attention.
         """
         ccfg = ccfg if ccfg is not None else self.ccfg
-        total = int(ccfg.n_lay + ccfg.n_mtp)
-        kinds = [str(k) for k in self._layer_types[: int(ccfg.n_lay)]]
-        if not kinds or len(set(kinds)) <= 1 and "linear" not in "".join(kinds):
-            ccfg.layer_custom_config = [(total, None)]
-            return
-
-        groups = []
-        for kind in kinds:
-            if groups and groups[-1][0] == kind:
-                groups[-1][1] += 1
-            else:
-                groups.append([kind, 1])
-        groups[-1][1] += int(ccfg.n_mtp)
-
-        ccfg.layer_custom_config = [
-            (count, self._layer_hook(kind)) for kind, count in groups
-        ]
-        logger.info(
-            "layer stack: %s",
-            ", ".join(f"{count}x{kind}" for kind, count in groups),
-        )
-
-    def _layer_hook(self, kind: str):
-        """Return the hook that gives one layer group its attention flavour.
-
-        Same contract as the arch hooks: the memory backbone calls it with an
-        evaluator, the performance path with a bare config.
-        """
-        linear = dict(self._linear_attn)
-
-        def apply(lccfg: Any) -> None:
-            """Give *lccfg* this group's attention flavour."""
-            if "linear" not in kind:
-                _restore_full_attention(lccfg)
-                return
-            if not (linear["n_v"] and linear["d_v"] and linear["d_k"]):
-                logger.warning(
-                    "layer_types declares %s but the config carries no linear "
-                    "attention dimensions; costing it as full attention", kind,
-                )
-                _restore_full_attention(lccfg)
-                return
-            if getattr(lccfg, "full_attn", None) is None:
-                lccfg.full_attn = {
-                    name: _declared(lccfg, name) for name in _LINEAR_ATTN_FIELDS
-                }
-            lccfg.attn_kind = "linear"
-            for name, value in linear.items():
-                setattr(lccfg, "lin_" + name, value)
-            # Map the flavour onto the q/k/v/o formula: the value heads carry
-            # the q-side width, the key heads the kv-side, and the gate
-            # projection is exactly a second q-wide tensor.
-            lccfg.a = linear["n_v"]
-            lccfg.dh = linear["d_v"]
-            lccfg.n_kv = linear["n_k"] * linear["d_k"] / linear["d_v"]
-            lccfg.attn_output_gate = True
-            # A recurrent layer keeps no score matrix, so none of the terms
-            # that scale with s^2 exist on it.
-            lccfg.n_attBMM = 0
-            lccfg.n_softmax = 0
-            lccfg.n_headCast = 0
-            lccfg.n_linrec = 1
-            # Short convolution over the projected stream, plus the two
-            # per-head gates the delta rule needs.
-            qkv_width = 2 * linear["n_k"] * linear["d_k"] + linear["n_v"] * linear["d_v"]
-            lccfg.attn_extra_p = linear["conv"] * qkv_width + 2 * lccfg.h * linear["n_v"]
-
-        def hook(e: Any) -> None:
-            """Apply the flavour through an evaluator or a bare config."""
-            # A bare config has to be wrapped; hasattr cannot tell, because a
-            # missing attribute on a Config resolves to 0 rather than raising.
-            if isinstance(e, CostModelConfig):
-                e = CWrap(e)
-            e.set_ccfg(apply)
-
-        return hook
+        ccfg.layer_custom_config = stack_layer_groups(ccfg.layer_stack, int(ccfg.n_lay + ccfg.n_mtp))
+        if len(ccfg.layer_custom_config) > 1:
+            logger.info(
+                "layer stack: %s",
+                ", ".join(f"{group.count}x{group.kind.name}" for group in ccfg.layer_stack.groups),
+            )
 
     # -- Multimodal ----------------------------------------------------
 
@@ -456,6 +354,8 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
+        cc.layer_stack = None
+        cc.layer_binding = None
         cc.layer_custom_config = [(cc.n_lay, None)]
         cc.offset = self._front_loaded_offset(cc.n_lay)
         return cc

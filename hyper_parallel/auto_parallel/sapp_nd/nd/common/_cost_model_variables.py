@@ -47,6 +47,11 @@ class _CostModVar:
     mm_ccfgs: any = None
     mm_order: list = None
     layer_custom_config: list = None
+    # The layer stack the parser settled (an auto_parallel LayerStack), and
+    # the fields each of its kinds assigns, bound per candidate by the arch
+    # hook from the config it is applied to.
+    layer_stack: any = None
+    layer_binding: dict = None
     overwrite_eval_functions: dict = None
     parser: any = None
 
@@ -92,12 +97,9 @@ class _CostModVar:
     lin_n_v: float = 0
     lin_d_v: float = 0
     lin_conv: float = 0
-    # Recurrent-state update and readout, the linear-attention op the
-    # arch hooks have no counterpart for. Zero for every other flavour.
+    # Recurrent-state update and readout, the linear-attention op. Zero for
+    # every other flavour.
     n_linrec: float = 0
-    # The attention fields a linear group displaced, kept so a later full
-    # group can put them back when hooks run in place, layer after layer.
-    full_attn: dict = None
     n_mtp: float = 0
     is_mtp_in_offset: bool = True
     multiple_of: float = 0

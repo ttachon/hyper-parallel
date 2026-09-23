@@ -50,9 +50,15 @@ DEFAULT_ARCH = "default"
 ATTENTION_FLAVOURS = ("full", "linear")
 FFN_FLAVOURS = ("dense", "moe")
 
-# Families a model name is matched against, in order, first match wins.  This
-# is the order the cost model itself used to match names in.
-_NAME_ORDER = ("llama2", "mixtral", "t5", "pangualpha", "deepseek", "qwen", "cm")
+# Names a model name is matched against, in order, first match wins, with the
+# family each one means.  This is the order the cost model itself used to
+# match names in; Qwen3.5 comes before the Qwen family it would otherwise
+# fall into, under both the Transformers spelling and the release name.
+_NAME_ORDER = (
+    ("llama2", "llama2"), ("mixtral", "mixtral"), ("t5", "t5"),
+    ("pangualpha", "pangualpha"), ("deepseek", "deepseek"),
+    ("qwen3_5", "qwen3_5"), ("qwen3.5", "qwen3_5"), ("qwen", "qwen"), ("cm", "cm"),
+)
 
 
 @dataclass(frozen=True)
@@ -180,8 +186,8 @@ def infer_arch(name: Any) -> str:
     here.
     """
     lowered = str(name).lower()
-    for arch in _NAME_ORDER:
-        if arch in lowered:
+    for pattern, arch in _NAME_ORDER:
+        if pattern in lowered:
             return arch
     logger.warning(
         "no op profile matches model %r, pricing it as %r; declare arch to choose one",

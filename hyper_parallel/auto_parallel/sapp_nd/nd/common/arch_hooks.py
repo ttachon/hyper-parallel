@@ -19,11 +19,16 @@ or the counts its model spec declares.  What the hooks below still set is
 what a profile cannot express yet: byte widths, activation sharding, and the
 dense/MoE layer stack.  A hook is chosen by ``ccfg.arch``, which the parser
 settles, and never by matching the model name.
+
+A layer stack the parser settled as data (``ccfg.layer_stack``) needs no hook
+of its own: :func:`apply_layer_kind` gives a layer its kind from the fields
+:func:`bind_layer_stack` recorded when the family hook ran.
 """
 import math
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, LinearAttentionDims
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
-from hyper_parallel.auto_parallel._op_profiles import load_op_profile
+from hyper_parallel.auto_parallel._op_profiles import LayerKind, load_op_profile
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -120,6 +125,124 @@ def layer_hook(
 
     hook.__name__ = f"hook_{kind}"
     return hook
+
+
+# The fields an attention flavour assigns.  Every kind of a stack whose kinds
+# differ in attention writes all of them, so applying kinds in place, one
+# layer after another and in any order, leaves each layer the same config.
+_ATTENTION_FIELDS = (
+    "attn_kind", "a", "dh", "n_kv", "attn_output_gate", "attn_extra_p",
+    "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
+)
+
+
+def _linear_attention(snapshot: Any, linear: LinearAttentionDims) -> Dict[str, Any]:
+    """The attention fields of a gated-DeltaNet layer.
+
+    The flavour maps onto the q/k/v/o formula: the value heads carry the
+    q-side width, the key heads the kv-side, and the output gate is a second
+    q-wide tensor.  What the formula does not describe is stated apart: the
+    short convolution over the projected stream and the two per-head gates
+    as extra parameters, the recurrent state update as the ``linrec`` op.
+    """
+    n_k, d_k = linear.num_key_heads, linear.key_head_dim
+    n_v, d_v = linear.num_value_heads, linear.value_head_dim
+    qkv_width = 2 * n_k * d_k + n_v * d_v
+    return {
+        "attn_kind": "linear",
+        "a": n_v,
+        "dh": d_v,
+        "n_kv": n_k * d_k / d_v,
+        "attn_output_gate": True,
+        "attn_extra_p": linear.conv_kernel_dim * qkv_width + 2 * snapshot.h * n_v,
+        "lin_n_k": n_k,
+        "lin_d_k": d_k,
+        "lin_n_v": n_v,
+        "lin_d_v": d_v,
+        "lin_conv": linear.conv_kernel_dim,
+    }
+
+
+def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str, Any]:
+    """The fields *kind* assigns beyond its op counts, from the bound config."""
+    fields: Dict[str, Any] = {}
+    if any(other.attention != "full" for other in stack.distinct_kinds()):
+        if kind.attention == "linear":
+            fields.update(_linear_attention(snapshot, stack.linear))
+        else:
+            fields.update({name: getattr(snapshot, name) for name in _ATTENTION_FIELDS})
+    return fields
+
+
+def bind_layer_stack(ccfg: Any) -> None:
+    """Record, per kind of the config's stack, the fields it assigns.
+
+    Called where the family hook runs, per search candidate and per
+    estimate, so the values a kind restores are the model's own as that
+    hook left them.  A config without a stack gets no binding.
+    """
+    stack = getattr(ccfg, "layer_stack", None)
+    if stack is None:
+        ccfg.layer_binding = None
+        return
+    ccfg.layer_binding = {
+        kind.name: _kind_fields(ccfg, stack, kind) for kind in stack.distinct_kinds()
+    }
+
+
+def apply_layer_kind(e: Any, kind: LayerKind) -> None:
+    """Make the layer about to be priced one of *kind*.
+
+    Same contract as every layer hook: the memory backbone calls it with an
+    evaluator, the performance path with a bare config.
+    """
+    if isinstance(e, CostModelConfig):
+        e = CWrap(e)
+    if getattr(e.ccfg, "layer_binding", None) is None:
+        bind_layer_stack(e.ccfg)
+    fields = e.ccfg.layer_binding[kind.name]
+
+    def assign(c: Any) -> None:
+        """Give config *c* the kind's counts, then its flavours' fields."""
+        apply_op_counts(c, kind.ops)
+        for name, value in fields.items():
+            setattr(c, name, value)
+
+    e.set_ccfg(assign)
+
+
+class KindHook:
+    """A layer kind in the callable form a layer-group list still takes."""
+
+    def __init__(self, kind: LayerKind) -> None:
+        self.kind = kind
+        self.__name__ = f"hook_{kind.name}"
+
+    def __call__(self, e: Any) -> None:
+        """Apply the kind to an evaluator or a bare config."""
+        apply_layer_kind(e, self.kind)
+
+
+def _needs_kinds(stack: LayerStack) -> bool:
+    """Whether a stack's layers differ from the config the family hook leaves."""
+    kinds = stack.distinct_kinds()
+    return len(kinds) > 1 or any(kind.attention != "full" or kind.ffn is not None for kind in kinds)
+
+
+def stack_layer_groups(stack: Optional[LayerStack], total: int) -> List[Tuple[int, Any]]:
+    """Return the layer-group list of a stack: one hook per group, or none.
+
+    Args:
+        stack: The stack the parser settled, if any.
+        total: The number of layers a stack without kinds of its own covers.
+
+    Returns:
+        ``(count, hook)`` pairs in model order.  A stack whose one kind is
+        what the family hook already set needs no hook, as before.
+    """
+    if stack is None or not _needs_kinds(stack):
+        return [(total, None)]
+    return [(group.count, KindHook(group.kind)) for group in stack.groups]
 
 
 def _set_bytes(ccfg: Any, grad: int = 4, dropout: int = 0) -> None:
@@ -230,14 +353,22 @@ def custom_deepseek3(ccfg, arch="deepseek"):
     ]
 
 
-def custom_qwen(ccfg):
+def custom_qwen(ccfg, arch="qwen"):
     """qwen2"""
-    _decoder(ccfg, "qwen")
+    _decoder(ccfg, arch)
     # if "72b" in ccfg.model_name :
     #     ccfg.s = ccfg.s * 3/4
     ccfg.shard_recompute_input = ccfg.t
     ccfg.shard_output_activ = ccfg.t
     # ccfg.bytes_grad = 4
+
+
+def custom_qwen3_5(ccfg: Any) -> None:
+    """Qwen3.5: Qwen's hook, on the full-attention kind of its hybrid profile.
+
+    The linear-attention layers get their kind from the layer stack.
+    """
+    custom_qwen(ccfg, arch="qwen3_5")
 
 
 def custom_cm(ccfg):
@@ -286,13 +417,18 @@ ARCH_HOOKS = {
     "pangualpha": custom_pangualpha,
     "deepseek": custom_deepseek3,
     "qwen": custom_qwen,
+    "qwen3_5": custom_qwen3_5,
     "cm": custom_cm,
     "vision": custom_vision_tower,
 }
 
 
 def check_and_apply_custom_hook(e: Any) -> None:
-    """Apply the hook of the family the config declares in ``ccfg.arch``."""
+    """Apply the hook of the family the config declares in ``ccfg.arch``.
+
+    Then bind the config's layer stack, so each kind restores the values
+    that hook left.
+    """
     if isinstance(e, CostModelConfig):
         e = CWrap(e)
     arch = getattr(e.ccfg, "arch", None)
@@ -304,3 +440,4 @@ def check_and_apply_custom_hook(e: Any) -> None:
         )
         hook = custom_default_transformer
     e.set_ccfg(hook)
+    bind_layer_stack(e.ccfg)

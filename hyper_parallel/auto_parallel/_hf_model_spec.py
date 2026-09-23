@@ -249,17 +249,19 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     Parsing and re-serialising is what makes the schema load-bearing rather
     than advisory: a field the model declares but the IR does not know would
-    be dropped here, and an incoherent one raises by name.  The op profile is
-    settled here too, so the serialised spec states what it will be priced
-    with even when the family was only inferred from the model name.  A
-    stated layer stack is checked against that profile.
+    be dropped here, and an incoherent one raises by name.  The op profile
+    and the layer stack are settled here too, so the serialised spec states
+    what it will be priced with and which kind each layer is, even when the
+    family was only inferred from the model name and the stack from
+    ``layer_types`` or ``first_k_dense_replace``.  ``layer_types`` is
+    consumed: ``layers`` says the same, checked against the profile.
     """
     typed = ModelSpec.from_dict(spec)
     typed = dataclasses.replace(typed, arch=typed.arch or infer_arch(typed.name))
     resolve_ops(typed.arch, typed.ops)
-    if typed.layers is not None:
-        spec_layer_stack(typed)
-    return typed.to_dict()
+    layers = spec_layer_stack(typed).to_layers()
+    extra = {key: value for key, value in typed.extra.items() if key != "layer_types"}
+    return dataclasses.replace(typed, layers=layers, extra=extra).to_dict()
 
 
 def resolve_hf_model_spec(
