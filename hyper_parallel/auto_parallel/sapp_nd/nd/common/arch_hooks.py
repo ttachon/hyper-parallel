@@ -141,24 +141,16 @@ def _linear_attention(snapshot: Any, linear: LinearAttentionDims) -> Dict[str, A
     }
 
 
-def _dense_width(snapshot: Any) -> Any:
-    """The feed-forward width of a dense layer, as each framework's config states it."""
-    if snapshot.config_format == "yaml":
-        return int(snapshot.hff)
-    if snapshot.config_format == "json":
-        return snapshot.ffn_hidden_size
-    return snapshot.specs.inter_dim or snapshot.specs.hidden_dim or snapshot.h
-
-
 def _feed_forward(snapshot: Any, flavour: Optional[str]) -> Dict[str, Any]:
     """The feed-forward fields of a layer of *flavour*, from the bound config.
 
     A MoE layer runs the routed experts at their width.  A dense layer runs
-    one expert at the dense width, no shared one, and no expert parallelism.
-    A kind without a flavour keeps the model's own.
+    one expert at the model's feed-forward width, the parser's ``hff``, with
+    no shared expert and no expert parallelism.  A kind without a flavour
+    keeps the model's own.
     """
     if flavour == "dense":
-        return {"hff": _dense_width(snapshot), "n_chosen_exp": 1, "n_exp": 1, "n_shared_exp": 0, "ep": 1}
+        return {"hff": snapshot.hff, "n_chosen_exp": 1, "n_exp": 1, "n_shared_exp": 0, "ep": 1}
     fields = {name: getattr(snapshot, name) for name in _FFN_FIELDS}
     if flavour == "moe":
         fields["hff"] = snapshot.hff_exp

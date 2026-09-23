@@ -528,6 +528,25 @@ class TestDenseThenMoE(unittest.TestCase):
         self.assertEqual(states[1], {"hff": 512, "n_chosen_exp": 2, "n_exp": 8, "n_shared_exp": 1, "ep": 2})
         self.assertEqual(states[2], states[0])
 
+    def test_a_dense_layer_runs_the_parsers_width_in_every_format(self):
+        """
+        Feature: dense width.
+        Description: A dense layer of a config each parser format produces:
+            MindFormers and hyper_v2 (yaml), MindSpeed (json) and TorchTitan
+            (toml).
+        Expectation: The parser's hff in all three.
+        """
+        for config_format in ("yaml", "json", "toml"):
+            with self.subTest(config_format=config_format):
+                cfg = _bare("deepseek", resolve_ops("deepseek"), config_format=config_format)
+                cfg.layer_stack = resolve_layers(
+                    "deepseek", derive_layers(load_op_profile("deepseek"), 4, first_k_dense=2), cfg.op_counts,
+                )
+                check_and_apply_custom_hook(CWrap(cfg))
+                layer = copy.deepcopy(cfg)
+                apply_layer_kind(CWrap(layer), cfg.layer_stack.groups[0].kind)
+                self.assertEqual((layer.hff, layer.n_exp), (32, 1))
+
     def test_ep_is_written_past_the_evaluators_guard(self):
         """
         Feature: strategy a kind sets.
