@@ -306,9 +306,7 @@ class CostModelParserMindformers(_CostModelParser):
             )
             self.ccfg.is_mtp_in_offset = False
 
-        # Layer custom config
-        # [(num layers selected, layer custom config to apply)]
-        self.ccfg.layer_custom_config = [(self.ccfg.n_lay + self.ccfg.n_mtp, None)]
+        self.config_layer_stack(self.ccfg, self.ccfg.n_lay + self.ccfg.n_mtp)
 
         self.__config_parse_yaml_op_recompute()
         # By default, 100% of layers use a unique custom config (if specified)

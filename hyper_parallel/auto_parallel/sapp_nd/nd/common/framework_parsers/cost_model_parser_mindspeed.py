@@ -298,7 +298,6 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation
         self.__config_parse_json_op_recompute(cc)
-        cc.layer_custom_config = [(cc.n_lay, None)]
-        # By default, 100% of layers use a unique custom config (if specified)
+        self.config_layer_stack(cc, cc.n_lay)
         cc.overwrite_eval_functions = {}
         return cc  # mod_hook

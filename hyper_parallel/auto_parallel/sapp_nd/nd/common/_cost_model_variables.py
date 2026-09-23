@@ -52,6 +52,9 @@ class _CostModVar:
     # hook from the config it is applied to.
     layer_stack: any = None
     layer_binding: dict = None
+    # Fields the family hook gives every layer of the stack on top of its
+    # kind's, such as t5's byte widths.
+    layer_fields: dict = None
     overwrite_eval_functions: dict = None
     parser: any = None
 

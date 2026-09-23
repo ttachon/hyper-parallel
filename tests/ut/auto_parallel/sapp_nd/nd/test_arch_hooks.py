@@ -18,14 +18,16 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_arch_hooks.py -v
 """
 import copy
+import math
 import os
 import unittest
 from types import SimpleNamespace
 from typing import Any
 
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup, derive_layers, resolve_layers
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
-from hyper_parallel.auto_parallel._op_profiles import known_archs, resolve_ops
+from hyper_parallel.auto_parallel._op_profiles import LayerKind, known_archs, load_op_profile, resolve_ops
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
@@ -34,7 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     apply_layer_kind,
     check_and_apply_custom_hook,
     custom_vision_tower,
-    layer_hook,
+    stack_layer_groups,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -207,13 +209,14 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
                 with self.subTest(arch=arch, table=with_table, has_op=has_op, p=p):
                     table = resolve_ops(arch) if with_table else None
                     cfg = _bare(arch, table, has_op=has_op, p=p)
+                    cfg.layer_stack = resolve_layers(arch, derive_layers(load_op_profile(arch), cfg.n_lay), table)
                     check_and_apply_custom_hook(CWrap(cfg))
                     if arch != "t5":
                         kind = next(iter(_LEGACY_OPS[arch]))
                         self.assertEqual(_state(cfg), _legacy_state(arch, kind, has_op, p))
                         continue
-                    # t5 sets its counts per layer group, not on the model.
-                    for kind, (count, hook) in zip(("encoder", "decoder"), cfg.layer_custom_config):
+                    # t5 sets its counts and byte widths per layer, from its stack's kinds.
+                    for kind, (count, hook) in zip(("encoder", "decoder"), stack_layer_groups(cfg.layer_stack, 4)):
                         layer = copy.deepcopy(cfg)
                         hook(CWrap(layer))
                         self.assertEqual(count, cfg.n_lay // 2)
@@ -288,15 +291,12 @@ class TestTwoKindStack(unittest.TestCase):
     def _stack(self, linear_layers: int = 2) -> CostModelConfig:
         """Four layers: full attention, then *linear_layers* without scores."""
         ccfg = _ccfg(arch="default")
-        ccfg.op_counts = {
-            "decoder": OpCounts.from_dict(_counts()),
-            "linear_attention": OpCounts.from_dict(_counts(**self._LINEAR)),
-        }
-        groups = [
-            (4 - linear_layers, layer_hook("default", "decoder")),
-            (linear_layers, layer_hook("default", "linear_attention")),
-        ]
-        ccfg.layer_custom_config = [group for group in groups if group[0]]
+        groups = (
+            StackGroup(LayerKind("decoder", OpCounts.from_dict(_counts())), 4 - linear_layers),
+            StackGroup(LayerKind("scoreless", OpCounts.from_dict(_counts(**self._LINEAR))), linear_layers),
+        )
+        ccfg.layer_stack = LayerStack("default", tuple(group for group in groups if group.count))
+        ccfg.layer_custom_config = stack_layer_groups(ccfg.layer_stack, 4)
         return ccfg
 
     def test_each_group_gets_its_vector(self):
@@ -463,6 +463,106 @@ class TestStackAsData(unittest.TestCase):
         self.assertNotEqual(results[0][1], results[2][1])
 
 
+_DEEPSEEK = {
+    "num_hidden_layers": 4, "first_k_dense_replace": 1, "mtp_depth": 1, "num_experts": 8,
+    "num_experts_per_tok": 2, "num_shared_experts": 1, "moe_intermediate_size": 512,
+}
+
+
+def _deepseek(name: str = "deepseek_v3") -> CostModelConfig:
+    """A small DeepSeek-shaped model at ep 2: one dense layer, three MoE and one MTP."""
+    config = _hyper_config(name, **_DEEPSEEK)
+    config["accelerator"]["ep_size"] = 2
+    return CostModelConfig(config, framework="hyper_v2")
+
+
+class TestDenseThenMoE(unittest.TestCase):
+    """DeepSeek's dense and MoE layers, cm's and t5's halves are kinds of the stack."""
+
+    _FFN = ("hff", "n_chosen_exp", "n_exp", "n_shared_exp", "ep")
+
+    def test_the_stack_comes_from_first_k_dense_replace(self):
+        """
+        Feature: DeepSeek layer stack.
+        Description: One dense layer, three MoE layers and one MTP layer.
+        Expectation: Three groups, the MTP one repeating the MoE kind, one hook each.
+        """
+        ccfg = _deepseek()
+        self.assertEqual([(group.kind.name, group.count, group.mtp) for group in ccfg.layer_stack.groups],
+                         [("dense", 1, False), ("moe", 3, False), ("moe", 1, True)])
+        self.assertEqual([count for count, _ in ccfg.layer_custom_config], [1, 3, 1])
+
+    def test_each_kind_assigns_the_whole_feed_forward(self):
+        """
+        Feature: complete assignments.
+        Description: Apply the dense kind, a MoE one, then the dense one
+            again, in place, as the memory backbone does.
+        Expectation: A dense layer runs one expert at the dense width, no
+            shared one and no expert parallelism; a MoE layer runs the model's
+            experts at their width and ep; and the dense layers match.
+        """
+        ccfg = _deepseek()
+        check_and_apply_custom_hook(ccfg)
+        dense, moe = (group.kind for group in ccfg.layer_stack.groups[:2])
+        layer = copy.deepcopy(ccfg)
+        states = []
+        for kind in (dense, moe, dense):
+            apply_layer_kind(layer, kind)
+            states.append({name: getattr(layer, name) for name in self._FFN})
+        self.assertEqual(states[0], {"hff": 2816, "n_chosen_exp": 1, "n_exp": 1, "n_shared_exp": 0, "ep": 1})
+        self.assertEqual(states[1], {"hff": 512, "n_chosen_exp": 2, "n_exp": 8, "n_shared_exp": 1, "ep": 2})
+        self.assertEqual(states[2], states[0])
+
+    def test_ep_is_written_past_the_evaluators_guard(self):
+        """
+        Feature: strategy a kind sets.
+        Description: The memory backbone applies kinds through an evaluator,
+            whose guard refuses a strategy write inside a hook.
+        Expectation: A dense layer still runs at ep 1, and a MoE one at 2.
+        """
+        evaluator = EvaluatorV2(None, ccfg=_deepseek())
+        dense, moe = (group.kind for group in evaluator.ccfg.layer_stack.groups[:2])
+        apply_layer_kind(evaluator, dense)
+        self.assertEqual(evaluator.ccfg.ep, 1)
+        apply_layer_kind(evaluator, moe)
+        self.assertEqual(evaluator.ccfg.ep, 2)
+
+    def test_cm_shards_every_layer_as_its_hook_says(self):
+        """
+        Feature: fields the family gives every layer.
+        Description: cm runs DeepSeek's stack with its own optimizer and
+            embedding sharding on each layer.
+        Expectation: Both kinds assign the sharding cm's hook derived.
+        """
+        ccfg = _deepseek("cm_llama_moe")
+        self.assertEqual(ccfg.arch, "cm")
+        check_and_apply_custom_hook(ccfg)
+        expected = (ccfg.shard_p_os_exp_partial, math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp), ccfg.t)
+        for kind in ccfg.layer_stack.distinct_kinds():
+            layer = copy.deepcopy(ccfg)
+            apply_layer_kind(layer, kind)
+            self.assertEqual((layer.shard_p_os_exp, layer.shard_p_os_non_exp_partial, layer.shard_embed),
+                             expected, kind.name)
+
+    def test_t5_prices_each_half_as_its_kind(self):
+        """
+        Feature: t5 layer stack.
+        Description: A four-layer t5.
+        Expectation: Two encoder then two decoder layers, each with its own
+            counts and t5's one-byte dropout mask, which the model does not
+            take.
+        """
+        ccfg = _ccfg("t5_small")
+        self.assertEqual([(group.kind.name, group.count) for group in ccfg.layer_stack.groups],
+                         [("encoder", 2), ("decoder", 2)])
+        check_and_apply_custom_hook(ccfg)
+        self.assertEqual(ccfg.bytes_dropout, 0)
+        for kind, attention_matmuls in zip(ccfg.layer_stack.distinct_kinds(), (4, 8)):
+            layer = copy.deepcopy(ccfg)
+            apply_layer_kind(layer, kind)
+            self.assertEqual((layer.n_attMM, layer.bytes_dropout), (attention_matmuls, 1), kind.name)
+
+
 class TestParsersRecordTheArch(unittest.TestCase):
     """Every parser settles the arch before any hook runs."""
 
@@ -475,6 +575,20 @@ class TestParsersRecordTheArch(unittest.TestCase):
         ccfg = CostModelConfig(os.path.join(_SAPP_ND, "nd", "yamls", "deepseek.yaml"))
         self.assertEqual(ccfg.arch, "deepseek")
         self.assertEqual(ccfg.op_counts, resolve_ops("deepseek"))
+
+    def test_mindformers_derives_the_stack(self):
+        """
+        Feature: MindFormers parser.
+        Description: The DeepSeek yaml declares first_k_dense_replace and one
+            MTP layer.
+        Expectation: The dense prefix, the MoE body and the MTP layer, as groups.
+        """
+        ccfg = CostModelConfig(os.path.join(_SAPP_ND, "nd", "yamls", "deepseek.yaml"))
+        groups = [(group.kind.name, group.count, group.mtp) for group in ccfg.layer_stack.groups]
+        self.assertEqual(groups, [("dense", ccfg.k_1st_dense, False),
+                                  ("moe", ccfg.n_lay - ccfg.k_1st_dense, False),
+                                  ("moe", ccfg.n_mtp, True)])
+        self.assertEqual([count for count, _ in ccfg.layer_custom_config], [count for _, count, _ in groups])
 
     def test_hyper_reads_the_spec(self):
         """

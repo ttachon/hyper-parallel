@@ -73,7 +73,6 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
     custom_vision_tower,
-    stack_layer_groups,
 )
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
@@ -142,7 +141,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.config_optimizer_shard(self.ccfg)
         self.config_comm_flag(self.ccfg)
         self._init_shard()
-        self._init_layer_stack()
+        self.config_layer_stack(self.ccfg, self.ccfg.n_lay + self.ccfg.n_mtp, self.ccfg.layer_stack)
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
 
@@ -260,24 +259,6 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.multiple_of = self._spec_int(spec, "multiple_of", 256)
         ccfg.fdm = float(spec.get("ffn_dim_multiplier", 1.0) or 1.0)
 
-    # -- Layer stack ----------------------------------------------------
-
-    def _init_layer_stack(self, ccfg: Any = None) -> None:
-        """Hand the layer stack to the estimators as layer groups.
-
-        The stack is data the spec states or implies: a hybrid model
-        (Qwen3.5) names each layer's kind in ``layer_types``, so its
-        linear-attention layers are priced as such rather than charged the
-        quadratic score term of full attention.
-        """
-        ccfg = ccfg if ccfg is not None else self.ccfg
-        ccfg.layer_custom_config = stack_layer_groups(ccfg.layer_stack, int(ccfg.n_lay + ccfg.n_mtp))
-        if len(ccfg.layer_custom_config) > 1:
-            logger.info(
-                "layer stack: %s",
-                ", ".join(f"{group.count}x{group.kind.name}" for group in ccfg.layer_stack.groups),
-            )
-
     # -- Multimodal ----------------------------------------------------
 
     def _resolve_multimodal(self) -> None:
@@ -332,7 +313,7 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.model_name = name
         cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
         cc.overwrite_eval_functions = dict(self.ccfg.overwrite_eval_functions)
-        self._init_layer_stack(cc)
+        self.config_layer_stack(cc, cc.n_lay + cc.n_mtp, cc.layer_stack)
         cc.offset = self._even_offset()
         return cc
 

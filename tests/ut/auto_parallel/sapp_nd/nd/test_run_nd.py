@@ -28,6 +28,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
+from hyper_parallel.auto_parallel._op_profiles import load_op_profile
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
@@ -1288,21 +1290,29 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(cfg.shard_recompute_input, cfg.t)
 
         t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
+        t5_cfg.layer_stack = resolve_layers("t5", derive_layers(load_op_profile("t5"), 4))
         ArchHooks.custom_t5(t5_cfg)
-        self.assertEqual(len(t5_cfg.layer_custom_config), 2)
+        ArchHooks.bind_layer_stack(t5_cfg)
+        t5_groups = ArchHooks.stack_layer_groups(t5_cfg.layer_stack, 4)
+        self.assertEqual(len(t5_groups), 2)
         t5_wrap = ArchHooks.CWrap(t5_cfg)
-        t5_cfg.layer_custom_config[0][1](t5_wrap)
+        t5_groups[0][1](t5_wrap)
         self.assertEqual(t5_cfg.n_attBMM, 1)
-        t5_cfg.layer_custom_config[1][1](t5_wrap)
+        t5_groups[1][1](t5_wrap)
         self.assertEqual(t5_cfg.n_attMM, 8)
 
         deepseek_cfg = _make_arch_cfg(model_name="deepseek")
+        deepseek_cfg.layer_stack = resolve_layers(
+            "deepseek", derive_layers(load_op_profile("deepseek"), 4, 1, first_k_dense=2)
+        )
         ArchHooks.custom_deepseek3(deepseek_cfg)
-        self.assertEqual(len(deepseek_cfg.layer_custom_config), 3)
+        ArchHooks.bind_layer_stack(deepseek_cfg)
+        deepseek_groups = ArchHooks.stack_layer_groups(deepseek_cfg.layer_stack, 5)
+        self.assertEqual(len(deepseek_groups), 3)
         deepseek_wrap = ArchHooks.CWrap(deepseek_cfg)
-        deepseek_cfg.layer_custom_config[0][1](deepseek_wrap)
+        deepseek_groups[0][1](deepseek_wrap)
         self.assertEqual(deepseek_cfg.n_exp, 1)
-        deepseek_cfg.layer_custom_config[1][1](deepseek_wrap)
+        deepseek_groups[1][1](deepseek_wrap)
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
         cm_cfg = _make_arch_cfg(model_name="cm")
