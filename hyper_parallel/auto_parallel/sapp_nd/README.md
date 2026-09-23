@@ -86,6 +86,18 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
 
+## Comparing with a Profiled Run
+
+`ParallelizeLayer.test_from_csv_comm_classified` compares ND's estimate with a measured run. `nd.trace_classify` writes its input CSV from per-rank `torch.profiler` traces recorded with `with_stack=True`:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify traces/rank*.pt.trace.json.gz \
+    --dims DP=4,PP=1,MB=2,MBS=1,OP=4 \
+    --csv real.csv --perf-parts perf.csv --detail detail.csv
+```
+
+Each profiled step is split into `comp`, one `<dim>_wait` per parallelism type and the idle rest. A wait is time blocked in communication, typed by the HyperParallel module that issued it; the CSV holds the mean over steps and ranks. `--perf-parts` writes the same step in the columns of ND's `debug.csv`, and `--detail` keeps every rank and step by call site. `--dims` takes the acronyms of `-l` except `SP`, which ND reads back as true whatever its value. The split measures host-side blocking, which is exact for host-synchronous backends such as gloo.
+
 ## Structure
 
 ```text
@@ -109,7 +121,8 @@ sapp_nd/
 |   |-- global_config.py
 |   |-- logger.py
 |   |-- parallelize.py
-|   `-- run_nd.py
+|   |-- run_nd.py
+|   `-- trace_classify.py
 `-- perf_estimation/
 ```
 
