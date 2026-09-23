@@ -38,6 +38,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHoo
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
+    HYPER_SELECTIVE_REC_OP,
     _CostModelParser,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
@@ -1648,6 +1649,15 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.model_name, "llama-unit")
             self.assertEqual(hp_ccfg.vp, 2)
             self.assertEqual(hp_ccfg.layer_custom_config, [(2, None)])
+            self.assertEqual(vars(hp_ccfg.rec_op), dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1))
+
+            hp_config.activation_checkpoint.mode = "selective"
+            sel_ccfg = _ParserCostModelConfig()
+            sel_ccfg.config = hp_config
+            sel_ccfg.source_code = source_path
+            CostModelParserHyperparallel(sel_ccfg).parse()
+            self.assertTrue(sel_ccfg.sel_rec)
+            self.assertEqual(vars(sel_ccfg.rec_op), HYPER_SELECTIVE_REC_OP)
 
         ms_mod = {
             "model_id": "vision",

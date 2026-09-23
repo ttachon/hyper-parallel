@@ -622,15 +622,7 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.sel_rec = ac_mode == "selective"
 
-        self.ccfg.rec_op = Config({
-            "attBMM": 1,
-            "headCast": 1,
-            "dropout": 1,
-            "softmax": 1,
-            "normOp": 1,
-            "gather": 1,
-            "ffAct": 1,
-        })
+        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
 
     def _init_bytes(self):
         """Set FP byte sizes from AutoModels or legacy dtype fields.

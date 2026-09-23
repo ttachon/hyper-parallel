@@ -24,6 +24,9 @@ from unittest.mock import patch
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
+    HYPER_SELECTIVE_REC_OP,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
     custom_vision_tower_hook,
@@ -480,22 +483,36 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: _parse_recompute.
         Description: Three activation_checkpoint modes.
-        Expectation: Correct full_rec / sel_rec / rec_op values.
+        Expectation: Correct full_rec / sel_rec / rec_op values: only the
+            selective mode recomputes ops, the ones HyperParallel's
+            selective checkpointing recomputes.
         """
+        keep_all = dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
         cases = [
-            ("full", True, False),
-            ("selective", False, True),
-            ("none", False, False),
+            ("full", True, False, keep_all),
+            ("selective", False, True, HYPER_SELECTIVE_REC_OP),
+            ("none", False, False, keep_all),
         ]
-        for ac_mode, expect_full, expect_sel in cases:
+        for ac_mode, expect_full, expect_sel, expect_rec_op in cases:
             cfg = _dense_overrides(train={
                 "gradient_checkpointing": {"activation_checkpoint": ac_mode},
             })
             ccfg = _make_ccfg(cfg)
             self.assertEqual(ccfg.full_rec, expect_full, f"mode={ac_mode}")
             self.assertEqual(ccfg.sel_rec, expect_sel, f"mode={ac_mode}")
-            if ac_mode != "none":
-                self.assertIsNotNone(ccfg.rec_op)
+            self.assertEqual(vars(ccfg.rec_op), expect_rec_op, f"mode={ac_mode}")
+
+    def test_selective_recomputes_what_hyperparallel_recomputes(self):
+        """
+        Feature: HYPER_SELECTIVE_REC_OP.
+        Description: The switches of HyperParallel's selective checkpointing.
+        Expectation: Attention kernels are kept; the elementwise ops and the
+            all-gather around them are recomputed; all seven switches are set.
+        """
+        self.assertEqual(
+            HYPER_SELECTIVE_REC_OP,
+            {"attBMM": 1, "headCast": 0, "dropout": 0, "softmax": 0, "normOp": 0, "gather": 0, "ffAct": 0},
+        )
 
     # ---- L0: Feature flags -----------------------------------------------
 
