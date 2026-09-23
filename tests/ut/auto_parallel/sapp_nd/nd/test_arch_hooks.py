@@ -36,8 +36,14 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     layer_hook,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
+    estimate_comp,
+    estimate_performance,
+    op_table,
+)
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_custom_configs
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
 _SAPP_ND = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -281,10 +287,11 @@ class TestTwoKindStack(unittest.TestCase):
             "decoder": OpCounts.from_dict(_counts()),
             "linear_attention": OpCounts.from_dict(_counts(**self._LINEAR)),
         }
-        ccfg.layer_custom_config = [
+        groups = [
             (4 - linear_layers, layer_hook("default", "decoder")),
             (linear_layers, layer_hook("default", "linear_attention")),
         ]
+        ccfg.layer_custom_config = [group for group in groups if group[0]]
         return ccfg
 
     def test_each_group_gets_its_vector(self):
@@ -299,6 +306,26 @@ class TestTwoKindStack(unittest.TestCase):
         full, linear = groups[0][0], groups[1][0]
         self.assertEqual((full.n_attBMM, full.n_softmax, full.n_headCast), (2, 1, 1))
         self.assertEqual((linear.n_attBMM, linear.n_softmax, linear.n_headCast), (0, 0, 0))
+
+    def test_flops_differ_by_exactly_the_missing_ops(self):
+        """
+        Feature: per-kind op counts on the performance path.
+        Description: Price the stack, and the same stack with every layer
+            full, on one pipeline stage.
+        Expectation: They differ by two layers' worth of the three ops the
+            linear kind does not run, and nothing else.
+        """
+        layers = [LayerType.NOT_REC_LAYER] * 4
+        stages = [[[LayerType.EMBEDDING_LAYER] + layers + [LayerType.OUTPUT_LAYER]]]
+        mixed = self._stack(linear_layers=2)
+        full = self._stack(linear_layers=0)
+        check_and_apply_custom_hook(mixed)
+        check_and_apply_custom_hook(full)
+        table = op_table(full)
+        missing = 2 * (2 * table["n_attBMM"] + table["n_softmax"] + table["n_headCast"])
+        saved = (estimate_comp(full, CustomConfig(), stages)[0]
+                 - estimate_comp(mixed, CustomConfig(), stages)[0])
+        self.assertAlmostEqual(saved / missing, 1.0, places=9)
 
     def test_memory_path_prices_each_layer_from_its_kind(self):
         """

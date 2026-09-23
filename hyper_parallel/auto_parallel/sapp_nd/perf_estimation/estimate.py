@@ -34,7 +34,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_configs_by_position,
     get_table_quantity,
 )
 
@@ -95,15 +95,13 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
         cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
     )
 
-    lccfgs = get_layer_custom_configs(cfg)
-    layer_count = 0
-    idx_lccfg = 0
+    lccfg_at = get_layer_configs_by_position(cfg, stages)
 
     flops = []
-    for stage in stages:
+    for stage_id, stage in enumerate(stages):
         flops += [0]
-        for chunk in stage:
-            for layer in chunk:
+        for chunk_id, chunk in enumerate(stage):
+            for lay_id, layer in enumerate(chunk):
                 if layer == LayerType.EMBEDDING_LAYER:
                     continue
 
@@ -121,23 +119,16 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
                     )
                     continue
 
-                layer_count += 1
-                if (
-                    idx_lccfg + 1 < len(lccfgs)
-                    and lccfgs[idx_lccfg][1] <= layer_count
-                ):
-                    layer_count = 0
-                    idx_lccfg += 1
-
+                lccfg = lccfg_at[(stage_id, chunk_id, lay_id)]
                 flop = get_table_quantity(
-                    lccfgs[idx_lccfg][0],
-                    table_exp if (lccfgs[idx_lccfg][0].n_exp > 1) else table,
+                    lccfg,
+                    table_exp if (lccfg.n_exp > 1) else table,
                     layer,
                     with_recomp,
                 )
 
                 if ccfg.ttype == PerformanceType.TIME:
-                    flop = estimate_comp_flop_time(lccfgs[idx_lccfg][0], flop)
+                    flop = estimate_comp_flop_time(lccfg, flop)
 
                 flops[-1] += flop
 
