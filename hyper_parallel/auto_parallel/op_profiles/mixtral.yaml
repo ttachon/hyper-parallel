@@ -1,12 +1,14 @@
 # Mixtral: gated experts, two softmaxes and five normalisations per layer.
 kinds:
   decoder:
-    attMM: 4
-    attBMM: 2
-    ffMM: 3
-    softmax: 2
-    dropout: 0
-    normOp: 5
-    gather: 4
-    headCast: 1
-    ffAct: 1
+    ops:
+      attMM: 4
+      attBMM: 2
+      ffMM: 3
+      softmax: 2
+      dropout: 0
+      normOp: 5
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0

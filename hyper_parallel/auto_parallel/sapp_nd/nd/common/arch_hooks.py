@@ -131,8 +131,8 @@ def _set_bytes(ccfg: Any, grad: int = 4, dropout: int = 0) -> None:
 
 
 def _decoder(ccfg: Any, arch: str) -> None:
-    """Op counts and byte widths of a decoder shaped like the default one."""
-    apply_op_counts(ccfg, layer_op_counts(ccfg, arch, "decoder"))
+    """Op counts of the family's default kind, and the byte widths of a decoder."""
+    apply_op_counts(ccfg, layer_op_counts(ccfg, arch, load_op_profile(arch).default))
     _set_bytes(ccfg)
 
 

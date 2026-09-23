@@ -78,7 +78,7 @@ _LEGACY_BYTES = {
 
 def _counts(**overrides) -> dict:
     """The default decoder's op counts, with *overrides* applied."""
-    counts = dict(zip(_OPS, _LEGACY_OPS["default"]["decoder"]), headCast=1, ffAct=1)
+    counts = dict(zip(_OPS, _LEGACY_OPS["default"]["decoder"]), headCast=1, ffAct=1, linrec=0)
     counts.update(overrides)
     return counts
 

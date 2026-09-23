@@ -2,22 +2,26 @@
 # layer adds cross-attention, so it runs twice the attention projections.
 kinds:
   encoder:
-    attMM: 4
-    attBMM: 1
-    ffMM: 2
-    softmax: 2
-    dropout: 5
-    normOp: 2
-    gather: 4
-    headCast: 1
-    ffAct: 1
+    ops:
+      attMM: 4
+      attBMM: 1
+      ffMM: 2
+      softmax: 2
+      dropout: 5
+      normOp: 2
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0
   decoder:
-    attMM: 8
-    attBMM: 2
-    ffMM: 2
-    softmax: 4
-    dropout: 7
-    normOp: 3
-    gather: 6
-    headCast: 1
-    ffAct: 1
+    ops:
+      attMM: 8
+      attBMM: 2
+      ffMM: 2
+      softmax: 4
+      dropout: 7
+      normOp: 3
+      gather: 6
+      headCast: 1
+      ffAct: 1
+      linrec: 0

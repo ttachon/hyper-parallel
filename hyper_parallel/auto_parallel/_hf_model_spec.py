@@ -28,6 +28,7 @@ import dataclasses
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel._op_profiles import infer_arch, resolve_ops
 
@@ -250,12 +251,15 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
     than advisory: a field the model declares but the IR does not know would
     be dropped here, and an incoherent one raises by name.  The op profile is
     settled here too, so the serialised spec states what it will be priced
-    with even when the family was only inferred from the model name.
+    with even when the family was only inferred from the model name.  A
+    stated layer stack is checked against that profile.
     """
     typed = ModelSpec.from_dict(spec)
-    arch = typed.arch or infer_arch(typed.name)
-    resolve_ops(arch, typed.ops)
-    return dataclasses.replace(typed, arch=arch).to_dict()
+    typed = dataclasses.replace(typed, arch=typed.arch or infer_arch(typed.name))
+    resolve_ops(typed.arch, typed.ops)
+    if typed.layers is not None:
+        spec_layer_stack(typed)
+    return typed.to_dict()
 
 
 def resolve_hf_model_spec(

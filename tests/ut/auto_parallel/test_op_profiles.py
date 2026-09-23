@@ -13,8 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """Tests for the op profiles and how a spec settles the one it is priced with."""
+import contextlib
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
+from hyper_parallel.auto_parallel import _op_profiles
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import (
@@ -31,6 +36,7 @@ def _counts(**overrides) -> dict:
     counts = {
         "attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1,
         "dropout": 0, "normOp": 2, "gather": 4, "headCast": 1, "ffAct": 1,
+        "linrec": 0,
     }
     counts.update(overrides)
     return counts
@@ -67,6 +73,7 @@ class TestProfiles(unittest.TestCase):
                 self.assertTrue(profile.kinds)
                 for counts in profile.kinds.values():
                     self.assertIsInstance(counts, OpCounts)
+                    self.assertEqual(counts.linrec, 0)
 
     def test_unknown_arch_raises_naming_the_profiles(self):
         """A misspelt arch is refused, and the message lists the real ones."""
@@ -81,6 +88,82 @@ class TestProfiles(unittest.TestCase):
         with self.assertRaises(ModelSpecError) as ctx:
             load_op_profile("t5").counts("block")
         self.assertIn("encoder", str(ctx.exception))
+
+
+@contextlib.contextmanager
+def _profile_file(text: str):
+    """Load profiles from a folder holding one ``unit.yaml`` with *text*."""
+    with tempfile.TemporaryDirectory() as folder:
+        with open(os.path.join(folder, "unit.yaml"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+        load_op_profile.cache_clear()
+        try:
+            with patch.object(_op_profiles, "PROFILE_DIR", folder):
+                yield
+        finally:
+            load_op_profile.cache_clear()
+
+
+class TestKindsAndFlavours(unittest.TestCase):
+    """A kind states how its layers are shaped, from a closed set."""
+
+    def test_deepseek_kinds_differ_in_their_feed_forward_only(self):
+        """
+        Feature: ffn flavour.
+        Description: DeepSeek's dense and MoE layers run the same ops.
+        Expectation: Two kinds, dense and moe flavours, equal counts, moe by default.
+        """
+        profile = load_op_profile("deepseek")
+        self.assertEqual((profile.kind("dense").ffn, profile.kind("moe").ffn), ("dense", "moe"))
+        self.assertEqual(profile.counts("dense"), profile.counts("moe"))
+        self.assertEqual(profile.default, "moe")
+
+    def test_attention_is_full_unless_stated(self):
+        """
+        Feature: attention flavour.
+        Description: No existing family declares linear attention.
+        Expectation: Every kind is full attention and keeps the model's feed-forward
+            unless it says otherwise.
+        """
+        for arch in known_archs():
+            for kind in load_op_profile(arch).layer_kinds.values():
+                with self.subTest(arch=arch, kind=kind.name):
+                    self.assertEqual(kind.attention, "full")
+                    if arch not in ("deepseek", "cm"):
+                        self.assertIsNone(kind.ffn)
+
+    def test_a_single_kind_is_its_own_default(self):
+        """
+        Feature: default kind.
+        Description: A family with one kind, and t5 with two and no default.
+        Expectation: The one kind, and None.
+        """
+        self.assertEqual(load_op_profile("qwen").default, "decoder")
+        self.assertIsNone(load_op_profile("t5").default)
+
+    def test_an_unknown_flavour_is_refused(self):
+        """
+        Feature: profile loader.
+        Description: A kind declares a flavour outside the closed set.
+        Expectation: Refused, naming the flavours there are.
+        """
+        text = f"kinds:\n  decoder:\n    attention: sliding\n    ops: {_counts()}\n"
+        with _profile_file(text):
+            with self.assertRaises(ModelSpecError) as ctx:
+                load_op_profile("unit")
+        self.assertIn("linear", str(ctx.exception))
+
+    def test_a_default_that_is_not_a_kind_is_refused(self):
+        """
+        Feature: profile loader.
+        Description: The default names a kind the profile does not declare.
+        Expectation: Refused, naming the kinds.
+        """
+        text = f"default: moe\nkinds:\n  decoder:\n    ops: {_counts()}\n"
+        with _profile_file(text):
+            with self.assertRaises(ModelSpecError) as ctx:
+                load_op_profile("unit")
+        self.assertIn("decoder", str(ctx.exception))
 
 
 class TestInferArch(unittest.TestCase):

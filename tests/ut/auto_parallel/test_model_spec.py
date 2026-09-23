@@ -18,6 +18,7 @@ import unittest
 import yaml
 
 from hyper_parallel.auto_parallel._model_spec import (
+    LayerGroup,
     ModelSpec,
     ModelSpecError,
     OpCounts,
@@ -64,6 +65,7 @@ def _counts(**overrides) -> dict:
     counts = {
         "attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1,
         "dropout": 0, "normOp": 2, "gather": 4, "headCast": 1, "ffAct": 1,
+        "linrec": 0,
     }
     counts.update(overrides)
     return counts
@@ -376,6 +378,96 @@ class TestOpsOnTheSpec(unittest.TestCase):
                 data["ops"] = bad
                 with self.assertRaises(ModelSpecError):
                     ModelSpec.from_dict(data)
+
+
+class TestLayersOnTheSpec(unittest.TestCase):
+    """A spec may state its layer stack, and it must add up."""
+
+    @staticmethod
+    def _with_layers(layers) -> dict:
+        data = _qwen35()
+        data["layers"] = layers
+        return data
+
+    def test_layers_round_trip_through_yaml_text(self):
+        """
+        Feature: ModelSpec.layers.
+        Description: 40 body layers and one MTP layer, dumped and reloaded.
+        Expectation: The same typed groups, and mtp written only where true.
+        """
+        layers = [{"kind": "decoder", "count": 40}, {"kind": "decoder", "count": 1, "mtp": True}]
+        spec = ModelSpec.from_dict(self._with_layers(layers))
+        self.assertEqual(spec.layers, (LayerGroup("decoder", 40), LayerGroup("decoder", 1, mtp=True)))
+        text = yaml.safe_dump(spec.to_dict(), sort_keys=True)
+        self.assertEqual(ModelSpec.from_dict(yaml.safe_load(text)), spec)
+        self.assertEqual(spec.to_dict()["layers"], layers)
+
+    def test_the_body_must_add_up(self):
+        """
+        Feature: layer counts.
+        Description: The groups hold 39 body layers against 40 declared.
+        Expectation: Refused, naming both counts.
+        """
+        layers = [{"kind": "decoder", "count": 39}, {"kind": "decoder", "count": 1, "mtp": True}]
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(self._with_layers(layers))
+        self.assertIn("39", str(ctx.exception))
+        self.assertIn("40", str(ctx.exception))
+
+    def test_the_mtp_layers_must_add_up(self):
+        """
+        Feature: layer counts.
+        Description: No MTP group although mtp_depth is 1.
+        Expectation: Refused, naming mtp_depth.
+        """
+        with self.assertRaises(ModelSpecError) as ctx:
+            ModelSpec.from_dict(self._with_layers([{"kind": "decoder", "count": 40}]))
+        self.assertIn("mtp_depth", str(ctx.exception))
+
+    def test_mtp_layers_come_last(self):
+        """
+        Feature: layer order.
+        Description: An MTP group before a body group.
+        Expectation: Refused.
+        """
+        layers = [
+            {"kind": "decoder", "count": 20},
+            {"kind": "decoder", "count": 1, "mtp": True},
+            {"kind": "decoder", "count": 20},
+        ]
+        with self.assertRaises(ModelSpecError):
+            ModelSpec.from_dict(self._with_layers(layers))
+
+    def test_malformed_groups_raise(self):
+        """
+        Feature: LayerGroup.
+        Description: An empty group, a missing kind, an unknown key, a string mtp.
+        Expectation: Each refused.
+        """
+        for bad in (
+            [{"kind": "decoder", "count": 0}],
+            [{"count": 40}],
+            [{"kind": "decoder", "count": 40, "flavour": "moe"}],
+            [{"kind": "decoder", "count": 40, "mtp": "yes"}],
+            [],
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ModelSpecError):
+                    ModelSpec.from_dict(self._with_layers(bad))
+
+    def test_linear_dimensions_are_fields(self):
+        """
+        Feature: linear-attention fields.
+        Description: A Qwen3.5 spec declares its gated-DeltaNet dimensions.
+        Expectation: Typed fields, not extra, and absent when not declared.
+        """
+        data = _qwen35()
+        data.update(linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=32,
+                    linear_value_head_dim=128, linear_conv_kernel_dim=4)
+        spec = ModelSpec.from_dict(data)
+        self.assertEqual(spec.linear_num_value_heads, 32)
+        self.assertNotIn("linear_num_value_heads", spec.extra)
+        self.assertNotIn("linear_num_value_heads", ModelSpec.from_dict(_dense()).to_dict())
 
 
 class TestNormalizedConfigAccessor(unittest.TestCase):

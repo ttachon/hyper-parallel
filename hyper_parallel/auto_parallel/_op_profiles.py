@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Op profiles: the op counts of each known architecture family, as data.
+"""Op profiles: the layer kinds of each known architecture family, as data.
 
-Every file under ``op_profiles/`` names a family and declares, per layer kind,
-how many times one layer runs each op the cost model prices.  These are the
-numbers the ND arch hooks used to assign in code, one callback per family.
+Every file under ``op_profiles/`` names a family and declares its layer kinds.
+A kind states how many times one layer runs each op the cost model prices,
+the numbers the ND arch hooks used to assign in code, and two flavours from a
+closed set that say how the layer is shaped:
+
+- ``attention``: ``full`` (the default) or ``linear``, a gated-DeltaNet layer
+  priced on the model's linear-attention dimensions;
+- ``ffn``: ``dense`` or ``moe``, or absent to keep the model's own
+  feed-forward, for families whose layers do not differ in it.
+
+A profile with more than one kind may name a ``default``, the kind a layer
+takes when nothing says otherwise; a profile with one kind defaults to it.
 
 A model spec names its profile with ``arch``, and may declare its own counts
 in ``ops`` instead.  The cost model reads only what the spec declares.  A
@@ -38,26 +47,63 @@ logger = logging.getLogger(__name__)
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "op_profiles")
 DEFAULT_ARCH = "default"
 
+ATTENTION_FLAVOURS = ("full", "linear")
+FFN_FLAVOURS = ("dense", "moe")
+
 # Families a model name is matched against, in order, first match wins.  This
 # is the order the cost model itself used to match names in.
 _NAME_ORDER = ("llama2", "mixtral", "t5", "pangualpha", "deepseek", "qwen", "cm")
 
 
 @dataclass(frozen=True)
+class LayerKind:
+    """One kind of layer: the ops it runs and how it is shaped.
+
+    Attributes:
+        name: The kind's name in its profile, which a layer stack refers to.
+        ops: How many times one layer of this kind runs each op.
+        attention: ``full``, or ``linear`` for a gated-DeltaNet layer.
+        ffn: ``dense``, ``moe``, or ``None`` to keep the model's own.
+    """
+
+    name: str
+    ops: OpCounts
+    attention: str = "full"
+    ffn: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class OpProfile:
-    """The op counts of one architecture family, per layer kind."""
+    """The layer kinds of one architecture family.
+
+    Attributes:
+        arch: The family, the profile's file name.
+        layer_kinds: Every kind of the family, by name.
+        default: The kind a layer takes when nothing says otherwise, or
+            ``None`` for a family whose stack always states its kinds.
+    """
 
     arch: str
-    kinds: Dict[str, OpCounts]
+    layer_kinds: Dict[str, LayerKind]
+    default: Optional[str] = None
+
+    @property
+    def kinds(self) -> Dict[str, OpCounts]:
+        """Return each kind's op counts, by kind name."""
+        return {name: kind.ops for name, kind in self.layer_kinds.items()}
 
     def counts(self, kind: str) -> OpCounts:
         """Return one layer kind's counts, or raise naming the kinds there are."""
-        if kind not in self.kinds:
+        return self.kind(kind).ops
+
+    def kind(self, name: str) -> LayerKind:
+        """Return one layer kind, or raise naming the kinds there are."""
+        if name not in self.layer_kinds:
             raise ModelSpecError(
-                f"op profile {self.arch!r} has no layer kind {kind!r}; "
-                f"it has {sorted(self.kinds)}"
+                f"op profile {self.arch!r} has no layer kind {name!r}; "
+                f"it has {sorted(self.layer_kinds)}"
             )
-        return self.kinds[kind]
+        return self.layer_kinds[name]
 
 
 def known_archs() -> Tuple[str, ...]:
@@ -67,13 +113,39 @@ def known_archs() -> Tuple[str, ...]:
     ))
 
 
+def _flavour(value: Any, allowed: Tuple[str, ...], where: str, optional: bool) -> Optional[str]:
+    """Return a flavour value, refusing one outside *allowed*."""
+    if value is None and optional:
+        return None
+    if value not in allowed:
+        raise ModelSpecError(f"{where} must be one of {list(allowed)}, got {value!r}")
+    return str(value)
+
+
+def _layer_kind(arch: str, name: str, data: Any) -> LayerKind:
+    """Build one kind of a profile from its ``{ops, attention, ffn}`` mapping."""
+    where = f"{arch}.kinds.{name}"
+    if not isinstance(data, Mapping):
+        raise ModelSpecError(f"{where} must map ops and flavours, got {data!r}")
+    unknown = sorted(set(data) - {"ops", "attention", "ffn"})
+    if unknown:
+        raise ModelSpecError(f"{where} has unknown keys {unknown}; a kind has ops, attention and ffn")
+    return LayerKind(
+        name=str(name),
+        ops=OpCounts.from_dict(data.get("ops"), f"{where}.ops"),
+        attention=_flavour(data.get("attention", "full"), ATTENTION_FLAVOURS, f"{where}.attention", False),
+        ffn=_flavour(data.get("ffn"), FFN_FLAVOURS, f"{where}.ffn", True),
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def load_op_profile(arch: str) -> OpProfile:
     """Read and validate the profile of one family.
 
     Raises:
         ModelSpecError: If no profile has that name, or the file declares no
-            layer kind, an unknown key, or an incomplete op vector.
+            layer kind, an unknown key, an incomplete op vector, an unknown
+            flavour, or a default that is not one of its kinds.
     """
     if arch not in known_archs():
         raise ModelSpecError(
@@ -81,16 +153,21 @@ def load_op_profile(arch: str) -> OpProfile:
         )
     with open(os.path.join(PROFILE_DIR, f"{arch}.yaml"), encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
-    unknown = sorted(set(data) - {"kinds"})
+    unknown = sorted(set(data) - {"kinds", "default"})
     if unknown:
         raise ModelSpecError(f"op profile {arch!r} has unknown keys {unknown}")
     kinds = data.get("kinds")
     if not isinstance(kinds, Mapping) or not kinds:
         raise ModelSpecError(f"op profile {arch!r} declares no layer kind")
-    return OpProfile(arch, {
-        str(kind): OpCounts.from_dict(counts, f"{arch}.kinds.{kind}")
-        for kind, counts in kinds.items()
-    })
+    layer_kinds = {str(name): _layer_kind(arch, name, kind) for name, kind in kinds.items()}
+    default = data.get("default")
+    if default is None and len(layer_kinds) == 1:
+        default = next(iter(layer_kinds))
+    if default is not None and default not in layer_kinds:
+        raise ModelSpecError(
+            f"op profile {arch!r} names default kind {default!r}, but its kinds are {sorted(layer_kinds)}"
+        )
+    return OpProfile(arch, layer_kinds, default)
 
 
 def infer_arch(name: Any) -> str:
