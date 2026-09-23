@@ -103,3 +103,67 @@ model/tokenizer loading into `local_files_only` mode. The Offline launcher also
 validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
+
+## Cropped Qwen3.5-MoE
+
+`cropped_qwen3_5_moe.py` and `train_qwen3_5_moe.yaml` build a layer-cropped
+Qwen3.5-35B-A3B text tower the same way, from configuration only. Qwen3.5-MoE
+alternates three `linear_attention` (Gated DeltaNet) layers with one
+`full_attention` layer, so `num_hidden_layers` must stay a multiple of four;
+the builder truncates `layer_types` with it. Only the text tower is built: the
+vision tower and the MTP layer are not part of the causal-LM class.
+
+```bash
+bash examples/training_demo/run_qwen3_5_moe.sh
+```
+
+The launcher generates the Indexed Dataset when absent and defaults to the
+shared cluster model path. Pass a directory as the first argument, or set
+`MODEL_PATH`, to use another copy. `--model.num_experts=32` makes a first pass
+cheaper.
+
+### Topology
+
+The config ships one node of 16 dies with `ep_size: 8`. When scaling out:
+
+| field | rule |
+|---|---|
+| `accelerator.ep_size` | divides `num_experts` (256) and the world size |
+| `fsdp_config.dp_shard_size` | the world size |
+| `fsdp_config.edp_shard_size` | world size / `ep_size`; 1 leaves expert optimizer state unsharded |
+| `training.global_batch_size` | a multiple of `micro_batch_size` x `dp_world_size` |
+
+`tp_size` and `pp_size` stay at 1. TP breaks the Gated DeltaNet grouped
+convolution, because `conv1d` is sharded while `groups` and `conv_dim` stay
+global. The Trainer has no pipeline schedule, so `pp_size` above 1 does not
+raise and does not pipeline: each stage group trains a full replica.
+
+### Multinode
+
+`cluster_qwen3_5_moe.env` is a cluster-kit run config for a four node pool.
+
+```bash
+cluster -c examples/training_demo/cluster_qwen3_5_moe.env torchrun -n 4 \
+    scripts/train_lm.py examples/training_demo/train_qwen3_5_moe.yaml \
+    --fsdp_config.dp_shard_size=64 \
+    --fsdp_config.edp_shard_size=8 \
+    --training.global_batch_size=64
+```
+
+Every node needs the repository, the generated dataset and the compiled
+`_indexed_helpers_cpp` extension. `cluster sync` delivers none of the last two:
+it honours `.gitignore`, which excludes `output/` and `*.so`, and it never
+deletes, so files removed or renamed upstream survive on the targets. A stale
+`hyper_parallel/core/shard/ops/yaml/` is fatal rather than subtle, because the
+op registry globs that directory and rejects any duplicate operator name.
+Mirror the tree instead:
+
+```bash
+for h in <nodes>; do
+    rsync -a --delete --exclude '.git/' \
+        /path/to/hyper-parallel/ root@$h:/path/to/hyper-parallel/
+done
+```
+
+Read the kit's node logs first when a multinode launch fails. A node whose
+environment setup fails exits before training starts and reports it only there.
