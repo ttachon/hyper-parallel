@@ -186,6 +186,7 @@ class _FakeParallelize:
         self.kwargs = kwargs
         self.run_args = None
         self.run_kwargs = None
+        self.compare_args = None
         self.__class__.instances.append(self)
 
     def run_generation_to_ordering(self, *args: Any, **kwargs: Any) -> list:
@@ -193,6 +194,13 @@ class _FakeParallelize:
         self.run_args = args
         self.run_kwargs = kwargs
         return [("parallel-config", 128.0, 1.0, {})]
+
+    def compare_with_csv(self, csv_f: str, output_path: Any = None, plot_idle: bool = False) -> tuple:
+        """Return one measured configuration and its metrics without estimating."""
+        self.compare_args = (csv_f, output_path, plot_idle)
+        real = {"comp": 6.0, "dp_wait": 4.0}
+        configs = [(Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP]), 1, 10.0, 10.0, [1.0] * 9, real)]
+        return configs, Debug.correlation_with_classified_comms(configs)
 
     def last_run_kwargs(self) -> dict:
         """Return keyword arguments from the latest fake run call."""
@@ -1235,6 +1243,99 @@ class TestSappNDRunND(unittest.TestCase):
         metric_data = (correls, distances, topk, total)
         self.assertIn("total", Debug.print_part_x_file([metric_data], Debug.get_distance_i))
         self.assertIsNone(Debug.print_correlations_classified([metric_data]))
+
+    def test_classified_comparison_report_and_distances(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Format measured versus estimated parts and compute per-configuration distances.
+        Expectation: Shares are over each side's total, idle is the measured remainder,
+            and TOTAL keeps one distance per configuration.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 4), (Dim.OP, 4)], all_dims=[Dim.DP, Dim.OP])
+        # FW, BW, RECOMPUTE, DP, MP, EP, CP, PP, BUBBLE: ND compute 6, DP 2, EP 1, PP + bubble 1.
+        estimations = [2.0, 3.0, 1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+        real = {"comp": 5.0, "dp_wait": 2.0, "mp_wait": 0.0, "ep_wait": 1.0, "cp_wait": 0.0,
+                "pp_wait": 1.0, "op_wait": 1.0, "sp_wait": 0.0}
+        doubled = {part: 2 * value for part, value in real.items()}
+        configs_estimated = [(dims, 1, 12.0, 10.0, estimations, real),
+                             (dims, 1, 24.0, 10.0, estimations, doubled)]
+
+        report = Debug.format_classified_comparison(configs_estimated[:1])
+        rows = {line.split()[0]: line.split()[1:] for line in report.splitlines()[2:]}
+        self.assertEqual(rows["comp"], ["5", "41.7%", "60.0%", "-18.3%"])
+        self.assertEqual(rows["dp_wait"], ["3", "25.0%", "20.0%", "+5.0%"])
+        self.assertEqual(rows["idle"], ["2", "16.7%", "-"])
+
+        _, distances, _, total = Debug.correlation_with_classified_comms(configs_estimated)
+        self.assertEqual(total, 2)
+        self.assertEqual(len(distances[Debug.RealParts.TOTAL]), 2)
+        self.assertAlmostEqual(Debug.get_distance_i(Debug.RealParts.TOTAL, ({}, distances, 0, total)),
+                               sum(distances[Debug.RealParts.TOTAL]) / 2)
+
+    def test_compare_with_csv_without_debug_logging(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Estimate the configurations of a classified CSV with debug logging off.
+        Expectation: The per-part split is still collected, debug.csv is not written,
+            and both the estimates and the metrics are returned.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
+        runner.memory_estim = lambda: 32
+
+        def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
+            """Fill two parts the way estimate_performance does and return the score."""
+            debugger.info[Debug.PerfParts.FW_COMPUTE] = 6.0
+            debugger.info[Debug.PerfParts.DP_COMM] = 4.0
+            return 10.0
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = os.path.join(tmp_dir, "real.csv")
+            with open(csv_path, "w", encoding="utf-8") as csv_file:
+                csv_file.write("DP,OP,time,comp,dp_wait,mp_wait,ep_wait,cp_wait,pp_wait\n4,4,12,5,6,0,0,0,0\n")
+            with patch.object(Par, "estimate_performance", side_effect=fake_estimate), \
+                    patch.object(Debug.Debug, "write") as write:
+                configs_estimated, metrics = runner.compare_with_csv(csv_path)
+
+        write.assert_not_called()
+        self.assertEqual(len(configs_estimated), 1)
+        _, _, real_time, score, values, _ = configs_estimated[0]
+        self.assertEqual((real_time, score), (12.0, 10.0))
+        self.assertEqual(values[Debug.PerfParts.DP_COMM.value - 1], 4.0)
+        self.assertEqual(metrics[3], 1)
+
+    def test_run_nd_cli_real_csv_compares_instead_of_searching(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Run the run_nd CLI with --real_csv on a fake Parallelize.
+        Expectation: The runner compares with the CSV and exits without searching;
+            a missing CSV is rejected before any runner is built.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            real_csv = os.path.join(tmp_dir, "real.csv")
+            with open(real_csv, "w", encoding="utf-8") as csv_file:
+                csv_file.write("DP,time,comp,dp_wait\n8,10,6,4\n")
+            out_dir = os.path.join(tmp_dir, "cmp")
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0", "--real_csv", real_csv, "-o", out_dir]
+            with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as done:
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(done.exception.code, 0)
+            instance = _FakeParallelize.instances[-1]
+            self.assertEqual(instance.compare_args, (real_csv, out_dir, True))
+            self.assertIsNone(instance.last_run_kwargs())
+            self.assertTrue(os.path.isdir(out_dir))
+
+            argv[argv.index(real_csv)] = os.path.join(tmp_dir, "missing.csv")
+            _FakeParallelize.instances = []
+            with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as missing:
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(missing.exception.code, 2)
+            self.assertEqual(_FakeParallelize.instances, [])
 
     def test_debug_plot_data_helpers(self) -> None:
         """

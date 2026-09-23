@@ -73,6 +73,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-mppb | --manual_pipeline_balance]
     [-t TOP_CONFIG_NUMBER]
     [-mem MEM_FOR_PPB]
+    [--real_csv REAL_CSV [-o OUTPUT_DIR]]
 ```
 
 - `-y`, `--yaml_config`: path to the framework yaml configuration file.
@@ -85,10 +86,11 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-mppb`, `--manual_pipeline_balance`: read offset and recompute from yaml.
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
+- `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plot is written there.
 
 ## Comparing with a Profiled Run
 
-`ParallelizeLayer.test_from_csv_comm_classified` compares ND's estimate with a measured run. `nd.trace_classify` writes its input CSV from per-rank `torch.profiler` traces recorded with `with_stack=True`:
+`nd.trace_classify` turns per-rank `torch.profiler` traces recorded with `with_stack=True` into the measured-run CSV ND compares against:
 
 ```bash
 python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify traces/rank*.pt.trace.json.gz \
@@ -97,6 +99,15 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify traces/rank*.pt
 ```
 
 Each profiled step is split into `comp`, one `<dim>_wait` per parallelism type and the idle rest. A wait is time blocked in communication, typed by the HyperParallel module that issued it; the CSV holds the mean over steps and ranks. `--perf-parts` writes the same step in the columns of ND's `debug.csv`, and `--detail` keeps every rank and step by call site. `--dims` takes the acronyms of `-l` except `SP`, which ND reads back as true whatever its value. The split measures host-side blocking, which is exact for host-synchronous backends such as gloo.
+
+Then run ND on the same model and cluster with `--real_csv`:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd -f hyper_v2 -y train.yaml -d 4 \
+    --real_csv real.csv -o compare/
+```
+
+ND estimates every configuration in the CSV and prints, per configuration, each part's measured value and share next to ND's share of its own score, then the correlation and distance of every part across configurations. Shares make the two comparable despite ND's score units. Correlations need at least two configurations. ND has no idle term, so the measured idle share is what the estimate does not account for.
 
 ## Structure
 

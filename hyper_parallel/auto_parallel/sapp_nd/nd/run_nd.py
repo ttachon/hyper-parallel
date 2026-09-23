@@ -21,8 +21,26 @@ import sys
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+
+
+def _compare_with_real_csv(runner, cli_args):
+    """Print ND's estimate next to the configurations measured in a classified CSV.
+
+    Args:
+        runner: The ND runner built from the CLI arguments.
+        cli_args: The parsed CLI namespace. Requires ``real_csv``; ND's
+            real-versus-estimate plot goes to ``output_dir`` when it is set.
+    """
+    if cli_args.output_dir is not None:
+        os.makedirs(cli_args.output_dir, exist_ok=True)
+    configs_estimated, metrics = runner.compare_with_csv(
+        cli_args.real_csv, output_path=cli_args.output_dir, plot_idle=True
+    )
+    logger.output("%s", Debug.format_classified_comparison(configs_estimated))
+    Debug.print_correlations_classified([metrics])
 
 
 def _run_hyper_v2_search(cli_parser, cli_args):
@@ -269,10 +287,20 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Directory for output files when using --search-config "
-        "(default: current directory).",
+        "(default: current directory), and for the real-versus-estimate "
+        "plot of --real_csv (no plot when omitted).",
+    )
+    parser.add_argument(
+        "--real_csv",
+        type=str,
+        default=None,
+        help="Instead of searching, compare ND's estimate with the configurations "
+        "measured in a classified profiling CSV (see nd.trace_classify).",
     )
 
     args = parser.parse_args()
+    if args.real_csv is not None and not os.path.isfile(args.real_csv):
+        parser.error(f"real_csv not found: {args.real_csv}")
 
     max_mem = (
         Memory.from_string(args.max_mem.strip())
@@ -342,6 +370,10 @@ if __name__ == "__main__":
         mem_for_ppb=Memory.from_string(args.mem_for_ppb.strip()),
         # vpp_less_mem=args.less_memory,
     )
+
+    if args.real_csv is not None:
+        _compare_with_real_csv(nd_runner, args)
+        sys.exit(0)
 
     if YAML_FOLDER and not os.path.exists(YAML_FOLDER):
         os.makedirs(YAML_FOLDER)

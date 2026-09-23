@@ -452,9 +452,8 @@ class ParallelizeLayer:
         scored_space = []
         debug_parts = []
         for config, real_time, real_comm_wait in space:
-            debugger = Debug.Debug(
-                config, info_type=Debug.PerfParts, enable=self.enable_debug
-            )
+            # The comparison needs the per-part split at any verbosity; debug.csv stays opt-in.
+            debugger = Debug.Debug(config, info_type=Debug.PerfParts, enable=True)
             self.config.set_parallel_config(config)
             peak_mem = self.memory_estim()
             score = estimate_performance(
@@ -463,7 +462,8 @@ class ParallelizeLayer:
                 device_type=self.machine.device,
                 stage_focused=0,
             )  # , memory = mem)
-            debugger.write()
+            if self.enable_debug:
+                debugger.write()
             debug_parts = list(debugger.info.keys())
             values = list(debugger.info.values())
             del values[-2:]
@@ -614,6 +614,24 @@ class ParallelizeLayer:
         self, csv_f, output_path=None, plot_idle=False
     ):
         """Run test to compare estimation with detailed profiling"""
+        return self.compare_with_csv(csv_f, output_path=output_path, plot_idle=plot_idle)[1]
+
+    def compare_with_csv(
+        self, csv_f: str, output_path: Optional[str] = None, plot_idle: bool = False
+    ) -> Tuple[list, Any]:
+        """Estimate every measured configuration of a classified profiling CSV.
+
+        Args:
+            csv_f: CSV read by ``Debug.get_comm_classified_data``, e.g. written by
+                ``nd.trace_classify``.
+            output_path: Directory for ND's real-versus-estimate plot; no plot when None.
+            plot_idle: Whether the measured bars include the idle remainder.
+
+        Returns:
+            ``(configs_estimated, metrics)``: one ``(config, peak_mem, real_time, score,
+            values, real_parts)`` entry per measured configuration, ordered by measured
+            time, and ``Debug.correlation_with_classified_comms`` over them.
+        """
         configs = Debug.get_comm_classified_data(csv_f, plot_idle=plot_idle)
         configs_estimated, debug_parts = self.order_space_test_comm_classified(
             configs, order_by=2
@@ -629,7 +647,7 @@ class ParallelizeLayer:
                 plot_idle=plot_idle,
             )
 
-        return Debug.correlation_with_classified_comms(configs_estimated)
+        return configs_estimated, Debug.correlation_with_classified_comms(configs_estimated)
 
 
 class ParallelizeMultiModal(ParallelizeLayer):

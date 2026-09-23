@@ -14,8 +14,8 @@
 # ============================================================================
 """Split profiled training steps into ND's real-profiling parts.
 
-``ParallelizeLayer.test_from_csv_comm_classified`` compares ND's estimate with a
-measured run given as a CSV of per-part times (read by
+``run_nd --real_csv`` (``ParallelizeLayer.compare_with_csv``) compares ND's
+estimate with a measured run given as a CSV of per-part times (read by
 ``debug.get_comm_classified_data``). This module writes that CSV from
 ``torch.profiler`` Chrome traces, one per rank.
 
