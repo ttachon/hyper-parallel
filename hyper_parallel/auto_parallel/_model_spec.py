@@ -95,7 +95,6 @@ class OpCounts:
     attMM: int     # attention projections: q, k, v, o
     attBMM: int    # attention batched matmuls: QK^T and AV
     ffMM: int      # feed-forward projections, e.g. 3 for a gated MLP
-    ffBMM: int     # feed-forward projections run as batched matmuls
     softmax: int
     dropout: int
     normOp: int

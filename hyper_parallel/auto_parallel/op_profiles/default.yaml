@@ -10,7 +10,6 @@ kinds:
     attMM: 4      # q, k, v and o projections
     attBMM: 2     # QK^T and AV
     ffMM: 3       # gate, up and down projections
-    ffBMM: 0      # feed-forward projections run as one batched matmul
     softmax: 1
     dropout: 0
     normOp: 2

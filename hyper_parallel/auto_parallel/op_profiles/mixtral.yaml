@@ -1,10 +1,9 @@
-# Mixtral: the experts' feed-forward is priced as one batched matmul.
+# Mixtral: gated experts, two softmaxes and five normalisations per layer.
 kinds:
   decoder:
     attMM: 4
     attBMM: 2
-    ffMM: 0
-    ffBMM: 3
+    ffMM: 3
     softmax: 2
     dropout: 0
     normOp: 5

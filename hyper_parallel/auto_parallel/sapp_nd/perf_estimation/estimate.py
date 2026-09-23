@@ -53,7 +53,6 @@ def op_table(cfg):
     )
     table["n_ffMM"] = 6 * cfg.b * cfg.s * cfg.h * cfg.hff
     table["n_attBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.h
-    table["n_ffBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.hff
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
@@ -89,9 +88,6 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
 
     table_exp = deepcopy(table)  # Verify this with MF MoEV2
     table_exp["n_ffMM"] *= (
-        cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
-    )
-    table_exp["n_ffBMM"] *= (
         cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
     )
 

@@ -159,7 +159,7 @@ class TestPerformanceAgreesWithMemory(unittest.TestCase):
             "dataset": {"data_transform": {"max_seq_len": 2048}},
             "context": {"max_device_memory": "64GB", "device_num": 4},
         }, framework="hyper_v2")
-        counts = {"attMM": 4, "attBMM": 2, "ffMM": 3, "ffBMM": 0, "softmax": 1,
+        counts = {"attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1,
                   "dropout": 0, "normOp": 2, "gather": 4, "headCast": 1, "ffAct": 1}
         ccfg.op_counts = {
             "decoder": OpCounts.from_dict(counts),

@@ -80,7 +80,7 @@ def _make_ccfg(**overrides):
         "bw_intra": 400.0, "bw_inter": 25.0, "cp_algo": "colossalai_cp",
         "comm_cp": 1, "comm_t": 1, "comm_ep": 1,
         "n_softmax": 4, "n_attBMM": 4, "n_attMM": 4, "n_attParamCast": 0,
-        "n_ffMM": 4, "n_ffBMM": 4, "n_ffParamCast": 0, "n_normOp": 2,
+        "n_ffMM": 4, "n_ffParamCast": 0, "n_normOp": 2,
         "n_dropout": 1, "n_exp": 1, "n_shared_exp": 0, "n_chosen_exp": 1,
         "cap_fact": 1.0, "gmm": False, "hff": 28672,
         "bytes_compute": 2, "bytes_softmax": 2, "bytes_dropout": 2,

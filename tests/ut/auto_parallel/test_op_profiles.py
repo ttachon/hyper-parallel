@@ -29,7 +29,7 @@ from hyper_parallel.auto_parallel._op_profiles import (
 def _counts(**overrides) -> dict:
     """The default decoder's op counts, with *overrides* applied."""
     counts = {
-        "attMM": 4, "attBMM": 2, "ffMM": 3, "ffBMM": 0, "softmax": 1,
+        "attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1,
         "dropout": 0, "normOp": 2, "gather": 4, "headCast": 1, "ffAct": 1,
     }
     counts.update(overrides)

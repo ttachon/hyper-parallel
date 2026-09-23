@@ -168,7 +168,7 @@ class EvalFFn:
         """Parameters count"""
         experts_param_size = (
             (ccfg.n_exp + ccfg.n_shared_exp)
-            * max(ccfg.n_ffMM, ccfg.n_ffBMM)
+            * ccfg.n_ffMM
             * (ccfg.hff * ccfg.h + ccfg.hff)
         )
         return experts_param_size
@@ -177,19 +177,19 @@ class EvalFFn:
     def num_params_routed_expert(ccfg: CostModelConfig, _) -> float:
         """Routed expert parameters count (with ETP correction)"""
         hff_sliced = ccfg.hff_exp / max(ccfg.etp, 1)
-        return ccfg.n_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (hff_sliced * ccfg.h + hff_sliced)
+        return ccfg.n_exp * ccfg.n_ffMM * (hff_sliced * ccfg.h + hff_sliced)
 
     @staticmethod
     def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
         """Shared expert parameters count"""
-        return ccfg.n_shared_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (ccfg.hff * ccfg.h + ccfg.hff)
+        return ccfg.n_shared_exp * ccfg.n_ffMM * (ccfg.hff * ccfg.h + ccfg.hff)
 
     @staticmethod
     def ffn_activations(ccfg: CostModelConfig, ctx: Context) -> float:
         """ "Activations count"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         tok_size = ccfg.s * ccfg.b
-        n_mm = max(ccfg.n_ffMM, ccfg.n_ffBMM)
+        n_mm = ccfg.n_ffMM
         if n_mm % 2 == 0:
             matmul = 0.5 * ccfg.h + 0.5 * ccfg.hff
         else:

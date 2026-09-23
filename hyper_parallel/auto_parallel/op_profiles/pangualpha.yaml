@@ -4,7 +4,6 @@ kinds:
     attMM: 4
     attBMM: 1
     ffMM: 2
-    ffBMM: 0
     softmax: 2
     dropout: 5
     normOp: 4

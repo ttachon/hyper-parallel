@@ -50,21 +50,22 @@ _SAPP_ND = os.path.join(
     *[os.pardir] * 5, "hyper_parallel", "auto_parallel", "sapp_nd",
 )
 
-_OPS = ("attMM", "attBMM", "ffMM", "ffBMM", "softmax", "dropout", "normOp", "gather")
+_OPS = ("attMM", "attBMM", "ffMM", "softmax", "dropout", "normOp", "gather")
 
 # The literal op counts each arch hook assigned before the counts became
-# profiles, in _OPS order.  headCast and ffAct were pinned to 1 by the
-# estimator for every family.
+# profiles, in _OPS order, except that mixtral's three expert projections
+# were counted as batched matmuls and now count as the matmuls they are.
+# headCast and ffAct were pinned to 1 by the estimator for every family.
 _LEGACY_OPS = {
-    "default": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
-    "llama2": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
-    "qwen": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
-    "deepseek": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
-    "cm": {"decoder": (4, 2, 3, 0, 1, 0, 2, 4)},
-    "mixtral": {"decoder": (4, 2, 0, 3, 2, 0, 5, 4)},
-    "pangualpha": {"decoder": (4, 1, 2, 0, 2, 5, 4, 4)},
-    "t5": {"encoder": (4, 1, 2, 0, 2, 5, 2, 4), "decoder": (8, 2, 2, 0, 4, 7, 3, 6)},
-    "vision": {"encoder": (4, 2, 2, 0, 1, 0, 2, 4)},
+    "default": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
+    "llama2": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
+    "qwen": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
+    "deepseek": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
+    "cm": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
+    "mixtral": {"decoder": (4, 2, 3, 2, 0, 5, 4)},
+    "pangualpha": {"decoder": (4, 1, 2, 2, 5, 4, 4)},
+    "t5": {"encoder": (4, 1, 2, 2, 5, 2, 4), "decoder": (8, 2, 2, 4, 7, 3, 6)},
+    "vision": {"encoder": (4, 2, 2, 1, 0, 2, 4)},
 }
 
 # The byte widths the same hooks set: (bytes_grad at p > 1, at p == 1, bytes_dropout).

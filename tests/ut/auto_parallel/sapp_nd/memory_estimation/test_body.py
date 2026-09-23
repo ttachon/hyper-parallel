@@ -65,7 +65,6 @@ def _make_ccfg(
     ccfg.ep = ep
     ccfg.etp = etp
     ccfg.n_ffMM = 1
-    ccfg.n_ffBMM = 0
     ccfg.bytes_p = bytes_p
     ccfg.bytes_os = bytes_os
     ccfg.bytes_grad = bytes_grad
@@ -305,7 +304,7 @@ class TestNumParamsRoutedExpert(unittest.TestCase):
         """BD-R01: routed expert params with etp=1 (no TP slicing)."""
         ccfg = _make_ccfg(n_exp=8, h=4096, hff_exp=2048, etp=1)
         result = EvalFFn.num_params_routed_expert(ccfg, None)
-        # n_exp * max(n_ffMM, n_ffBMM) * (hff_exp * h + hff_exp) = 8 * 1 * (2048*4096 + 2048)
+        # n_exp * n_ffMM * (hff_exp * h + hff_exp) = 8 * 1 * (2048*4096 + 2048)
         expected = 8 * 1 * (2048 * 4096 + 2048)
         self.assertAlmostEqual(result, expected, places=0)
 
