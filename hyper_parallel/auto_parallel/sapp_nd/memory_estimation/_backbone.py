@@ -43,6 +43,10 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 EVAL_YML = os.path.join(current_dir, "configs_eval/default.yaml")
 
 
+def _no_hook(_) -> None:
+    """The hook recorded for a layer whose group has none."""
+
+
 class _Backbone:
     """backbone class"""
 
@@ -558,13 +562,13 @@ class _Backbone:
                 record_lay_types[(stage_id, chunk_id, lay_id)] = (
                     self._ccfg,
                     self._ctx,
-                    lambda _: None,
+                    _no_hook,
                 )
         else:
             record_lay_types[(stage_id, chunk_id, lay_id)] = (
                 self._ccfg,
                 self._ctx,
-                lambda _: None,
+                _no_hook,
             )
         if verbose:
             logger.info(
@@ -623,6 +627,7 @@ class _Backbone:
                             self._ccfg,
                             self._ctx,
                             sm["stat"][stage_id][chunk_id][lay_id],
+                            record_lay_types[(stage_id, chunk_id, lay_id)][2],
                         )
                         self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
                     elif compute_ppb == 2:

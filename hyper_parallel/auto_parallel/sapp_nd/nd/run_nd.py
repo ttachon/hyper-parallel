@@ -215,13 +215,15 @@ if __name__ == "__main__":
         "0 being no output and 6 being debug level output. "
         "Plot and debug csv are generated from 2",
     )
-    # parser.add_argument(
-    #     "-k",
-    #     "--ppb_k",
-    #     type=int,
-    #     default=None,
-    #     help="choose configuration number k for ppb",
-    # )
+    parser.add_argument(
+        "-k",
+        "--ppb_k",
+        type=int,
+        default=None,
+        help="Write the pipeline balancer's layer description, with per-layer "
+        "times for every recompute option, of the k-th ranked configuration "
+        "(0 is the best) to the output directory.",
+    )
     parser.add_argument(
         "-A",
         "--device_type",
@@ -392,3 +394,9 @@ if __name__ == "__main__":
         top_num=args.top_config_number,
         cache_file=args.cache_file,
     )
+
+    if args.ppb_k is not None:
+        if not 0 <= args.ppb_k < len(space):
+            parser.error(f"-k/--ppb_k: {len(space)} configurations were ranked, got {args.ppb_k}")
+        yaml_name = os.path.splitext(os.path.basename(str(args.yaml_config)))[0]
+        nd_runner.to_ppb(space, args.ppb_k, yaml_name)

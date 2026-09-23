@@ -15,7 +15,7 @@
 """performance estimation"""
 import json
 from copy import deepcopy
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 import numpy as np
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
@@ -420,6 +420,99 @@ def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
     if debugger and debugger.is_enabled():
         debugger.info[PerfParts.PP_COMM] = p2p
     return p2p
+
+
+def estimate_layer_times(
+    cfg: CostModelConfig,
+    hook: Optional[Callable],
+    layer_type: LayerType,
+    device_type: Any,
+    ccfg: Optional[CustomConfig] = None,
+) -> Tuple[float, float]:
+    """Forward and backward time of one layer, priced as a stage prices it.
+
+    Runs the compute, communication and stage estimates of
+    :func:`estimate_performance` on one layer of the group *hook* makes, alone
+    in the first stage of a copy of *cfg*. For a stage whose layers all belong
+    to one group, the sum of their times is what the search charges the stage
+    before pipeline bubbles and point-to-point communication. The search
+    prices each layer on a config the previous layers' hooks have run on, so a
+    stage that mixes groups, or holds the embedding or output layer, can
+    differ by a few percent; here every layer is priced in its own group's
+    state, wherever it sits.
+
+    Args:
+        cfg: The model's cost-model config, before its layer hooks run.
+        hook: The layer group's hook; ``None`` for the embedding and output.
+        layer_type: How the layer runs: plain, selective or full recompute,
+            embedding or output.
+        device_type: The device the communication is priced on.
+        ccfg: Estimator options; the search's defaults when omitted.
+
+    Returns:
+        ``(forward, backward)``, *backward* including the layer's recompute.
+    """
+    ccfg = ccfg if ccfg is not None else CustomConfig()
+
+    def _alone() -> Tuple[CostModelConfig, list]:
+        # A fresh copy each time: the communication estimate applies the
+        # layer's hook to the config it is given.
+        single = deepcopy(cfg)
+        single.layer_custom_config = [(1, hook)]
+        single.n = single.d * single.t * single.p
+        stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]
+        stages[0][0] = [layer_type]
+        return single, stages
+
+    single, stages = _alone()
+    comp = estimate_comp(single, ccfg, stages)[0]
+    recomp = comp
+    if ccfg.retype in {RecType.COMPUTE_ONLY, RecType.WITH}:
+        recomp = estimate_comp(single, ccfg, stages, with_recomp=True)[0]
+
+    # After this call *grouped* carries the layer's hook, as a layer of its
+    # group would when the stage estimate weighs it.
+    grouped, stages = _alone()
+    comm = estimate_comm(grouped, ccfg, stages, device_type)[0]
+    recomm = comm
+    if ccfg.retype in {RecType.COMM_ONLY, RecType.WITH}:
+        fresh, fresh_stages = _alone()
+        recomm = estimate_comm(fresh, ccfg, fresh_stages, device_type, with_recomp=True)[0]
+
+    once = estimate_stage(grouped, ccfg, [comp], [comm], [comp], [comm])[0]
+    total = estimate_stage(grouped, ccfg, [comp], [comm], [recomp], [recomm])[0]
+    forward = once / (1 + BACKWARD_RATIO)
+    return forward, total - forward
+
+
+class LayerTimes:
+    """Prices the layers of a pipeline balancer's layer description.
+
+    The memory backbone calls it for every layer it describes, with the config
+    it walks and the layer's hook. A config is copied the first time it is
+    seen, at its embedding layer, before the walk runs any layer hook on it,
+    and each hook and layer type is priced once.
+    """
+
+    def __init__(self, device_type: Any, ccfg: Optional[CustomConfig] = None) -> None:
+        """Price on *device_type*, with the estimator options *ccfg*."""
+        self._device_type = device_type
+        self._ccfg = ccfg
+        self._base = {}
+        self._times = {}
+
+    def __call__(
+        self, cfg: CostModelConfig, hook: Optional[Callable], layer_type: LayerType
+    ) -> Tuple[float, float]:
+        """``(forward, backward)`` of a *layer_type* layer of *hook*'s group."""
+        if id(cfg) not in self._base:
+            self._base[id(cfg)] = deepcopy(cfg)
+        key = (id(cfg), hook, layer_type)
+        if key not in self._times:
+            self._times[key] = estimate_layer_times(
+                self._base[id(cfg)], hook, layer_type, self._device_type, self._ccfg
+            )
+        return self._times[key]
 
 
 def apply_regression_coefficients(coeffs, debugger, old_perf):

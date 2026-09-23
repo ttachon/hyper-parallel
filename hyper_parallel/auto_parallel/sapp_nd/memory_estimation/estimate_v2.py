@@ -31,7 +31,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._hook_manager import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, Union
+    from typing import Any, Callable, Dict, Optional, Union
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 
@@ -102,10 +102,28 @@ class EvaluatorV2(_Utils, _HookManager):
         return insights
 
     def estimate_layer_memory(
-        self, stages: list = None, ppb_format=1, device_type=Hard.Device_A2
+        self,
+        stages: list = None,
+        ppb_format=1,
+        device_type=Hard.Device_A2,
+        layer_times: Optional[Callable] = None,
     ) -> Dict:
-        """PPB's input"""
+        """PPB's input
+
+        Args:
+            layer_times: Prices a layer as ``(forward, backward)`` from its
+                config, hook and layer type, such as
+                ``perf_estimation.estimate.LayerTimes``. With it, every layer
+                description carries its times instead of a placeholder, and
+                the result is not cached.
+        """
         logger.info(device_type)
+        if layer_times is not None:
+            self._ppb_obj.layer_times = layer_times
+            try:
+                return self._estimate_on_copy(stages, False, ppb_format, -1, False)[1]
+            finally:
+                self._ppb_obj.layer_times = None
         if self.ppb:
             return self.ppb
         res = self._estimate_on_copy(stages, False, ppb_format, -1, False)

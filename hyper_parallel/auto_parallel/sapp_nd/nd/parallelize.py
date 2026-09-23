@@ -24,7 +24,7 @@ import logging
 from typing import Any, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -558,43 +558,46 @@ class ParallelizeLayer:
                 )
         return scored_space
 
-    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any) -> None:
-        """Create an input file for pipeline balancing"""
+    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any, folder: Optional[str] = None) -> str:
+        """Write the pipeline balancer's layer description of the k-th configuration.
+
+        Every layer carries its forward time and the backward time of each of
+        its recompute options, priced by the estimate the search scores with.
+
+        Args:
+            scored_space: The ordered search space.
+            k: Rank of the configuration to describe.
+            cfg_name: Prefix of the model name the balancer is given.
+            folder: Where to write; ND's output directory by default.
+
+        Returns:
+            The path of the file written.
+        """
         parallel_config = scored_space[k][0]
         self.config.set_parallel_config(parallel_config)
-        self.mem_eval.update_config(self.config)
-        m = cfg_name + "_nd_to_ppb_" + str(k)
-        s = self.config.dim_val(Dim.PP, parallel_config)
-        mb = self.config.dim_val(Dim.MBN, parallel_config)
-        i = self.config.dim_val(Dim.VPP, parallel_config)
-        mem = str(self.config.ccfg.device_capacity.to_mb)
-        filename = (
-            os.path.dirname(os.path.realpath(__file__))
-            + "/../pipeline_balance/layers/"
-            + m
-            + ".json"
+        self.mem_eval.set_config(self.config.ccfg)
+        name = f"{cfg_name}_nd_to_ppb_{k}"
+        folder = os.path.abspath(folder or Debug.output_dir())
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name + ".json")
+        description = self.mem_eval.estimate_layer_memory(
+            device_type=self.machine.device,
+            layer_times=LayerTimes(self.machine.device),
         )
-        with open(filename, "w+", encoding="utf-8") as fp:
-            json.dump(
-                self.mem_eval.estimate_layer_memory(
-                    device_type=self.machine.device
-                ),
-                fp,
-                indent=4,
-            )
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(description, fp, indent=4)
         logger.output(
             "To run pipeline balancing on configuration %s:"
-            "\npython run_pipeline_balance.py "
-            "-m %d -s %d -mb %d -i %d -mem %d",
+            "\npython run_pipeline_balance.py -lf %s -m %s -s %s -mb %s -i %s -mem %s",
             parallel_config,
-            m,
-            s,
-            mb,
-            i,
-            mem,
+            folder,
+            name,
+            self.config.dim_val(Dim.PP, parallel_config),
+            self.config.dim_val(Dim.MBN, parallel_config),
+            self.config.dim_val(Dim.VPP, parallel_config),
+            int(self.config.ccfg.device_capacity.to_mb().size),
         )
-        logger.output("Warning: currently select_recompute_memory \
-                should be removed & layer time need to be added")
+        return path
 
     def test_from_csv(self, csv_f, output_path=None):
         """Run estimation tests against a real run profiling in csv format"""

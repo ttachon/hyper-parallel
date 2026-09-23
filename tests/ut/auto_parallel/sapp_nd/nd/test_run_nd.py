@@ -187,6 +187,7 @@ class _FakeParallelize:
         self.kwargs = kwargs
         self.run_args = None
         self.run_kwargs = None
+        self.to_ppb_calls = []
         self.__class__.instances.append(self)
 
     def run_generation_to_ordering(self, *args: Any, **kwargs: Any) -> list:
@@ -194,6 +195,10 @@ class _FakeParallelize:
         self.run_args = args
         self.run_kwargs = kwargs
         return [("parallel-config", 128.0, 1.0, {})]
+
+    def to_ppb(self, *args: Any) -> None:
+        """Record which configuration the CLI hands to pipeline balancing."""
+        self.to_ppb_calls.append(args)
 
     def last_run_kwargs(self) -> dict:
         """Return keyword arguments from the latest fake run call."""
@@ -802,6 +807,29 @@ class TestSappNDRunND(unittest.TestCase):
             (2, 5, 1, 1), (4, 1), (4, 1, 2, False)
         )
         self.assertTrue(gc_etp.ep_constraints_valid(pc_etp))
+
+    def test_run_nd_cli_writes_the_ppb_description_of_rank_k(self) -> None:
+        """
+        Feature: run_nd -k/--ppb_k.
+        Description: Rank the space, then ask for the pipeline balancer's
+            description of rank 0, then of a rank the space does not have.
+        Expectation: Rank 0 is handed to to_ppb under the yaml's name; the
+            missing rank is refused before anything is written.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-k", "0"]
+            with patch.object(sys, "argv", argv):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].to_ppb_calls,
+                             [([("parallel-config", 128.0, 1.0, {})], 0, "deepseek")])
+
+            argv[-1] = "1"
+            with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].to_ppb_calls, [])
 
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """

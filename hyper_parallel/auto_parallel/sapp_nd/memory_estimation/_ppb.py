@@ -15,7 +15,7 @@
 """PPB input module"""
 from __future__ import annotations
 
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 from types import SimpleNamespace
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
@@ -40,6 +40,9 @@ class _PPB:
         self.eval_cfg = eval_cfg
         self._inner_dynamic_mem = inner_dyn_fun
         self.mb = EvalUtils.mb
+        # Prices a layer as ``(forward, backward)`` from its config, hook and
+        # layer type; set while a description with times is being built.
+        self.layer_times: Optional[Callable] = None
 
     @staticmethod
     def add_to_ppb_list(ppb_lay_desc: list, desc: dict) -> None:
@@ -62,8 +65,14 @@ class _PPB:
                     desc["name"] = desc["type"]
                 ppb_lay_desc += [desc]
 
-    def lay_ppb(self, ccfg: CostModelConfig, ctx: Context, res_stat: float) -> dict:
-        """layer description preparation"""
+    def lay_ppb(
+        self, ccfg: CostModelConfig, ctx: Context, res_stat: float, hook: Optional[Callable] = None
+    ) -> dict:
+        """layer description preparation
+
+        With ``layer_times`` set, the description also carries the layer's
+        times, priced with *hook*, the hook of the layer's group.
+        """
         desc = {"model_name": ccfg.model_name}
         original_enable_node_log = ctx.enable_node_log
         ctx.enable_node_log = False
@@ -95,7 +104,31 @@ class _PPB:
                 desc["time"] = 1
         finally:
             ctx.enable_node_log = original_enable_node_log
+        if self.layer_times is not None:
+            self._time_ppb(desc, ccfg, hook)
         return desc
+
+    def _time_ppb(self, desc: dict, ccfg: CostModelConfig, hook: Optional[Callable]) -> None:
+        """Add the layer's forward time and the backward time of each option.
+
+        The keys are the ones the pipeline balancer reads. A selective option
+        whose switches keep every op is the plain layer again, and offering it
+        would hand the balancer a tie, so it is withdrawn.
+        """
+        end = {"HEAD": LayerType.EMBEDDING_LAYER, "TAIL": LayerType.OUTPUT_LAYER}.get(desc["type"])
+        if end is not None:
+            desc["forward_time"], desc["backward_time"] = self.layer_times(ccfg, None, end)
+        else:
+            desc["forward_time"], desc["backward_time"] = self.layer_times(
+                ccfg, hook, LayerType.NOT_REC_LAYER
+            )
+            desc["recompute_time"] = self.layer_times(ccfg, hook, LayerType.FULL_REC_LAYER)[1]
+            switches = vars(ccfg.rec_op) if ccfg.rec_op is not None else {}
+            if not all(switches.values()):
+                desc["select_rec_time"] = self.layer_times(ccfg, hook, LayerType.SEL_REC_LAYER)[1]
+            else:
+                del desc["memory_select_rec"]
+        desc["time"] = desc["forward_time"]
 
     def ppb_combine_bodies(self, ppb_lay_desc: list) -> None:
         """combine descriptions into a new body"""
