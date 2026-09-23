@@ -208,6 +208,7 @@ class TestPerformanceAgreesWithMemory(unittest.TestCase):
         return _hybrid_config(self.folder, [FULL, FULL, LINEAR, LINEAR] * 2, pp=2, vp=2, sched=sched)
 
     def _check(self, sched: str) -> None:
+        """Assert the performance and memory paths give every layer the same kind."""
         ccfg = self._stack(sched)
         stages = ccfg.generate_partitions_vpp()
         perf = {pos: cfg.n_softmax for pos, cfg in get_layer_configs_by_position(ccfg, stages).items()}

@@ -199,9 +199,8 @@ def _describe_parallelism(
     for short_key, canonical_key in _UNIFIED_DIM_MAP.items():
         candidates = search_space.get(canonical_key)
         if short_key in _NOT_SEARCHABLE:
-            state = "fixed %s (no ND dimension)" % (
-                candidates[0] if candidates else "default"
-            )
+            fixed = candidates[0] if candidates else "default"
+            state = f"fixed {fixed} (no ND dimension)"
         elif canonical_key in auto_dims:
             state = "searched (auto)"
         elif candidates is None:
