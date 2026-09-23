@@ -189,20 +189,22 @@ class LayerGroup:
         return out
 
 
-def layers_from_list(data: Any) -> Tuple[LayerGroup, ...]:
+def layers_from_list(data: Any, where: str = "layers") -> Tuple[LayerGroup, ...]:
     """Parse a list of groups, the serialised form of ``ModelSpec.layers``."""
     if not isinstance(data, (list, tuple)) or not data:
-        raise ModelSpecError(f"layers must list at least one group, got {data!r}")
-    return tuple(LayerGroup.from_dict(group, f"layers[{index}]") for index, group in enumerate(data))
+        raise ModelSpecError(f"{where} must list at least one group, got {data!r}")
+    return tuple(LayerGroup.from_dict(group, f"{where}[{index}]") for index, group in enumerate(data))
 
 
-def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_depth: int) -> None:
+def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_depth: int,
+                       where: str = "layers") -> None:
     """Raise unless *layers* covers exactly the body and the MTP layers, in order.
 
     Args:
         layers: The groups, in model order.
         num_layers: The number of body layers the model declares.
         mtp_depth: The number of MTP layers the model declares.
+        where: The field the groups were read from, for the message.
 
     Raises:
         ModelSpecError: If a body group follows an MTP group, or either
@@ -211,14 +213,14 @@ def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_dept
     seen_mtp = False
     for index, group in enumerate(layers):
         if seen_mtp and not group.mtp:
-            raise ModelSpecError(f"layers[{index}] is a body group after an MTP group; MTP layers come last")
+            raise ModelSpecError(f"{where}[{index}] is a body group after an MTP group; MTP layers come last")
         seen_mtp = seen_mtp or group.mtp
     body = sum(group.count for group in layers if not group.mtp)
     mtp = sum(group.count for group in layers if group.mtp)
     if body != num_layers:
-        raise ModelSpecError(f"layers list {body} body layers, but num_hidden_layers is {num_layers}")
+        raise ModelSpecError(f"{where} list {body} body layers, but num_hidden_layers is {num_layers}")
     if mtp != mtp_depth:
-        raise ModelSpecError(f"layers list {mtp} MTP layers, but mtp_depth is {mtp_depth}")
+        raise ModelSpecError(f"{where} list {mtp} MTP layers, but mtp_depth is {mtp_depth}")
 
 
 @dataclass(frozen=True)
@@ -229,7 +231,9 @@ class VisionSpec:
     more than one and a consumer can ask whether there is one at all.
     ``max_position_embeddings`` here is the encoder sequence length in merged
     visual tokens, which depends on the images the dataset serves and is
-    therefore an input, not a property of the checkpoint.
+    therefore an input, not a property of the checkpoint.  ``layers`` is the
+    tower's stack, groups of kinds of the vision profile; a producer states
+    one encoder group when the config states none.
     """
 
     hidden_size: int
@@ -242,6 +246,7 @@ class VisionSpec:
     spatial_merge_size: Optional[int] = None
     num_position_embeddings: Optional[int] = None
     max_position_embeddings: Optional[int] = None
+    layers: Optional[Tuple[LayerGroup, ...]] = None
 
     def validate(self) -> None:
         """Raise :class:`ModelSpecError` if the tower cannot be costed."""
@@ -251,6 +256,20 @@ class VisionSpec:
                 raise ModelSpecError(
                     f"vision.{name} is required and must be positive, got {value!r}"
                 )
+        if self.layers is not None:
+            if any(group.mtp for group in self.layers):
+                raise ModelSpecError("vision.layers marks MTP layers; a tower has none")
+            check_layer_counts(self.layers, self.num_hidden_layers, 0, "vision.layers")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the tower as a plain mapping, unset fields omitted."""
+        out: Dict[str, Any] = {}
+        for spec_field in fields(self):
+            value = getattr(self, spec_field.name)
+            if value is None:
+                continue
+            out[spec_field.name] = [group.to_dict() for group in value] if spec_field.name == "layers" else value
+        return out
 
 
 @dataclass(frozen=True)
@@ -429,12 +448,7 @@ class ModelSpec:
         if self.layers is not None:
             out["layers"] = [group.to_dict() for group in self.layers]
         if self.vision is not None:
-            vision: Dict[str, Any] = {}
-            for vision_field in fields(self.vision):
-                value = getattr(self.vision, vision_field.name)
-                if value is not None:
-                    vision[vision_field.name] = value
-            out["vision"] = vision
+            out["vision"] = self.vision.to_dict()
         out.update(self.extra)
         return out
 
@@ -502,7 +516,10 @@ class ModelSpec:
         for key, value in data.items():
             if key not in known:
                 continue
-            kwargs[key] = str(value) if key == "name" else _as_int(value, f"vision.{key}")
+            if key == "layers":
+                kwargs[key] = None if value is None else layers_from_list(value, "vision.layers")
+            else:
+                kwargs[key] = str(value) if key == "name" else _as_int(value, f"vision.{key}")
         missing = [
             name for name in ("hidden_size", "num_hidden_layers", "num_attention_heads")
             if name not in kwargs

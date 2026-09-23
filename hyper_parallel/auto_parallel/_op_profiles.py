@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "op_profiles")
 DEFAULT_ARCH = "default"
+# The profile every vision tower is priced with.
+VISION_ARCH = "vision"
 
 ATTENTION_FLAVOURS = ("full", "linear")
 FFN_FLAVOURS = ("dense", "moe")

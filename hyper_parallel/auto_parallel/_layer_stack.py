@@ -27,6 +27,9 @@ config already carries, by the rules the cost model's hooks used to encode:
 - any other model runs the profile's default kind throughout;
 - the ``mtp_depth`` MTP layers repeat the kind of the last body layer.
 
+A vision tower's stack is the same, of kinds of the vision profile: one
+encoder group unless the tower states otherwise.
+
 :func:`resolve_layers` checks a stack against its profile and the model's
 dimensions and returns it as a :class:`LayerStack`, each kind resolved.
 """
@@ -39,8 +42,10 @@ from hyper_parallel.auto_parallel._model_spec import (
     ModelSpec,
     ModelSpecError,
     OpCounts,
+    VisionSpec,
 )
 from hyper_parallel.auto_parallel._op_profiles import (
+    VISION_ARCH,
     LayerKind,
     OpProfile,
     load_op_profile,
@@ -285,3 +290,15 @@ def spec_layer_stack(spec: ModelSpec) -> LayerStack:
             first_k_dense=spec.first_k_dense_replace or 0,
         )
     return resolve_layers(spec.arch, layers, spec.ops, linear)
+
+
+def tower_layer_stack(vision: VisionSpec) -> LayerStack:
+    """Return a vision tower's stack, as it states it or as one encoder group.
+
+    Raises:
+        ModelSpecError: If the tower names a kind the vision profile lacks.
+    """
+    layers = vision.layers
+    if layers is None:
+        layers = derive_layers(load_op_profile(VISION_ARCH), vision.num_hidden_layers)
+    return resolve_layers(VISION_ARCH, layers)

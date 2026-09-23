@@ -29,14 +29,17 @@ import yaml
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_groups
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    CWrap,
+    check_and_apply_custom_hook,
+    layer_groups,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
-    custom_vision_tower_hook,
 )
 
 
@@ -989,7 +992,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.mm_order, ["vision", "text"])
         self.assertEqual(ccfg.mm_main, "text")
         self.assertEqual(ccfg.n_lay, 0)
-        self.assertEqual(set(ccfg.hooks_dict), {"vision", "text"})
+        self.assertIsNone(ccfg.hooks_dict)
 
         text = ccfg.mm_ccfgs["text"]
         self.assertEqual(text.h, 2048)
@@ -1005,6 +1008,9 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(vision.v, 0)
         self.assertEqual(vision.n_exp, 1)
         self.assertEqual(vision.s, 2304 // 4)
+        self.assertEqual((vision.arch, vision.inherited_arch, text.arch), ("vision", "qwen", "qwen"))
+        self.assertEqual([(group.kind.name, group.count) for group in vision.layer_stack.groups],
+                         [("encoder", 27)])
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_vl_submodules_keep_private_eval_function_caches(self, mock_hf):
@@ -1084,20 +1090,22 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertNotIn("num_params_norm", vision.overwrite_eval_functions)
         self.assertNotIn("num_params_norm", ccfg.overwrite_eval_functions)
 
-    def test_vision_hook_wraps_a_bare_config(self):
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_the_tower_inherits_its_language_models_hook(self, mock_hf):
         """
-        Feature: vision-tower arch hook.
-        Description: The hook is handed an evaluator during estimation, but a
-            bare cost config when applied directly.
-        Expectation: A config without set_ccfg is wrapped, and the tower's
-            two-matmul MLP profile is applied either way.
+        Feature: vision tower as data.
+        Description: The tower's arch is the vision profile, and it names its
+            language model's family as the hook it inherits; the arch hooks
+            apply both, with no hook of the parser's.
+        Expectation: Qwen's activation sharding, then the tower's two-matmul
+            MLP, with no gated triple to cast.
         """
-        bare = SimpleNamespace(has_op=False, p=2)
-        custom_vision_tower_hook(bare)
-        self.assertEqual(bare.n_ffMM, 2)
-        self.assertEqual(bare.n_normOp, 2)
-        # A ViT block has no gated triple, unlike the language model.
-        self.assertEqual(bare.n_ffParamCast, 2)
+        mock_hf.return_value = self._vl_config()
+        vision = _make_ccfg(_auto_models_config()).mm_ccfgs["vision"]
+        check_and_apply_custom_hook(CWrap(vision))
+        self.assertEqual((vision.shard_output_activ, vision.shard_recompute_input), (vision.t, vision.t))
+        self.assertEqual((vision.n_ffMM, vision.n_normOp), (2, 2))
+        self.assertEqual(vision.n_ffParamCast, 0 if vision.has_op else 2)
 
     def test_capacity_factor_override(self):
         """

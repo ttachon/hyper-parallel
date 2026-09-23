@@ -27,7 +27,11 @@ from PIL import Image
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import apply_layer_kind, layer_kinds
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    apply_layer_kind,
+    check_and_apply_custom_hook,
+    layer_kinds,
+)
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -425,7 +429,12 @@ class _Backbone:
             strategy = tmp_evaluator.get_strategy()
             full_rec = strategy["full_rec"]
             offset = strategy["offset"]
-            self._ccfg.hooks_dict[m](tmp_evaluator)
+            # A user hook class names one hook per submodule; built-in
+            # submodules are dispatched by their arch.
+            if self._ccfg.hooks_dict:
+                self._ccfg.hooks_dict[m](tmp_evaluator)
+            else:
+                check_and_apply_custom_hook(tmp_evaluator)
             strategy = tmp_evaluator.get_strategy()
             if (
                 tmp_evaluator.get_num_layers() != num_layer

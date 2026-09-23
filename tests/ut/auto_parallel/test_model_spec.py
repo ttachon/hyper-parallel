@@ -284,6 +284,28 @@ class TestVisionTower(unittest.TestCase):
         spec = ModelSpec.from_dict(self._vl())
         self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
 
+    def test_vision_layers_round_trip(self):
+        """A tower's stated stack survives the round trip, typed as groups."""
+        data = self._vl()
+        data["vision"]["layers"] = [{"kind": "encoder", "count": 27}]
+        spec = ModelSpec.from_dict(data)
+        self.assertEqual(spec.vision.layers, (LayerGroup("encoder", 27),))
+        self.assertEqual(spec.to_dict()["vision"]["layers"], [{"kind": "encoder", "count": 27}])
+        self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+
+    def test_vision_layers_must_cover_the_tower(self):
+        """A tower's stack sums to its own layer count, and has no MTP layers."""
+        for layers, words in (
+            ([{"kind": "encoder", "count": 26}], "vision.layers list 26"),
+            ([{"kind": "encoder", "count": 27, "mtp": True}], "MTP"),
+        ):
+            data = self._vl()
+            data["vision"]["layers"] = layers
+            with self.subTest(layers=layers):
+                with self.assertRaises(ModelSpecError) as ctx:
+                    ModelSpec.from_dict(data)
+                self.assertIn(words, str(ctx.exception))
+
     def test_vision_missing_field_raises(self):
         """The tower is held to the same standard as the parent."""
         data = self._vl()

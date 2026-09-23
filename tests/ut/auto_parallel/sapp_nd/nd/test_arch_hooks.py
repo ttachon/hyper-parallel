@@ -241,6 +241,18 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
         for arch in known_archs():
             self._check(arch, with_table=False)
 
+    def test_a_tower_runs_its_inherited_hook_first(self):
+        """
+        Feature: vision tower as data.
+        Description: A tower's config is dispatched on the vision arch and
+            names qwen as the family whose hook it inherits.
+        Expectation: Qwen's activation sharding, and the tower's counts.
+        """
+        cfg = _bare("vision", resolve_ops("qwen"), inherited_arch="qwen")
+        check_and_apply_custom_hook(CWrap(cfg))
+        self.assertEqual((cfg.shard_output_activ, cfg.shard_recompute_input), (2, 2))
+        self.assertEqual(_state(cfg), _legacy_state("vision", "encoder", False, 2))
+
     def test_the_vision_tower_uses_its_own_profile(self):
         """
         Feature: vision tower counts.

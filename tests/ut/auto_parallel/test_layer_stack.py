@@ -21,8 +21,9 @@ from hyper_parallel.auto_parallel._layer_stack import (
     derive_layers,
     resolve_layers,
     spec_layer_stack,
+    tower_layer_stack,
 )
-from hyper_parallel.auto_parallel._model_spec import LayerGroup, ModelSpec, ModelSpecError, OpCounts
+from hyper_parallel.auto_parallel._model_spec import LayerGroup, ModelSpec, ModelSpecError, OpCounts, VisionSpec
 from hyper_parallel.auto_parallel._op_profiles import LayerKind, OpProfile, load_op_profile
 
 _COUNTS = {
@@ -286,6 +287,33 @@ class TestSpecStack(unittest.TestCase):
         overrides = self._spec(arch="qwen", mtp_depth=1, layers=layers)
         spec = resolve_hf_model_spec({"name": "unit", "config_overrides": overrides})
         self.assertEqual(spec["layers"], layers)
+
+
+
+class TestTowerStack(unittest.TestCase):
+    """A vision tower's stack is data of the vision profile's kinds."""
+
+    def test_one_encoder_group_by_default(self):
+        """
+        Feature: tower stack.
+        Description: A six-layer tower that states no stack.
+        Expectation: One group of six encoder layers of the vision profile.
+        """
+        stack = tower_layer_stack(VisionSpec(hidden_size=64, num_hidden_layers=6, num_attention_heads=4))
+        self.assertEqual(stack.arch, "vision")
+        self.assertEqual([(group.kind.name, group.count) for group in stack.groups], [("encoder", 6)])
+
+    def test_a_stated_kind_must_be_the_vision_profiles(self):
+        """
+        Feature: tower stack.
+        Description: A tower that names a kind of a language model's profile.
+        Expectation: Refused, naming the vision kinds.
+        """
+        tower = VisionSpec(hidden_size=64, num_hidden_layers=6, num_attention_heads=4,
+                           layers=(LayerGroup("decoder", 6),))
+        with self.assertRaises(ModelSpecError) as ctx:
+            tower_layer_stack(tower)
+        self.assertIn("encoder", str(ctx.exception))
 
 
 if __name__ == "__main__":

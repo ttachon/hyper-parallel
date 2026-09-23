@@ -43,6 +43,9 @@ class _CostModVar:
     # layer kind; both settled by the parser, never matched from model_name.
     arch: str = None
     op_counts: dict = None
+    # A vision tower's arch is the vision profile; this is the family whose
+    # hook it inherits, its language model's, which runs first.
+    inherited_arch: str = None
     device_capacity: Memory = Memory.zero()  # float = 0
     mm_ccfgs: any = None
     mm_order: list = None

@@ -31,7 +31,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, LinearAttentionDims
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
-from hyper_parallel.auto_parallel._op_profiles import LayerKind, load_op_profile
+from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, LayerKind, load_op_profile
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
@@ -352,10 +352,14 @@ def custom_cm(ccfg):
 def custom_vision_tower(ccfg: Any) -> None:
     """Vision tower of a multimodal model.
 
-    Always priced with the vision profile.  A tower's config carries the arch
-    of its language model, whose hook the evaluator applies to it first.
+    Always priced with the vision profile.  A tower inherits the hook of its
+    language model's family, named in ``ccfg.inherited_arch``, which runs
+    first and gives it that family's activation sharding.
     """
-    apply_op_counts(ccfg, load_op_profile("vision").counts("encoder"))
+    inherited = getattr(ccfg, "inherited_arch", None)
+    if inherited not in (None, VISION_ARCH):
+        ARCH_HOOKS[inherited](ccfg)
+    apply_op_counts(ccfg, load_op_profile(VISION_ARCH).counts("encoder"))
     _set_bytes(ccfg)
 
 
@@ -369,7 +373,7 @@ ARCH_HOOKS = {
     "qwen": custom_qwen,
     "qwen3_5": custom_qwen3_5,
     "cm": custom_cm,
-    "vision": custom_vision_tower,
+    VISION_ARCH: custom_vision_tower,
 }
 
 

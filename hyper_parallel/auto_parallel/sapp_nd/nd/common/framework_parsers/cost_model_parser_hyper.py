@@ -69,25 +69,15 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
-    CWrap,
-    check_and_apply_custom_hook,
-    custom_vision_tower,
-)
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
 from hyper_parallel.auto_parallel._layer_stack import LinearAttentionDims, resolve_layers
 from hyper_parallel.auto_parallel._model_spec import layers_from_list, ops_from_dict
+from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH
 
 logger = logging.getLogger(__name__)
-
-def custom_vision_tower_hook(evaluator: Any) -> None:
-    """Apply the vision-tower profile to an evaluator or a config."""
-    if not hasattr(evaluator, "set_ccfg"):
-        evaluator = CWrap(evaluator)
-    evaluator.set_ccfg(custom_vision_tower)
 
 
 class CostModelParserHyperV2(_CostModelParser):
@@ -280,10 +270,8 @@ class CostModelParserHyperV2(_CostModelParser):
         # Vision runs first; the language model drives the search space.
         self.ccfg.mm_order = ["vision", "text"]
         self.ccfg.mm_main = "text"
-        self.ccfg.hooks_dict = {
-            "vision": custom_vision_tower_hook,
-            "text": check_and_apply_custom_hook,
-        }
+        # Each submodule is priced by its own arch, through the arch hooks.
+        self.ccfg.hooks_dict = None
         self.ccfg.n_lay = 0
         self.ccfg.layer_stack = None
         logger.info(
@@ -325,16 +313,20 @@ class CostModelParserHyperV2(_CostModelParser):
         """
         cc = self._clone_submodule(str(vision_spec.get("name", "vision")))
         self._apply_spec(cc, vision_spec)
-        # The tower's name carries the language model's type, so its inferred
-        # arch is the language model's: that family's hook runs on it first.
+        # A tower is priced with the vision profile.  Its name carries the
+        # language model's type: the family it implies is the one whose hook
+        # the tower inherits, and whose op counts that hook reads.
         self.config_op_counts(cc)
+        cc.inherited_arch, cc.arch = cc.arch, VISION_ARCH
         cc.v = 0  # patch embedding, not a vocabulary table
         cc.vocab_emb_dp = False
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
-        cc.layer_stack = None
         cc.layer_binding = None
+        self.config_layer_stack(cc, resolve_layers(
+            VISION_ARCH, layers_from_list(vision_spec.get("layers"), "vision.layers"),
+        ))
         cc.offset = self._front_loaded_offset(cc.n_lay)
         return cc
 
