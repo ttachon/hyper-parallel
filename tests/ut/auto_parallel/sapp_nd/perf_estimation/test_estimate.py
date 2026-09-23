@@ -127,7 +127,8 @@ class TestLayerTimes(unittest.TestCase):
         recomp = estimate_comp(copy.deepcopy(self.ccfg), custom, self.stages, with_recomp=True)
         walked = copy.deepcopy(self.ccfg)
         comm = estimate_comm(walked, custom, self.stages, Hard.Device_A2)
-        search = estimate_stage(walked, custom, comp, comm, recomp, [0] * self.ccfg.p)
+        recomm = estimate_comm(copy.deepcopy(self.ccfg), custom, self.stages, Hard.Device_A2, with_recomp=True)
+        search = estimate_stage(walked, custom, comp, comm, recomp, recomm)
         times = LayerTimes(Hard.Device_A2)
         checked = 0
         for s, stage in enumerate(self.stages):

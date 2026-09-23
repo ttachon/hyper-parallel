@@ -64,7 +64,7 @@ class CustomConfig:
         #  ttype = PerformanceType.TIME,
         ttype=PerformanceType.FLOP,
         ptype=P2PCommType.NONE, # MANUAL,
-        retype=RecType.COMPUTE_ONLY,
+        retype=RecType.WITH,  # recompute re-runs compute and communication
     ):
         self.rtype = rtype
         self.ttype = ttype
