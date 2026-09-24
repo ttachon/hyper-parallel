@@ -111,6 +111,30 @@ def _names(recompute: Optional[FrozenSet[str]], configured: Mapping[str, Any]) -
     return tuple(names)
 
 
+def price_option(
+    profile: SwitchProfile, recompute: Optional[FrozenSet[str]], configured: Optional[Mapping[str, Any]] = None
+) -> LayerOption:
+    """The option recomputing *recompute*, priced from the kind's *profile*.
+
+    Args:
+        profile: The kind's costs, each switch measured alone.
+        recompute: The switches to recompute; ``None`` for full recompute.
+        configured: The switches the config sets, which name the option.
+
+    Returns:
+        The option, whether or not it is on the kind's front.
+    """
+    cost = profile.full if recompute is None else profile.selective(recompute)
+    return LayerOption(
+        recompute=None if recompute is None else frozenset(recompute),
+        memory_per_micro_batch=cost.memory_per_micro_batch,
+        memory_once=cost.memory_once,
+        forward_time=profile.forward_time,
+        backward_time=cost.backward_time,
+        names=_names(recompute, configured or {}),
+    )
+
+
 def build_front(
     profile: SwitchProfile, configured: Optional[Mapping[str, Any]] = None
 ) -> Tuple[LayerOption, ...]:
@@ -140,15 +164,41 @@ def build_front(
             if other_index != index
         )
         if not beaten or recompute is None or not recompute:
-            kept.append(LayerOption(
-                recompute=recompute,
-                memory_per_micro_batch=cost.memory_per_micro_batch,
-                memory_once=cost.memory_once,
-                forward_time=profile.forward_time,
-                backward_time=cost.backward_time,
-                names=_names(recompute, configured or {}),
-            ))
+            kept.append(price_option(profile, recompute, configured))
     return tuple(sorted(kept, key=lambda option: (option.backward_time, -option.memory_per_micro_batch)))
+
+
+def configured_switches(evaluator: EvaluatorV2) -> Mapping[str, Any]:
+    """The recompute switches the evaluator's config sets."""
+    rec_op = getattr(evaluator.ccfg, "rec_op", None)
+    return vars(rec_op) if rec_op is not None else {}
+
+
+def layer_profiles(
+    evaluator: EvaluatorV2,
+    device_type: Any,
+    ccfg: Optional[CustomConfig] = None,
+    most_in_flight: Optional[int] = None,
+    each_switch: bool = True,
+) -> Dict[Tuple[str, Optional[LayerKind]], SwitchProfile]:
+    """What each switch of every layer kind saves and costs, at the evaluator's current strategy.
+
+    Args:
+        evaluator: The memory evaluator, set to the strategy to price.
+        device_type: The device the times are priced on.
+        ccfg: Estimator options; the search's defaults when omitted.
+        most_in_flight: The most micro-batches any stage keeps in flight, up
+            to which an option's memory is exact; see
+            :meth:`EvaluatorV2.estimate_switch_profiles`.
+        each_switch: Whether to measure each switch alone; without, a profile
+            prices only the plain and the fully recomputed layer.
+
+    Returns:
+        ``{(model name, layer kind): SwitchProfile}``, in model order.
+    """
+    return evaluator.estimate_switch_profiles(
+        LayerTimes(device_type, ccfg), most_in_flight=most_in_flight, each_switch=each_switch
+    )
 
 
 def layer_fronts(
@@ -174,9 +224,8 @@ def layer_fronts(
     Returns:
         One front per model and layer kind, in model order.
     """
-    profiles = evaluator.estimate_switch_profiles(LayerTimes(device_type, ccfg), most_in_flight=most_in_flight)
-    rec_op = getattr(evaluator.ccfg, "rec_op", None)
-    configured = vars(rec_op) if rec_op is not None else {}
+    profiles = layer_profiles(evaluator, device_type, ccfg, most_in_flight)
+    configured = configured_switches(evaluator)
     return tuple(
         KindFront(model_name, kind, build_front(profile, configured))
         for (model_name, kind), profile in profiles.items()

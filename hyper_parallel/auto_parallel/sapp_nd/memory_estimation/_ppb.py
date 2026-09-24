@@ -69,6 +69,9 @@ class _PPB:
         # The most micro-batches any stage keeps in flight, where profiles
         # split the buffers when set.
         self.profile_in_flight: Optional[int] = None
+        # Whether profiles measure each switch alone, or only the plain and
+        # the fully recomputed layer.
+        self.profile_each_switch = True
 
     @staticmethod
     def add_to_ppb_list(ppb_lay_desc: list, desc: dict) -> None:
@@ -187,7 +190,10 @@ class _PPB:
         keep = dict.fromkeys(SWITCHES, 1)
         ctx.current_node = LayerType.NOT_REC_LAYER
         plain = self._dynamic_mem(many)
-        alone = {name: self._selective_dynamic_mem(ccfg, ctx, dict(keep, **{name: 0}), many) for name in SWITCHES}
+        alone = {
+            name: self._selective_dynamic_mem(ccfg, ctx, dict(keep, **{name: 0}), many)
+            for name in (SWITCHES if self.profile_each_switch else ())
+        }
         ctx.current_node = LayerType.FULL_REC_LAYER
         full = self._dynamic_mem(many)
 

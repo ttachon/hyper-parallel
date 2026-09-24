@@ -16,6 +16,7 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import patch, MagicMock
 
@@ -495,6 +496,13 @@ class TestModelSectionIsTheSpec(unittest.TestCase):
         hp_yaml = runner._build_hp_yaml_dict(config)
         self.assertEqual(hp_yaml["context"]["max_device_memory"], "60.0GB")
 
+    def test_auto_recompute_describes_the_model_fully_recomputed(self):
+        """With recompute "auto", candidates are kept fully recomputed, so the model is described so."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.estimator["recompute_strategy"] = "auto"
+        self.assertEqual(runner._build_hp_yaml_dict(config)["activation_checkpoint"]["mode"], "full")
+
 
 class TestSearchStrategies(unittest.TestCase):
     """End-to-end tests for search_strategies with mocked ND."""
@@ -524,6 +532,52 @@ class TestSearchStrategies(unittest.TestCase):
         self.assertIn("tp", result)
         self.assertIn("dp", result)
         self.assertIn("memory_estimate_mb", result)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_chooses_the_trainer_mode(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """With recompute "auto" the search chooses among the trainer's modes and reports each layer's own."""
+        # pylint: disable=import-outside-toplevel,unused-import
+        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # noqa: F401
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import LayerRange, RecomputeChoice
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+        mock_dims = MagicMock()
+        mock_dims.dims_val = {
+            _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
+            _MOCK_CP: 1, _MOCK_EP: 1, _MOCK_MBN: 2,
+        }
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [(mock_dims, 1024.0, 0.05, [])]
+        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=1.0, memory_once=0.0,
+                            forward_time=1.0, backward_time=2.0)
+        per_layer = RecomputeChoice(ranges=(LayerRange(0, 4, None, plain),), stage_memory=(900.0, 950.0),
+                                    stage_savings=(1.0, 1.0))
+        mock_runner.recompute_choices = {mock_dims: SimpleNamespace(mode="off")}
+        mock_runner.recompute_per_layer.return_value = (per_layer, 0.04)
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.estimator["recompute_strategy"] = "auto"
+        result = sr.search_strategies(config)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertTrue(kwargs["auto_recompute"])
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_RECOMPUTE_MODES)
+        self.assertEqual(result["activation_checkpoint"], "off")
+        self.assertEqual(result["recompute_per_layer"], {
+            "score": 0.04, "memory_estimate_mb": 950.0,
+            "ranges": [{"first": 0, "count": 4, "kind": None, "recompute": "none"}],
+        })
+
+        mock_runner.recompute_choices = {}
+        mock_runner.recompute_per_layer.return_value = (None, None)
+        result = sr.search_strategies(config)
+        self.assertEqual(result["activation_checkpoint"], "full")
+        self.assertNotIn("recompute_per_layer", result)
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",

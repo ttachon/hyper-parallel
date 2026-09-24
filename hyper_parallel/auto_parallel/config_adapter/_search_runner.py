@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The activation_checkpoint modes HyperParallel's trainer runs every layer
+# with, that recompute "auto" chooses among. Its selective mode recomputes
+# every other matmul, which the cost model's selective recompute does not
+# price, so it stays out until the cost model follows it.
+TRAINER_RECOMPUTE_MODES = ("off", "full")
+
 def _get_dim_module():
     """Lazy-import the sapp_nd dimensions module."""
     import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as dim_mod  # pylint: disable=C0415
@@ -214,7 +220,9 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if visual_seq_len:
         context["visual_seq_len"] = int(visual_seq_len)
 
-    gc_dict: Dict[str, Any] = {"mode": "off" if recompute == "none" else recompute}
+    # "auto" chooses per candidate; the search keeps the candidates that fit
+    # fully recomputed, so the model is described fully recomputed.
+    gc_dict: Dict[str, Any] = {"mode": {"none": "off", "auto": "full"}.get(recompute, recompute)}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
         gc_dict["recompute_slice_activation"] = bool(recompute_slice)
@@ -437,6 +445,34 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
     return result
 
 
+def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
+    """The recompute the search chose for the best configuration, for the result.
+
+    Args:
+        nd_runner: The search, run with recompute "auto".
+        best_entry: The best scored entry.
+
+    Returns:
+        ``activation_checkpoint``, the mode the trainer runs every layer
+        with: the chosen one, or ``full``, the policy the configuration was
+        scored with when there was nothing to choose. With a choice per layer
+        possible, ``recompute_per_layer`` also gives each layer's own fastest
+        option and the score and memory it would reach: what the trainer
+        would gain from running each layer its own way.
+    """
+    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import to_records  # pylint: disable=C0415
+    choice = nd_runner.recompute_choices.get(best_entry[0])
+    result: Dict[str, Any] = {"activation_checkpoint": choice.mode if choice is not None else "full"}
+    per_layer, score = nd_runner.recompute_per_layer(best_entry[0])
+    if per_layer is not None:
+        result["recompute_per_layer"] = {
+            "score": float(score),
+            "memory_estimate_mb": float(per_layer.memory),
+            "ranges": to_records(per_layer),
+        }
+    return result
+
+
 def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     """Run the ND strategy search and return the optimal strategy.
 
@@ -467,12 +503,14 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
+    auto = config.estimator.get("recompute_strategy") == "auto"
     nd_runner = _Par.Parallelize(
         "hyper_v2",
         hp_config,
         machine,
         global_batch_size=config.constraint.get("global_batch_size", 0),
         dimensions=dims,
+        **({"auto_recompute": True, "recompute_modes": TRAINER_RECOMPUTE_MODES} if auto else {}),
     )
     scored_space = nd_runner.run_generation_to_ordering(
         yaml_folder=None,
@@ -494,6 +532,8 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
         )
     best = filtered[0]
     result = _format_result(best, config)
+    if auto:
+        result.update(_recompute_result(nd_runner, best))
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "

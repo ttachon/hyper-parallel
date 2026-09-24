@@ -1251,6 +1251,30 @@ class TestWriter(unittest.TestCase):
         self.assertNotIn("train", data)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_sets_the_chosen_checkpoint_mode(self) -> None:
+        """The activation checkpoint mode the search chose reaches both schemas, in their own spelling."""
+        legacy = os.path.join(self.tmpdir, "legacy_ac.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {},
+                       "gradient_checkpointing": {"activation_checkpoint": "full"}}}, fh)
+        auto_models = os.path.join(self.tmpdir, "auto_models_ac.yaml")
+        with open(auto_models, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "full", "swap_inputs": True}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "off"}
+        written = {}
+        for name, path in (("legacy", legacy), ("auto_models", auto_models)):
+            out = os.path.join(self.tmpdir, f"resolved_{name}.yaml")
+            write_resolved_yaml(config, path, out)
+            with open(out, "r", encoding="utf-8") as fh:
+                written[name] = yaml.safe_load(fh)
+        self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "none")
+        self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "off", "swap_inputs": True})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
         """A strategy that contradicts the trainer batch derivation is refused."""
         original_yaml_path = os.path.join(self.tmpdir, "auto_models_batch.yaml")

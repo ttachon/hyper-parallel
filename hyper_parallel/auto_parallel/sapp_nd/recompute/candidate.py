@@ -27,23 +27,37 @@ At the end of warm-up, the memory model also charges each stage one layer's
 working set at one micro-batch: the plain layer's if the stage's last layer is
 fully recomputed, the layer's own otherwise. The budget keeps room for the
 heaviest of these, whatever option the last layer runs.
+
+A runtime that runs every layer one way, such as HyperParallel's trainer with
+its ``activation_checkpoint.mode``, gets the fastest of its modes that fits
+instead, from the same budgets: see :data:`MODES`.
 """
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
-from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption, layer_fronts
+from hyper_parallel.auto_parallel.sapp_nd.recompute.front import (
+    LayerOption,
+    build_front,
+    configured_switches,
+    layer_profiles,
+    price_option,
+)
 from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import MEGABYTE, Layers, PipelineChoice, Stage, pp_lite
 from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES
 
 # The pipeline schedules whose micro-batches in flight and end-of-warm-up
 # working set the budget follows.
 SCHEDULES = ("1f1b",)
+# The ways a runtime can run every layer: nothing recomputed, the switches the
+# config sets recomputed, or everything recomputed.
+MODES = ("off", "selective", "full")
 _ENDS = (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER)
 
 
@@ -76,11 +90,14 @@ class RecomputeChoice:
         stage_savings: The time each stage's layers save against the
             recompute the config gives them, in the performance estimate's
             units.
+        mode: The mode every layer runs, one of :data:`MODES`, when one mode
+            was chosen for all of them; ``None`` for a choice per layer.
     """
 
     ranges: Tuple[LayerRange, ...]
     stage_memory: Tuple[float, ...]
     stage_savings: Tuple[float, ...]
+    mode: Optional[str] = None
 
     @property
     def memory(self) -> float:
@@ -130,6 +147,29 @@ def micro_batches_in_flight(evaluator: EvaluatorV2) -> List[List[int]]:
         return max(1, count(ccfg, where))
 
     return [[_at(stage, chunk) for chunk in range(ccfg.vp)] for stage in range(ccfg.p)]
+
+
+def mode_recompute(mode: str, configured: Mapping[str, Any]) -> Optional[FrozenSet[str]]:
+    """The switches a mode recomputes; ``None`` for full recompute.
+
+    Args:
+        mode: One of :data:`MODES`.
+        configured: The switches the config sets, 1 to keep an op and 0 to
+            recompute it, which say what ``selective`` recomputes.
+
+    Returns:
+        The switches.
+
+    Raises:
+        ValueError: For a mode not in :data:`MODES`.
+    """
+    if mode == "off":
+        return frozenset()
+    if mode == "full":
+        return None
+    if mode == "selective":
+        return frozenset(name for name in SWITCHES if not int(bool(configured.get(name, 1))))
+    raise ValueError(f"unknown recompute mode {mode!r}; expected one of {', '.join(MODES)}")
 
 
 def _own(node: LayerType, options: Sequence[LayerOption]) -> Optional[LayerOption]:
@@ -279,11 +319,85 @@ def _ranges(layers: Sequence[_Layer], chosen: Dict[int, LayerOption]) -> Tuple[L
     return tuple(ranges)
 
 
+def _result(
+    layers: Sequence[Sequence[_Layer]], fixed: Sequence[float], chosen: Dict[int, LayerOption], mode: Optional[str]
+) -> RecomputeChoice:
+    """The choice of *chosen* options, with each stage's memory and time saved."""
+    every = [layer for stage_layers in layers for layer in stage_layers]
+    return RecomputeChoice(
+        ranges=_ranges(every, chosen),
+        stage_memory=tuple(
+            (kept + sum(_kept(chosen[layer.index], layer.in_flight) for layer in stage_layers)) / MEGABYTE
+            for kept, stage_layers in zip(fixed, layers)
+        ),
+        stage_savings=tuple(
+            sum(_time(layer.own) - _time(chosen[layer.index]) for layer in stage_layers) for stage_layers in layers
+        ),
+        mode=mode,
+    )
+
+
+def _one_mode(
+    layers: Sequence[Sequence[_Layer]],
+    stages: Sequence[Stage],
+    by_mode: Dict[Hashable, Dict[str, LayerOption]],
+    modes: Sequence[str],
+) -> Optional[Tuple[str, Dict[int, LayerOption]]]:
+    """The fastest of *modes* that every stage fits when every layer runs it, and each layer's option."""
+    fastest, best = math.inf, None
+    for mode in modes:
+        chosen = {layer.index: by_mode[layer.key][mode] for stage_layers in layers for layer in stage_layers}
+        fits = all(
+            sum(_kept(chosen[layer.index], layer.in_flight) for layer in stage_layers) <= stage.budget
+            for stage_layers, stage in zip(layers, stages)
+        )
+        time = sum(_time(option) for option in chosen.values())
+        if fits and time < fastest:
+            fastest, best = time, (mode, chosen)
+    return best
+
+
+def _offered(
+    profiles: Dict[Hashable, Any], configured: Mapping[str, Any], modes: Optional[Sequence[str]]
+) -> Tuple[Dict[Hashable, Tuple[LayerOption, ...]], Optional[Dict[Hashable, Dict[str, LayerOption]]]]:
+    """Each kind's options: its front, or with *modes*, the option of each mode the profiles can price.
+
+    Returns:
+        ``(options, by_mode)``: each kind's options, and with *modes* each
+        kind's option by mode.
+    """
+    if modes is None:
+        return {key: build_front(profile, configured) for key, profile in profiles.items()}, None
+    offered = MODES if "selective" in modes else tuple(mode for mode in MODES if mode != "selective")
+    by_mode = {
+        key: {mode: price_option(profile, mode_recompute(mode, configured), configured) for mode in offered}
+        for key, profile in profiles.items()
+    }
+    return {key: tuple(options.values()) for key, options in by_mode.items()}, by_mode
+
+
+def _stages(
+    evaluator: EvaluatorV2,
+    layers: Sequence[Sequence[_Layer]],
+    ends: Sequence[Sequence[_Layer]],
+    fronts: Dict[Hashable, Tuple[LayerOption, ...]],
+) -> Tuple[List[Stage], List[float]]:
+    """Every stage for the knapsack, and the bytes each keeps outside the choice."""
+    capacity = evaluator.ccfg.device_capacity.to_mb().size
+    stages, fixed = [], []
+    for stage_layers, stage_ends, insight in zip(layers, ends, evaluator.estimate_peak_insight()):
+        stage, kept = _stage(stage_layers, stage_ends, fronts, insight["Static"] + insight["Dynamic"], capacity)
+        stages.append(stage)
+        fixed.append(kept)
+    return stages, fixed
+
+
 def choose_recompute(
     evaluator: EvaluatorV2,
     device_type: Any,
     ccfg: Optional[CustomConfig] = None,
     bucket: float = MEGABYTE,
+    modes: Optional[Sequence[str]] = None,
 ) -> Optional[RecomputeChoice]:
     """The fastest recompute option of every layer that fits, at the evaluator's current strategy.
 
@@ -292,44 +406,36 @@ def choose_recompute(
         device_type: The device the times are priced on.
         ccfg: Estimator options; the search's defaults when omitted.
         bucket: The knapsack's memory granularity, in bytes.
+        modes: For a runtime that runs every layer one way, the modes it
+            runs, of :data:`MODES`: the fastest that fits is chosen for every
+            layer. Without them, each layer gets its own option from its
+            kind's front.
 
     Returns:
         The choice, or ``None`` when there is none to make: a multimodal
         model, a schedule other than those in :data:`SCHEDULES`, a layer
-        that runs an option its kind's front does not have, or a stage that
-        does not fit even fully recomputed.
+        that runs an option its kind cannot offer, or a stage that does not
+        fit even with the lightest option or mode.
     """
     config = evaluator.ccfg
     if config.multimodal or config.pp_sched not in SCHEDULES:
         return None
     counts = micro_batches_in_flight(evaluator)
-    most = max(max(row) for row in counts)
-    fronts = {
-        (front.model_name, front.kind): front.options
-        for front in layer_fronts(evaluator, device_type, ccfg, most_in_flight=most)
-    }
+    profiles = layer_profiles(evaluator, device_type, ccfg, most_in_flight=max(max(row) for row in counts),
+                              each_switch=modes is None or "selective" in modes)
+    fronts, by_mode = _offered(profiles, configured_switches(evaluator), modes)
     found = _body_layers(evaluator, fronts, counts)
     if found is None:
         return None
     layers, ends = found
-    capacity = config.device_capacity.to_mb().size
-    stages, fixed = [], []
-    for stage_layers, stage_ends, insight in zip(layers, ends, evaluator.estimate_peak_insight()):
-        stage, kept = _stage(stage_layers, stage_ends, fronts, insight["Static"] + insight["Dynamic"], capacity)
-        stages.append(stage)
-        fixed.append(kept)
+    stages, fixed = _stages(evaluator, layers, ends, fronts)
+    if by_mode is not None:
+        one = _one_mode(layers, stages, by_mode, modes)
+        return None if one is None else _result(layers, fixed, one[1], one[0])
     choice = pp_lite(stages, fronts, bucket)
     if choice is None:
         return None
-    every = [layer for stage_layers in layers for layer in stage_layers]
-    chosen = _assign(every, choice)
-    return RecomputeChoice(
-        ranges=_ranges(every, chosen),
-        stage_memory=tuple((kept + made.memory) / MEGABYTE for kept, made in zip(fixed, choice.stages)),
-        stage_savings=tuple(
-            sum(_time(layer.own) - _time(chosen[layer.index]) for layer in stage_layers) for stage_layers in layers
-        ),
-    )
+    return _result(layers, fixed, _assign([layer for stage in layers for layer in stage], choice), None)
 
 
 def option_label(option: LayerOption) -> str:
@@ -341,9 +447,36 @@ def option_label(option: LayerOption) -> str:
     return "recompute " + "+".join(name for name in SWITCHES if name in option.recompute)
 
 
+def option_record(option: LayerOption) -> Any:
+    """An option as plain data: ``"none"``, ``"full"``, or the switches it recomputes, in switch order."""
+    if option.recompute is None:
+        return "full"
+    if not option.recompute:
+        return "none"
+    return [name for name in SWITCHES if name in option.recompute]
+
+
+def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
+    """The choice's ranges as plain data, for a result file.
+
+    Returns:
+        One ``{"first", "count", "kind", "recompute"}`` per range, in model
+        order; ``kind`` is the kind's name, or ``None``.
+    """
+    return [
+        {
+            "first": item.first,
+            "count": item.count,
+            "kind": item.kind.name if item.kind is not None else None,
+            "recompute": option_record(item.option),
+        }
+        for item in choice.ranges
+    ]
+
+
 def describe(choice: RecomputeChoice) -> str:
-    """The choice as one line per range of layers."""
-    lines = []
+    """The choice as one line per range of layers, after its mode when one was chosen for every layer."""
+    lines = [] if choice.mode is None else [f"every layer: {choice.mode}"]
     for item in choice.ranges:
         last = item.first + item.count - 1
         layers = f"layer {item.first}" if item.count == 1 else f"layers {item.first}-{last}"

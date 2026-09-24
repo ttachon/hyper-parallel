@@ -834,8 +834,9 @@ class TestSappNDRunND(unittest.TestCase):
         Feature: run_nd -ar/--auto_recompute.
         Description: Ask for auto recompute alone, then with the yaml's
             recompute, then with a search config.
-        Expectation: Alone, the search is built with it; with either of the
-            others, the command line is refused before any search is built.
+        Expectation: Alone, the search is built with it; with the yaml's
+            recompute, the command line is refused before any search is
+            built; a search config is told to choose its recompute.
         """
         with tempfile.TemporaryDirectory() as tmp_dir, \
                 patch.object(Par, "Parallelize", _FakeParallelize), \
@@ -845,11 +846,15 @@ class TestSappNDRunND(unittest.TestCase):
             with patch.object(sys, "argv", argv):
                 runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
             self.assertTrue(_FakeParallelize.instances[-1].kwargs["auto_recompute"])
-            for extra in (["-mppb"], ["-s", config_path]):
-                _FakeParallelize.instances = []
-                with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
-                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
-                self.assertEqual(_FakeParallelize.instances, [])
+            _FakeParallelize.instances = []
+            with patch.object(sys, "argv", argv + ["-mppb"]), self.assertRaises(SystemExit):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances, [])
+        run_nd = runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="run_nd")
+        search_cfg = SimpleNamespace(constraint={}, cluster_spec={}, estimator={"recompute_strategy": "full"})
+        cli = SimpleNamespace(global_batch_size=None, max_mem=None, devices=None, auto_recompute=True)
+        run_nd["_apply_cli_overrides"](search_cfg, cli)
+        self.assertEqual(search_cfg.estimator["recompute_strategy"], "auto")
 
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """

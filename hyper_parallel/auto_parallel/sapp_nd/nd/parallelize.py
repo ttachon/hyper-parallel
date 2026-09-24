@@ -25,7 +25,12 @@ from typing import Any, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
-from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import RecomputeChoice, choose_recompute, describe
+from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
+    MODES,
+    RecomputeChoice,
+    choose_recompute,
+    describe,
+)
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -66,16 +71,19 @@ class ParallelizeLayer:
             raise ValueError(
                 "auto_recompute chooses every layer's recompute, so it cannot also take it from the config (mppb)"
             )
+        # With auto_recompute, the modes a runtime that runs every layer one
+        # way offers, of recompute.candidate.MODES; without them, each layer
+        # gets its own option.
+        self.recompute_modes = extra_config.pop("recompute_modes", None)
+        unknown = sorted(set(self.recompute_modes or ()) - set(MODES))
+        if unknown:
+            raise ValueError(f"unknown recompute modes {unknown}; expected some of {', '.join(MODES)}")
 
         self.mem_eval = evaluator
         # Choose every layer's recompute option for each candidate, rather
-        # than score it fully recomputed; for single models.
-        self.auto_recompute = bool(auto_recompute) and not self.mem_eval.ccfg.multimodal
-        if auto_recompute and not self.auto_recompute:
-            logger.warning(
-                "auto_recompute handles single models only: %s is scored with its configured recompute",
-                self.mem_eval.ccfg.model_name,
-            )
+        # than score it fully recomputed. The choice prices the model the
+        # search prices: a multimodal model by its main submodule.
+        self.auto_recompute = bool(auto_recompute)
         # The options chosen for each configuration the ordering scored.
         self.recompute_choices = {}
 
@@ -495,10 +503,36 @@ class ParallelizeLayer:
         if not self.auto_recompute:
             return None
         self.mem_eval.set_config(self.config.ccfg)
-        choice = choose_recompute(self.mem_eval, self.machine.device)
+        choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes)
         if choice is not None:
             self.recompute_choices[parallel_config] = choice
         return choice
+
+    def recompute_per_layer(self, parallel_config: Any) -> Tuple[Optional[RecomputeChoice], Optional[float]]:
+        """Each layer's own fastest option for one configuration, and the score it gives.
+
+        What the configuration gains when every layer may run its own way,
+        for a search that chose one mode for all of them.
+
+        Args:
+            parallel_config: The configuration.
+
+        Returns:
+            ``(choice, score)``, or ``(None, None)`` when there is no choice
+            to make.
+        """
+        self.config.set_parallel_config(parallel_config)
+        self.mem_eval.set_config(self.config.ccfg)
+        choice = choose_recompute(self.mem_eval, self.machine.device)
+        if choice is None:
+            return None, None
+        score = estimate_performance(
+            self.config.ccfg,
+            device_type=self.machine.device,
+            memory=int(round(choice.memory)),
+            stage_savings=choice.stage_savings,
+        )
+        return choice, score
 
     def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
         """Order the given space with performance estimation"""
@@ -591,7 +625,8 @@ class ParallelizeLayer:
         )
         if self.auto_recompute:
             logger.output(
-                "Recompute was chosen per layer for %d of %d configurations",
+                "Recompute was chosen %s for %d of %d configurations",
+                "per layer" if self.recompute_modes is None else "among " + ", ".join(self.recompute_modes),
                 len(self.recompute_choices),
                 len(scored_space),
             )

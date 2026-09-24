@@ -35,6 +35,8 @@ def _apply_cli_overrides(search_cfg, cli_args):
     """
     if cli_args.global_batch_size is not None:
         search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
+    if getattr(cli_args, "auto_recompute", False):
+        search_cfg.estimator["recompute_strategy"] = "auto"
     if cli_args.max_mem is not None:
         # -M sets the device budget the search checks against, exactly as it
         # does on the CLI path, instead of being silently ignored here.
@@ -125,6 +127,14 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     resolve_path = os.path.join(output_dir, "resolved.yaml")
     write_resolved_yaml(search_cfg, cli_args.yaml_config, resolve_path)
     logger.output("Resolved strategy written to %s", resolve_path)
+    if "activation_checkpoint" in result:
+        logger.output("Activation checkpoint mode for every layer: %s", result["activation_checkpoint"])
+        per_layer = result.get("recompute_per_layer")
+        if per_layer:
+            logger.output(
+                "With each layer run its own way, the score would be %.2e at %.0f MB: %s",
+                per_layer["score"], per_layer["memory_estimate_mb"], per_layer["ranges"],
+            )
     logger.output(
         "Optimal strategy: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
         "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
@@ -340,8 +350,6 @@ if __name__ == "__main__":
 
     if args.auto_recompute and args.mppb:
         parser.error("-ar/--auto_recompute chooses the recompute, so it cannot take it from the yaml (-mppb)")
-    if args.auto_recompute and args.search_config:
-        parser.error("-ar/--auto_recompute does not apply to a search config (-s) yet")
 
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)

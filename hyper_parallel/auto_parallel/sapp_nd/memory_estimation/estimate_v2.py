@@ -133,7 +133,11 @@ class EvaluatorV2(_Utils, _HookManager):
         return ppb
 
     def estimate_switch_profiles(
-        self, layer_times: Callable, stages: list = None, most_in_flight: Optional[int] = None
+        self,
+        layer_times: Callable,
+        stages: list = None,
+        most_in_flight: Optional[int] = None,
+        each_switch: bool = True,
     ) -> Dict:
         """What each recompute switch saves and costs, per model and layer kind.
 
@@ -151,6 +155,10 @@ class EvaluatorV2(_Utils, _HookManager):
                 and at this many, so the split is exact at both. Under 1F1B
                 without interleaving, the least of the stages and the
                 micro-batches when omitted.
+            each_switch: Whether to measure each switch alone. Without, a
+                profile prices only the plain and the fully recomputed
+                layer, which is all one mode for every layer needs unless it
+                is selective.
 
         Returns:
             ``{(model name, layer kind): SwitchProfile}``, in model order.
@@ -158,6 +166,7 @@ class EvaluatorV2(_Utils, _HookManager):
         self._ppb_obj.layer_times = layer_times
         self._ppb_obj.profiles = {}
         self._ppb_obj.profile_in_flight = most_in_flight
+        self._ppb_obj.profile_each_switch = each_switch
         try:
             self._estimate_on_copy(stages, False, True, -1, False)
             return self._ppb_obj.profiles
@@ -165,6 +174,7 @@ class EvaluatorV2(_Utils, _HookManager):
             self._ppb_obj.layer_times = None
             self._ppb_obj.profiles = None
             self._ppb_obj.profile_in_flight = None
+            self._ppb_obj.profile_each_switch = True
 
     # Specific estimation
 

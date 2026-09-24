@@ -23,6 +23,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import patch
 
 import yaml
 
@@ -31,18 +32,22 @@ import yaml
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
+from hyper_parallel.auto_parallel import _hf_model_spec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
+    MODES,
     LayerRange,
     RecomputeChoice,
     choose_recompute,
     describe,
     micro_batches_in_flight,
+    mode_recompute,
     option_label,
+    to_records,
 )
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
 
@@ -60,6 +65,28 @@ _DENSE = {
               "micro_batch_size": 1, "micro_batch_num": 4,
               "gradient_checkpointing": {"activation_checkpoint": "full"}, "optimizer": {"max_grad_norm": 1.0}},
     "context": {"max_device_memory": "64GB"},
+}
+
+
+# A vision-language model: a small tower in front of a four-layer MoE text model.
+_VL = SimpleNamespace(
+    model_type="qwen3_vl_moe",
+    text_config=SimpleNamespace(
+        hidden_size=2048, num_hidden_layers=4, num_attention_heads=16, num_key_value_heads=8,
+        intermediate_size=5632, vocab_size=32000, max_position_embeddings=8192, head_dim=128,
+        num_experts=16, num_experts_per_tok=4, moe_intermediate_size=768),
+    vision_config=SimpleNamespace(
+        hidden_size=1152, depth=2, num_heads=16, intermediate_size=4304, out_hidden_size=2048,
+        patch_size=16, spatial_merge_size=2, num_position_embeddings=2304),
+)
+_VL_TRAINING = {
+    "model": {"pretrained_model_name_or_path": "local/vl", "torch_dtype": "bfloat16"},
+    "training": {"global_batch_size": 16, "micro_batch_size": 1, "max_grad_norm": 1.0},
+    "accelerator": {"tp_size": 1, "pp_size": 2, "cp_size": 1, "ep_size": 1},
+    "fsdp_config": {"dp_shard_size": 4},
+    "activation_checkpoint": {"mode": "full"},
+    "dataset": {"data_transform": {"max_seq_len": 4096}},
+    "context": {"max_device_memory": "64GB", "device_num": 8},
 }
 
 
@@ -242,6 +269,87 @@ class TestStageMemory(unittest.TestCase):
         self.assertGreater(saved[0], saved[-1])
 
 
+class TestOneMode(unittest.TestCase):
+    """One mode for every layer, the way a runtime with one activation checkpoint mode runs them."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Seven DeepSeek layers over two stages."""
+        cls.folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        cls.path = _small_deepseek(cls.folder.name, 1)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Remove the config."""
+        cls.folder.cleanup()
+
+    def _evaluator(self) -> EvaluatorV2:
+        """A fresh evaluator of the small DeepSeek."""
+        return EvaluatorV2(self.path, framework="mindformers", log_level=0)
+
+    def test_a_roomy_device_runs_every_layer_off(self):
+        """
+        Feature: choose_recompute modes.
+        Description: A 1 TB device, choosing between off and full.
+        Expectation: Off, every layer plain, and each stage keeps what the
+            memory model says it keeps with every layer plain, to its MB.
+        """
+        evaluator = _with_capacity(self._evaluator(), 1024 * 1024)
+        choice = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        self.assertEqual(choice.mode, "off")
+        self.assertTrue(all(_is_plain(item.option) for item in choice.ranges))
+        for mine, model in zip(choice.stage_memory, _stage_peaks(evaluator, full_rec=False)):
+            self.assertLessEqual(abs(mine - model), 1.0)
+
+    def test_a_device_only_full_recompute_fits_keeps_it(self):
+        """
+        Feature: choose_recompute modes.
+        Description: A device a little larger than the heaviest stage fully
+            recomputed, smaller than it plain.
+        Expectation: Full, no stage saving any time, at the memory model's
+            peak.
+        """
+        evaluator = self._evaluator()
+        full = _stage_peaks(evaluator, full_rec=True)
+        self.assertLess(max(full) + 16, max(_stage_peaks(evaluator, full_rec=False)))
+        choice = choose_recompute(_with_capacity(evaluator, max(full) + 16), Hard.Device_A2, modes=MODES)
+        self.assertEqual(choice.mode, "full")
+        self.assertEqual(choice.stage_savings, tuple(0.0 for _ in full))
+        self.assertLessEqual(abs(choice.memory - max(full)), 1.0)
+
+    def test_a_choice_per_layer_is_as_fast_as_one_mode(self):
+        """
+        Feature: choose_recompute modes.
+        Description: The heaviest stage, plain, a little too big for the
+            device: one mode for every layer, and a choice per layer.
+        Expectation: One mode must recompute every layer fully; the choice
+            per layer saves more time, still within the device.
+        """
+        evaluator = self._evaluator()
+        capacity = max(_stage_peaks(evaluator, full_rec=False)) - 64
+        _with_capacity(evaluator, capacity)
+        one = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        each = choose_recompute(evaluator, Hard.Device_A2)
+        self.assertEqual(one.mode, "full")
+        self.assertIsNone(each.mode)
+        self.assertGreater(sum(each.stage_savings), sum(one.stage_savings))
+        self.assertLessEqual(each.memory, capacity)
+
+    def test_the_modes_recompute_what_their_names_say(self):
+        """
+        Feature: mode_recompute.
+        Description: Each mode, with the switches a config sets.
+        Expectation: Off recomputes nothing, full everything, selective the
+            switches set to 0; another name is refused.
+        """
+        configured = {"attBMM": 1, "normOp": 0, "ffAct": 0}
+        self.assertEqual(mode_recompute("off", configured), frozenset())
+        self.assertIsNone(mode_recompute("full", configured))
+        self.assertEqual(mode_recompute("selective", configured), frozenset({"normOp", "ffAct"}))
+        with self.assertRaises(ValueError):
+            mode_recompute("sometimes", configured)
+
+
 class TestNoChoice(unittest.TestCase):
     """What the choice does not cover."""
 
@@ -297,6 +405,21 @@ class TestDescribe(unittest.TestCase):
                          ["layers 0-1: no recompute", "layer 2: recompute attBMM+ffAct", "layers 3-6: full recompute"])
         self.assertEqual(option_label(_option(None)), "full recompute")
         self.assertEqual(choice.memory, 2.0)
+        self.assertEqual(to_records(choice), [
+            {"first": 0, "count": 2, "kind": None, "recompute": "none"},
+            {"first": 2, "count": 1, "kind": None, "recompute": ["attBMM", "ffAct"]},
+            {"first": 3, "count": 4, "kind": None, "recompute": "full"},
+        ])
+
+    def test_one_mode_reads_first(self):
+        """
+        Feature: describe.
+        Description: A choice of one mode for every layer.
+        Expectation: Its mode on the first line.
+        """
+        choice = RecomputeChoice(ranges=(LayerRange(0, 4, None, _option(frozenset())),), stage_memory=(1.0,),
+                                 stage_savings=(0.0,), mode="off")
+        self.assertEqual(describe(choice).splitlines(), ["every layer: off", "layers 0-3: no recompute"])
 
 
 class TestAutoRecomputeSearch(unittest.TestCase):
@@ -336,12 +459,68 @@ class TestAutoRecomputeSearch(unittest.TestCase):
     def test_the_recompute_cannot_also_come_from_the_config(self):
         """
         Feature: ParallelizeLayer auto_recompute.
-        Description: Ask for auto recompute and for the config's recompute.
-        Expectation: Refused.
+        Description: Ask for auto recompute and for the config's recompute,
+            then for a mode no runtime has.
+        Expectation: Both refused.
         """
         with self.assertRaises(ValueError):
             Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
                             auto_recompute=True, mppb=True)
+        with self.assertRaises(ValueError):
+            Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
+                            auto_recompute=True, recompute_modes=("off", "sometimes"))
+
+    def test_one_mode_per_candidate_and_the_per_layer_choice_of_one(self):
+        """
+        Feature: ParallelizeLayer recompute_modes and recompute_per_layer.
+        Description: Order the space choosing off or full for every layer,
+            then ask the best configuration for a choice per layer.
+        Expectation: Every candidate gets one of the two modes; the choice
+            per layer scores no worse than the best candidate's mode.
+        """
+        set_verbose_level(1)
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        runner = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"),
+                                 dimensions=[Dim.TP, Dim.PP], auto_recompute=True,
+                                 recompute_modes=("off", "full")).instance
+        results, _ = runner.device_loops(({}, 0), None)
+        space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+        scored, _ = runner.order_search_space(space, None, None)
+        self.assertEqual({choice.mode for choice in runner.recompute_choices.values()} - {"off", "full"}, set())
+        self.assertEqual(len(runner.recompute_choices), len(scored))
+        per_layer, score = runner.recompute_per_layer(scored[0][0])
+        self.assertIsNone(per_layer.mode)
+        self.assertLessEqual(score, scored[0][2] * (1 + 1e-12))
+
+    def test_a_multimodal_search_chooses_for_the_model_it_prices(self):
+        """
+        Feature: ParallelizeMultiModal auto_recompute.
+        Description: A vision-language model, whose search prices its text
+            model (IR finding F2).
+        Expectation: Every candidate gets options for the text model's
+            layers.
+        """
+        set_verbose_level(1)
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "vl.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_VL_TRAINING, handle)
+            with patch.object(_hf_model_spec, "_get_hf_config", return_value=_VL), \
+                    patch.dict(os.environ, {"MPLCONFIGDIR": folder}):
+                runner = Par.Parallelize("hyper_v2", path, Hard.Machine(8, "A2"), global_batch_size=16,
+                                         dimensions=[Dim.DP], auto_recompute=True).instance
+                self.assertIsInstance(runner, Par.ParallelizeMultiModal)
+                results, _ = runner.device_loops(({}, 0), None)
+                space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+                scored, _ = runner.order_search_space(space, None, None)
+        self.assertTrue(scored)
+        text_layers = len(layer_kinds(runner.config.ccfg))
+        for config, _, _, _ in scored:
+            ranges = runner.recompute_choices[config].ranges
+            self.assertEqual(sum(item.count for item in ranges), text_layers)
 
 
 if __name__ == "__main__":
