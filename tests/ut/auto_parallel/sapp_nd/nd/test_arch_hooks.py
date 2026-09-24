@@ -215,7 +215,12 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
                         kind = next(iter(_LEGACY_OPS[arch]))
                         self.assertEqual(_state(cfg), _legacy_state(arch, kind, has_op, p))
                         continue
-                    # t5 sets its counts and byte widths per layer, from its stack's kinds.
+                    # t5 sets its counts per layer, from its stack's kinds, and its
+                    # byte widths on the model, which every layer keeps.
+                    bytes_names = ("bytes_grad", "bytes_os", "bytes_dropout", "bytes_norm")
+                    legacy = _legacy_state(arch, "encoder", has_op, p)
+                    self.assertEqual({name: getattr(cfg, name) for name in bytes_names},
+                                     {name: legacy[name] for name in bytes_names})
                     for name, (kind, count) in zip(("encoder", "decoder"), layer_groups(cfg)):
                         layer = copy.deepcopy(cfg)
                         apply_layer_kind(CWrap(layer), kind)
@@ -583,14 +588,14 @@ class TestDenseThenMoE(unittest.TestCase):
         Feature: t5 layer stack.
         Description: A four-layer t5.
         Expectation: Two encoder then two decoder layers, each with its own
-            counts and t5's one-byte dropout mask, which the model does not
-            take.
+            counts, and t5's one-byte dropout mask on the model and on every
+            layer.
         """
         ccfg = _ccfg("t5_small")
         self.assertEqual([(group.kind.name, group.count) for group in ccfg.layer_stack.groups],
                          [("encoder", 2), ("decoder", 2)])
         check_and_apply_custom_hook(ccfg)
-        self.assertEqual(ccfg.bytes_dropout, 0)
+        self.assertEqual(ccfg.bytes_dropout, 1)
         for kind, attention_matmuls in zip(ccfg.layer_stack.distinct_kinds(), (4, 8)):
             layer = copy.deepcopy(ccfg)
             apply_layer_kind(layer, kind)

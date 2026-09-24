@@ -24,8 +24,8 @@ The layer stack is data too (``ccfg.layer_stack``), and needs no hook of its
 own.  The estimators read each layer's kind from :func:`layer_groups`, and
 :func:`apply_layer_kind` gives a layer its kind from the fields
 :func:`bind_layer_stack` recorded when the family hook ran.  A family whose
-layers take some fields per layer rather than on the model, such as t5's
-byte widths, leaves them in ``ccfg.layer_fields`` for every kind to assign.
+layers take some fields per layer rather than on the model, such as cm's
+sharding, leaves them in ``ccfg.layer_fields`` for every kind to assign.
 """
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -288,10 +288,9 @@ def custom_mixtral(ccfg):
 def custom_t5(ccfg):
     """t5: the encoder and decoder are kinds of its layer stack.
 
-    Both store a one-byte dropout mask, and t5 sets its byte widths per
-    layer, not on the model.
+    Both store a one-byte dropout mask.
     """
-    ccfg.layer_fields = _byte_widths(ccfg, dropout=1)
+    _set_bytes(ccfg, dropout=1)
 
 
 def custom_pangualpha(ccfg):
