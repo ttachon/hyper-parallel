@@ -1,4 +1,7 @@
-# PanGu-Alpha: a two-projection feed-forward, with dropout.
+# PanGu-Alpha: a two-projection feed-forward, with dropout, which keeps a
+# one-byte mask.
+run:
+  dropout_bytes: 1
 kinds:
   decoder:
     ops:

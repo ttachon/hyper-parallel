@@ -44,7 +44,9 @@ SELECTIVE_RULES = ("hyperparallel", "mindformers")
 class ExecSpec:
     """How a model is trained: the strategy a search varies, and the run.
 
-    Every field is optional; ``None`` means the spec does not state it.
+    Every field is optional; ``None`` means the spec does not state it.  A
+    byte width, ``grad_accumulation`` or ``shard_activations`` that no spec
+    states takes the default of the model's family, from its op profile.
 
     Attributes:
         dp, tp, pp, vpp, cp, ep: The data, tensor, pipeline, virtual
@@ -53,10 +55,15 @@ class ExecSpec:
             layer runs with the dense layers' tensor parallelism.
         sequence_parallel: Whether activations are split along the sequence
             over the tensor-parallel group.
+        shard_activations: Whether tensor parallelism shards the activations
+            between layers, which a fully recomputed layer keeps as its
+            input, and the output layer's.
         micro_batch_size, micro_batch_num, global_batch_size: The batch.
         optimizer_parallel: Whether optimizer states are sharded.
         optimizer_shard: How many ways optimizer states are sharded.
         grad_shard: Whether gradients are sharded too.
+        grad_accumulation: Whether gradients take memory without pipeline
+            parallelism too; under it they always do.
         pp_schedule: The pipeline schedule, such as ``1f1b``.
         offset: How many layers each pipeline stage holds beyond an even
             split, per stage or per chunk and stage.
@@ -74,9 +81,9 @@ class ExecSpec:
         recompute_slice_activation: Whether a recomputed layer keeps its
             input sliced over tensor parallelism.
         param_bytes, compute_bytes, softmax_bytes, grad_bytes,
-            optimizer_state_bytes, norm_bytes: Bytes per element of the
-            parameters, activations, softmax outputs, gradients, optimizer
-            states and norm activations.
+            optimizer_state_bytes, norm_bytes, dropout_bytes: Bytes per
+            element of the parameters, activations, softmax outputs,
+            gradients, optimizer states, norm activations and dropout masks.
         flash_attention, grad_clip, grouped_gemm, tie_embeddings: Kernels
             and features the run uses.
         vocab_emb_dp: Whether the vocabulary embedding runs data parallel.
@@ -99,6 +106,7 @@ class ExecSpec:
     ep: Optional[int] = None
     etp: Optional[int] = None
     sequence_parallel: Optional[bool] = None
+    shard_activations: Optional[bool] = None
 
     micro_batch_size: Optional[int] = None
     micro_batch_num: Optional[int] = None
@@ -107,6 +115,7 @@ class ExecSpec:
     optimizer_parallel: Optional[bool] = None
     optimizer_shard: Optional[int] = None
     grad_shard: Optional[bool] = None
+    grad_accumulation: Optional[bool] = None
 
     pp_schedule: Optional[str] = None
     offset: Optional[Union[int, list]] = None
@@ -127,6 +136,7 @@ class ExecSpec:
     grad_bytes: Optional[int] = None
     optimizer_state_bytes: Optional[int] = None
     norm_bytes: Optional[int] = None
+    dropout_bytes: Optional[int] = None
 
     flash_attention: Optional[bool] = None
     grad_clip: Optional[bool] = None
@@ -202,11 +212,11 @@ _KINDS: Dict[str, tuple] = {
     "count": ("dp", "tp", "pp", "vpp", "cp", "ep", "micro_batch_size", "micro_batch_num",
               "global_batch_size", "optimizer_shard", "seq_split", "seq_length"),
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
-             "optimizer_state_bytes", "norm_bytes"),
-    "flag": ("sequence_parallel", "optimizer_parallel", "grad_shard", "mtp_in_offset",
-             "emb_out_in_offset", "recompute_slice_activation", "flash_attention", "grad_clip",
-             "grouped_gemm", "vocab_emb_dp", "emb_dp_sharded", "tie_embeddings",
-             "shard_mtp_param", "frozen"),
+             "optimizer_state_bytes", "norm_bytes", "dropout_bytes"),
+    "flag": ("sequence_parallel", "shard_activations", "optimizer_parallel", "grad_shard",
+             "grad_accumulation", "mtp_in_offset", "emb_out_in_offset",
+             "recompute_slice_activation", "flash_attention", "grad_clip", "grouped_gemm",
+             "vocab_emb_dp", "emb_dp_sharded", "tie_embeddings", "shard_mtp_param", "frozen"),
     "name": ("pp_schedule", "selective_rule", "cp_algo", "optimizer", "device_memory"),
 }
 

@@ -27,6 +27,13 @@ closed set that say how the layer is shaped:
 A profile with more than one kind may name a ``default``, the kind a layer
 takes when nothing says otherwise; a profile with one kind defaults to it.
 
+A profile may also state what a model of its family has when its producer
+does not say: under ``run``, the run's byte widths, whether its gradients
+take memory without pipeline parallelism and whether tensor parallelism
+shards the activations between layers (:data:`DEFAULT_RUN` otherwise); under
+``model``, an MLA family's value-head width.  The cost model's ``derive``
+reads them.
+
 A model spec names its profile with ``arch``, and may declare its own counts
 in ``ops`` instead.  The cost model reads only what the spec declares.  A
 producer that has nothing better than a free-text model name, such as a
@@ -35,11 +42,13 @@ MindFormers ``trainer.model_name``, falls back on :func:`infer_arch`.
 import functools
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import yaml
 
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec, ExecSpecError
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
 
 logger = logging.getLogger(__name__)
@@ -51,6 +60,23 @@ VISION_ARCH = "vision"
 
 ATTENTION_FLAVOURS = ("full", "linear")
 FFN_FLAVOURS = ("dense", "moe")
+
+# The run of a family's model when its producer states none of it, and the
+# only execution-spec fields a profile's ``run`` may change: the byte widths
+# of gradients, optimizer states, norm activations and dropout masks, whether
+# gradients take memory without pipeline parallelism, and whether tensor
+# parallelism shards the activations between layers.
+DEFAULT_RUN = MappingProxyType({
+    "grad_bytes": 4,
+    "optimizer_state_bytes": 4,
+    "norm_bytes": 4,
+    "dropout_bytes": 0,
+    "grad_accumulation": False,
+    "shard_activations": False,
+})
+
+# The model facts a profile's ``model`` may give a model that states none.
+MODEL_DEFAULT_KEYS = ("v_head_dim",)
 
 # Names a model name is matched against, in order, first match wins, with the
 # family each one means.  This is the order the cost model itself used to
@@ -89,11 +115,16 @@ class OpProfile:
         layer_kinds: Every kind of the family, by name.
         default: The kind a layer takes when nothing says otherwise, or
             ``None`` for a family whose stack always states its kinds.
+        run: The run of the family's models where their producer states
+            none, every key of :data:`DEFAULT_RUN`.
+        model: The model facts the family gives a model that states none.
     """
 
     arch: str
     layer_kinds: Dict[str, LayerKind]
     default: Optional[str] = None
+    run: Mapping[str, Any] = field(default_factory=lambda: DEFAULT_RUN)
+    model: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
     @property
     def kinds(self) -> Dict[str, OpCounts]:
@@ -114,6 +145,7 @@ class OpProfile:
         return self.layer_kinds[name]
 
 
+@functools.lru_cache(maxsize=None)
 def known_archs() -> Tuple[str, ...]:
     """Return the name of every family that has a profile file."""
     return tuple(sorted(
@@ -146,6 +178,37 @@ def _layer_kind(arch: str, name: str, data: Any) -> LayerKind:
     )
 
 
+def _run_defaults(arch: str, data: Any) -> Mapping[str, Any]:
+    """Return a family's run: :data:`DEFAULT_RUN`, with what its profile states."""
+    stated = {} if data is None else data
+    if not isinstance(stated, Mapping):
+        raise ModelSpecError(f"{arch}.run must map run facts to values, got {data!r}")
+    unknown = sorted(set(stated) - set(DEFAULT_RUN))
+    if unknown:
+        raise ModelSpecError(f"{arch}.run has unknown keys {unknown}; a family states {sorted(DEFAULT_RUN)}")
+    try:
+        spec = ExecSpec.from_dict(stated)
+    except ExecSpecError as exc:
+        raise ModelSpecError(f"{arch}.run: {exc}") from exc
+    return MappingProxyType({**DEFAULT_RUN, **spec.to_dict()})
+
+
+def _model_defaults(arch: str, data: Any) -> Mapping[str, int]:
+    """Return the model facts a family gives a model that states none."""
+    stated = {} if data is None else data
+    if not isinstance(stated, Mapping):
+        raise ModelSpecError(f"{arch}.model must map model facts to values, got {data!r}")
+    unknown = sorted(set(stated) - set(MODEL_DEFAULT_KEYS))
+    if unknown:
+        raise ModelSpecError(
+            f"{arch}.model has unknown keys {unknown}; a family states {list(MODEL_DEFAULT_KEYS)}"
+        )
+    for key, value in stated.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ModelSpecError(f"{arch}.model.{key} must be a positive whole number, got {value!r}")
+    return MappingProxyType(dict(stated))
+
+
 @functools.lru_cache(maxsize=None)
 def load_op_profile(arch: str) -> OpProfile:
     """Read and validate the profile of one family.
@@ -153,7 +216,8 @@ def load_op_profile(arch: str) -> OpProfile:
     Raises:
         ModelSpecError: If no profile has that name, or the file declares no
             layer kind, an unknown key, an incomplete op vector, an unknown
-            flavour, or a default that is not one of its kinds.
+            flavour, a default that is not one of its kinds, or a run or
+            model default it cannot state.
     """
     if arch not in known_archs():
         raise ModelSpecError(
@@ -161,7 +225,7 @@ def load_op_profile(arch: str) -> OpProfile:
         )
     with open(os.path.join(PROFILE_DIR, f"{arch}.yaml"), encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
-    unknown = sorted(set(data) - {"kinds", "default"})
+    unknown = sorted(set(data) - {"kinds", "default", "run", "model"})
     if unknown:
         raise ModelSpecError(f"op profile {arch!r} has unknown keys {unknown}")
     kinds = data.get("kinds")
@@ -175,7 +239,13 @@ def load_op_profile(arch: str) -> OpProfile:
         raise ModelSpecError(
             f"op profile {arch!r} names default kind {default!r}, but its kinds are {sorted(layer_kinds)}"
         )
-    return OpProfile(arch, layer_kinds, default)
+    return OpProfile(arch, layer_kinds, default, _run_defaults(arch, data.get("run")),
+                     _model_defaults(arch, data.get("model")))
+
+
+def family_profile(arch: Optional[str]) -> OpProfile:
+    """Return the profile of *arch*, or the default family's when no profile has that name."""
+    return load_op_profile(arch if arch in known_archs() else DEFAULT_ARCH)
 
 
 def infer_arch(name: Any) -> str:

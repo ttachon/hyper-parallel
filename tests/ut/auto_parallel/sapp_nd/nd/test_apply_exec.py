@@ -93,6 +93,21 @@ class TestApplyExec(unittest.TestCase):
         got = (ccfg.t, ccfg.sp, ccfg.shard_recompute_input, ccfg.d)
         self.assertEqual(got, (2, 2, 2, dp), f"t, sp, shard_recompute_input, d={got}")
 
+    def test_a_stated_run_fact_wins_over_the_family(self):
+        """
+        Feature: apply_exec and the family's defaults.
+        Description: The Hyper Qwen config states no byte width and no
+            activation sharding.  State two-byte gradients that accumulate
+            without pipelining, and whole activations.
+        Expectation: Before, the family's 4-byte gradients and Qwen's
+            sharded output layer; after, what the spec states.
+        """
+        ccfg = CostModelConfig(os.path.join(_YAMLS, "hyper_qwen3_72b.yaml"), framework="hyper_v2")
+        self.assertEqual((ccfg.bytes_grad, ccfg.shard_output_activ), (4, ccfg.t))
+        apply_exec(ccfg, ExecSpec(grad_bytes=2, grad_accumulation=True, shard_activations=False))
+        self.assertEqual((ccfg.bytes_grad, ccfg.shard_output_activ), (2, 1))
+        self.assertEqual(exec_of(ccfg).grad_bytes, 2)
+
     def test_device_memory_from_a_string(self):
         """
         Feature: apply_exec.

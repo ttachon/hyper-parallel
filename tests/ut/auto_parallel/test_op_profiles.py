@@ -24,6 +24,8 @@ from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import (
     DEFAULT_ARCH,
+    DEFAULT_RUN,
+    family_profile,
     infer_arch,
     known_archs,
     load_op_profile,
@@ -98,11 +100,13 @@ def _profile_file(text: str):
         with open(os.path.join(folder, "unit.yaml"), "w", encoding="utf-8") as handle:
             handle.write(text)
         load_op_profile.cache_clear()
+        known_archs.cache_clear()
         try:
             with patch.object(_op_profiles, "PROFILE_DIR", folder):
                 yield
         finally:
             load_op_profile.cache_clear()
+            known_archs.cache_clear()
 
 
 class TestKindsAndFlavours(unittest.TestCase):
@@ -181,6 +185,70 @@ class TestKindsAndFlavours(unittest.TestCase):
             with self.assertRaises(ModelSpecError) as ctx:
                 load_op_profile("unit")
         self.assertIn("decoder", str(ctx.exception))
+
+
+class TestFamilyDefaults(unittest.TestCase):
+    """What a family's model has where its producer states nothing."""
+
+    def test_each_family_states_what_its_hook_set(self):
+        """
+        Feature: run and model defaults.
+        Description: The byte widths, gradient accumulation and activation
+            sharding the family hooks set in code, and DeepSeek's head width.
+        Expectation: Each profile states its own over DEFAULT_RUN, and only
+            the MLA families a model default.
+        """
+        runs = {
+            "llama2": {"grad_bytes": 2, "grad_accumulation": True},
+            "mixtral": {"grad_bytes": 2},
+            "pangualpha": {"dropout_bytes": 1},
+            "t5": {"dropout_bytes": 1},
+            "qwen": {"shard_activations": True},
+            "qwen3_5": {"shard_activations": True},
+        }
+        models = {"deepseek": {"v_head_dim": 128}, "cm": {"v_head_dim": 128}}
+        for arch in known_archs():
+            with self.subTest(arch=arch):
+                profile = load_op_profile(arch)
+                self.assertEqual(dict(profile.run), {**DEFAULT_RUN, **runs.get(arch, {})})
+                self.assertEqual(dict(profile.model), models.get(arch, {}))
+
+    def test_a_run_default_it_cannot_state_is_refused(self):
+        """
+        Feature: profile loader.
+        Description: A run default outside DEFAULT_RUN, and one that is not
+            a whole number of bytes.
+        Expectation: Refused, naming the key.
+        """
+        for run, named in (("dp: 2", "dp"), ("grad_bytes: two", "grad_bytes")):
+            text = f"run:\n  {run}\nkinds:\n  decoder:\n    ops: {_counts()}\n"
+            with self.subTest(run=run), _profile_file(text):
+                with self.assertRaises(ModelSpecError) as ctx:
+                    load_op_profile("unit")
+                self.assertIn(named, str(ctx.exception))
+
+    def test_a_model_default_it_cannot_state_is_refused(self):
+        """
+        Feature: profile loader.
+        Description: A model default other than v_head_dim, and a zero
+            value-head width.
+        Expectation: Refused, naming the key.
+        """
+        for model, named in (("hidden_size: 64", "hidden_size"), ("v_head_dim: 0", "v_head_dim")):
+            text = f"model:\n  {model}\nkinds:\n  decoder:\n    ops: {_counts()}\n"
+            with self.subTest(model=model), _profile_file(text):
+                with self.assertRaises(ModelSpecError) as ctx:
+                    load_op_profile("unit")
+                self.assertIn(named, str(ctx.exception))
+
+    def test_a_name_no_profile_has_is_the_default_family(self):
+        """
+        Feature: family_profile.
+        Description: No arch, an arch no profile has, and a known one.
+        Expectation: The default family twice, then the named one.
+        """
+        got = [family_profile(arch).arch for arch in (None, "gpt", "qwen")]
+        self.assertEqual(got, [DEFAULT_ARCH, DEFAULT_ARCH, "qwen"])
 
 
 class TestInferArch(unittest.TestCase):

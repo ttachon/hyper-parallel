@@ -51,7 +51,7 @@ class _CostModelParser(ABC):
         arch: Optional[str] = None,
         ops: Optional[Mapping[str, OpCounts]] = None,
     ) -> None:
-        """Settle the op profile the arch hooks price the model with.
+        """Settle the op profile the model is priced with.
 
         A parser that reads a declared arch passes it, with any op counts the
         spec declares; one that has only a model name leaves the family to

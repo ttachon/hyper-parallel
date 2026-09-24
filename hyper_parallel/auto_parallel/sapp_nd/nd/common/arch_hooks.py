@@ -12,28 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Custom variables per model (expert knowledge)
+"""A model's family, applied to its config, and its layer kinds.
 
-A family's op counts are data: its profile in ``auto_parallel/op_profiles``,
-or the counts its model spec declares.  What the hooks below still set is
-what a profile cannot express yet: byte widths and activation sharding.  A
-hook is chosen by ``ccfg.arch``, which the parser settles, and never by
-matching the model name.
+A family is data: its op profile in ``auto_parallel/op_profiles``, or the op
+counts its model spec declares, chosen by ``ccfg.arch``, which the parser
+settles, never by matching the model name.  :func:`check_and_apply_custom_hook`
+applies it where the estimators price a config: what the family decides
+where the run states nothing (:func:`derive_family`), then the op counts of
+its default kind.
 
-The layer stack is data too (``ccfg.layer_stack``), and needs no hook of its
-own.  The estimators read each layer's kind from :func:`layer_groups`, and
-:func:`apply_layer_kind` gives a layer its kind from the fields
-:func:`bind_layer_stack` recorded when the family hook ran.  A family whose
-layers take some fields per layer rather than on the model, such as cm's
-sharding, leaves them in ``ccfg.layer_fields`` for every kind to assign.
+The layer stack is data too (``ccfg.layer_stack``).  The estimators read each
+layer's kind from :func:`layer_groups`, and :func:`apply_layer_kind` gives a
+layer its kind from the fields :func:`bind_layer_stack` recorded when the
+family was applied.  A family whose layers take some fields per layer rather
+than on the model, cm's sharding, leaves them in ``ccfg.layer_fields`` for
+every kind to assign.
 """
-import math
 from typing import Any, Dict, List, Optional, Tuple
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, LinearAttentionDims
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
-from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, LayerKind, load_op_profile
+from hyper_parallel.auto_parallel._op_profiles import (
+    VISION_ARCH, LayerKind, family_profile, known_archs, load_op_profile,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_layer_strategy
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive_family
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 
@@ -181,9 +184,10 @@ def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str,
 def bind_layer_stack(ccfg: Any) -> None:
     """Record, per kind of the config's stack, the fields it assigns.
 
-    Called where the family hook runs, per search candidate and per
-    estimate, so the values a kind restores are the model's own as that
-    hook left them.  A config without a stack gets no binding.
+    Called where the family is applied, per search candidate and per
+    estimate, so the values a kind restores are the model's own, as
+    applying its family left them.  A config without a stack gets no
+    binding.
     """
     stack = getattr(ccfg, "layer_stack", None)
     if stack is None:
@@ -220,7 +224,7 @@ def apply_layer_kind(e: Any, kind: LayerKind) -> None:
 
 
 def _needs_kinds(stack: LayerStack) -> bool:
-    """Whether a stack's layers differ from the config the family hook leaves."""
+    """Whether a stack's layers differ from the config applying its family leaves."""
     kinds = stack.distinct_kinds()
     return len(kinds) > 1 or any(kind.attention != "full" or kind.ffn is not None for kind in kinds)
 
@@ -230,7 +234,7 @@ def layer_groups(ccfg: Any) -> List[Tuple[Optional[LayerKind], int]]:
 
     Returns:
         ``(kind, count)`` per group of the config's stack.  A config without
-        a stack, or whose stack's one kind is the config the family hook
+        a stack, or whose stack's one kind is the config applying its family
         leaves, is one group of all its layers, MTP included, with no kind:
         they are priced on the config as it stands.
     """
@@ -245,143 +249,37 @@ def layer_kinds(ccfg: Any) -> List[Optional[LayerKind]]:
     return [kind for kind, count in layer_groups(ccfg) for _ in range(count)]
 
 
-def _byte_widths(ccfg: Any, grad: int = 4, dropout: int = 0) -> Dict[str, int]:
-    """Byte widths a family sets alongside its op counts."""
-    return {
-        "bytes_grad": grad if ccfg.p > 1 else 0,  # gradients
-        "bytes_os": 4,  # optimizer states
-        "bytes_dropout": dropout,  # dropout mask
-        "bytes_norm": 4,  # normalization input
-    }
+def apply_family(ccfg: Any) -> None:
+    """Give *ccfg* what its family decides, and the op counts of its default kind.
 
-
-def _set_bytes(ccfg: Any, grad: int = 4, dropout: int = 0) -> None:
-    """Set a family's byte widths on the model."""
-    for name, value in _byte_widths(ccfg, grad, dropout).items():
-        setattr(ccfg, name, value)
-
-
-def _decoder(ccfg: Any, arch: str) -> None:
-    """Op counts of the family's default kind, and the byte widths of a decoder."""
-    apply_op_counts(ccfg, layer_op_counts(ccfg, arch, load_op_profile(arch).default))
-    _set_bytes(ccfg)
-
-
-def custom_default_transformer(ccfg):
-    """base"""
-    _decoder(ccfg, "default")
-
-
-def custom_llama2(ccfg):
-    """llama2"""
-    _decoder(ccfg, "llama2")
-    ccfg.bytes_grad = 2  # gradients
-
-
-def custom_mixtral(ccfg):
-    """mixtral"""
-    apply_op_counts(ccfg, layer_op_counts(ccfg, "mixtral", "decoder"))
-    _set_bytes(ccfg, grad=2)
-    ccfg.hff = ccfg.hff_exp
-
-
-def custom_t5(ccfg):
-    """t5: the encoder and decoder are kinds of its layer stack.
-
-    Both store a one-byte dropout mask.
+    A vision tower takes the vision profile's encoder counts, whatever
+    counts it carries from its language model.  A family whose stack always
+    states its kinds, t5's, has no default kind: each layer takes its kind's.
     """
-    _set_bytes(ccfg, dropout=1)
-
-
-def custom_pangualpha(ccfg):
-    """pangualpha"""
-    apply_op_counts(ccfg, layer_op_counts(ccfg, "pangualpha", "decoder"))
-    _set_bytes(ccfg, dropout=1)
-
-
-def custom_deepseek3(ccfg, arch="deepseek"):
-    """DeepSeek-V3: its dense and MoE layers are kinds of its layer stack."""
-    _decoder(ccfg, arch)
-    ccfg.dh = 128
-
-
-def custom_qwen(ccfg, arch="qwen"):
-    """qwen2"""
-    _decoder(ccfg, arch)
-    # if "72b" in ccfg.model_name :
-    #     ccfg.s = ccfg.s * 3/4
-    ccfg.shard_recompute_input = ccfg.t
-    ccfg.shard_output_activ = ccfg.t
-    # ccfg.bytes_grad = 4
-
-
-def custom_qwen3_5(ccfg: Any) -> None:
-    """Qwen3.5: Qwen's hook, on the full-attention kind of its hybrid profile.
-
-    The linear-attention layers get their kind from the layer stack.
-    """
-    custom_qwen(ccfg, arch="qwen3_5")
-
-
-def custom_cm(ccfg):
-    """llama moe: DeepSeek's stack, each layer sharding its states as below."""
-    layer_fields = {
-        "shard_p_os_exp": ccfg.shard_p_os_exp_partial,
-        "shard_p_os_non_exp_partial": math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp),
-        "shard_embed": ccfg.t,
-    }
-    custom_deepseek3(ccfg, arch="cm")
-    ccfg.layer_fields = layer_fields
-
-    def num_params_norm_cm(c, _):
-        return c.n_normOp * 2 * c.h + 0.5 * c.n_attMM * c.dh
-
-    ccfg.overwrite_eval_functions["num_params_norm"] = num_params_norm_cm
-
-
-def custom_vision_tower(ccfg: Any) -> None:
-    """Vision tower of a multimodal model.
-
-    Always priced with the vision profile.  A tower inherits the hook of its
-    language model's family, named in ``ccfg.inherited_arch``, which runs
-    first and gives it that family's activation sharding.
-    """
-    inherited = getattr(ccfg, "inherited_arch", None)
-    if inherited not in (None, VISION_ARCH):
-        ARCH_HOOKS[inherited](ccfg)
-    apply_op_counts(ccfg, load_op_profile(VISION_ARCH).counts("encoder"))
-    _set_bytes(ccfg)
-
-
-ARCH_HOOKS = {
-    "default": custom_default_transformer,
-    "llama2": custom_llama2,
-    "mixtral": custom_mixtral,
-    "t5": custom_t5,
-    "pangualpha": custom_pangualpha,
-    "deepseek": custom_deepseek3,
-    "qwen": custom_qwen,
-    "qwen3_5": custom_qwen3_5,
-    "cm": custom_cm,
-    VISION_ARCH: custom_vision_tower,
-}
+    derive_family(ccfg)
+    arch = getattr(ccfg, "arch", None)
+    if arch == VISION_ARCH:
+        apply_op_counts(ccfg, load_op_profile(VISION_ARCH).counts("encoder"))
+        return
+    profile = family_profile(arch)
+    if profile.default is not None:
+        apply_op_counts(ccfg, layer_op_counts(ccfg, profile.arch, profile.default))
 
 
 def check_and_apply_custom_hook(e: Any) -> None:
-    """Apply the hook of the family the config declares in ``ccfg.arch``.
+    """Apply the family the config declares in ``ccfg.arch``, :func:`apply_family`.
 
+    A config whose arch names no profile is priced as the default family.
     Then bind the config's layer stack, so each kind restores the values
-    that hook left.
+    applying the family left.
     """
     if isinstance(e, CostModelConfig):
         e = CWrap(e)
     arch = getattr(e.ccfg, "arch", None)
-    hook = ARCH_HOOKS.get(arch)
-    if hook is None:
+    if arch not in known_archs():
         logger.warning(
-            "Hook not defined for: %s (arch %r). Default one is chosen",
+            "No op profile for: %s (arch %r). The default one is chosen",
             e.get_model_name(), arch,
         )
-        hook = custom_default_transformer
-    e.set_ccfg(hook)
+    e.set_ccfg(apply_family)
     bind_layer_stack(e.ccfg)

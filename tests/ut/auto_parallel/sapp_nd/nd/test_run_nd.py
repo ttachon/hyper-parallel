@@ -295,7 +295,7 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
 
 
 def _make_arch_cfg(**kwargs: Any) -> SimpleNamespace:
-    """Build a tiny config for arch hook functions."""
+    """Build a tiny config to apply a family to."""
     defaults = {
         "model_name": "deepseek-unit",
         "has_op": False,
@@ -1270,24 +1270,28 @@ class TestSappNDRunND(unittest.TestCase):
     def test_arch_hook_variants(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover predefined architecture hooks using tiny fake configs.
-        Expectation: Hooks update model-specific attributes, and each stack kind applies per layer.
+        Description: Apply each family to tiny fake configs.
+        Expectation: Each family's profile sets its fields, and each stack kind applies per layer.
         """
-        cfg = _make_arch_cfg(model_name="llama2")
-        ArchHooks.custom_default_transformer(cfg)
+        cfg = _make_arch_cfg(arch="default")
+        ArchHooks.apply_family(cfg)
         self.assertEqual(cfg.n_attMM, 4)
-        ArchHooks.custom_llama2(cfg)
+        cfg.arch = "llama2"
+        ArchHooks.apply_family(cfg)
         self.assertEqual(cfg.bytes_grad, 2)
-        ArchHooks.custom_mixtral(cfg)
-        self.assertEqual(cfg.hff, cfg.hff_exp)
-        ArchHooks.custom_pangualpha(cfg)
-        self.assertEqual(cfg.n_normOp, 4)
-        ArchHooks.custom_qwen(cfg)
-        self.assertEqual(cfg.shard_recompute_input, cfg.t)
+        cfg.arch = "mixtral"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.bytes_grad, cfg.hff), (2, 32))
+        cfg.arch = "pangualpha"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.n_normOp, cfg.bytes_dropout), (4, 1))
+        cfg.arch = "qwen"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.shard_recompute_input, cfg.shard_output_activ), (cfg.t, cfg.t))
 
-        t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
+        t5_cfg = _make_arch_cfg(arch="t5", n_lay=4, n_mtp=0)
         t5_cfg.layer_stack = resolve_layers("t5", derive_layers(load_op_profile("t5"), 4))
-        ArchHooks.custom_t5(t5_cfg)
+        ArchHooks.apply_family(t5_cfg)
         ArchHooks.bind_layer_stack(t5_cfg)
         t5_groups = ArchHooks.layer_groups(t5_cfg)
         self.assertEqual(len(t5_groups), 2)
@@ -1297,11 +1301,12 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.apply_layer_kind(t5_wrap, t5_groups[1][0])
         self.assertEqual(t5_cfg.n_attMM, 8)
 
-        deepseek_cfg = _make_arch_cfg(model_name="deepseek")
+        deepseek_cfg = _make_arch_cfg(arch="deepseek")
         deepseek_cfg.layer_stack = resolve_layers(
             "deepseek", derive_layers(load_op_profile("deepseek"), 4, 1, first_k_dense=2)
         )
-        ArchHooks.custom_deepseek3(deepseek_cfg)
+        ArchHooks.apply_family(deepseek_cfg)
+        self.assertEqual(deepseek_cfg.dh, 128)
         ArchHooks.bind_layer_stack(deepseek_cfg)
         deepseek_groups = ArchHooks.layer_groups(deepseek_cfg)
         self.assertEqual(len(deepseek_groups), 3)
@@ -1311,10 +1316,10 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[1][0])
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
-        cm_cfg = _make_arch_cfg(model_name="cm")
-        ArchHooks.custom_cm(cm_cfg)
-        self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
-        self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
+        cm_cfg = _make_arch_cfg(arch="cm")
+        ArchHooks.apply_family(cm_cfg)
+        self.assertEqual(cm_cfg.layer_fields,
+                         {"shard_p_os_exp": 2, "shard_p_os_non_exp_partial": 2, "shard_embed": 2})
 
     def test_performance_formula_helpers(self) -> None:
         """

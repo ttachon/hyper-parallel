@@ -1,5 +1,7 @@
 # CM, a Llama MoE laid out like DeepSeek V3: the default decoder op counts,
-# in dense and in MoE layers alike.
+# in dense and in MoE layers alike, with DeepSeek's value-head width.
+model:
+  v_head_dim: 128
 default: moe
 kinds:
   dense:

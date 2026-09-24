@@ -289,6 +289,3 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.bytes_p = 4
         self.ccfg.bytes_compute = 2
         self.ccfg.bytes_softmax = 4
-        self.ccfg.bytes_grad = 4
-        self.ccfg.bytes_os = 4
-        self.ccfg.bytes_norm = 4

@@ -31,11 +31,9 @@ from hyper_parallel.auto_parallel._op_profiles import LayerKind, known_archs, lo
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
-    ARCH_HOOKS,
     CWrap,
     apply_layer_kind,
     check_and_apply_custom_hook,
-    custom_vision_tower,
     layer_groups,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -154,22 +152,13 @@ def _legacy_state(arch: str, kind: str, has_op: bool, p: int) -> dict:
 
 
 class TestDispatchReadsTheArch(unittest.TestCase):
-    """The hook is chosen by the declared arch, never by the model name."""
-
-    def test_every_profile_has_a_hook(self):
-        """
-        Feature: arch hook registry.
-        Description: A profile without a hook could never be applied, and a
-            hook without a profile would have no counts to read.
-        Expectation: The registry and the profile files name the same archs.
-        """
-        self.assertEqual(set(ARCH_HOOKS), set(known_archs()))
+    """The family is chosen by the declared arch, never by the model name."""
 
     def test_the_model_name_is_not_read(self):
         """
         Feature: dispatch on ccfg.arch.
         Description: A config named like a Qwen model but declaring the
-            default arch must not get the Qwen hook's activation sharding.
+            default arch must not get Qwen's activation sharding.
         Expectation: shard_output_activ stays 1 under tp=2.
         """
         ccfg = _ccfg("qwen2_72b", arch="default")
@@ -181,7 +170,7 @@ class TestDispatchReadsTheArch(unittest.TestCase):
         """
         Feature: dispatch on ccfg.arch.
         Description: A config with a neutral name declaring the qwen arch gets
-            the qwen hook.
+            Qwen's activation sharding.
         Expectation: shard_output_activ follows tp=2.
         """
         ccfg = _ccfg("unit", arch="qwen")
@@ -246,11 +235,11 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
         for arch in known_archs():
             self._check(arch, with_table=False)
 
-    def test_a_tower_runs_its_inherited_hook_first(self):
+    def test_a_tower_takes_its_language_models_activation_sharding(self):
         """
         Feature: vision tower as data.
         Description: A tower's config is dispatched on the vision arch and
-            names qwen as the family whose hook it inherits.
+            names qwen as its language model's family.
         Expectation: Qwen's activation sharding, and the tower's counts.
         """
         cfg = _bare("vision", resolve_ops("qwen"), inherited_arch="qwen")
@@ -261,13 +250,26 @@ class TestHooksMatchTheirLiterals(unittest.TestCase):
     def test_the_vision_tower_uses_its_own_profile(self):
         """
         Feature: vision tower counts.
-        Description: A tower's config carries its language model's arch and
-            counts; the tower hook must not price it as that decoder.
+        Description: A tower's config carries its language model's counts;
+            applying its family must not price it as that decoder.
         Expectation: The tower's two-projection feed-forward, not three.
         """
-        cfg = _bare("qwen", resolve_ops("qwen"))
-        custom_vision_tower(cfg)
+        cfg = _bare("vision", resolve_ops("qwen"), inherited_arch="qwen")
+        check_and_apply_custom_hook(CWrap(cfg))
         self.assertEqual(cfg.n_ffMM, 2)
+
+    def test_a_deepseek_model_is_priced_at_its_value_heads(self):
+        """
+        Feature: an MLA family's head width.
+        Description: A DeepSeek model whose heads are 64 wide by h / a,
+            declaring value heads 96 wide, then declaring none.
+        Expectation: dh is the declared 96, then the family's 128.
+        """
+        model = dict(_DEEPSEEK, num_attention_heads=16, num_key_value_heads=16)
+        declared = CostModelConfig(_hyper_config("deepseek_v3", v_head_dim=96, **model), framework="hyper_v2")
+        self.assertEqual((declared.v_head_dim, declared.dh), (96, 96))
+        undeclared = CostModelConfig(_hyper_config("deepseek_v3", **model), framework="hyper_v2")
+        self.assertEqual((undeclared.v_head_dim, undeclared.dh), (None, 128))
 
 
 class TestDeclaredCountsReachTheEstimate(unittest.TestCase):

@@ -8,6 +8,14 @@
 # A kind may also state its flavours: attention (full or linear) and ffn
 # (dense or moe).  A profile with several kinds may name a default, the kind
 # a layer takes when nothing says otherwise.
+#
+# A profile may also state, under run, what a model of the family runs with
+# when its producer does not say: grad_bytes, optimizer_state_bytes,
+# norm_bytes and dropout_bytes (4, 4, 4 and 0 otherwise), grad_accumulation,
+# whether gradients take memory without pipeline parallelism (false), and
+# shard_activations, whether tensor parallelism shards the activations
+# between layers and the output layer's (false).  Under model, an MLA
+# family states the v_head_dim a model that declares none has.
 kinds:
   decoder:
     ops:

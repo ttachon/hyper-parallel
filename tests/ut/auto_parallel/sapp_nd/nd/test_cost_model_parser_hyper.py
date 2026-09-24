@@ -35,6 +35,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     layer_groups,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import exec_of
+from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
@@ -50,8 +51,9 @@ class _ParserCostModelConfig:
     """Minimal cost-model object for parser unit tests.
 
     Mirrors the helper in ``test_run_nd.py``.  A permissive ``__getattr__``
-    returns 0 for any attribute not explicitly set, matching
-    ``_CostModVar``'s default behaviour.
+    returns, for an attribute not explicitly set, the default ``_CostModVar``
+    declares, such as ``None`` for a run fact no parser states, and 0 for
+    one it does not declare, as ``_CostModVar`` does.
     """
 
     def __init__(self, input_config: Any = None) -> None:
@@ -60,9 +62,8 @@ class _ParserCostModelConfig:
         self.hooks_dict = {}
         self.source_code = None
 
-    def __getattr__(self, attr: str) -> int:
-        _ = attr
-        return 0
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(_CostModVar, attr, 0)
 
     @staticmethod
     def fp_bytes(precision: str) -> int:
@@ -561,7 +562,8 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Feature: _init_bytes.
         Description: Bytes from dtype fields in model section.
         Expectation: bytes_p=4 (float32), bytes_compute=2 (bfloat16),
-            bytes_softmax=4 (float32), bytes_grad=4, bytes_os=4, bytes_norm=4.
+            bytes_softmax=4 (float32); the family's bytes_grad=4, bytes_os=4
+            and bytes_norm=4, which the parser leaves to derive.
         """
         cfg = _dense_overrides(model={
             "param_init_type": "float32",
@@ -1094,12 +1096,11 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertNotIn("num_params_norm", ccfg.overwrite_eval_functions)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
-    def test_the_tower_inherits_its_language_models_hook(self, mock_hf):
+    def test_the_tower_inherits_its_language_models_sharding(self, mock_hf):
         """
         Feature: vision tower as data.
         Description: The tower's arch is the vision profile, and it names its
-            language model's family as the hook it inherits; the arch hooks
-            apply both, with no hook of the parser's.
+            language model's family, whose activation sharding it takes.
         Expectation: Qwen's activation sharding, then the tower's two-matmul
             MLP, with no gated triple to cast.
         """

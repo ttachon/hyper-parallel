@@ -1,5 +1,8 @@
-# Qwen: the default decoder.  The family differs only in how it shards
-# activations, which is strategy rather than op counts.
+# Qwen: the default decoder.  The family differs only in its run, which
+# shards the activations between layers, and the output layer's, over
+# tensor parallelism.
+run:
+  shard_activations: true
 kinds:
   decoder:
     ops:

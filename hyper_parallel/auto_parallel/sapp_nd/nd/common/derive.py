@@ -17,12 +17,14 @@
 A parser states primary facts: the model's dimensions, the parallel strategy
 and the fixed facts of the run.  :func:`derive` computes what follows from
 them, once when a config is parsed and again whenever its strategy changes,
-where each parser used to compute it.
+where each parser used to compute it.  What a producer does not state, its
+model's family says, from its op profile: :func:`derive_family`.
 """
 import logging
 import math
-from typing import Any, Union
+from typing import Any, Callable, Dict, Mapping, Union
 
+from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, family_profile
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 
 logger = logging.getLogger(__name__)
@@ -161,15 +163,6 @@ def derive_embedding_sharding(ccfg: Any) -> None:
     ccfg.shard_embed = (ccfg.d if ccfg.emb_dp_sharded else 1) * tp
 
 
-def derive_recompute_sharding(ccfg: Any) -> None:
-    """Set how a recomputed layer's input is sharded, ``shard_recompute_input``.
-
-    It stays sliced over tensor parallelism when the run keeps sliced
-    activations for recompute, and is whole otherwise.
-    """
-    ccfg.shard_recompute_input = ccfg.t if ccfg.recompute_slice_activation else 1
-
-
 def hyper_rec_op(selective: Union[bool, list]) -> dict[str, int]:
     """Recompute switches for a HyperParallel activation checkpoint mode.
 
@@ -240,6 +233,104 @@ def derive_flash_attention_factor(ccfg: Any) -> None:
     ccfg.s_fa = ccfg.s / ccfg.a if ccfg.has_fa and ccfg.a > 0 else ccfg.s
 
 
+def family_run(ccfg: Any) -> Dict[str, Any]:
+    """Return the run defaults of the config's family, from its op profile.
+
+    A vision tower takes the vision profile's, but for its activation
+    sharding, which is its language model's family's.
+    """
+    arch = getattr(ccfg, "arch", None)
+    run = dict(family_profile(arch).run)
+    inherited = getattr(ccfg, "inherited_arch", None)
+    if arch == VISION_ARCH and inherited is not None:
+        run["shard_activations"] = family_profile(inherited).run["shard_activations"]
+    return run
+
+
+def _stated(ccfg: Any, name: str, run: Mapping[str, Any]) -> Any:
+    """Return the run fact *name* the config states, else its family's."""
+    value = getattr(ccfg, name, None)
+    return run[name] if value is None else value
+
+
+def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
+    """Set the byte widths the estimators read from those the run states, else its family's.
+
+    Gradients take memory only under pipeline parallelism, unless the run
+    accumulates them without it too (``grad_accumulation``).
+    """
+    accumulates = ccfg.p > 1 or _stated(ccfg, "grad_accumulation", run)
+    ccfg.bytes_grad = _stated(ccfg, "grad_bytes", run) if accumulates else 0
+    ccfg.bytes_os = _stated(ccfg, "optimizer_state_bytes", run)
+    ccfg.bytes_norm = _stated(ccfg, "norm_bytes", run)
+    ccfg.bytes_dropout = _stated(ccfg, "dropout_bytes", run)
+
+
+def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:
+    """Set how tensor parallelism shards what a layer keeps.
+
+    ``shard_recompute_input`` divides the input a fully recomputed layer
+    keeps, and ``shard_output_activ`` the output layer's activations.  Both
+    are the TP degree when the run shards the activations between layers
+    (``shard_activations``), and 1 otherwise; a recomputed layer's input is
+    sliced over TP too when the run's recompute slices it.
+    """
+    sharded = _stated(ccfg, "shard_activations", run)
+    sliced = sharded or getattr(ccfg, "recompute_slice_activation", False)
+    ccfg.shard_recompute_input = ccfg.t if sliced else 1
+    ccfg.shard_output_activ = ccfg.t if sharded else 1
+
+
+def derive_head_dim(ccfg: Any) -> None:
+    """Price an MLA family's heads at the value heads' width, ``dh``.
+
+    The model's ``v_head_dim``, else its family's.  A family whose profile
+    states no value-head width keeps the head width its parser read.
+    """
+    width = family_profile(getattr(ccfg, "arch", None)).model.get("v_head_dim")
+    if width is not None:
+        ccfg.dh = getattr(ccfg, "v_head_dim", None) or width
+
+
+def cm_layer_fields(ccfg: Any) -> Dict[str, Any]:
+    """Return what every layer of a cm model takes on top of its kind's fields.
+
+    Each layer shards its expert states as the model shards its partial
+    ones, its other states over the common divisor of the expert count and
+    their sharding, and its embedding over TP.
+    """
+    return {
+        "shard_p_os_exp": ccfg.shard_p_os_exp_partial,
+        "shard_p_os_non_exp_partial": math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp),
+        "shard_embed": ccfg.t,
+    }
+
+
+# The fields a family gives every layer, by family: a rule in code, where the
+# family's op profile cannot say it.
+LAYER_FIELD_RULES: Dict[str, Callable[[Any], Dict[str, Any]]] = {"cm": cm_layer_fields}
+
+
+def derive_layer_fields(ccfg: Any) -> None:
+    """Set the fields the family gives every layer, ``layer_fields``, or none."""
+    rule = LAYER_FIELD_RULES.get(getattr(ccfg, "arch", None))
+    ccfg.layer_fields = rule(ccfg) if rule is not None else None
+
+
+def derive_family(ccfg: Any) -> None:
+    """Set what the config's family decides where its producer states nothing.
+
+    The byte widths and the activation sharding, from the run facts the
+    config states and else its family's (:func:`family_run`); an MLA
+    family's head width; and the fields cm gives every layer.
+    """
+    run = family_run(ccfg)
+    derive_byte_widths(ccfg, run)
+    derive_activation_sharding(ccfg, run)
+    derive_head_dim(ccfg)
+    derive_layer_fields(ccfg)
+
+
 def derive(ccfg: Any, strict: bool = True) -> None:
     """Compute the config's derived fields from its primary ones.
 
@@ -256,8 +347,6 @@ def derive(ccfg: Any, strict: bool = True) -> None:
     derive_optimizer_sharding(ccfg)
     derive_comm_flags(ccfg)
     derive_embedding_sharding(ccfg)
-    derive_recompute_sharding(ccfg)
-    # The output layer's activation is kept whole; Qwen's family hook shards it.
-    ccfg.shard_output_activ = 1
     derive_recompute_switches(ccfg)
     derive_flash_attention_factor(ccfg)
+    derive_family(ccfg)

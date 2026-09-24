@@ -1,4 +1,7 @@
-# Mixtral: gated experts, two softmaxes and five normalisations per layer.
+# Mixtral: gated experts, two softmaxes and five normalisations per layer,
+# and two-byte gradients.
+run:
+  grad_bytes: 2
 kinds:
   decoder:
     ops:
