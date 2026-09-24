@@ -16,7 +16,8 @@
 
 A parser states primary facts: the model's dimensions, the parallel strategy
 and the fixed facts of the run.  :func:`derive` computes what follows from
-them, where each parser used to compute it.
+them, once when a config is parsed and again whenever its strategy changes,
+where each parser used to compute it.
 """
 import logging
 import math

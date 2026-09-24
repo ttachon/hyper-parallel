@@ -69,12 +69,7 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (
-    derive,
-    derive_embedding_sharding,
-    derive_flash_attention_factor,
-    derive_recompute_sharding,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
@@ -323,7 +318,9 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.vocab_emb_dp = False
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
-        derive_flash_attention_factor(cc)
+        # The tower's own facts set its derived fields, not the language
+        # model's it was cloned from.
+        derive(cc, strict=False)
         cc.layer_binding = None
         self.config_layer_stack(cc, resolve_layers(
             VISION_ARCH, layers_from_list(vision_spec.get("layers"), "vision.layers"),
@@ -708,14 +705,6 @@ class CostModelParserHyperV2(_CostModelParser):
                 self.ccfg.offset = [explicit] * self.ccfg.p
         else:
             self.ccfg.offset = [0] * self.ccfg.p
-
-    def config_shard_emb(self) -> None:
-        """Refresh the embedding's sharding after a strategy change."""
-        derive_embedding_sharding(self.ccfg)
-
-    def config_shard_recompute(self) -> None:
-        """Refresh the recompute input's sharding after a strategy change."""
-        derive_recompute_sharding(self.ccfg)
 
     def _init_shard(self):
         """State how the embedding and the recompute input are sharded.

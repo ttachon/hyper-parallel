@@ -157,6 +157,20 @@ class TestMultimodalCostModel(unittest.TestCase):
         self.assertEqual(ccfg.mm_ccfgs["vision"].t, 2)
         self.assertEqual(ccfg.mm_ccfgs["text"].t, 2)
 
+    def test_strategy_update_derives_each_submodule(self) -> None:
+        """
+        Feature: multimodal strategy fan-out.
+        Description: A submodule shares its parent's parser, so a refresh
+            through the parser lands on the parent.
+        Expectation: The language model's embedding sharding follows its own
+            new degrees.
+        """
+        ccfg = self._build().instance.mem_eval.ccfg
+        text = ccfg.mm_ccfgs["text"]
+        self.assertEqual(text.shard_embed, 4, f"parsed shard_embed={text.shard_embed}")
+        ccfg.set_strategy(dp=2, mp=4)
+        self.assertEqual(text.shard_embed, 8, f"shard_embed={text.shard_embed}, want d * t = 8")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -262,7 +262,8 @@ and the memory module.
 | Customization | `overwrite_eval_functions` | Function overrides resolved by the hook manager |
 
 Strategy fields should be updated through `e.set_strategy()` after evaluator
-construction. Non-strategy fields can be changed in hooks with `e.set_ccfg()`.
+construction, which derives the other fields again. Non-strategy fields can be
+changed in hooks with `e.set_ccfg()`.
 
 ## 7. Formula Context
 

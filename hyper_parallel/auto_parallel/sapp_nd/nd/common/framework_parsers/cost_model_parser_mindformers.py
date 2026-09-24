@@ -16,7 +16,7 @@
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive, derive_embedding_sharding
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class CostModelParserMindformers(_CostModelParser):
@@ -169,10 +169,6 @@ class CostModelParserMindformers(_CostModelParser):
         self.ccfg.sel_rec_rule = "mindformers"
         self.ccfg.full_rec = rc.recompute
         self.ccfg.recompute_slice_activation = bool(rc.recompute_slice_activation)
-
-    def config_shard_emb(self):
-        """Refresh the embedding's sharding after a strategy change."""
-        derive_embedding_sharding(self.ccfg)
 
     def __config_parse_yaml_fp_bytes(self):
         """FP byte storages of parameters, activations and softmax outputs."""

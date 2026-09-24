@@ -1696,13 +1696,11 @@ class TestSappNDRunND(unittest.TestCase):
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover cost-model copying, validation and strategy mutation with a fake parser.
-        Expectation: Strategy fields update consistently without parsing a model config.
+        Description: Cover cost-model copying, validation and strategy mutation without a parser.
+        Expectation: Strategy fields update consistently without parsing a model config, and the
+            fields derived from them follow.
         """
-        parser_calls = []
-        parser = SimpleNamespace(
-            config_shard_emb=lambda: parser_calls.append("embed"),
-        )
+        parser = SimpleNamespace()
         cost_cfg = object.__new__(CostModelConfig)
         cost_cfg.__dict__.update(
             model_name="unit",
@@ -1771,7 +1769,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        self.assertIn("embed", parser_calls)
+        self.assertEqual(cost_cfg.shard_embed, 8, f"shard_embed={cost_cfg.shard_embed}, want d * t = 8")
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):
@@ -1779,6 +1777,26 @@ class TestSappNDRunND(unittest.TestCase):
         cost_cfg.offset = [[0, 0], [0, 0]]
 
         self._test_multimodal_strategy(cost_cfg)
+
+    def test_strategy_change_derives_mindformers_fields(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: The DeepSeek MindFormers yaml keeps its recompute input sliced at TP 4
+            (recompute_slice_activation), and MindFormers' selective recompute depends on
+            sequence parallelism, which a strategy change sets to TP.
+        Expectation: Both follow each strategy change, where they kept their parse-time values.
+        """
+        cfg = CostModelConfig(config_path)
+        self.assertEqual(cfg.shard_recompute_input, 4, f"parsed shard_recompute_input={cfg.shard_recompute_input}")
+        cfg.set_strategy(mp=1)
+        self.assertEqual(cfg.shard_recompute_input, 1, f"at TP 1 shard_recompute_input={cfg.shard_recompute_input}")
+
+        cfg.set_strategy(mp=2, sel_rec=True)
+        dropped = sorted(op for op, keep in vars(cfg.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["ffAct", "headCast", "normOp"], f"recomputed at TP 2: {dropped}")
+        cfg.set_strategy(mp=1, sel_rec=True)
+        dropped = sorted(op for op, keep in vars(cfg.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""
