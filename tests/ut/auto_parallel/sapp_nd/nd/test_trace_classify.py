@@ -21,6 +21,7 @@ import csv
 import gzip
 import json
 import os
+import pathlib
 import shutil
 import tempfile
 import unittest
@@ -232,6 +233,166 @@ class TestTraceClassify(unittest.TestCase):
         self.assertTrue(os.path.isfile(real) and os.path.isfile(perf))
         with self.assertRaises(SystemExit):
             TC.main([self.trace, "--csv", real])
+
+
+_STEP_TRACE = (
+    "Device_id,Step,Computing,Communication(Not Overlapped),Overlapped,Communication,Free,Stage,"
+    "Bubble,Communication(Not Overlapped and Exclude Receive),Preparing\n"
+    "0,1,200000.0,80000.0,20000.0,100000.0,720000.0,1000000.0,0,80000.0,5000.0\n"
+)
+
+
+def _hccl(elapse, wait, transit, sdma, rdma=0.0):
+    """One communication.json entry in the shape CANN writes."""
+    return {
+        "Communication Time Info": {
+            "Start Timestamp(us)": 1790181398793803.2, "Elapse Time(ms)": elapse,
+            "Transit Time(ms)": transit, "Wait Time(ms)": wait, "Synchronization Time(ms)": wait,
+            "Idle Time(ms)": 0.0, "Wait Time Ratio": 1.0, "Synchronization Time Ratio": 1.0,
+        },
+        "Communication Bandwidth Info": {
+            "RDMA": {"Transit Size(MB)": rdma, "Transit Time(ms)": 0.0, "Bandwidth(GB/s)": 0.0},
+            "HCCS": {"Transit Size(MB)": 0.0, "Transit Time(ms)": 0.0, "Bandwidth(GB/s)": 0.0},
+            "PCIE": {"Transit Size(MB)": 0.0, "Transit Time(ms)": 0.0, "Bandwidth(GB/s)": 0.0},
+            "SDMA": {"Transit Size(MB)": sdma, "Transit Time(ms)": transit, "Bandwidth(GB/s)": 148.9},
+            # SIO repeats what SDMA already reports and must not be counted again.
+            "SIO": {"Transit Size(MB)": sdma, "Transit Time(ms)": transit, "Bandwidth(GB/s)": 148.9},
+        },
+    }
+
+
+_COMMUNICATION = {
+    "step1": {
+        "p2p": {},
+        "collective": {
+            "hcom_allGather__800_0_1@5862276110395350800": _hccl(30.0, 25.0, 5.0, 100.0),
+            "hcom_allGather__800_1_1@5862276110395350800": _hccl(20.0, 15.0, 5.0, 100.0),
+            "hcom_alltoallv__900_0_1@1111111111111111111": _hccl(50.0, 10.0, 40.0, 50.0, rdma=50.0),
+        },
+    },
+}
+
+
+class TestAscendTraceClassify(unittest.TestCase):
+    """Split an Ascend profiling run into ND parts."""
+
+    def setUp(self) -> None:
+        """Write a synthetic Ascend run to a fresh temporary directory."""
+        self.tmpdir = tempfile.mkdtemp()
+        self.run_dir = os.path.join(self.tmpdir, "profiling_dp64_ep16_op2")
+        self.output = os.path.join(self.run_dir, "host_1_20260924_ascend_pt", TC.ASCEND_OUTPUT)
+        os.makedirs(self.output)
+        with open(os.path.join(self.output, "step_trace_time.csv"), "w", encoding="utf-8") as handle:
+            handle.write(_STEP_TRACE)
+        with open(os.path.join(self.output, "communication.json"), "w", encoding="utf-8") as handle:
+            json.dump(_COMMUNICATION, handle)
+        self.dims = TC.parse_dims("DP=64,MP=1,PP=1,CP=1,EP=16,MB=1,OP=2")
+
+    def tearDown(self) -> None:
+        """Remove the temporary directory."""
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_output_dir_found_at_every_level(self):
+        """
+        Feature: trace_classify.ascend_output_dir.
+        Description: Locate ASCEND_PROFILER_OUTPUT from the run, the *_ascend_pt and the output directory.
+        Expectation: All three resolve to the same directory, and a plain trace is not mistaken for one.
+        """
+        for start in (self.run_dir, os.path.dirname(self.output), self.output):
+            self.assertEqual(TC.ascend_output_dir(start), pathlib.Path(self.output), msg=f"start={start}")
+            self.assertTrue(TC.is_ascend_output(start))
+        self.assertFalse(TC.is_ascend_output(os.path.join(self.tmpdir, "absent")))
+        with self.assertRaises(ValueError):
+            TC.ascend_output_dir(self.tmpdir)
+
+    def test_collective_kind_parses_hccl_names(self):
+        """
+        Feature: trace_classify.collective_kind.
+        Description: Split real HCCL operator names into kind and communication group.
+        Expectation: The kind is normalised, the group hash is kept, and unknown names are flagged.
+        """
+        self.assertEqual(TC.collective_kind("hcom_allGather__800_7_1@5862276110395350800"),
+                         ("all_gather", "5862276110395350800"))
+        self.assertEqual(TC.collective_kind("hcom_reduceScatter__800_0_1@58622")[0], "reduce_scatter")
+        self.assertEqual(TC.collective_kind("hcom_alltoallv__900_0_1@11")[0], "all_to_all")
+        self.assertEqual(TC.collective_kind("Memcpy HtoD"), ("unknown", ""))
+
+    def test_site_mapping_needs_ranks_when_tp_or_cp_active(self):
+        """
+        Feature: trace_classify.ascend_site.
+        Description: Map collective kinds to ND wait columns with and without TP or CP.
+        Expectation: All-to-all is EP and p2p is PP; gathers are FSDP only while TP and CP are 1.
+        """
+        self.assertEqual(TC.ascend_site("all_to_all", "collective", self.dims)[0], TC.EP_WAIT)
+        self.assertEqual(TC.ascend_site("all_gather", "collective", self.dims)[0], TC.OP_WAIT)
+        self.assertEqual(TC.ascend_site("all_reduce", "collective", self.dims)[0], TC.DP_WAIT)
+        self.assertEqual(TC.ascend_site("p2p", "p2p", self.dims)[0], TC.PP_WAIT)
+        with_tp = TC.parse_dims("DP=8,MP=2")
+        self.assertEqual(TC.ascend_site("all_gather", "collective", with_tp)[0], TC.UNCLASSIFIED)
+        self.assertEqual(TC.ascend_site("broadcast", "collective", self.dims)[0], TC.UNCLASSIFIED)
+
+    def test_split_apportions_exposed_communication(self):
+        """
+        Feature: trace_classify.split_ascend_output.
+        Description: Split the synthetic step, whose 100 ms of HCCL time stayed exposed for 80 ms.
+        Expectation: Compute is unsplit, each axis keeps its share of the exposed time scaled by 0.8,
+            idle equals the free column, and SIO is not counted twice in the volume.
+        """
+        splits = TC.split_ascend_output(self.run_dir, self.dims)
+        self.assertEqual(len(splits), 1)
+        split = splits[0]
+        self.assertEqual((split.rank, split.step), (0, "step1"))
+        self.assertAlmostEqual(split.time, 1000.0)
+        self.assertAlmostEqual(split.comp["unsplit"], 200.0)
+        self.assertAlmostEqual(sum(split.comp.values()), 200.0)
+        self.assertAlmostEqual(split.waits[TC.OP_WAIT], 40.0)
+        self.assertAlmostEqual(split.waits[TC.EP_WAIT], 40.0)
+        self.assertAlmostEqual(sum(split.waits.values()), 80.0)
+        self.assertAlmostEqual(split.idle, 720.0)
+        gather = split.sites[(TC.OP_WAIT, "fsdp all-gather")]
+        self.assertEqual((gather.calls, gather.payload_bytes), (2, int(200.0 * 2 ** 20)))
+        self.assertAlmostEqual(gather.wait_ms, 40.0)
+        self.assertEqual(split.sites[(TC.EP_WAIT, "expert all-to-all")].payload_bytes, int(100.0 * 2 ** 20))
+
+    def test_missing_communication_json_leaves_waits_empty(self):
+        """
+        Feature: trace_classify.split_ascend_output.
+        Description: Split a run whose communication.json is absent.
+        Expectation: The top-level split still comes from step_trace_time.csv, with no wait attributed.
+        """
+        os.remove(os.path.join(self.output, "communication.json"))
+        split = TC.split_ascend_output(self.run_dir, self.dims)[0]
+        self.assertAlmostEqual(split.comp["unsplit"], 200.0)
+        self.assertAlmostEqual(sum(split.waits.values()), 0.0)
+
+    def test_missing_step_trace_column_is_rejected(self):
+        """
+        Feature: trace_classify.split_ascend_output.
+        Description: Split a run whose step_trace_time.csv lacks a needed column.
+        Expectation: A ValueError names the missing column instead of a silent zero.
+        """
+        with open(os.path.join(self.output, "step_trace_time.csv"), "w", encoding="utf-8") as handle:
+            handle.write("Device_id,Step,Computing\n0,1,200000.0\n")
+        with self.assertRaises(ValueError) as raised:
+            TC.split_ascend_output(self.run_dir, self.dims)
+        self.assertIn("Stage", str(raised.exception))
+
+    def test_main_reads_a_run_directory_and_nd_reads_it_back(self):
+        """
+        Feature: trace_classify.main on an Ascend run.
+        Description: Run the command line on the run directory and read the CSV with ND's reader.
+        Expectation: The run is detected without a flag, ND parses the parts, and --dims is required.
+        """
+        real = self._path = os.path.join(self.tmpdir, "real.csv")
+        TC.main([self.run_dir, "--dims", "DP=64,MP=1,PP=1,CP=1,EP=16,MB=1,OP=2", "--csv", real])
+        dims, time, parts = Debug.get_comm_classified_data(real, plot_idle=True)[0]
+        self.assertEqual([dims.val(d) for d in (Dim.DP, Dim.EP, Dim.OP)], [64, 16, 2])
+        self.assertAlmostEqual(time, 1000.0)
+        self.assertAlmostEqual(parts[TC.COMP], 200.0, places=6)
+        self.assertAlmostEqual(parts[TC.EP_WAIT], 40.0, places=6)
+        self.assertAlmostEqual(parts["IDLE"], 720.0, places=6)
+        with self.assertRaises(SystemExit):
+            TC.main([self.run_dir])
 
 
 if __name__ == "__main__":

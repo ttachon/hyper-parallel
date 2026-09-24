@@ -100,6 +100,15 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify traces/rank*.pt
 
 Each profiled step is split into `comp`, one `<dim>_wait` per parallelism type and the idle rest. A wait is time blocked in communication, typed by the HyperParallel module that issued it; the CSV holds the mean over steps and ranks. `--perf-parts` writes the same step in the columns of ND's `debug.csv`, and `--detail` keeps every rank and step by call site. `--dims` takes the acronyms of `-l` except `SP`, which ND reads back as true whatever its value. The split measures host-side blocking, which is exact for host-synchronous backends such as gloo.
 
+An **Ascend** run is read from its directory instead of a trace file, and needs neither Python frames nor host blocking:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify profiling_dp64_ep16_op2 \
+    --dims DP=64,MP=1,PP=1,CP=1,EP=16,MB=1,OP=2 --csv real.csv
+```
+
+`step_trace_time.csv` gives the closed top-level split of each step, and `communication.json` apportions the exposed communication over the axes in proportion to each axis's share of HCCL elapse time. Two consequences worth knowing. Device compute is not attributed to a pass, so it lands in `UNSPLIT_COMPUTE` and leaves `FW_COMPUTE`, `BW_COMPUTE` and `RECOMPUTE` empty. And the axis of a collective comes from its kind, since all-to-all is expert parallelism and gathers and reduce-scatters are FSDP; when TP or CP is active those two are ambiguous and stay unclassified until the rank sets of `communication_matrix.json` are read.
+
 Then run ND on the same model and cluster with `--real_csv`:
 
 ```bash
