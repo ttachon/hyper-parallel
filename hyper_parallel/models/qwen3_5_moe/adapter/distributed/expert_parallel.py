@@ -53,9 +53,13 @@ def qwen3_5_moe_ep_compute_fn(
     combine drops the shared expert silently rather than failing.
 
     ``use_grouped_gemm`` selects ``npu_grouped_swiglu`` over the per-expert
-    loop. The loop costs one GEMM pair per LOCAL expert, so its cost grows as
-    ``num_experts / ep_size`` while the routed FLOPs stay EP-invariant; the
-    grouped path removes that dependence.
+    loop. The loop's cost is not its GEMMs, whose FLOPs are EP-invariant, but
+    its indexing: it selects ``gate_up_proj[i]`` and ``down_proj[i]`` from the
+    stacked parameters once per LOCAL expert, and each select's backward
+    materialises a zero buffer the size of the whole stack before accumulating
+    into it. Zeroing and accumulation are therefore quadratic in the local
+    expert count, which grows as ep_size falls. The grouped path passes the
+    stacks whole and never indexes them, so those buffers do not appear at all.
 
     Expected module interface: ``gate``, ``experts``, ``shared_expert``,
     ``shared_expert_gate``.
