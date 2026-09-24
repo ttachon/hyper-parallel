@@ -14,7 +14,8 @@
 # ============================================================================
 """parse config for cost model"""
 import inspect
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 import re
 from copy import deepcopy
 from enum import Enum
@@ -22,6 +23,7 @@ from pprint import pformat
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.generate_partitions import PartitionGenerator
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec, strategy_exec
 
 
 class AttentionType(Enum):
@@ -84,6 +86,13 @@ def compute_kv_dim(ccfg: Any) -> float:
 
 
 # class CostModelConfig(Config) :
+# The strategy fields a config armed by a search takes only through
+# set_strategy or apply_exec.
+STRATEGY_GUARDED = frozenset(("d", "t", "ep", "p", "vp", "cp", "os_max_shard"))
+# Where a config keeps whether its guard is armed; a copy never takes it.
+_GUARD = "_strategy_guard"
+
+
 class CostModelConfig(PartitionGenerator):
     """cost model variables class"""
 
@@ -122,20 +131,29 @@ class CostModelConfig(PartitionGenerator):
             return 0
         return self.__dict__[attr]
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in STRATEGY_GUARDED and self.__dict__.get(_GUARD):
+            raise AttributeError(f"Cannot directly modify {name}, use set_strategy()")
+        object.__setattr__(self, name, value)
+
     def __copy__(self):
         res = object.__new__(type(self))
         res.__dict__.update(self.__dict__)
+        res.__dict__.pop(_GUARD, None)
         return res
 
     def __deepcopy__(self, memo):
         res = object.__new__(type(self))
         for k, v in self.__dict__.items():
-            setattr(res, k, deepcopy(v, memo))
+            if k != _GUARD:
+                setattr(res, k, deepcopy(v, memo))
         return res
 
     def __getstate__(self) -> dict:
         """Return instance state for multiprocessing serialization."""
-        return self.__dict__.copy()
+        state = self.__dict__.copy()
+        state.pop(_GUARD, None)
+        return state
 
     def __setstate__(self, state: dict) -> None:
         """Restore instance state after multiprocessing deserialization."""
@@ -248,12 +266,6 @@ class CostModelConfig(PartitionGenerator):
             and is_valid_cfg(self.sel_rec)
         )
 
-    @staticmethod
-    def __maybe_set_int(target, attr, value):
-        """Set an integer strategy attribute when an override is supplied."""
-        if isinstance(value, int):
-            setattr(target, attr, value)
-
     def __strategy_target(self, model_name):
         """Get the config object targeted by a strategy update."""
         if not self.multimodal:
@@ -265,7 +277,12 @@ class CostModelConfig(PartitionGenerator):
         )
 
     def set_strategy(self, **kwargs: Any) -> None:
-        """overwrite parallelism"""
+        """Apply a keyword strategy: the ExecSpec it states, and what follows.
+
+        The keywords are ``strategy_exec``'s; ``model_name`` picks the
+        submodule of a multimodal config, and without it every submodule
+        takes the strategy.
+        """
         model_name = kwargs.get("model_name", None)
         if self.multimodal and model_name is None:
             # Submodules share one pipeline, so a strategy update with no
@@ -275,30 +292,8 @@ class CostModelConfig(PartitionGenerator):
                     **{**kwargs, "model_name": None}
                 )
             model_name = self.mm_main if self.mm_main else self.mm_order[-1]
-        op = kwargs.get("op", None)
-        off = kwargs.get("offset", None)
-        fr = kwargs.get("full_rec", None)
-        sr = kwargs.get("sel_rec", None)
         target_ccfg = self.__strategy_target(model_name)
-
-        for attr, key in (
-            ("d", "dp"),
-            ("t", "mp"),
-            ("ep", "ep"),
-            ("etp", "etp"),
-            ("cp", "cp"),
-            ("vp", "vpp"),
-            ("p", "pp"),
-            ("m", "mb"),
-            ("b", "mbs"),
-        ):
-            self.__maybe_set_int(target_ccfg, attr, kwargs.get(key, None))
-        target_ccfg.sp = target_ccfg.t
-        if op is not None and isinstance(op, int):
-            target_ccfg.os_max_shard = op
-            # Sync has_op with os_max_shard: op<=1 means no optimizer sharding
-            target_ccfg.has_op = op > 1
-        target_ccfg.gbs = target_ccfg.b * target_ccfg.d * target_ccfg.m
+        apply_exec(target_ccfg, strategy_exec(target_ccfg, kwargs))
         logger.debug(
             "in ccfg: DP = %d, TP = %d, EP = %d, CP = %d, "
             "PP = %d, MB = %d, MBS = %d, VPP = %d",
@@ -311,19 +306,6 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.b,
             target_ccfg.vp,
         )
-        if hasattr(target_ccfg.parser, "config_shard_emb"):
-            target_ccfg.parser.config_shard_emb()
-        if hasattr(target_ccfg.parser, "config_shard_recompute"):
-            target_ccfg.parser.config_shard_recompute()
-        target_ccfg.parser.config_dp_tp_exp(target_ccfg)
-        target_ccfg.parser.config_optimizer_shard(target_ccfg)
-        target_ccfg.parser.config_comm_flag(target_ccfg)
-        if fr is not None:
-            target_ccfg.full_rec = fr
-        if sr is not None:
-            target_ccfg.sel_rec = sr
-        if isinstance(off, (int, list)):
-            target_ccfg.offset = off
         if not target_ccfg.is_consistent_pp_config():
             raise AttributeError(
                 f"{target_ccfg.model_name}: "
@@ -333,7 +315,6 @@ class CostModelConfig(PartitionGenerator):
                 f"full_rec {target_ccfg.full_rec} "
                 f"sel_rec {target_ccfg.sel_rec}"
             )
-        self.__maybe_set_int(target_ccfg, "cp", kwargs.get("cp", None))
 
     def get_strategy(self) -> Any:
         """return parallelism/recompute strategies"""
@@ -359,3 +340,37 @@ class CostModelConfig(PartitionGenerator):
         if self.multimodal:
             return {mm.model_name: strategy(mm) for mm in self.mm_ccfgs.values()}
         return strategy(self)
+
+
+def arm_strategy_guard(ccfg: Any, armed: bool = True) -> None:
+    """Refuse, or allow again, a direct write of a strategy field.
+
+    Armed, the config and its submodules take a new degree only through
+    ``set_strategy`` or ``apply_exec``, and a layer kind's own degrees
+    through ``apply_layer_strategy``.  A copy of an armed config starts
+    unarmed, so an estimator can change its own.
+
+    Args:
+        ccfg: The config, multimodal or not.
+        armed: Whether to arm the guard or lift it.
+    """
+    object.__setattr__(ccfg, _GUARD, armed)
+    for sub in (getattr(ccfg, "mm_ccfgs", None) or {}).values():
+        arm_strategy_guard(sub, armed)
+
+
+@contextmanager
+def strategy_guarded(ccfg: Any) -> Iterator[Any]:
+    """Refuse a direct write of a strategy field on *ccfg* inside the block.
+
+    Afterwards the config is armed exactly as it was before.
+    """
+    before = ccfg.__dict__.get(_GUARD)
+    object.__setattr__(ccfg, _GUARD, True)
+    try:
+        yield ccfg
+    finally:
+        if before is None:
+            ccfg.__dict__.pop(_GUARD, None)
+        else:
+            object.__setattr__(ccfg, _GUARD, before)

@@ -35,6 +35,7 @@ from unittest.mock import MagicMock, PropertyMock
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive_optimizer_sharding
 
 
 def _make_ccfg(
@@ -612,7 +613,7 @@ class TestActCpLayer(unittest.TestCase):
 
 
 class TestConfigOptimizerShard(unittest.TestCase):
-    """Test config_optimizer_shard has_op guard on shard_p_os_exp.
+    """Test derive_optimizer_sharding's has_op guard on shard_p_os_exp.
 
     Verifies that when has_op=False, d_exp is NOT used as a sharding factor
     for expert optimizer state, preventing memory underestimation.
@@ -638,9 +639,8 @@ class TestConfigOptimizerShard(unittest.TestCase):
 
     def test_has_op_true_uses_d_exp(self):
         """BD-H01: has_op=True => shard_p_os_exp = d_exp * cp * t_exp."""
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=True)
-        _CostModelParser.config_optimizer_shard(None, ccfg)
+        derive_optimizer_sharding(ccfg)
         expected = 4 * 2 * 1  # d_exp * cp * t_exp
         self.assertEqual(ccfg.shard_p_os_exp, expected)
 
@@ -650,9 +650,8 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Without the guard, d_exp=4 would produce shard_p_os_exp=8, causing
         expert param/OS/grad memory to be underestimated by 4x.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
-        _CostModelParser.config_optimizer_shard(None, ccfg)
+        derive_optimizer_sharding(ccfg)
         expected = 1 * 2 * 1  # (d_exp if has_op else 1) * cp * t_exp
         self.assertEqual(ccfg.shard_p_os_exp, expected)
 
@@ -663,11 +662,10 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Expert:  shard_p_os_exp     = (d_exp if has_op else 1) * cp * t_exp
         Both bypass the DP sharding factor when has_op=False.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
         ccfg.d = 4
         ccfg.t = 1
-        _CostModelParser.config_optimizer_shard(None, ccfg)
+        derive_optimizer_sharding(ccfg)
         # Non-exp: (d if has_op else 1) * cp * t = 1 * 2 * 1 = 2
         # Expert:  (d_exp if has_op else 1) * cp * t_exp = 1 * 2 * 1 = 2
         self.assertEqual(ccfg.shard_p_os_non_exp, 2)

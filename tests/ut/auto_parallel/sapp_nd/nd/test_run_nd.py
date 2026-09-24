@@ -39,10 +39,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import global_config as GC
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHooks
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    HYPER_SELECTIVE_REC_OP,
-    _CostModelParser,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive_comm_flags
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
     CostModelParserHyperparallel,
 )
@@ -1508,17 +1505,13 @@ class TestSappNDRunND(unittest.TestCase):
         Feature: TestSappNDRunND.
         Description: Verify the transitional comm overlap fields
             (comm_dp_overlap, comm_tp_overlap) are populated by the real
-            framework parsers via config_comm_flag — the mechanism that
+            framework parsers through derive, which is what
             estimate_from_mem_comm reads on the search (FLOP) path.
         Expectation: After parsing, both overlap fields hold the documented
-            defaults (0.9 and 0.5).  CostModelParserHyperparallel and
-            CostModelParserMindformers both call the base config_comm_flag,
-            so the hyperparallel path covers both.  CostModelParserMindspeed
-            has an inline copy (see cost_model_parser_mindspeed.py:293-294)
-            but is not tested here per project priority.
+            defaults (0.9 and 0.5).  Every parser calls derive, so the
+            hyperparallel path covers them all.
         """
-        # --- Hyperparallel path: calls base config_comm_flag ---
-        # (same base method is also called by CostModelParserMindformers)
+        # --- Hyperparallel path: calls derive ---
         with tempfile.TemporaryDirectory() as tmp_dir:
             source_path = os.path.join(tmp_dir, "__init__.py")
             with open(source_path, "w", encoding="utf-8") as source_file:
@@ -1558,8 +1551,7 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.comm_dp_overlap, 0.9)
             self.assertEqual(hp_ccfg.comm_tp_overlap, 0.5)
 
-        # --- Direct test of base _CostModelParser.config_comm_flag ---
-        # Covers the shared method used by mindformers and hyper parsers.
+        # --- Direct test of derive_comm_flags ---
         ccfg_direct = _ParserCostModelConfig()
         ccfg_direct.d = 2
         ccfg_direct.t = 2
@@ -1568,14 +1560,7 @@ class TestSappNDRunND(unittest.TestCase):
         ccfg_direct.has_op = True
         ccfg_direct.has_grad_shard = True
         ccfg_direct.n_exp = 1
-
-        class _ConcreteParser(_CostModelParser):
-            """Concrete subclass for testing the abstract base."""
-
-            def parse(self) -> None:
-                """No-op parse; only config_comm_flag is under test."""
-                return None
-        _ConcreteParser(ccfg_direct).config_comm_flag(ccfg_direct)
+        derive_comm_flags(ccfg_direct)
         self.assertEqual(ccfg_direct.comm_dp_overlap, 0.9)
         self.assertEqual(ccfg_direct.comm_tp_overlap, 0.5)
 
@@ -1739,16 +1724,11 @@ class TestSappNDRunND(unittest.TestCase):
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover cost-model copying, validation and strategy mutation with fake parser hooks.
-        Expectation: Strategy fields update consistently without parsing a model config.
+        Description: Cover cost-model copying, validation and strategy mutation without a parser.
+        Expectation: Strategy fields update consistently without parsing a model config, and the
+            fields derived from them follow.
         """
-        parser_calls = []
-        parser = SimpleNamespace(
-            config_shard_emb=lambda: parser_calls.append("embed"),
-            config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
-            config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
-            config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
-        )
+        parser = SimpleNamespace()
         cost_cfg = object.__new__(CostModelConfig)
         cost_cfg.__dict__.update(
             model_name="unit",
@@ -1779,6 +1759,8 @@ class TestSappNDRunND(unittest.TestCase):
             shard_embed=1,
             shard_output_activ=1,
             shard_recompute_input=1,
+            n_exp=1,
+            hff_exp=8,
         )
 
         self.assertIn("model_name", str(cost_cfg))
@@ -1815,7 +1797,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        self.assertIn("embed", parser_calls)
+        self.assertEqual(cost_cfg.shard_embed, 8, f"shard_embed={cost_cfg.shard_embed}, want d * t = 8")
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):
@@ -1823,6 +1805,26 @@ class TestSappNDRunND(unittest.TestCase):
         cost_cfg.offset = [[0, 0], [0, 0]]
 
         self._test_multimodal_strategy(cost_cfg)
+
+    def test_strategy_change_derives_mindformers_fields(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: The DeepSeek MindFormers yaml keeps its recompute input sliced at TP 4
+            (recompute_slice_activation), and MindFormers' selective recompute depends on
+            sequence parallelism, which a strategy change sets to TP.
+        Expectation: Both follow each strategy change, where they kept their parse-time values.
+        """
+        cfg = CostModelConfig(config_path)
+        self.assertEqual(cfg.shard_recompute_input, 4, f"parsed shard_recompute_input={cfg.shard_recompute_input}")
+        cfg.set_strategy(mp=1)
+        self.assertEqual(cfg.shard_recompute_input, 1, f"at TP 1 shard_recompute_input={cfg.shard_recompute_input}")
+
+        cfg.set_strategy(mp=2, sel_rec=True)
+        dropped = sorted(op for op, keep in vars(cfg.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["ffAct", "headCast", "normOp"], f"recomputed at TP 2: {dropped}")
+        cfg.set_strategy(mp=1, sel_rec=True)
+        dropped = sorted(op for op, keep in vars(cfg.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""

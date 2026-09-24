@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, LinearAttentionDims
 from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, LayerKind, load_op_profile
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_layer_strategy
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
@@ -109,8 +110,8 @@ _ATTENTION_FIELDS = (
 # The fields a feed-forward flavour assigns, likewise.
 _FFN_FIELDS = ("hff", "n_chosen_exp", "n_exp", "n_shared_exp", "ep")
 
-# Strategy a kind still sets.  The evaluator's guard refuses a strategy write
-# through set_ccfg, so the applier writes these past it.
+# Strategy a kind still sets.  The guard refuses a strategy write through
+# set_ccfg, so the applier gives them through apply_layer_strategy.
 _STRATEGY_FIELDS = ("ep",)
 
 
@@ -215,9 +216,7 @@ def apply_layer_kind(e: Any, kind: LayerKind) -> None:
                 setattr(c, name, value)
 
     e.set_ccfg(assign)
-    for name in _STRATEGY_FIELDS:
-        if name in fields:
-            setattr(e.ccfg, name, fields[name])
+    apply_layer_strategy(e.ccfg, {name: fields[name] for name in _STRATEGY_FIELDS if name in fields})
 
 
 def _needs_kinds(stack: LayerStack) -> bool:

@@ -69,6 +69,7 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
@@ -111,12 +112,6 @@ class CostModelParserHyperV2(_CostModelParser):
         # --- Feature flags ---
         self._parse_feature_flags()
 
-        # Flash attention factor
-        if self.ccfg.has_fa and self.ccfg.a > 0:
-            self.ccfg.s_fa = self.ccfg.s / self.ccfg.a
-        else:
-            self.ccfg.s_fa = self.ccfg.s
-
         # --- Recompute ---
         self._parse_recompute()
 
@@ -128,11 +123,12 @@ class CostModelParserHyperV2(_CostModelParser):
 
         # --- Post-processing ---
         self._init_moe_strategy()
-        self.config_optimizer_shard(self.ccfg)
-        self.config_comm_flag(self.ccfg)
         self._init_shard()
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
+        # An expert layout the degrees cannot hold is clamped rather than
+        # refused: the search can still reach it, and rejects it by memory.
+        derive(self.ccfg, strict=False)
 
         # --- Multimodal split (vision-language models only) ---
         self._resolve_multimodal()
@@ -322,7 +318,9 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.vocab_emb_dp = False
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
-        cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
+        # The tower's own facts set its derived fields, not the language
+        # model's it was cloned from.
+        derive(cc, strict=False)
         cc.layer_binding = None
         self.config_layer_stack(cc, resolve_layers(
             VISION_ARCH, layers_from_list(vision_spec.get("layers"), "vision.layers"),
@@ -464,7 +462,6 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.cp = max(1, cp)
         self.ccfg.ep = max(1, ep)
         self.ccfg.d = self._resolve_data_parallel(dp_replicate, dp_shard)
-        self.ccfg.sp = self.ccfg.t  # Sequence parallel factor
         self.ccfg.etp = etp
         self.ccfg.vp = max(1, int(
             self._get_cfg_attr(accel, "pp_interleave_num", 1) or 1
@@ -504,7 +501,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
         )
-        self.ccfg.sp = self.ccfg.t if use_sp else 1
+        self.ccfg.sequence_parallel = use_sp
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
         )
@@ -634,8 +631,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self.ccfg.sel_rec = sel_rec_override
         else:
             self.ccfg.sel_rec = ac_mode == "selective"
-
-        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
+        self.ccfg.sel_rec_rule = "hyperparallel"
 
     def _init_bytes(self):
         """Set FP byte sizes from AutoModels or legacy dtype fields.
@@ -666,33 +662,16 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.bytes_norm = 4
 
     def _init_moe_strategy(self):
-        """Initialize MoE strategy variables via base helper.
+        """Default a MoE model's expert tensor-parallel degree.
 
         For MoE models (``n_exp > 1``), ``etp`` defaults to 1 when
         absent from the YAML, matching the MF parser's
         ``expert_model_parallel`` default.  For dense models the
         existing ``etp=0`` path continues to produce ``t_exp = t,
         d_exp = d``.
-
-        Catches invalid MoE combinations (e.g., ``d_exp = 0`` when
-        ``dp < ep``) so the search engine can proceed — invalid combos
-        will later be filtered by the memory budget check.
         """
         if self.ccfg.n_exp > 1 and self.ccfg.etp == 0:
             self.ccfg.etp = 1
-        try:
-            self.config_dp_tp_exp(self.ccfg)
-        except TypeError:
-            logger.warning(
-                "MoE config_dp_tp_exp failed for d=%d t=%d ep=%d etp=%d "
-                "n_exp=%d — clamping to minimum values.",
-                self.ccfg.d, self.ccfg.t, self.ccfg.ep,
-                self.ccfg.etp, self.ccfg.n_exp,
-            )
-            self.ccfg.d_exp = max(1, self.ccfg.d_exp)
-            self.ccfg.t_exp = max(1, self.ccfg.t_exp)
-            self.ccfg.hff_exp = max(1, self.ccfg.hff_exp)
-            self.ccfg.n_exp = max(1, self.ccfg.n_exp)
 
     def _init_offset(self):
         """Initialize the pipeline offset.
@@ -726,72 +705,23 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.offset = [0] * self.ccfg.p
 
-    def config_shard_emb(self) -> None:
-        """Configure embedding sharding based on current parallelism.
-
-        Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
-        ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
-        configuration changes.  When ``vocab_emb_dp`` is enabled and pipeline
-        parallelism is disabled (``p == 1``), the embedding is sharded only
-        along the data-parallel dimension (``d``); otherwise it is sharded
-        along ``t * d``.
-
-        Without this method, ``CostModelConfig.set_strategy`` skips the
-        ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
-        ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
-        producing an embedding-memory mismatch versus the MF parser.
-        """
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
-        )
-
-    def config_shard_recompute(self) -> None:
-        """Recompute ``shard_recompute_input`` after strategy changes.
-
-        When ``recompute_slice_activation`` is ``True``, the recompute input
-        is sharded by the current tensor-parallel degree ``t``; otherwise it
-        is not sharded (value ``1``).  This method is called by
-        ``set_strategy`` (via ``hasattr`` guard) so that changing ``t``
-        during search correctly updates the sharding factor.
-
-        Without this method, ``shard_recompute_input`` retains the value
-        computed at initial parse time (using the default ``t`` from the
-        YAML), causing memory-estimation errors when the search explores
-        strategies with different ``t`` values.
-        """
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t if self._recompute_slice_activation else 1
-        )
-
     def _init_shard(self):
-        """Initialize sharding variables.
+        """State how the embedding and the recompute input are sharded.
 
-        ``shard_embed`` is computed via :meth:`config_shard_emb` so the
-        initial value follows the same rule used on subsequent
-        ``set_strategy`` calls.  ``shard_output_activ`` defaults to 1 (no
-        sharding), matching the MF parser's default; the ``custom_qwen``
-        arch hook overrides it to ``ccfg.t`` for Qwen-family models via
-        ``check_and_apply_custom_hook``.
-
-        ``shard_recompute_input`` mirrors the MF parser's
-        ``recompute_config.recompute_slice_activation`` flag: when the flag
-        is ``True`` (DeepSeek-V3), activations are sharded by ``ccfg.t``;
-        when ``False`` (Qwen), they are not sharded.  The flag is stored
-        as ``self._recompute_slice_activation`` so that
-        :meth:`config_shard_recompute` can recompute the value after
-        ``set_strategy`` changes ``t``.  Per-model arch hooks
-        (e.g. ``custom_qwen``) may override this during ``EvaluatorV2``
-        initialisation.
+        The embedding is sharded over data parallelism, as under the MF
+        parser.  ``recompute_slice_activation`` mirrors the MF parser's
+        ``recompute_config`` flag: when it is set (DeepSeek-V3), a recomputed
+        layer keeps its input sliced over ``ccfg.t``, and when it is not
+        (Qwen), whole.  :func:`derive` computes the sharding factors from
+        them; the ``custom_qwen`` arch hook then shards the activations of
+        Qwen-family models over ``ccfg.t``.
         """
-        self.config_shard_emb()
-        self.ccfg.shard_output_activ = 1
+        self.ccfg.emb_dp_sharded = True
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
         ac = self._get_cfg_attr(self.config, "activation_checkpoint", Config({}))
-        self._recompute_slice_activation = bool(self._get_cfg_attr(
+        self.ccfg.recompute_slice_activation = bool(self._get_cfg_attr(
             ac,
             "recompute_slice_activation",
             self._get_cfg_attr(
@@ -800,5 +730,4 @@ class CostModelParserHyperV2(_CostModelParser):
                 self._get_cfg_attr(gc, "recompute_slice_activation", False),
             ),
         ))
-        self.config_shard_recompute()
         self.ccfg.is_shard_mtp_param = True

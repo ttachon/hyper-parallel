@@ -23,6 +23,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class CostModelParserHyperparallel(_CostModelParser):
@@ -144,14 +145,13 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.__parse_hyperparam()
         self.__parse_strat()
         self.__parse_moe()
-        self.config_optimizer_shard(self.ccfg)  # need to adapt FSDP
-        self.config_comm_flag(self.ccfg)
         self.__parse_batch()
         self.__init_shard()
         self.__init_bytes()
         self.ccfg.n_mtp = 0
         self.config_layer_stack(self.ccfg)
         self.ccfg.overwrite_eval_functions = {}
+        derive(self.ccfg)  # optimizer sharding needs adapting to FSDP
 
     def __parse_strat(self):
         """strategy vars"""
@@ -164,7 +164,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.p = max(1, self.config.parallelism.pipeline_parallel_degree)
         self.ccfg.cp = max(1, self.config.parallelism.context_parallel_degree)
         self.ccfg.ep = max(1, self.config.parallelism.expert_parallel_degree)
-        self.ccfg.sp = self.ccfg.t
+        self.ccfg.sequence_parallel = True
         self.ccfg.vp = 1
         self.ccfg.op_weight_shard = (
             self.config.parallelism.data_parallel_shard_degree * self.ccfg.t
@@ -206,7 +206,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.emb_out_in_offset = True
         self.ccfg.n_s_split = 1
         self.ccfg.cp_algo = "colossalai_cp"
-        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
+        self.ccfg.sel_rec_rule = "hyperparallel"
         self.ccfg.pp_partition = None
 
     def __parse_hyperparam(self):
@@ -225,9 +225,6 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.v = self.ccfg.specs.vocab_size
         self.ccfg.s = self.config.training.seq_len
         self.ccfg.a = self.ccfg.specs.n_heads
-        self.ccfg.s_fa = (
-            (self.ccfg.s / self.ccfg.a) if self.ccfg.has_fa else self.ccfg.s
-        )
         self.ccfg.n_lay = self.ccfg.specs.n_layers
         self.ccfg.n_kv = self.ccfg.specs.n_kv_heads
         if not self.ccfg.n_kv:
@@ -261,7 +258,6 @@ class CostModelParserHyperparallel(_CostModelParser):
             self.ccfg.n_shared_exp = 0
         self.ccfg.cap_fact = 1  # Assuming
         self.ccfg.etp = self.config.parallelism.expert_tensor_parallel_degree
-        self.config_dp_tp_exp(self.ccfg)  # need verification in code
 
     def __parse_feature_flag(self):
         """training feature vars"""
@@ -272,7 +268,6 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.vp_less_mem = False
         self.ccfg.has_clip = False
         self.ccfg.gmm = True
-        self.ccfg.vocab_emb_dp = True
         self.ccfg.tie_emb_out = self.ccfg.specs.enable_weight_tying
 
     def __parse_batch(self):
@@ -283,9 +278,10 @@ class CostModelParserHyperparallel(_CostModelParser):
 
     def __init_shard(self):
         """sharding vars"""
-        self.ccfg.shard_embed = self.ccfg.t
-        self.ccfg.shard_output_activ = True
-        self.ccfg.shard_recompute_input = True
+        # The embedding is priced split over tensor parallelism alone: FSDP's
+        # sharding of it over data parallelism is not modelled yet.
+        self.ccfg.vocab_emb_dp = False
+        self.ccfg.emb_dp_sharded = False
         self.ccfg.is_shard_mtp_param = True
 
     def __init_bytes(self):
