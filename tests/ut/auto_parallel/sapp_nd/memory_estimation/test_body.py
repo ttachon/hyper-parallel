@@ -35,6 +35,7 @@ from unittest.mock import MagicMock, PropertyMock
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 
 
 def _make_ccfg(
@@ -639,7 +640,6 @@ class TestConfigOptimizerShard(unittest.TestCase):
 
     def test_has_op_true_uses_d_exp(self):
         """BD-H01: has_op=True => shard_p_os_exp = d_exp * cp * t_exp."""
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=True)
         _CostModelParser.config_optimizer_shard(None, ccfg)
         expected = 4 * 2 * 1  # d_exp * cp * t_exp
@@ -651,7 +651,6 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Without the guard, d_exp=4 would produce shard_p_os_exp=8, causing
         expert param/OS/grad memory to be underestimated by 4x.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
         _CostModelParser.config_optimizer_shard(None, ccfg)
         expected = 1 * 2 * 1  # (d_exp if has_op else 1) * cp * t_exp
@@ -664,7 +663,6 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Expert:  shard_p_os_exp     = (d_exp if has_op else 1) * cp * t_exp
         Both bypass the DP sharding factor when has_op=False.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
         ccfg.d = 4
         ccfg.t = 1
@@ -673,6 +671,29 @@ class TestConfigOptimizerShard(unittest.TestCase):
         # Expert:  (d_exp if has_op else 1) * cp * t_exp = 1 * 2 * 1 = 2
         self.assertEqual(ccfg.shard_p_os_non_exp, 2)
         self.assertEqual(ccfg.shard_p_os_exp, 2)
+
+    def test_gradient_sharding_rules(self):
+        """BD-H04: gradients are sharded by one of three rules.
+
+        At d=4, t=2, t_exp=2 and an optimizer shard of 4: as the parameters
+        are when FSDP holds them so, over the whole optimizer shard under
+        gradient sharding, and over TP alone otherwise.
+        """
+        cases = [
+            ({"grads_as_params": True, "has_grad_shard": False}, (4, 8, 1)),
+            ({"grads_as_params": False, "has_grad_shard": True}, (8, 8, 1)),
+            ({"grads_as_params": False, "has_grad_shard": False}, (2, 2, 2)),
+        ]
+        for flags, want in cases:
+            with self.subTest(**flags):
+                ccfg = self._make_parser_ccfg(n_exp=1, d_exp=4, t_exp=2, os_max_shard=4)
+                ccfg.d = 4
+                ccfg.t = 2
+                for name, value in flags.items():
+                    setattr(ccfg, name, value)
+                _CostModelParser.config_optimizer_shard(None, ccfg)
+                got = (ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial)
+                self.assertEqual(got, want)
 
 
 if __name__ == "__main__":

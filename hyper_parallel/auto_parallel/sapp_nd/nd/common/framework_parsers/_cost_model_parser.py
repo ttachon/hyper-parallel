@@ -48,9 +48,6 @@ class _CostModelParser(ABC):
         ccfg.shard_p_os_non_exp = (
             (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
         )
-        ccfg.shard_grad_non_exp = (
-            ccfg.shard_p_os_non_exp if ccfg.has_grad_shard else ccfg.t
-        )
 
         # Expert params
         ccfg.shard_p_os_exp_partial = math.gcd(
@@ -60,16 +57,17 @@ class _CostModelParser(ABC):
         ccfg.shard_p_os_exp = (
             (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
         )
-        ccfg.shard_grad_exp = (
-            ccfg.shard_p_os_exp
-            if ccfg.has_grad_shard
-            else ccfg.t_exp
-        )
-        ccfg.shard_grad_exp_partial = (
-            ccfg.shard_p_os_exp_partial
-            if ccfg.has_grad_shard
-            else ccfg.t_exp
-        )
+
+        # Gradients: as the parameters are when FSDP holds them so, over the
+        # whole optimizer shard under gradient sharding, over TP alone
+        # otherwise.
+        if getattr(ccfg, "grads_as_params", False):
+            grads = (ccfg.shard_p_os_non_exp_partial, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
+        elif ccfg.has_grad_shard:
+            grads = (ccfg.shard_p_os_non_exp, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
+        else:
+            grads = (ccfg.t, ccfg.t_exp, ccfg.t_exp)
+        ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial = grads
 
     # def config_op_level(self, ccfg, strategy):
     #     def full_partial():

@@ -1328,6 +1328,28 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
         self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
 
+    def test_an_fsdp_run_keeps_gradients_as_its_parameters(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: A family hook applied to a run whose FSDP holds each gradient as its
+            parameter, without pipeline parallelism, and to one that does not.
+        Expectation: The first keeps gradients in the parameters' width at PP 1; the second keeps
+            none, but llama2's two-byte ones.
+        """
+        for hook, grads_as_params, want in (
+            (ArchHooks.custom_default_transformer, True, 2),
+            (ArchHooks.custom_llama2, True, 2),
+            (ArchHooks.custom_default_transformer, False, 0),
+            (ArchHooks.custom_llama2, False, 2),
+        ):
+            with self.subTest(hook=hook.__name__, grads_as_params=grads_as_params):
+                cfg = _make_arch_cfg(p=1, bytes_p=2, grads_as_params=grads_as_params)
+                hook(cfg)
+                self.assertEqual(cfg.bytes_grad, want)
+        fp32 = _make_arch_cfg(p=1, bytes_p=4, grads_as_params=True)
+        ArchHooks.custom_llama2(fp32)
+        self.assertEqual(fp32.bytes_grad, 4)
+
     def test_performance_formula_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.

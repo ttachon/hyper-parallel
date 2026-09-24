@@ -178,6 +178,9 @@ class _CostModVar:
     bytes_p: float = 0
     bytes_compute: float = 0
     bytes_softmax: float = 0
+    # Whether each gradient is held as its parameter is: in its width and
+    # sharding, at any pipeline degree, as FSDP holds it.
+    grads_as_params: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
     bytes_norm: float = 0

@@ -646,7 +646,11 @@ class CostModelParserHyperV2(_CostModelParser):
         )
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
-        """Populate optimizer and gradient sharding settings."""
+        """Populate optimizer and gradient sharding settings.
+
+        HyperParallel's FSDP holds every gradient as its parameter, from the
+        first backward to the optimizer step, whatever the pipeline degree.
+        """
         is_auto_models = is_auto_models_schema(self.config)
         self.ccfg.has_op = (
             dp_shard > 1
@@ -661,6 +665,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.has_grad_shard = bool(self._get_cfg_attr(accel,
                                                              "gradient_accumulation_shard",
                                                              False))
+        self.ccfg.grads_as_params = True
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
             else self.ccfg.d * self.ccfg.t
