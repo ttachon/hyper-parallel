@@ -1294,6 +1294,9 @@ class TestSappNDRunND(unittest.TestCase):
         t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
         ArchHooks.custom_t5(t5_cfg)
         self.assertEqual(len(t5_cfg.layer_custom_config), 2)
+        # The model takes the widths its layers take, for the embedding and the output layer.
+        widths = (t5_cfg.bytes_grad, t5_cfg.bytes_os, t5_cfg.bytes_dropout, t5_cfg.bytes_norm)
+        self.assertEqual(widths, (4, 4, 1, 4))
         t5_wrap = ArchHooks.CWrap(t5_cfg)
         t5_cfg.layer_custom_config[0][1](t5_wrap)
         self.assertEqual(t5_cfg.n_attBMM, 1)
