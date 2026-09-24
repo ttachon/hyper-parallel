@@ -312,10 +312,12 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.b,
             target_ccfg.vp,
         )
-        if hasattr(target_ccfg.parser, "config_shard_emb"):
-            target_ccfg.parser.config_shard_emb()
-        if hasattr(target_ccfg.parser, "config_shard_recompute"):
-            target_ccfg.parser.config_shard_recompute()
+        # Every field the strategy decides follows it, on the config the
+        # strategy changed: a multimodal submodule shares its parent's
+        # parser, so the parser is told which config to refresh.
+        for refresh in ("config_shard_emb", "config_shard_recompute", "config_rec_op"):
+            if hasattr(target_ccfg.parser, refresh):
+                getattr(target_ccfg.parser, refresh)(target_ccfg)
         target_ccfg.parser.config_dp_tp_exp(target_ccfg)
         target_ccfg.parser.config_optimizer_shard(target_ccfg)
         target_ccfg.parser.config_comm_flag(target_ccfg)

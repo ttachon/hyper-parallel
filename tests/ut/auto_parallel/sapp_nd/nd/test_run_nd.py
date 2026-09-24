@@ -28,6 +28,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import yaml
+
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
@@ -1711,7 +1713,7 @@ class TestSappNDRunND(unittest.TestCase):
         """
         parser_calls = []
         parser = SimpleNamespace(
-            config_shard_emb=lambda: parser_calls.append("embed"),
+            config_shard_emb=lambda cfg: parser_calls.append(("embed", cfg.d, cfg.t)),
             config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
             config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
             config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
@@ -1783,7 +1785,8 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        self.assertIn("embed", parser_calls)
+        # The refresh reaches the config the strategy changed, with its new degrees.
+        self.assertIn(("embed", 4, 2), parser_calls)
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):
@@ -1810,6 +1813,30 @@ class TestSappNDRunND(unittest.TestCase):
         wrapped_hook(evaluator)
         self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
         self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
+
+    def test_strategy_change_refreshes_mindformers_fields(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: The DeepSeek MindFormers yaml keeps its recompute input sliced at TP 4
+            (recompute_slice_activation), and MindFormers' selective recompute depends on
+            sequence parallelism, which a strategy change sets to TP.
+        Expectation: Both follow each strategy change, where they kept their parse-time values.
+        """
+        cfg = CostModelConfig(config_path)
+        self.assertEqual(cfg.shard_recompute_input, 4, f"parsed shard_recompute_input={cfg.shard_recompute_input}")
+        cfg.set_strategy(mp=1)
+        self.assertEqual(cfg.shard_recompute_input, 1, f"at TP 1 shard_recompute_input={cfg.shard_recompute_input}")
+
+        with open(config_path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        data["recompute_config"]["select_recompute"] = True
+        selective = CostModelConfig(data)
+        selective.set_strategy(mp=2)
+        dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["ffAct", "headCast", "normOp"], f"recomputed at TP 2: {dropped}")
+        selective.set_strategy(mp=1)
+        dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""

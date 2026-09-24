@@ -199,6 +199,10 @@ class CostModelParserMindspeed(_CostModelParser):
         # temporary
         cc.etp = self.config.tmp.etp  # ETP
 
+    def config_shard_emb(self, ccfg):
+        """Set how the embedding table is sharded, on *ccfg*: over TP and DP."""
+        ccfg.shard_embed = ccfg.t * ccfg.d
+
     def __config_parse_json_op_recompute(self, cc):
         """MindSpeed format for select recompute"""
         cc.rec_op = Config(
@@ -269,7 +273,7 @@ class CostModelParserMindspeed(_CostModelParser):
         self.config_optimizer_shard(cc)
 
         # Other factors
-        cc.shard_embed = cc.t * cc.d
+        self.config_shard_emb(cc)
         cc.shard_output_activ = 1
         cc.shard_recompute_input = 1
         cc.s_fa = (
