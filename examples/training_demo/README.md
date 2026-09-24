@@ -150,20 +150,35 @@ cluster -c examples/training_demo/cluster_qwen3_5_moe.env torchrun -n 4 \
     --training.global_batch_size=64
 ```
 
-Every node needs the repository, the generated dataset and the compiled
-`_indexed_helpers_cpp` extension. `cluster sync` delivers none of the last two:
+Every node needs the repository, the compiled `_indexed_helpers_cpp`
+extension and the generated dataset. `cluster sync` delivers neither of the
+last two:
 it honours `.gitignore`, which excludes `output/` and `*.so`, and it never
 deletes, so files removed or renamed upstream survive on the targets. A stale
 `hyper_parallel/core/shard/ops/yaml/` is fatal rather than subtle, because the
 op registry globs that directory and rejects any duplicate operator name.
-Mirror the tree instead:
+
+Mirror the code, excluding run outputs so the mirror can never delete a node's
+dataset:
 
 ```bash
 for h in <nodes>; do
-    rsync -a --delete --exclude '.git/' \
+    rsync -a --delete --exclude '.git/' --exclude 'output/' \
         /path/to/hyper-parallel/ root@$h:/path/to/hyper-parallel/
 done
 ```
+
+Then generate the dataset once on every node. It is deterministic, so every
+node produces identical files and nothing has to ship it:
+
+```bash
+cluster -c examples/training_demo/cluster_qwen3_5_moe.env exec \
+    'python -m examples.training_demo.prepare_parallel_data \
+        --output-dir ./output/training_demo/data --num-samples 1024 --seq-length 128'
+```
+
+`cluster exec` runs inside `REPO_DIR` with the environment hook sourced, so both
+the relative path and the interpreter resolve correctly.
 
 Read the kit's node logs first when a multinode launch fails. A node whose
 environment setup fails exits before training starts and reports it only there.
