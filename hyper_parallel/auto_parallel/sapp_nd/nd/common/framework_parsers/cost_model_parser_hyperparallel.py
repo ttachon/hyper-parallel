@@ -274,6 +274,8 @@ class CostModelParserHyperparallel(_CostModelParser):
         """training feature vars"""
         self.ccfg.has_op = True  # Assuming
         self.ccfg.has_grad_shard = True  # Assuming FSDP
+        # FSDP holds every gradient as its parameter, at any pipeline degree.
+        self.ccfg.grads_as_params = True
         self.ccfg.freeze = False
         self.ccfg.has_fa = True  # Assuming
         self.ccfg.vp_less_mem = False

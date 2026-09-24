@@ -19,6 +19,19 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 
+def _grad_bytes(ccfg, width, without_pp=False):
+    """Return the bytes a gradient takes.
+
+    A run whose FSDP holds each gradient as its parameter keeps it in the
+    parameters' width at any pipeline degree.  Otherwise a gradient takes
+    the family's *width* under pipeline parallelism, and nothing without it
+    unless the family keeps its gradients then too (*without_pp*).
+    """
+    if getattr(ccfg, "grads_as_params", False):
+        return ccfg.bytes_p
+    return width if (without_pp or ccfg.p > 1) else 0
+
+
 class CWrap:
     """Temporary evaluator-like instance"""
 
@@ -67,7 +80,7 @@ def custom_default_transformer(ccfg):
     ccfg.n_dropout = 0  # num dropout
     ccfg.n_normOp = 2  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
+    ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
     ccfg.bytes_os = 4  # optimizer states
     ccfg.bytes_dropout = 0  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
@@ -77,7 +90,7 @@ def custom_llama2(ccfg):
     """llama2"""
     custom_default_transformer(ccfg)
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2  # gradients
+    ccfg.bytes_grad = _grad_bytes(ccfg, 2, without_pp=True)  # gradients
 
 
 def custom_mixtral(ccfg):
@@ -98,7 +111,7 @@ def custom_mixtral(ccfg):
     ccfg.n_dropout = 0  # num dropout
     ccfg.n_normOp = 5  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2 if ccfg.p > 1 else 0  # gradients
+    ccfg.bytes_grad = _grad_bytes(ccfg, 2)  # gradients
     ccfg.bytes_os = 4  # optimizer states
     ccfg.bytes_dropout = 0  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
@@ -124,7 +137,7 @@ def custom_t5(ccfg):
         c.n_dropout = 5  # num dropout
         c.n_normOp = 2  # num normalization
         c.n_gather = 4  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
+        c.bytes_grad = _grad_bytes(c, 4)  # gradients
         c.bytes_os = 4  # optimizer states
         c.bytes_dropout = 1  # dropout mask
         c.bytes_norm = 4  # normalization input
@@ -144,7 +157,7 @@ def custom_t5(ccfg):
         c.n_dropout = 7  # num dropout
         c.n_normOp = 3  # num normalization
         c.n_gather = 6  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
+        c.bytes_grad = _grad_bytes(c, 4)  # gradients
         c.bytes_os = 4  # optimizer states
         c.bytes_dropout = 1  # dropout mask
         c.bytes_norm = 4  # normalization input
@@ -161,7 +174,7 @@ def custom_t5(ccfg):
 
     # The model takes the byte widths every layer takes: the embedding and
     # the output layer are priced on it, before and after any layer.
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
+    ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
     ccfg.bytes_os = 4  # optimizer states
     ccfg.bytes_dropout = 1  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
@@ -187,7 +200,7 @@ def custom_pangualpha(ccfg):
     ccfg.n_dropout = 5  # num dropout
     ccfg.n_normOp = 4  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
+    ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
     ccfg.bytes_os = 4  # optimizer states
     ccfg.bytes_dropout = 1  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
