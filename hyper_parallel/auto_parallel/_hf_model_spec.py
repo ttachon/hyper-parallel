@@ -93,6 +93,12 @@ _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 # Fallback when a vision tower declares no positional-embedding grid.
 _DEFAULT_VISUAL_SEQ_LEN = 1024
 
+# Keys of ``model.config_overrides`` that state the run, not the model.  The
+# model spec never sees them; the Hyper parser reads them into its ExecSpec.
+EXEC_OVERRIDE_KEYS = (
+    "offset", "full_rec", "sel_rec", "capacity_factor", "cap_fact", "use_gmm", "gmm", "seq_length",
+)
+
 
 def _declares_pretrained_path(mapping: Any) -> bool:
     """Return whether the ``model`` section names a Transformers checkpoint.
@@ -239,9 +245,26 @@ def _get_hf_config(model_raw: Mapping[str, Any]) -> Any:
 
 
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return the ``config_overrides`` fallback as a plain dict."""
+    """Return the model keys of the ``config_overrides`` fallback."""
     overrides = model_raw.get("config_overrides")
-    return dict(overrides) if isinstance(overrides, Mapping) else {}
+    if not isinstance(overrides, Mapping):
+        return {}
+    return {key: value for key, value in overrides.items() if key not in EXEC_OVERRIDE_KEYS}
+
+
+def exec_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the run keys of the ``config_overrides`` fallback.
+
+    Args:
+        model_raw: The ``model`` section, as a plain mapping.
+
+    Returns:
+        The entries whose keys are in :data:`EXEC_OVERRIDE_KEYS`.
+    """
+    overrides = model_raw.get("config_overrides")
+    if not isinstance(overrides, Mapping):
+        return {}
+    return {key: value for key, value in overrides.items() if key in EXEC_OVERRIDE_KEYS}
 
 
 def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -264,8 +287,7 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
     vision = typed.vision
     if vision is not None:
         vision = dataclasses.replace(vision, layers=tower_layer_stack(vision).to_layers())
-    extra = {key: value for key, value in typed.extra.items() if key != "layer_types"}
-    return dataclasses.replace(typed, layers=layers, vision=vision, extra=extra).to_dict()
+    return dataclasses.replace(typed, layers=layers, vision=vision, layer_types=None).to_dict()
 
 
 def resolve_hf_model_spec(
@@ -282,7 +304,9 @@ def resolve_hf_model_spec(
     ``model.config_overrides`` stays supported for standalone cost-model
     search files, and doubles as the fallback when the Transformers config
     cannot be reached (offline node, unreachable repository).  Explicit
-    overrides always win over resolved values.
+    overrides always win over resolved values.  Its run keys,
+    :data:`EXEC_OVERRIDE_KEYS`, are not the model's: :func:`exec_overrides`
+    returns them.
 
     Args:
         model_raw: The ``model`` section, as a plain mapping.

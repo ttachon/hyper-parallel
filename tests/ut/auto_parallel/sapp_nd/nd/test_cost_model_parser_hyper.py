@@ -34,6 +34,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     check_and_apply_custom_hook,
     layer_groups,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import exec_of
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
@@ -399,7 +400,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: _parse_parallelism — optimizer shard.
         Description: enable_parallel_optimizer and optimizer_weight_shard_size.
-        Expectation: has_op, op_weight_shard, os_max_shard match inputs.
+        Expectation: has_op and os_max_shard match inputs.
         """
         cfg = _dense_overrides(train={
             "accelerator": {
@@ -409,7 +410,6 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         })
         ccfg = _make_ccfg(cfg)
         self.assertTrue(ccfg.has_op)
-        self.assertEqual(ccfg.op_weight_shard, 4)
         self.assertEqual(ccfg.os_max_shard, 4)
 
         cfg2 = _dense_overrides(train={
@@ -724,14 +724,19 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         ccfg = _make_ccfg(cfg)
         self.assertEqual(ccfg.hff_exp, ccfg.hff)
 
-    def test_feature_flags_vp_less_mem(self):
+    def test_the_run_reaches_the_config_as_an_exec_spec(self):
         """
-        Feature: _parse_feature_flags — vp_less_mem.
-        Description: vp_less_mem is always False.
-        Expectation: vp_less_mem is False.
+        Feature: the ExecSpec the parser states.
+        Description: Parse a dense config whose overrides state its offset, and
+            read the config's ExecSpec back.
+        Expectation: The run the train yaml states, and a dense model's run of
+            the expert layers.
         """
-        ccfg = _make_ccfg(_dense_overrides())
-        self.assertFalse(ccfg.vp_less_mem)
+        ccfg = _make_ccfg(_dense_overrides(model={"config_overrides": {"offset": 0}}))
+        spec = exec_of(ccfg)
+        got = (spec.selective_rule, spec.flash_attention, spec.grouped_gemm, spec.capacity_factor,
+               spec.mtp_in_offset, spec.offset, spec.seq_split)
+        self.assertEqual(got, ("hyperparallel", True, False, 1, False, 0, 1), f"ExecSpec fields={got}")
 
     def test_bytes_dtype_edge_cases(self):
         """

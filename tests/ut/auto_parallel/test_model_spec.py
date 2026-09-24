@@ -23,6 +23,7 @@ from hyper_parallel.auto_parallel._model_spec import (
     ModelSpecError,
     OpCounts,
     VisionSpec,
+    model_fields,
 )
 
 
@@ -236,25 +237,36 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(first, second)
 
 
-class TestExtraPassthrough(unittest.TestCase):
-    """Strategy and runtime keys ride along untouched until the exec IR exists."""
+class TestModelKeysOnly(unittest.TestCase):
+    """A model spec states the model; a run's keys belong in the ExecSpec."""
 
-    def test_unknown_keys_land_in_extra(self):
-        """A key that is not model shape is kept, not dropped or rejected."""
+    def test_an_unknown_key_is_refused(self):
+        """A key that is not the model's is refused, by name, not carried."""
         data = _dense()
         data["compute_dtype"] = "bfloat16"
-        data["local_batch_size"] = 1
-        spec = ModelSpec.from_dict(data)
-        self.assertEqual(spec.extra["compute_dtype"], "bfloat16")
-        self.assertEqual(spec.extra["local_batch_size"], 1)
+        with self.assertRaisesRegex(ModelSpecError, "compute_dtype"):
+            ModelSpec.from_dict(data)
 
-    def test_extra_survives_the_round_trip(self):
-        """Nothing a producer supplied is lost by passing through the spec."""
-        data = _dense()
-        data["compute_dtype"] = "bfloat16"
+    def test_model_fields_takes_the_model_from_a_run(self):
+        """A mapping that states the run too gives up only the model's keys."""
+        data = dict(_dense(), local_batch_size=1, offset=[1, -1], compute_dtype="bfloat16")
+        fields = model_fields(data)
+        self.assertEqual(sorted(set(data) - set(fields)), ["compute_dtype", "local_batch_size", "offset"])
+        self.assertEqual(ModelSpec.from_dict(fields).hidden_size, _dense()["hidden_size"])
+
+    def test_the_facts_extra_held_are_fields(self):
+        """attn_output_gate, qk_nope_head_dim and layer_types are typed, and round-trip."""
+        data = dict(_dense(), attn_output_gate=True, qk_nope_head_dim=128,
+                    layer_types=["full_attention"] * _dense()["num_hidden_layers"])
         spec = ModelSpec.from_dict(data)
+        got = (spec.attn_output_gate, spec.qk_nope_head_dim, spec.layer_types[0])
+        self.assertEqual(got, (True, 128, "full_attention"), f"fields={got}")
         self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
-        self.assertEqual(spec.to_dict()["compute_dtype"], "bfloat16")
+
+    def test_a_non_boolean_gate_is_refused(self):
+        """attn_output_gate is true or false, not a string that reads as one."""
+        with self.assertRaisesRegex(ModelSpecError, "attn_output_gate"):
+            ModelSpec.from_dict(dict(_dense(), attn_output_gate="yes"))
 
 
 class TestVisionTower(unittest.TestCase):
@@ -383,7 +395,6 @@ class TestOpsOnTheSpec(unittest.TestCase):
         self.assertEqual(spec.arch, "default")
         self.assertIsInstance(spec.ops["decoder"], OpCounts)
         self.assertEqual(spec.ops["decoder"].softmax, 0)
-        self.assertNotIn("ops", spec.extra)
 
     def test_ops_round_trip_through_yaml_text(self):
         """Declared counts survive a dump and a reload through real YAML."""
@@ -481,14 +492,13 @@ class TestLayersOnTheSpec(unittest.TestCase):
         """
         Feature: linear-attention fields.
         Description: A Qwen3.5 spec declares its gated-DeltaNet dimensions.
-        Expectation: Typed fields, not extra, and absent when not declared.
+        Expectation: Typed fields, and absent when not declared.
         """
         data = _qwen35()
         data.update(linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=32,
                     linear_value_head_dim=128, linear_conv_kernel_dim=4)
         spec = ModelSpec.from_dict(data)
         self.assertEqual(spec.linear_num_value_heads, 32)
-        self.assertNotIn("linear_num_value_heads", spec.extra)
         self.assertNotIn("linear_num_value_heads", ModelSpec.from_dict(_dense()).to_dict())
 
 
@@ -515,6 +525,11 @@ class TestNormalizedConfigAccessor(unittest.TestCase):
         with self.assertRaises(ModelSpecError) as ctx:
             self._config(**data).model()
         self.assertIn("vocab_size", str(ctx.exception))
+
+    def test_model_leaves_the_run_keys_to_the_adapter(self):
+        """The adapter's own keys in the mapping do not stop the typed spec."""
+        spec = self._config(**_dense(), local_batch_size=1, compute_dtype="bfloat16").model()
+        self.assertEqual(spec.num_hidden_layers, _dense()["num_hidden_layers"])
 
 if __name__ == "__main__":
     unittest.main()

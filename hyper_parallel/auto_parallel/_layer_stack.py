@@ -286,7 +286,7 @@ def spec_layer_stack(spec: ModelSpec) -> LayerStack:
             load_op_profile(spec.arch),
             spec.num_hidden_layers,
             spec.mtp_depth or 0,
-            layer_types=spec.extra.get("layer_types"),
+            layer_types=spec.layer_types,
             first_k_dense=spec.first_k_dense_replace or 0,
         )
     return resolve_layers(spec.arch, layers, spec.ops, linear)

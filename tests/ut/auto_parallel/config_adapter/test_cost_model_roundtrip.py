@@ -137,6 +137,22 @@ class TestCostModelRoundTrip(unittest.TestCase):
         self.assertEqual(yaml_dict["model"]["config_overrides"]["head_dim"], 128)
         self.assertEqual(_parse(yaml_dict).dh, 128)
 
+    def test_run_keys_reach_the_parser_and_the_adapter_keys_stay_out(self) -> None:
+        """
+        Feature: config_overrides of the generated YAML.
+        Description: The model section states a capacity factor, a run key the
+            parser reads from config_overrides, beside the adapter's own keys.
+        Expectation: The capacity factor reaches the parser; the adapter's
+            keys stay out of config_overrides.
+        """
+        config = _normalized_config()
+        config.model_spec["capacity_factor"] = 1.5
+        yaml_dict = _build_hp_yaml_dict(config)
+        overrides = yaml_dict["model"]["config_overrides"]
+        for key in ("local_batch_size", "compute_dtype", "moe_enabled"):
+            self.assertNotIn(key, overrides, f"{key} rode into config_overrides")
+        self.assertEqual(_parse(yaml_dict).cap_fact, 1.5)
+
     def test_device_num_reaches_the_parser(self) -> None:
         """
         Feature: cluster size propagation.
