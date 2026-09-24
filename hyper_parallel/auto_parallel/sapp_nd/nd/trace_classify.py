@@ -450,14 +450,24 @@ def _transit_bytes(bandwidth_info: dict) -> int:
     return int(total * 2 ** 20)
 
 
-def _step_collectives(step_comm: dict, dims: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], SiteStats], float]:
-    """Aggregate one step's HCCL operators per wait column, with their total elapse."""
+def _step_collectives(step_comm: dict, dims: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], SiteStats], float, set]:
+    """Aggregate one step's HCCL operators per wait column, with their total elapse.
+
+    Every operator name starts with ``hcom_``. Anything else is one of the
+    summary entries CANN writes beside them, such as ``Total Op Info``, which
+    repeats the whole step and would double its communication; those are skipped
+    and returned so the caller can say what it ignored.
+    """
     sites: Dict[Tuple[str, str], SiteStats] = defaultdict(SiteStats)
     total = 0.0
+    skipped = set()
     for section, operators in step_comm.items():
         if not isinstance(operators, dict):
             continue
         for name, entry in operators.items():
+            if not name.startswith("hcom_"):
+                skipped.add(name)
+                continue
             info = entry.get("Communication Time Info", {})
             elapse = float(info.get("Elapse Time(ms)", 0.0))
             stats = sites[ascend_site(collective_kind(name)[0], section, dims)]
@@ -467,7 +477,7 @@ def _step_collectives(step_comm: dict, dims: Dict[str, str]) -> Tuple[Dict[Tuple
             stats.transit_ms += float(info.get("Transit Time(ms)", 0.0))
             stats.payload_bytes += _transit_bytes(entry.get("Communication Bandwidth Info", {}))
             total += elapse
-    return sites, total
+    return sites, total, skipped
 
 
 def _read_step_trace(path: Path) -> list:
@@ -513,21 +523,29 @@ def split_ascend_output(path: str, dims: Dict[str, str]) -> List[StepSplit]:
         raw = json.loads(comm_path.read_text(encoding="utf-8"))
         communication = {int(re.sub(r"\D", "", key) or 0): value for key, value in raw.items()}
     splits = []
+    ignored = set()
     for row in _read_step_trace(base / _STEP_TRACE_CSV):
         step_number = int(row["step"])
-        sites, elapse = _step_collectives(communication.get(step_number, {}), dims)
+        sites, elapse, skipped = _step_collectives(communication.get(step_number, {}), dims)
+        ignored |= skipped
         exposed, bubble = row["exposed"] / 1e3, row["bubble"] / 1e3
         # communication.json times every collective; the CSV says how much stayed exposed.
+        # Concurrent operators overlap, so their elapse sums past the step: rescale to what
+        # stayed exposed, and keep the wait and transit shares on that same basis.
         scale = exposed / elapse if elapse else 0.0
         waits = dict.fromkeys(WAIT_COLUMNS + (UNCLASSIFIED,), 0.0)
         for key, stats in sites.items():
             stats.ms *= scale
+            stats.wait_ms *= scale
+            stats.transit_ms *= scale
             waits[key[0]] += stats.ms
         waits[PP_WAIT] += bubble
         comp = dict.fromkeys(PHASES, 0.0)
         comp["unsplit"] = row["comp"] / 1e3
         splits.append(StepSplit(int(row["device"]), f"step{step_number}", row["stage"] / 1e3,
                                 comp, waits, dict(sites)))
+    if ignored:
+        logger.info("%s: ignored %d summary entrie(s): %s", base, len(ignored), ", ".join(sorted(ignored)))
     return splits
 
 

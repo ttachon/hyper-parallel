@@ -268,6 +268,8 @@ _COMMUNICATION = {
             "hcom_allGather__800_0_1@5862276110395350800": _hccl(30.0, 25.0, 5.0, 100.0),
             "hcom_allGather__800_1_1@5862276110395350800": _hccl(20.0, 15.0, 5.0, 100.0),
             "hcom_alltoallv__900_0_1@1111111111111111111": _hccl(50.0, 10.0, 40.0, 50.0, rdma=50.0),
+            # CANN repeats the whole step in a summary entry beside the operators.
+            "Total Op Info": _hccl(100.0, 50.0, 50.0, 250.0, rdma=50.0),
         },
     },
 }
@@ -336,7 +338,8 @@ class TestAscendTraceClassify(unittest.TestCase):
         Feature: trace_classify.split_ascend_output.
         Description: Split the synthetic step, whose 100 ms of HCCL time stayed exposed for 80 ms.
         Expectation: Compute is unsplit, each axis keeps its share of the exposed time scaled by 0.8,
-            idle equals the free column, and SIO is not counted twice in the volume.
+            idle equals the free column, SIO is not counted twice in the volume, and the
+            summary entry is ignored rather than doubling the step.
         """
         splits = TC.split_ascend_output(self.run_dir, self.dims)
         self.assertEqual(len(splits), 1)
@@ -351,8 +354,12 @@ class TestAscendTraceClassify(unittest.TestCase):
         self.assertAlmostEqual(split.idle, 720.0)
         gather = split.sites[(TC.OP_WAIT, "fsdp all-gather")]
         self.assertEqual((gather.calls, gather.payload_bytes), (2, int(200.0 * 2 ** 20)))
-        self.assertAlmostEqual(gather.wait_ms, 40.0)
+        # Waiting is rescaled with the elapse it belongs to, so it cannot exceed it.
+        self.assertAlmostEqual(gather.wait_ms, 32.0)
+        self.assertLessEqual(gather.wait_ms, gather.ms)
         self.assertEqual(split.sites[(TC.EP_WAIT, "expert all-to-all")].payload_bytes, int(100.0 * 2 ** 20))
+        self.assertAlmostEqual(split.waits[TC.UNCLASSIFIED], 0.0)
+        self.assertNotIn((TC.UNCLASSIFIED, "unknown"), split.sites)
 
     def test_missing_communication_json_leaves_waits_empty(self):
         """
