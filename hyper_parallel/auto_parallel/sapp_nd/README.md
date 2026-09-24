@@ -73,6 +73,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-mppb | --manual_pipeline_balance]
     [-t TOP_CONFIG_NUMBER]
     [-mem MEM_FOR_PPB]
+    [--real_csv REAL_CSV [-o OUTPUT_DIR]]
 ```
 
 - `-y`, `--yaml_config`: path to the framework yaml configuration file.
@@ -85,6 +86,37 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-mppb`, `--manual_pipeline_balance`: read offset and recompute from yaml.
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
+- `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plot is written there.
+
+## Comparing with a Profiled Run
+
+`nd.trace_classify` turns per-rank `torch.profiler` traces recorded with `with_stack=True` into the measured-run CSV ND compares against:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify traces/rank*.pt.trace.json.gz \
+    --dims DP=4,PP=1,MB=2,MBS=1,OP=4 \
+    --csv real.csv --perf-parts perf.csv --detail detail.csv
+```
+
+Each profiled step is split into `comp`, one `<dim>_wait` per parallelism type and the idle rest. A wait is time blocked in communication, typed by the HyperParallel module that issued it; the CSV holds the mean over steps and ranks. `--perf-parts` writes the same step in the columns of ND's `debug.csv`, and `--detail` keeps every rank and step by call site. `--dims` takes the acronyms of `-l` except `SP`, which ND reads back as true whatever its value. The split measures host-side blocking, which is exact for host-synchronous backends such as gloo.
+
+An **Ascend** run is read from its directory instead of a trace file, and needs neither Python frames nor host blocking:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify profiling_dp64_ep16_op2 \
+    --dims DP=64,MP=1,PP=1,CP=1,EP=16,MB=1,OP=2 --csv real.csv
+```
+
+`step_trace_time.csv` gives the closed top-level split of each step, and `communication.json` apportions the exposed communication over the axes in proportion to each axis's share of HCCL elapse time. Two consequences worth knowing. Device compute is not attributed to a pass, so it lands in `UNSPLIT_COMPUTE` and leaves `FW_COMPUTE`, `BW_COMPUTE` and `RECOMPUTE` empty. And the axis of a collective comes from its kind, since all-to-all is expert parallelism and gathers and reduce-scatters are FSDP; when TP or CP is active those two are ambiguous and stay unclassified until the rank sets of `communication_matrix.json` are read.
+
+Then run ND on the same model and cluster with `--real_csv`:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd -f hyper_v2 -y train.yaml -d 4 \
+    --real_csv real.csv -o compare/
+```
+
+ND estimates every configuration in the CSV and prints, per configuration, each part's measured value and share next to ND's share of its own score, then the correlation and distance of every part across configurations. Shares make the two comparable despite ND's score units. Correlations need at least two configurations. ND has no idle term, so the measured idle share is what the estimate does not account for.
 
 ## Structure
 
@@ -109,7 +141,8 @@ sapp_nd/
 |   |-- global_config.py
 |   |-- logger.py
 |   |-- parallelize.py
-|   `-- run_nd.py
+|   |-- run_nd.py
+|   `-- trace_classify.py
 `-- perf_estimation/
 ```
 

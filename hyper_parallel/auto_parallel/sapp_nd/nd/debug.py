@@ -615,7 +615,7 @@ def real_in_parts(parts, real, time):
     return parts
 
 
-def correlation_with_classified_comms(configs_estimated):
+def correlation_with_classified_comms(configs_estimated: list) -> tuple:
     """Computes correlation and distance between components time & estimation."""
     score_classified = {}
     time_classified = {}
@@ -658,12 +658,48 @@ def correlation_with_classified_comms(configs_estimated):
                 )
                 square_distances_sum += distance * distance
                 distances[wait].append(abs(distance))
-        distances[RealParts.TOTAL] = sqrt(square_distances_sum)
+        distances[RealParts.TOTAL].append(sqrt(square_distances_sum))
 
     correls = {}
     for wait in RealParts:
         pearson_wait(correls, time_classified, score_classified, wait)
     return correls, distances, topk, len(configs_estimated)
+
+
+def _share(value, total):
+    """Fraction of a total, 0 when the total is 0"""
+    return value / total if total else 0.0
+
+
+def format_classified_comparison(configs_estimated: list) -> str:
+    """Side-by-side measured and estimated parts of every configuration.
+
+    Shares are over each side's own total. ND has no idle term, so the measured
+    idle share is the part of the step the estimate does not account for.
+
+    Args:
+        configs_estimated: Entries of ``ParallelizeLayer.order_space_test_comm_classified``.
+
+    Returns:
+        One table per configuration: measured value and share, ND share, and their difference.
+    """
+    parts = [part for part in RealParts if part not in {RealParts.IDLE, RealParts.TOTAL}]
+    lines = []
+    for config, _, time, score, values, real_values in configs_estimated:
+        estim = estimation_in_real_parts({part: [] for part in RealParts}, values, score)
+        real = real_in_parts({part: [] for part in RealParts}, real_values, time)
+        lines.append(f"{config}: measured {time:.6g}, ND score {score:.6g}")
+        lines.append(f"  {'part':8s} {'measured':>12s} {'share':>8s} {'ND share':>9s} {'diff':>8s}")
+        for part in parts:
+            real_share = _share(real[part][-1], time)
+            estim_share = _share(estim[part][-1], score)
+            lines.append(
+                f"  {str(part):8s} {real[part][-1]:12.6g} {real_share:8.1%} {estim_share:9.1%} "
+                f"{real_share - estim_share:+8.1%}"
+            )
+        idle = time - sum(real[part][-1] for part in parts)
+        lines.append(f"  {str(RealParts.IDLE):8s} {idle:12.6g} {_share(idle, time):8.1%} {'-':>9s}")
+    return "\n".join(lines)
 
 
 def color_diff(diff):
@@ -705,11 +741,9 @@ def print_diff(case, prev, new, **kwargs):
     logger.output(msg.expandtabs(tabsize))
 
 
-def get_distance_i(part, data_i):
+def get_distance_i(part: RealParts, data_i: tuple) -> float:
     """get the average distance of a given part"""
     _, distance, _, _ = data_i
-    if part is RealParts.TOTAL:
-        return distance[part]
     return sum(distance[part]) / len(distance[part])
 
 
