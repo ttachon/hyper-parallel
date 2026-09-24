@@ -25,6 +25,7 @@ from typing import Any, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import RecomputeChoice, choose_recompute, describe
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -60,8 +61,23 @@ class ParallelizeLayer:
             manual_ppb = extra_config.pop("mppb")
         else:
             manual_ppb = False
+        auto_recompute = extra_config.pop("auto_recompute", False)
+        if auto_recompute and manual_ppb:
+            raise ValueError(
+                "auto_recompute chooses every layer's recompute, so it cannot also take it from the config (mppb)"
+            )
 
         self.mem_eval = evaluator
+        # Choose every layer's recompute option for each candidate, rather
+        # than score it fully recomputed; for single models.
+        self.auto_recompute = bool(auto_recompute) and not self.mem_eval.ccfg.multimodal
+        if auto_recompute and not self.auto_recompute:
+            logger.warning(
+                "auto_recompute handles single models only: %s is scored with its configured recompute",
+                self.mem_eval.ccfg.model_name,
+            )
+        # The options chosen for each configuration the ordering scored.
+        self.recompute_choices = {}
 
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
@@ -393,14 +409,19 @@ class ParallelizeLayer:
             multiproc = True
         scored_space = []
         debug_parts = []
+        self.recompute_choices = {}
         with (
             proc.Pool(processes=threads_num)
             if multiproc
             else nullcontext()
         ) as pool:
-            for config, mem in space:
+            for config, peak in space:
                 self.config.set_parallel_config(config)
                 values = []
+                mem, savings = peak, None
+                choice = self.choose_recompute(config)
+                if choice is not None:
+                    mem, savings = int(round(choice.memory)), choice.stage_savings
                 if multiproc:
                     score = pool.apply_async(
                         pool_estimate_performance,
@@ -409,6 +430,7 @@ class ParallelizeLayer:
                             self.machine.device,
                             mem,
                             cache_file,
+                            savings,
                         ),
                     )
                 else:
@@ -424,6 +446,7 @@ class ParallelizeLayer:
                             device_type=self.machine.device,
                             memory=mem,
                             cache_file=cache_file,
+                            stage_savings=savings,
                         )
                         debugger.write()
                         debug_parts = list(debugger.info.keys())
@@ -435,6 +458,7 @@ class ParallelizeLayer:
                             self.config.ccfg,
                             device_type=self.machine.device,
                             memory=mem,
+                            stage_savings=savings,
                         )
                 scored_space.append((config, mem, score, values))
 
@@ -454,6 +478,27 @@ class ParallelizeLayer:
             else:
                 new_scored_space = scored_space
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
+
+    def choose_recompute(self, parallel_config: Any) -> Optional[RecomputeChoice]:
+        """Every layer's recompute option for the configuration just set, with auto_recompute.
+
+        The options are the fastest that fit the device, and are kept in
+        ``recompute_choices`` under *parallel_config*.
+
+        Args:
+            parallel_config: The configuration the config was just set to.
+
+        Returns:
+            The choice; ``None`` without auto_recompute, or when there is
+            none to make and the configuration keeps its own recompute.
+        """
+        if not self.auto_recompute:
+            return None
+        self.mem_eval.set_config(self.config.ccfg)
+        choice = choose_recompute(self.mem_eval, self.machine.device)
+        if choice is not None:
+            self.recompute_choices[parallel_config] = choice
+        return choice
 
     def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
         """Order the given space with performance estimation"""
@@ -544,6 +589,17 @@ class ParallelizeLayer:
         logger.output(
             "Offset & Recompute were%s computed from config info", is_not
         )
+        if self.auto_recompute:
+            logger.output(
+                "Recompute was chosen per layer for %d of %d configurations",
+                len(self.recompute_choices),
+                len(scored_space),
+            )
+            if scored_space and scored_space[0][0] in self.recompute_choices:
+                logger.output(
+                    "Recompute of the best configuration:\n%s",
+                    describe(self.recompute_choices[scored_space[0][0]]),
+                )
         logger.output(
             "Device number is %d, global batch size is %d, dimensions are %s",
             self.machine.number,
@@ -766,6 +822,7 @@ def pool_estimate_performance(
     device: Hard.Type,
     memory: Optional[float] = None,
     cache_file: Optional[str] = None,
+    stage_savings: Optional[Tuple[float, ...]] = None,
 ) -> float:
     """Calls performance estimation for multiprocessing"""
     return estimate_performance(
@@ -773,4 +830,5 @@ def pool_estimate_performance(
         device_type=device,
         memory=memory,
         cache_file=cache_file,
+        stage_savings=stage_savings,
     )

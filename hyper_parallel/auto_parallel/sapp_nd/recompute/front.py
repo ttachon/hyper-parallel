@@ -152,7 +152,10 @@ def build_front(
 
 
 def layer_fronts(
-    evaluator: EvaluatorV2, device_type: Any, ccfg: Optional[CustomConfig] = None
+    evaluator: EvaluatorV2,
+    device_type: Any,
+    ccfg: Optional[CustomConfig] = None,
+    most_in_flight: Optional[int] = None,
 ) -> Tuple[KindFront, ...]:
     """The recompute front of every layer kind of the evaluator's model, at its current strategy.
 
@@ -164,11 +167,14 @@ def layer_fronts(
         evaluator: The memory evaluator, set to the strategy to price.
         device_type: The device the times are priced on.
         ccfg: Estimator options; the search's defaults when omitted.
+        most_in_flight: The most micro-batches any stage keeps in flight, up
+            to which an option's memory is exact; see
+            :meth:`EvaluatorV2.estimate_switch_profiles`.
 
     Returns:
         One front per model and layer kind, in model order.
     """
-    profiles = evaluator.estimate_switch_profiles(LayerTimes(device_type, ccfg))
+    profiles = evaluator.estimate_switch_profiles(LayerTimes(device_type, ccfg), most_in_flight=most_in_flight)
     rec_op = getattr(evaluator.ccfg, "rec_op", None)
     configured = vars(rec_op) if rec_op is not None else {}
     return tuple(

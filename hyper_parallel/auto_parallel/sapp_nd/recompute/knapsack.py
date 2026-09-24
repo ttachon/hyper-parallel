@@ -154,11 +154,16 @@ def choose(
     """
     if budget < 0:
         return None
+    useful = [_useful(fronts[group.kind], group.in_flight) for group in groups]
+    if sum(group.count * _kept(options[-1], group.in_flight) for group, options in zip(groups, useful)) <= budget:
+        # Every layer's fastest option fits: nothing to choose.
+        return _stage_choice(
+            [Assignment(group, options[-1], group.count) for group, options in zip(groups, useful) if group.count]
+        )
     size = int(budget // bucket)
     # fastest[w]: the least time of the layers seen so far keeping exactly w buckets.
     fastest = np.full(size + 1, np.inf)
     fastest[0] = 0.0
-    useful = [_useful(fronts[group.kind], group.in_flight) for group in groups]
     steps = []
     for position, (group, options) in enumerate(zip(groups, useful)):
         weights = [math.ceil(_kept(option, group.in_flight) / bucket) for option in options]
@@ -187,6 +192,11 @@ def choose(
         chosen = [(options[index], count) for (found, index), count in counts.items() if found == position]
         for option, count in sorted(chosen, key=lambda pair: -_time(pair[0])):
             assignments.append(Assignment(group, option, count))
+    return _stage_choice(assignments)
+
+
+def _stage_choice(assignments: Sequence[Assignment]) -> StageChoice:
+    """A stage's assignments, with the memory they keep and the time they take."""
     return StageChoice(
         assignments=tuple(assignments),
         memory=sum(item.count * _kept(item.option, item.layers.in_flight) for item in assignments),

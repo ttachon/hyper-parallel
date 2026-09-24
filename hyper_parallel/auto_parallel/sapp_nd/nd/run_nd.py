@@ -252,6 +252,14 @@ if __name__ == "__main__":
         help="Takes offset and recompute from yaml",
     )
     parser.add_argument(
+        "-ar",
+        "--auto_recompute",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Give every layer of each configuration the fastest recompute "
+        "option that fits, instead of scoring it fully recomputed",
+    )
+    parser.add_argument(
         "-t",
         "--top_config_number",
         type=int,
@@ -330,6 +338,11 @@ if __name__ == "__main__":
             )
             args.cache_file = None
 
+    if args.auto_recompute and args.mppb:
+        parser.error("-ar/--auto_recompute chooses the recompute, so it cannot take it from the yaml (-mppb)")
+    if args.auto_recompute and args.search_config:
+        parser.error("-ar/--auto_recompute does not apply to a search config (-s) yet")
+
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)
         sys.exit(0)
@@ -378,6 +391,7 @@ if __name__ == "__main__":
         dimensions=dims,
         swap_os=args.swap_opt_state,
         mppb=args.mppb,
+        auto_recompute=args.auto_recompute,
         model=args.model,
         # model="Telecom",  # args.model ====ONLY FOR XINYU BRANCH====
         max_mem=max_mem,

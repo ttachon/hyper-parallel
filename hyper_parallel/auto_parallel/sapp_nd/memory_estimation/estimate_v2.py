@@ -132,7 +132,9 @@ class EvaluatorV2(_Utils, _HookManager):
         self.ppb = ppb
         return ppb
 
-    def estimate_switch_profiles(self, layer_times: Callable, stages: list = None) -> Dict:
+    def estimate_switch_profiles(
+        self, layer_times: Callable, stages: list = None, most_in_flight: Optional[int] = None
+    ) -> Dict:
         """What each recompute switch saves and costs, per model and layer kind.
 
         Walks the stages as :meth:`estimate_layer_memory` does and measures
@@ -143,18 +145,26 @@ class EvaluatorV2(_Utils, _HookManager):
         Args:
             layer_times: Prices a layer, as for :meth:`estimate_layer_memory`.
             stages: The partition; the config's own when omitted.
+            most_in_flight: The most micro-batches any stage keeps in flight.
+                A buffer is split into what grows with the micro-batches in
+                flight and what is kept once by its size at one micro-batch
+                and at this many, so the split is exact at both. Under 1F1B
+                without interleaving, the least of the stages and the
+                micro-batches when omitted.
 
         Returns:
             ``{(model name, layer kind): SwitchProfile}``, in model order.
         """
         self._ppb_obj.layer_times = layer_times
         self._ppb_obj.profiles = {}
+        self._ppb_obj.profile_in_flight = most_in_flight
         try:
             self._estimate_on_copy(stages, False, True, -1, False)
             return self._ppb_obj.profiles
         finally:
             self._ppb_obj.layer_times = None
             self._ppb_obj.profiles = None
+            self._ppb_obj.profile_in_flight = None
 
     # Specific estimation
 

@@ -829,6 +829,28 @@ class TestSappNDRunND(unittest.TestCase):
                 runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
             self.assertEqual(_FakeParallelize.instances[-1].to_ppb_calls, [])
 
+    def test_run_nd_cli_asks_for_auto_recompute(self) -> None:
+        """
+        Feature: run_nd -ar/--auto_recompute.
+        Description: Ask for auto recompute alone, then with the yaml's
+            recompute, then with a search config.
+        Expectation: Alone, the search is built with it; with either of the
+            others, the command line is refused before any search is built.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-ar"]
+            with patch.object(sys, "argv", argv):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertTrue(_FakeParallelize.instances[-1].kwargs["auto_recompute"])
+            for extra in (["-mppb"], ["-s", config_path]):
+                _FakeParallelize.instances = []
+                with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(_FakeParallelize.instances, [])
+
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1862,6 +1884,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.global_batch_size = 8
         runner.model_name = "unit"
         runner.enable_debug = False
+        runner.auto_recompute = False
         runner.mem_eval = SimpleNamespace(
             mem_fit=lambda peak: peak < 100,
             get_strategy=lambda: {},

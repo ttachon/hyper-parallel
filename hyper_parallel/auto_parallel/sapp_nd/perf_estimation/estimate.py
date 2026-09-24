@@ -620,6 +620,31 @@ def _resolve_estimate_args(args, kwargs):
     return _EstimateArgs(cfg, stages, extra_custom_func, ccfg, debugger, device_type, memory)
 
 
+def _save_recompute(stage_perfs, savings, debugger):
+    """Stage times less the recompute time each stage saves.
+
+    Args:
+        stage_perfs: Each stage's time, its layers recomputed as the config
+            says.
+        savings: The time each stage's layers save with the recompute
+            options chosen for them instead; ``None`` when none are.
+        debugger: Records the recompute part of each stage, which is where
+            the time is saved.
+
+    Returns:
+        Each stage's time.
+    """
+    if savings is None:
+        return stage_perfs
+    if len(savings) != len(stage_perfs):
+        raise ValueError(f"{len(savings)} stage savings for {len(stage_perfs)} stages")
+    if debugger and debugger.is_enabled():
+        debugger.info[PerfParts.RECOMPUTE] = [
+            recompute - saved for recompute, saved in zip(debugger.info[PerfParts.RECOMPUTE], savings)
+        ]
+    return [perf - saved for perf, saved in zip(stage_perfs, savings)]
+
+
 def _finalize_perf(perf, cache_file, debugger, memory):
     """Apply cached regression coefficients and record debug info.
 
@@ -644,7 +669,12 @@ def _finalize_perf(perf, cache_file, debugger, memory):
 
 # performance estimation
 def estimate_performance(*args, **kwargs):
-    """main estimation"""
+    """main estimation
+
+    With ``stage_savings``, each stage's time is lowered by the recompute
+    time its layers save under the options chosen for them, before the
+    pipeline is timed.
+    """
     (
         cfg,
         stages,
@@ -713,6 +743,7 @@ def estimate_performance(*args, **kwargs):
         recomm_perfs,
         debugger=debugger,
     )
+    stage_perfs = _save_recompute(stage_perfs, kwargs.get("stage_savings"), debugger)
     logger.info("PerfEst: stage_perfs %s", stage_perfs)
 
     stage_focused = kwargs.get("stage_focused", None)

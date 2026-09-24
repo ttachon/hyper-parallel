@@ -66,6 +66,9 @@ class _PPB:
         # Each model's and layer kind's switch profile; set while profiles
         # are being measured.
         self.profiles: Optional[Dict[tuple, SwitchProfile]] = None
+        # The most micro-batches any stage keeps in flight, where profiles
+        # split the buffers when set.
+        self.profile_in_flight: Optional[int] = None
 
     @staticmethod
     def add_to_ppb_list(ppb_lay_desc: list, desc: dict) -> None:
@@ -107,13 +110,22 @@ class _PPB:
 
         With ``layer_times`` set, a body also offers COMM and BOTH, and the
         description carries the layer's times, priced on *kind*, the
-        layer's kind.
+        layer's kind. While ``profiles`` are measured, a body is profiled
+        instead and no layer is described.
         """
         desc = {"model_name": ccfg.model_name}
         timed = self.layer_times is not None
         original_enable_node_log = ctx.enable_node_log
         ctx.enable_node_log = False
         try:
+            if self.profiles is not None:
+                if ctx.current_node == ctx.head_node:
+                    # The pricer copies a config where it first sees it, which
+                    # must come before the walk gives any layer its kind.
+                    self.layer_times(ccfg, None, LayerType.EMBEDDING_LAYER)
+                elif ctx.current_node != ctx.tail_node:
+                    self._profile(ccfg, ctx, kind)
+                return {}
             if ctx.current_node == ctx.head_node:
                 d_emb = self.mb(sum(self._inner_dynamic_mem(ppb=True)))
                 desc["type"] = "HEAD"
@@ -126,8 +138,6 @@ class _PPB:
                 desc["time"] = 1
             else:
                 self._body_memory(desc, ccfg, ctx, res_stat, timed)
-                if self.profiles is not None:
-                    self._profile(ccfg, ctx, kind)
         finally:
             ctx.enable_node_log = original_enable_node_log
         if timed:
@@ -173,7 +183,7 @@ class _PPB:
         key = (ccfg.model_name, kind)
         if key in self.profiles:
             return
-        many = self._many(ccfg)
+        many = max(2, self.profile_in_flight) if self.profile_in_flight else self._many(ccfg)
         keep = dict.fromkeys(SWITCHES, 1)
         ctx.current_node = LayerType.NOT_REC_LAYER
         plain = self._dynamic_mem(many)

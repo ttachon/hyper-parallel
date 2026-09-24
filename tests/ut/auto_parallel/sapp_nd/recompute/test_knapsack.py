@@ -22,7 +22,7 @@ import math
 import os
 import random
 import unittest
-from typing import Dict, Hashable, Optional, Sequence
+from typing import Dict, Hashable, Optional, Sequence, Tuple
 
 # The package has an import cycle that only the memory estimator's import order
 # settles; the performance modules cannot be the first a process loads.
@@ -59,18 +59,18 @@ def _kept(option: LayerOption, in_flight: int) -> float:
 
 
 def _brute_force(groups: Sequence[Layers], fronts: Dict[Hashable, Sequence[LayerOption]], budget: float,
-                 bucket: float) -> Optional[float]:
-    """The least time of any choice whose bucketed memory fits, trying every one."""
+                 bucket: float) -> Tuple[Optional[float], Optional[float]]:
+    """The least time of any choice that fits, and of any whose bucketed memory fits, trying every one."""
     layers = [(group, fronts[group.kind]) for group in groups for _ in range(group.count)]
-    best = None
+    exact, bucketed = None, None
     for picks in itertools.product(*(range(len(options)) for _, options in layers)):
-        buckets = sum(math.ceil(_kept(options[pick], group.in_flight) / bucket)
-                      for (group, options), pick in zip(layers, picks))
-        if buckets * bucket <= budget:
-            time = sum(options[pick].forward_time + options[pick].backward_time
-                       for (_, options), pick in zip(layers, picks))
-            best = time if best is None else min(best, time)
-    return best
+        chosen = [(options[pick], group.in_flight) for (group, options), pick in zip(layers, picks)]
+        time = sum(option.forward_time + option.backward_time for option, _ in chosen)
+        if sum(_kept(option, flight) for option, flight in chosen) <= budget:
+            exact = time if exact is None else min(exact, time)
+        if sum(math.ceil(_kept(option, flight) / bucket) for option, flight in chosen) * bucket <= budget:
+            bucketed = time if bucketed is None else min(bucketed, time)
+    return exact, bucketed
 
 
 class TestChoose(unittest.TestCase):
@@ -81,8 +81,9 @@ class TestChoose(unittest.TestCase):
         Feature: choose.
         Description: Random stages of two kinds of layers, some kept longer
             in flight, under random budgets.
-        Expectation: As fast as the best of every possible choice, and
-            never keeping more than the budget.
+        Expectation: At least as fast as the best choice whose memory fits
+            in whole buckets, no faster than the best that fits, and never
+            keeping more than the budget.
         """
         rng = random.Random(7)
         for _ in range(40):
@@ -91,12 +92,17 @@ class TestChoose(unittest.TestCase):
             groups = [Layers("a", rng.randint(1, 3), rng.randint(1, 3)), Layers("b", rng.randint(0, 2))]
             budget = rng.uniform(0, 600) * MEGABYTE
             bucket = rng.choice([MEGABYTE, 7 * MEGABYTE])
-            best = _brute_force(groups, fronts, budget, bucket)
+            exact, bucketed = _brute_force(groups, fronts, budget, bucket)
             choice = choose(groups, fronts, budget, bucket)
-            if best is None:
+            if exact is None:
                 self.assertIsNone(choice)
                 continue
-            self.assertAlmostEqual(choice.time, best, places=9)
+            if bucketed is not None:
+                self.assertIsNotNone(choice)
+                self.assertLessEqual(choice.time, bucketed + 1e-9)
+            if choice is None:
+                continue
+            self.assertGreaterEqual(choice.time, exact - 1e-9)
             self.assertLessEqual(choice.memory, budget)
             for group in groups:
                 self.assertEqual(sum(item.count for item in choice.assignments if item.layers is group),
@@ -131,6 +137,17 @@ class TestChoose(unittest.TestCase):
         four = choose([Layers("a", 4, 4)], {"a": _FRONT}, budget)
         self.assertLess(one.time, four.time)
         self.assertLessEqual(four.memory, budget)
+
+    def test_a_budget_the_fastest_options_fit_needs_no_search(self):
+        """
+        Feature: choose.
+        Description: A budget far beyond what any bucket count could index.
+        Expectation: Every layer runs its fastest option, found without
+            searching over the budget.
+        """
+        choice = choose([Layers("a", 4, 3)], {"a": _FRONT}, 1e30)
+        self.assertEqual([(item.option, item.count) for item in choice.assignments], [(_FRONT[0], 4)])
+        self.assertEqual(choice.memory, 4 * _kept(_FRONT[0], 3))
 
     def test_of_the_fastest_choices_the_lightest_is_given(self):
         """

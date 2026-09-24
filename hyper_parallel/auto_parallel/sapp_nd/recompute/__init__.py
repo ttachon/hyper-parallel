@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""SAPP-ND recompute search: what each layer kind can recompute, and at what cost."""
+"""SAPP-ND recompute search: what each layer kind can recompute, at what cost, and what each layer runs."""
 
-__all__ = ["front", "profile"]
+__all__ = ["candidate", "front", "knapsack", "profile"]

@@ -29,6 +29,8 @@ from unittest.mock import patch
 # settles; perf_estimation.estimate cannot be the first module a process loads.
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate as Estimate
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     check_and_apply_custom_hook,
@@ -83,6 +85,42 @@ class TestEstimatePerformance(unittest.TestCase):
         first = estimate_performance(ccfg, device_type=Hard.Device_A2)
         self.assertEqual(_plain_values(ccfg), before)
         self.assertEqual(estimate_performance(ccfg, device_type=Hard.Device_A2), first)
+
+    @staticmethod
+    def _debugged(ccfg: CostModelConfig, **kwargs: Any) -> tuple:
+        """The score and its parts."""
+        debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, ccfg.d)], all_dims=[Dim.DP]), info_type=Debug.PerfParts,
+                               enable=True)
+        score = estimate_performance(ccfg, debugger=debugger, device_type=Hard.Device_A2, **kwargs)
+        return score, debugger.info
+
+    def test_stage_savings_come_off_the_recompute(self):
+        """
+        Feature: estimate_performance stage_savings.
+        Description: DeepSeek-V3 over 16 stages and 32 micro-batches,
+            saving nothing, then the same time on every stage.
+        Expectation: Saving nothing changes nothing. Saving the same time
+            everywhere lowers the score, and the recompute part of the
+            slowest stage by that time for each micro-batch.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        score, parts = self._debugged(ccfg)
+        self.assertEqual(self._debugged(ccfg, stage_savings=[0.0] * ccfg.p)[0], score)
+        saved = parts[Debug.PerfParts.RECOMPUTE] / ccfg.m / 4
+        lower, lower_parts = self._debugged(ccfg, stage_savings=[saved] * ccfg.p)
+        self.assertLess(lower, score)
+        self.assertAlmostEqual(lower_parts[Debug.PerfParts.RECOMPUTE] / (parts[Debug.PerfParts.RECOMPUTE]
+                                                                           - saved * ccfg.m), 1.0, places=12)
+
+    def test_stage_savings_need_one_per_stage(self):
+        """
+        Feature: estimate_performance stage_savings.
+        Description: Savings for fewer stages than the pipeline has.
+        Expectation: Refused.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        with self.assertRaises(ValueError):
+            estimate_performance(ccfg, device_type=Hard.Device_A2, stage_savings=[0.0] * (ccfg.p - 1))
 
 
 class TestOpTable(unittest.TestCase):
