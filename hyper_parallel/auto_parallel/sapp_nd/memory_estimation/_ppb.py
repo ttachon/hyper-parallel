@@ -21,13 +21,12 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
+from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES, Cost, SwitchProfile
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel._op_profiles import LayerKind
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 
-# The recompute switches; 1 keeps an op's activation, 0 recomputes the op.
-_SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
 # The balancer's recompute options, in the order that settles a tie between two.
 _OPTIONS = ("NONE", "SLCT", "COMM", "BOTH", "FULL")
 # Where the balancer reads each option's memory per micro-batch and its backward time.
@@ -64,6 +63,9 @@ class _PPB:
         # layer type and recompute switches; set while a description with
         # times is being built.
         self.layer_times: Optional[Callable] = None
+        # Each model's and layer kind's switch profile; set while profiles
+        # are being measured.
+        self.profiles: Optional[Dict[tuple, SwitchProfile]] = None
 
     @staticmethod
     def add_to_ppb_list(ppb_lay_desc: list, desc: dict) -> None:
@@ -94,8 +96,8 @@ class _PPB:
         the tensor-parallel gathers alone, and BOTH does both.
         """
         rec_op = vars(ccfg.rec_op)
-        keep = dict.fromkeys(_SWITCHES, 1)
-        configured = {name: int(bool(rec_op.get(name, 1))) for name in _SWITCHES}
+        keep = dict.fromkeys(SWITCHES, 1)
+        configured = {name: int(bool(rec_op.get(name, 1))) for name in SWITCHES}
         return {"SLCT": configured, "COMM": dict(keep, gather=0), "BOTH": dict(configured, gather=0)}
 
     def lay_ppb(
@@ -124,6 +126,8 @@ class _PPB:
                 desc["time"] = 1
             else:
                 self._body_memory(desc, ccfg, ctx, res_stat, timed)
+                if self.profiles is not None:
+                    self._profile(ccfg, ctx, kind)
         finally:
             ctx.enable_node_log = original_enable_node_log
         if timed:
@@ -140,8 +144,7 @@ class _PPB:
         recomputes, is charged per micro-batch, and the rest, the largest
         any option keeps, once.
         """
-        # The most micro-batches a stage keeps in flight under 1F1B.
-        many = max(2, min(getattr(ccfg, "p", 1), getattr(ccfg, "m", 1)))
+        many = self._many(ccfg)
         ctx.current_node = LayerType.NOT_REC_LAYER
         dyn = {"NONE": self._dynamic_mem(many)}
         ctx.current_node = LayerType.SEL_REC_LAYER
@@ -159,6 +162,40 @@ class _PPB:
                 activation, per_micro_batch, _ = dyn[name]
                 desc[_MEMORY_KEY[name]] = self.mb(activation) + self.mb(per_micro_batch)
         desc["time"] = 1
+
+    @staticmethod
+    def _many(ccfg: CostModelConfig) -> int:
+        """The most micro-batches a stage keeps in flight under 1F1B, and at least 2."""
+        return max(2, min(getattr(ccfg, "p", 1), getattr(ccfg, "m", 1)))
+
+    def _profile(self, ccfg: CostModelConfig, ctx: Context, kind: Optional[LayerKind]) -> None:
+        """Measure the layer plain, with each op alone recomputed and fully recomputed, once per model and kind."""
+        key = (ccfg.model_name, kind)
+        if key in self.profiles:
+            return
+        many = self._many(ccfg)
+        keep = dict.fromkeys(SWITCHES, 1)
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        plain = self._dynamic_mem(many)
+        alone = {name: self._selective_dynamic_mem(ccfg, ctx, dict(keep, **{name: 0}), many) for name in SWITCHES}
+        ctx.current_node = LayerType.FULL_REC_LAYER
+        full = self._dynamic_mem(many)
+
+        def _cost(memory: Tuple[float, float, float], backward: float) -> Cost:
+            """A measurement as a cost: activations and growing buffers per micro-batch, the rest once."""
+            activation, per_micro_batch, once = memory
+            return Cost(activation + per_micro_batch, once, backward)
+
+        forward, backward = self.layer_times(ccfg, kind, LayerType.NOT_REC_LAYER)
+        self.profiles[key] = SwitchProfile(
+            forward_time=forward,
+            plain=_cost(plain, backward),
+            alone={
+                name: _cost(memory, self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, dict(keep, **{name: 0}))[1])
+                for name, memory in alone.items()
+            },
+            full=_cost(full, self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]),
+        )
 
     def _dynamic_mem(self, many: int) -> Tuple[float, float, float]:
         """``(activation, buffers per micro-batch, buffers once)`` of the current layer.

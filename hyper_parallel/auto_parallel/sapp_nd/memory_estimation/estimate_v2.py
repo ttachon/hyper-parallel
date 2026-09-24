@@ -132,6 +132,30 @@ class EvaluatorV2(_Utils, _HookManager):
         self.ppb = ppb
         return ppb
 
+    def estimate_switch_profiles(self, layer_times: Callable, stages: list = None) -> Dict:
+        """What each recompute switch saves and costs, per model and layer kind.
+
+        Walks the stages as :meth:`estimate_layer_memory` does and measures
+        the first body layer of each kind: plain, with each op the switches
+        name recomputed alone, and fully recomputed. The config is left as it
+        was found.
+
+        Args:
+            layer_times: Prices a layer, as for :meth:`estimate_layer_memory`.
+            stages: The partition; the config's own when omitted.
+
+        Returns:
+            ``{(model name, layer kind): SwitchProfile}``, in model order.
+        """
+        self._ppb_obj.layer_times = layer_times
+        self._ppb_obj.profiles = {}
+        try:
+            self._estimate_on_copy(stages, False, True, -1, False)
+            return self._ppb_obj.profiles
+        finally:
+            self._ppb_obj.layer_times = None
+            self._ppb_obj.profiles = None
+
     # Specific estimation
 
     def static_mem_stage(self, stage_id: int) -> float:
