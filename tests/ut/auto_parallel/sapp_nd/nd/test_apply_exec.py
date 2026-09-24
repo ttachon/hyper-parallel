@@ -17,15 +17,27 @@
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_apply_exec.py -v
 """
+import copy
 import os
 import unittest
 from typing import Any, Dict
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel._exec_spec import ExecSpec
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec, exec_of, strategy_exec
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import (
+    apply_exec,
+    apply_layer_strategy,
+    exec_of,
+    strategy_exec,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
+    STRATEGY_GUARDED,
+    CostModelConfig,
+    arm_strategy_guard,
+    strategy_guarded,
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _YAMLS = os.path.join(_HERE, *[os.pardir] * 5, "hyper_parallel", "auto_parallel", "sapp_nd", "nd", "yamls")
@@ -109,6 +121,75 @@ class TestApplyExec(unittest.TestCase):
                         sequence_parallel=True, global_batch_size=ccfg.b * 4 * 8, offset=[0, 0],
                         full_recompute=True)
         self.assertEqual(spec, want, f"strategy_exec gave {spec}")
+
+
+class TestStrategyGuard(unittest.TestCase):
+    """An armed config takes a degree only through apply_exec."""
+
+    def setUp(self) -> None:
+        """The DeepSeek MindFormers config, armed as a search arms it."""
+        self.ccfg = CostModelConfig(os.path.join(_HERE, "deepseek.yaml"))
+        arm_strategy_guard(self.ccfg)
+
+    def test_a_direct_degree_write_is_refused(self):
+        """
+        Feature: the strategy guard.
+        Description: Write each guarded field of an armed config directly.
+        Expectation: AttributeError for each, and the field keeps its value.
+        """
+        for name in sorted(STRATEGY_GUARDED):
+            before = getattr(self.ccfg, name)
+            with self.assertRaises(AttributeError, msg=f"{name} was written"):
+                setattr(self.ccfg, name, 3)
+            self.assertEqual(getattr(self.ccfg, name), before, f"{name} changed")
+
+    def test_the_sanctioned_writers_still_write(self):
+        """
+        Feature: the strategy guard.
+        Description: Change an armed config through set_strategy, apply_exec
+            and a layer kind's degrees, and write a field that is not a
+            degree, such as the recompute switches a pricer sets.
+        Expectation: Every write lands.
+        """
+        self.ccfg.set_strategy(mp=2)
+        apply_exec(self.ccfg, ExecSpec(dp=8))
+        apply_layer_strategy(self.ccfg, {"ep": 1})
+        self.ccfg.rec_op = Config({"gather": 0})
+        got = (self.ccfg.t, self.ccfg.d, self.ccfg.ep, self.ccfg.rec_op.gather)
+        self.assertEqual(got, (2, 8, 1, 0), f"t, d, ep, rec_op.gather={got}")
+
+    def test_a_copy_starts_unarmed(self):
+        """
+        Feature: the strategy guard.
+        Description: Copy an armed config, shallow and deep, as an estimator
+            does before it prices a layer.
+        Expectation: The copies take a direct write; the original still refuses one.
+        """
+        for copier in (copy.copy, copy.deepcopy):
+            clone = copier(self.ccfg)
+            clone.t = 8
+            self.assertEqual(clone.t, 8, f"{copier.__name__}: t={clone.t}")
+        with self.assertRaises(AttributeError):
+            self.ccfg.t = 8
+
+    def test_a_hook_is_guarded_for_its_length(self):
+        """
+        Feature: the strategy guard.
+        Description: Run a hook that writes a degree through an evaluator's
+            set_ccfg, on an unarmed config, then guard an armed one for a block.
+        Expectation: The hook is refused; afterwards the unarmed config takes
+            a direct write again, and the armed one still refuses one.
+        """
+        unarmed = CostModelConfig(os.path.join(_HERE, "deepseek.yaml"))
+        evaluator = EvaluatorV2(None, ccfg=unarmed)
+        with self.assertRaises(AttributeError):
+            evaluator.set_ccfg(lambda cfg: setattr(cfg, "t", 1))
+        unarmed.t = 1
+        self.assertEqual(unarmed.t, 1, f"t={unarmed.t}")
+        with strategy_guarded(self.ccfg):
+            pass
+        with self.assertRaises(AttributeError):
+            self.ccfg.t = 1
 
 
 if __name__ == "__main__":

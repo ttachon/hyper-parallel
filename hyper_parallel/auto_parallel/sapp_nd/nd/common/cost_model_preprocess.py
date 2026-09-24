@@ -14,7 +14,8 @@
 # ============================================================================
 """parse config for cost model"""
 import inspect
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 import re
 from copy import deepcopy
 from enum import Enum
@@ -85,6 +86,13 @@ def compute_kv_dim(ccfg: Any) -> float:
 
 
 # class CostModelConfig(Config) :
+# The strategy fields a config armed by a search takes only through
+# set_strategy or apply_exec.
+STRATEGY_GUARDED = frozenset(("d", "t", "ep", "p", "vp", "cp", "os_max_shard"))
+# Where a config keeps whether its guard is armed; a copy never takes it.
+_GUARD = "_strategy_guard"
+
+
 class CostModelConfig(PartitionGenerator):
     """cost model variables class"""
 
@@ -123,20 +131,29 @@ class CostModelConfig(PartitionGenerator):
             return 0
         return self.__dict__[attr]
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in STRATEGY_GUARDED and self.__dict__.get(_GUARD):
+            raise AttributeError(f"Cannot directly modify {name}, use set_strategy()")
+        object.__setattr__(self, name, value)
+
     def __copy__(self):
         res = object.__new__(type(self))
         res.__dict__.update(self.__dict__)
+        res.__dict__.pop(_GUARD, None)
         return res
 
     def __deepcopy__(self, memo):
         res = object.__new__(type(self))
         for k, v in self.__dict__.items():
-            setattr(res, k, deepcopy(v, memo))
+            if k != _GUARD:
+                setattr(res, k, deepcopy(v, memo))
         return res
 
     def __getstate__(self) -> dict:
         """Return instance state for multiprocessing serialization."""
-        return self.__dict__.copy()
+        state = self.__dict__.copy()
+        state.pop(_GUARD, None)
+        return state
 
     def __setstate__(self, state: dict) -> None:
         """Restore instance state after multiprocessing deserialization."""
@@ -323,3 +340,37 @@ class CostModelConfig(PartitionGenerator):
         if self.multimodal:
             return {mm.model_name: strategy(mm) for mm in self.mm_ccfgs.values()}
         return strategy(self)
+
+
+def arm_strategy_guard(ccfg: Any, armed: bool = True) -> None:
+    """Refuse, or allow again, a direct write of a strategy field.
+
+    Armed, the config and its submodules take a new degree only through
+    ``set_strategy`` or ``apply_exec``, and a layer kind's own degrees
+    through ``apply_layer_strategy``.  A copy of an armed config starts
+    unarmed, so an estimator can change its own.
+
+    Args:
+        ccfg: The config, multimodal or not.
+        armed: Whether to arm the guard or lift it.
+    """
+    object.__setattr__(ccfg, _GUARD, armed)
+    for sub in (getattr(ccfg, "mm_ccfgs", None) or {}).values():
+        arm_strategy_guard(sub, armed)
+
+
+@contextmanager
+def strategy_guarded(ccfg: Any) -> Iterator[Any]:
+    """Refuse a direct write of a strategy field on *ccfg* inside the block.
+
+    Afterwards the config is armed exactly as it was before.
+    """
+    before = ccfg.__dict__.get(_GUARD)
+    object.__setattr__(ccfg, _GUARD, True)
+    try:
+        yield ccfg
+    finally:
+        if before is None:
+            ccfg.__dict__.pop(_GUARD, None)
+        else:
+            object.__setattr__(ccfg, _GUARD, before)

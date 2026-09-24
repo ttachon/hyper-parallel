@@ -34,6 +34,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     CostModelConfig,
+    arm_strategy_guard,
     detect_attention_type,
 )
 
@@ -105,6 +106,9 @@ class ParallelizeLayer:
             self.global_batch_size = self.config.ccfg.gbs
 
         self.bound_space()
+        # From here on the configs this search owns take a strategy only
+        # through set_strategy; an estimator's copy of one starts unarmed.
+        arm_strategy_guard(self.mem_eval.ccfg)
 
     def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""

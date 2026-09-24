@@ -18,7 +18,9 @@
 fields an :class:`~hyper_parallel.auto_parallel._exec_spec.ExecSpec` states
 and derives the rest.  :func:`exec_of` reads a config's ExecSpec back, for a
 parser that fills the config itself, and :func:`strategy_exec` is the
-ExecSpec a search's keyword strategy states.
+ExecSpec a search's keyword strategy states.  A config a search owns refuses
+any other write of a degree, but :func:`apply_layer_strategy`, which gives
+the layer about to be priced the degrees its kind runs with.
 """
 from typing import Any, Mapping
 
@@ -109,8 +111,24 @@ def apply_exec(ccfg: Any, exec_spec: ExecSpec, strict: bool = True) -> None:
             continue
         if name == "device_memory" and isinstance(value, str):
             value = _memory(value)
-        setattr(ccfg, field, value)
+        # The one sanctioned write of a strategy field, past the guard.
+        object.__setattr__(ccfg, field, value)
     derive(ccfg, strict)
+
+
+def apply_layer_strategy(ccfg: Any, degrees: Mapping[str, Any]) -> None:
+    """Give the layer about to be priced the degrees its kind runs with.
+
+    A dense kind in a MoE model runs with no expert parallelism.  Only the
+    degrees are written: the fields derived from the model's degrees stay as
+    the estimators read them.
+
+    Args:
+        ccfg: The config the layer is priced on.
+        degrees: The strategy fields the kind states.
+    """
+    for name, value in degrees.items():
+        object.__setattr__(ccfg, name, value)
 
 
 def strategy_exec(ccfg: Any, strategy: Mapping[str, Any]) -> ExecSpec:
