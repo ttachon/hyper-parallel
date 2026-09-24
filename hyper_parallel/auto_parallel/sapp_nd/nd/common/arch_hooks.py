@@ -87,8 +87,10 @@ def custom_mixtral(ccfg):
     ccfg.n_attParamCast = (
         ccfg.n_attMM if not ccfg.has_op else 0
     )  # num attention parameters cast
-    ccfg.n_ffMM = 0  # num feedforward matmul
-    ccfg.n_ffBMM = 3  # num feedforward batch matmul
+    # A gated expert runs three projections, matmuls like every other
+    # family's feed-forward.
+    ccfg.n_ffMM = 3  # num feedforward matmul
+    ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
         ccfg.n_ffMM if not ccfg.has_op else 0
     )  # num feedforward parameters cast

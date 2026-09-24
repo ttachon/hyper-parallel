@@ -1283,6 +1283,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(cfg.bytes_grad, 2)
         ArchHooks.custom_mixtral(cfg)
         self.assertEqual(cfg.hff, cfg.hff_exp)
+        self.assertEqual((cfg.n_ffMM, cfg.n_ffBMM, cfg.n_ffParamCast), (3, 0, 3))
         ArchHooks.custom_pangualpha(cfg)
         self.assertEqual(cfg.n_normOp, 4)
         ArchHooks.custom_qwen(cfg)
