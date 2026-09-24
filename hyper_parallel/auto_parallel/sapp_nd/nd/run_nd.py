@@ -24,7 +24,6 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -76,6 +75,8 @@ def _compare_with_real_csv(runner, cli_args):
     """
     if cli_args.output_dir is not None:
         os.makedirs(cli_args.output_dir, exist_ok=True)
+    # Keep debug.csv beside the plot rather than inside the installed package.
+    Debug.set_output_dir(cli_args.output_dir)
     configs_estimated, metrics = runner.compare_with_csv(
         cli_args.real_csv, output_path=cli_args.output_dir, plot_idle=True
     )
