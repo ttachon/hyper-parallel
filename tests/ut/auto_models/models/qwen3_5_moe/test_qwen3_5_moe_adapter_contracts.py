@@ -188,7 +188,8 @@ class TestQwen35MoeAdapterContracts(unittest.TestCase):
         """The EP override must keep the gated shared-expert branch.
 
         ``qwen3moe_ep_compute_fn`` returns the routed branch only: it passes the
-        archetype interface check and silently drops ``shared_expert``.
+        archetype interface check and silently drops ``shared_expert``. The
+        family factory composes the qwen2moe combine, which keeps it.
         """
         entries = yaml.safe_load(RECIPE.read_text(encoding="utf-8"))["plan_overrides"]
         ep_entries = [e for e in entries if e.get("when") == "ep"]
@@ -196,8 +197,8 @@ class TestQwen35MoeAdapterContracts(unittest.TestCase):
         self.assertEqual(ep_entries[0]["match"], "*.mlp")
         self.assertEqual(
             ep_entries[0]["local_compute_fn"]["_target_"],
-            "hyper_parallel.distributed.expert_parallel.recipes"
-            ".qwen2moe_ep_compute_fn",
+            "hyper_parallel.models.qwen3_5_moe.adapter.distributed"
+            ".expert_parallel.qwen3_5_moe_ep_compute_fn",
         )
 
     def test_recipe_pins_the_topologies_master_can_actually_run(self):

@@ -72,11 +72,14 @@ plan_overrides:
   # which is the qwen2moe archetype exactly. Do NOT substitute qwen3moe_ep_compute_fn:
   # it passes the same interface check but returns the routed branch only, silently
   # dropping the shared expert.
+  # use_grouped_gemm picks npu_grouped_swiglu over the per-expert loop, whose cost
+  # grows as num_experts / ep_size. Set it false to fall back to the loop.
   - match: "*.mlp"
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
+      _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
+      use_grouped_gemm: true
   # Only active at cp_size > 1. The p2p algorithm has no divisibility requirement;
   # qwen3_5_gdn_ulysses_cp_wrapper is the alternative when cp divides 16 and 32.
   # CP and TP cannot be combined on this model.

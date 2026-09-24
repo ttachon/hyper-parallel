@@ -65,11 +65,14 @@ plan_overrides:
   # 与 qwen2moe archetype 完全一致。
   # 注意：不要改用 qwen3_moe 的 qwen3moe_ep_compute_fn，它只返回 routed 分支，
   # 会通过接口检查但静默丢掉 shared expert。
+  # use_grouped_gemm picks npu_grouped_swiglu over the per-expert loop, whose cost
+  # grows as num_experts / ep_size. Set it false to fall back to the loop.
   - match: "*.mlp"
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
+      _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
+      use_grouped_gemm: true
   # 开启 CP 时需要下面两条（cp_size > 1 才生效）。GDN 用 p2p 算法对 cp 无整除要求；
   # 当 cp 同时整除 16（k heads）与 32（v heads）时也可换成 qwen3_5_gdn_ulysses_cp_wrapper。
   - match: "*.linear_attn"

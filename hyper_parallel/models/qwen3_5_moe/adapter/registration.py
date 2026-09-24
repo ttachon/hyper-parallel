@@ -33,6 +33,14 @@ def _load_context_parallel():
     return context_parallel
 
 
+def _load_expert_parallel():
+    """Return the family's EP compute factory through a lazy provider."""
+    from hyper_parallel.models.qwen3_5_moe.adapter.distributed import (  # pylint: disable=C0415
+        expert_parallel,
+    )
+    return expert_parallel
+
+
 def _load_sharding_rules():
     """Return GDN and MoE parameter roles not covered by generic naming rules.
 
@@ -57,6 +65,7 @@ QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
     context_parallel=_load_context_parallel,
+    expert_parallel=_load_expert_parallel,
     sharding_rules=_load_sharding_rules,
 )
 
@@ -64,6 +73,7 @@ QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForCausalLM",
     model_type="qwen3_5_moe_text",
     context_parallel=_load_context_parallel,
+    expert_parallel=_load_expert_parallel,
     sharding_rules=_load_sharding_rules,
 )
 
