@@ -307,6 +307,23 @@ class TestAscendTraceClassify(unittest.TestCase):
         with self.assertRaises(ValueError):
             TC.ascend_output_dir(self.tmpdir)
 
+    def test_a_second_run_in_the_same_directory_is_refused(self):
+        """
+        Feature: trace_classify.ascend_output_dir.
+        Description: Re-profiling into a directory that already holds a run leaves both.
+        Expectation: The error names both runs rather than silently reading the older one.
+        """
+        second = os.path.join(self.run_dir, "host_2_20260925_ascend_pt", TC.ASCEND_OUTPUT)
+        os.makedirs(second)
+        shutil.copy(os.path.join(self.output, "step_trace_time.csv"), second)
+        with self.assertRaises(ValueError) as raised:
+            TC.ascend_output_dir(self.run_dir)
+        message = str(raised.exception)
+        self.assertIn("host_1_20260924_ascend_pt", message)
+        self.assertIn("host_2_20260925_ascend_pt", message)
+        # Naming one of them directly still works.
+        self.assertEqual(TC.ascend_output_dir(second), pathlib.Path(second))
+
     def test_collective_kind_parses_hccl_names(self):
         """
         Feature: trace_classify.collective_kind.

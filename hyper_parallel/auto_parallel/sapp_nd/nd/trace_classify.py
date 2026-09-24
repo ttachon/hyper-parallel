@@ -376,13 +376,24 @@ def ascend_output_dir(path: str) -> Path:
         The directory holding ``step_trace_time.csv``.
 
     Raises:
-        ValueError: If no such directory is found under ``path``.
+        ValueError: If no such directory is found under ``path``, or if the run
+            directory holds more than one. Re-profiling into a directory that
+            already holds a run leaves both, and silently reading either one
+            makes a stale profile look like a fresh one.
     """
     base = Path(path)
-    candidates = [base, base / ASCEND_OUTPUT, *sorted(base.glob(f"*/{ASCEND_OUTPUT}"))]
-    for candidate in candidates:
+    for candidate in (base, base / ASCEND_OUTPUT):
         if (candidate / _STEP_TRACE_CSV).is_file():
             return candidate
+    nested = [c for c in sorted(base.glob(f"*/{ASCEND_OUTPUT}"))
+              if (c / _STEP_TRACE_CSV).is_file()]
+    if len(nested) > 1:
+        listed = "".join(f"\n  {c.parent.name}" for c in nested)
+        raise ValueError(
+            f"{path} holds {len(nested)} profiling runs; pass the one to read:{listed}"
+        )
+    if nested:
+        return nested[0]
     raise ValueError(f"no {ASCEND_OUTPUT}/{_STEP_TRACE_CSV} under {path}")
 
 
