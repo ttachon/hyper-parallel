@@ -38,12 +38,11 @@ width zero, and half its attention parameters missing, all silently:
   whose fields contradict each other, at parse time and by name, instead of
   resolving to a number that is wrong further downstream.
 
-The strategy half (degrees, sharding, recompute, precision) is deliberately
-absent.  Anything a producer supplies that is not model shape rides in
-:attr:`ModelSpec.extra` untouched, so the boundary stays visible until the
-execution IR exists to take it.
+The strategy half (degrees, sharding, recompute, precision) is the execution
+spec's, :class:`~hyper_parallel.auto_parallel._exec_spec.ExecSpec`.  A key that
+states neither the model nor the run is refused.
 """
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 
@@ -291,9 +290,9 @@ class ModelSpec:
             the profile, body first and MTP layers last.  A producer derives
             it from ``layer_types``, ``first_k_dense_replace`` and
             ``mtp_depth`` when the config does not state it.
-        extra: Producer-supplied keys that are not model shape (precision,
-            batch, runtime knobs).  Carried verbatim so nothing is lost while
-            the execution IR does not yet exist to receive it.
+        layer_types: The attention flavour of each layer, as a hybrid config
+            such as Qwen3.5 lists them; a producer states ``layers`` from
+            them and drops them.
     """
 
     name: str
@@ -321,7 +320,10 @@ class ModelSpec:
     kv_lora_rank: Optional[int] = None
     q_lora_rank: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
+    # Qwen3.5 fuses an output gate into the query projection, doubling its width.
+    attn_output_gate: Optional[bool] = None
 
     # Gated DeltaNet linear attention (Qwen3.5), for the layers a linear kind prices.
     linear_num_key_heads: Optional[int] = None
@@ -333,9 +335,9 @@ class ModelSpec:
     arch: Optional[str] = None
     ops: Optional[Dict[str, OpCounts]] = None
     layers: Optional[Tuple[LayerGroup, ...]] = None
+    layer_types: Optional[Tuple[str, ...]] = None
 
     vision: Optional[VisionSpec] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
 
     _REQUIRED = ("hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size")
 
@@ -438,7 +440,7 @@ class ModelSpec:
         """
         out: Dict[str, Any] = {}
         for spec_field in fields(self):
-            if spec_field.name in ("vision", "extra", "ops", "layers"):
+            if spec_field.name in ("vision", "ops", "layers", "layer_types"):
                 continue
             value = getattr(self, spec_field.name)
             if value is not None:
@@ -447,34 +449,39 @@ class ModelSpec:
             out["ops"] = {kind: counts.to_dict() for kind, counts in self.ops.items()}
         if self.layers is not None:
             out["layers"] = [group.to_dict() for group in self.layers]
+        if self.layer_types is not None:
+            out["layer_types"] = list(self.layer_types)
         if self.vision is not None:
             out["vision"] = self.vision.to_dict()
-        out.update(self.extra)
         return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], strict: bool = True) -> "ModelSpec":
-        """Build a spec from a mapping, keeping unknown keys in ``extra``.
+        """Build a spec from a mapping, refusing a key it does not know.
 
         Args:
             data: A parsed YAML mapping, or whatever a producer assembled.
+                :func:`model_fields` takes the model's keys from a mapping
+                that also states the run.
             strict: Validate before returning.  Only a test constructing a
                 deliberately partial spec should pass ``False``.
 
         Raises:
-            ModelSpecError: If a required field is missing, a field is not an
-                integer, or the declared fields contradict each other.
+            ModelSpecError: If a key is unknown, a required field is missing,
+                a field is not an integer, or the declared fields contradict
+                each other.
         """
-        known = {f.name for f in fields(cls)} - {"vision", "extra"}
+        unknown = sorted(set(data) - MODEL_KEYS)
+        if unknown:
+            raise ModelSpecError(
+                f"unknown model spec keys {unknown}: a model spec states the model only, "
+                "and a run's strategy, such as its offset or recompute, belongs in its "
+                "execution spec"
+            )
         kwargs: Dict[str, Any] = {}
-        extra: Dict[str, Any] = {}
         for key, value in data.items():
-            if key == "vision":
-                continue
-            if key in known:
+            if key != "vision":
                 kwargs[key] = cls._field_value(key, value)
-            else:
-                extra[key] = value
 
         for name in cls._REQUIRED:
             if name not in kwargs:
@@ -488,7 +495,7 @@ class ModelSpec:
         if isinstance(raw_vision, Mapping):
             kwargs["vision"] = cls._vision_from_dict(raw_vision)
 
-        spec = cls(extra=extra, **kwargs)
+        spec = cls(**kwargs)
         return spec.validate() if strict else spec
 
     @staticmethod
@@ -506,6 +513,14 @@ class ModelSpec:
             return layers_from_list(value)
         if key == "ffn_dim_multiplier":
             return float(value)
+        if key == "attn_output_gate":
+            if not isinstance(value, bool):
+                raise ModelSpecError(f"attn_output_gate must be true or false, got {value!r}")
+            return value
+        if key == "layer_types":
+            if not isinstance(value, (list, tuple)) or not all(isinstance(kind, str) for kind in value):
+                raise ModelSpecError(f"layer_types must list layer type names, got {value!r}")
+            return tuple(value)
         return _as_int(value, key)
 
     @staticmethod
@@ -529,3 +544,16 @@ class ModelSpec:
                 f"vision tower is missing required fields: {', '.join(missing)}"
             )
         return VisionSpec(**kwargs)
+
+
+# The keys a model spec reads.
+MODEL_KEYS = frozenset(spec_field.name for spec_field in fields(ModelSpec))
+
+
+def model_fields(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the entries of *data* a model spec reads.
+
+    For a mapping that states the model and the run together, such as a
+    search config's model section.
+    """
+    return {key: value for key, value in data.items() if key in MODEL_KEYS}

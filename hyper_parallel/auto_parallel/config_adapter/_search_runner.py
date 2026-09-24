@@ -22,7 +22,8 @@ memory budget, and returns the optimal strategy.
 import logging
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel._hf_model_spec import EXEC_OVERRIDE_KEYS
+from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 
@@ -100,9 +101,10 @@ def _validate_before_search(config: NormalizedConfig) -> None:
 def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     """Build the ``model`` section of the HP YAML from *model* spec.
 
-    All ``config_overrides`` field names in *model* already match the
-    HP YAML convention, so they are passed through directly without
-    any name mapping.
+    The model's fields go through the model spec, whose names are the HP
+    YAML's, and the run keys the parser reads from ``config_overrides``
+    pass through as they are.  The adapter's own keys, such as the
+    micro-batch size, reach the HP YAML through their own sections.
 
     Args:
         model: The ``model_spec`` dict from :class:`NormalizedConfig`.
@@ -110,9 +112,10 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         A dict suitable for the ``model`` key of a HP ``train.yaml``.
     """
-    spec = ModelSpec.from_dict(model)
+    spec = ModelSpec.from_dict(model_fields(model))
     overrides = spec.to_dict()
     overrides.pop("name", None)
+    overrides.update({key: model[key] for key in EXEC_OVERRIDE_KEYS if key in model})
     return {"name": spec.name, "config_overrides": overrides}
 
 

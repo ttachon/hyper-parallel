@@ -26,9 +26,11 @@ from unittest.mock import patch
 
 from hyper_parallel.auto_parallel import _hf_model_spec as spec_mod
 from hyper_parallel.auto_parallel._hf_model_spec import (
+    exec_overrides,
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._model_spec import ModelSpecError
 
 _REGISTRY = "hyper_parallel.models._transformers.config_resolver"
 
@@ -202,6 +204,27 @@ class TestTransformersEntryPoint(unittest.TestCase):
             })
         self.assertEqual(result["num_hidden_layers"], 4)
         self.assertEqual(result["hidden_size"], 2048)
+
+
+class TestOverridesOfTheRun(unittest.TestCase):
+    """config_overrides states the model, and a few keys of the run."""
+
+    _MODEL = {"hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8,
+              "vocab_size": 32000}
+
+    def test_the_run_keys_leave_the_model_spec(self) -> None:
+        """The offset, the recompute and the capacity factor are not the model's."""
+        run = {"offset": [1, -1], "full_rec": [2, 1], "sel_rec": False, "capacity_factor": 1.5}
+        model_raw = {"name": "toy", "config_overrides": dict(self._MODEL, **run)}
+        resolved = resolve_hf_model_spec(model_raw)
+        self.assertEqual(sorted(set(run) & set(resolved)), [], f"resolved={resolved}")
+        self.assertEqual(exec_overrides(model_raw), run)
+
+    def test_an_unknown_key_is_refused(self) -> None:
+        """A misspelt model field fails by name instead of pricing nothing."""
+        model_raw = {"name": "toy", "config_overrides": dict(self._MODEL, hidden_sise=2048)}
+        with self.assertRaisesRegex(ModelSpecError, "hidden_sise"):
+            resolve_hf_model_spec(model_raw)
 
 
 if __name__ == "__main__":

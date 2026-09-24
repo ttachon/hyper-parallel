@@ -28,6 +28,7 @@ except ImportError:
     yaml = None  # pragma: no cover
 
 from hyper_parallel.auto_parallel._hf_model_spec import (
+    exec_overrides,
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
@@ -99,9 +100,12 @@ def _load_auto_models_model_spec(
     """Resolve model dimensions through the shared AutoModels path.
 
     Delegates to :func:`resolve_hf_model_spec` so this reader and the
-    SAPP-ND parser cannot disagree about field names or fallbacks.
+    SAPP-ND parser cannot disagree about field names or fallbacks.  The run
+    keys of ``config_overrides`` ride along, as the adapter hands them on.
     """
-    return _normalize_model_spec(resolve_hf_model_spec(model_raw, visual_seq_len))
+    spec = resolve_hf_model_spec(model_raw, visual_seq_len)
+    spec.update(exec_overrides(model_raw))
+    return _normalize_model_spec(spec)
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:

@@ -17,7 +17,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Literal
 
-from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
 
 
 @dataclass
@@ -70,7 +70,7 @@ class NormalizedConfig:
             ModelSpecError: If a required field is missing or the declared
                 fields contradict each other.
         """
-        return ModelSpec.from_dict(self.model_spec)
+        return ModelSpec.from_dict(model_fields(self.model_spec))
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize all config sections to a nested dictionary."""

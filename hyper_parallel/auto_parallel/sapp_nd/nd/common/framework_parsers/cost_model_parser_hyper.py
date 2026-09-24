@@ -64,12 +64,12 @@ and wins over anything read from the checkpoint.
 """
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
@@ -98,37 +98,16 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.mm_ccfgs = None
         self.ccfg.mm_order = None
         self._vision_spec = None
+        self._model_seq_len = 0
 
-        # Resolve model hyperparameters via AutoModels' Transformers pipeline.
+        # The model, through AutoModels' Transformers pipeline.
         self._resolve_model_config_pipeline()
-        self._resolve_sequence_length()
 
-        # --- Parallelism ---
-        self._parse_parallelism()
-
-        # --- Batch ---
-        self._parse_batch()
-
-        # --- Feature flags ---
-        self._parse_feature_flags()
-
-        # --- Recompute ---
-        self._parse_recompute()
-
-        # --- n_s_split ---
-        self.ccfg.n_s_split = 1
-
-        # --- Bytes ---
-        self._init_bytes()
-
-        # --- Post-processing ---
-        self._init_moe_strategy()
-        self._init_shard()
-        self._init_offset()
+        # The run, as the train yaml states it.  An expert layout the
+        # degrees cannot hold is clamped rather than refused: the search can
+        # still reach it, and rejects it by memory.
+        apply_exec(self.ccfg, self._exec_spec(), strict=False)
         self.ccfg.overwrite_eval_functions = {}
-        # An expert layout the degrees cannot hold is clamped rather than
-        # refused: the search can still reach it, and rejects it by memory.
-        derive(self.ccfg, strict=False)
 
         # --- Multimodal split (vision-language models only) ---
         self._resolve_multimodal()
@@ -153,7 +132,7 @@ class CostModelParserHyperV2(_CostModelParser):
             spec["arch"], layers_from_list(spec["layers"]), ops,
             LinearAttentionDims.from_fields(spec),
         ))
-        self._resolve_device_capacity()
+        self._model_seq_len = self._spec_int(spec, "max_position_embeddings")
 
     def _model_section(self) -> Dict[str, Any]:
         """Return the ``model`` section as a plain mapping."""
@@ -190,11 +169,7 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.a = self._spec_int(spec, "num_attention_heads")
         ccfg.hff = self._spec_int(spec, "intermediate_size")
         ccfg.v = self._spec_int(spec, "vocab_size")
-        ccfg.s = (
-            self._spec_int(spec, "max_position_embeddings")
-            or self._spec_int(spec, "seq_length")
-            or 4096
-        )
+        ccfg.s = self._spec_int(spec, "max_position_embeddings") or 4096
         ccfg.n_kv = self._spec_int(spec, "num_key_value_heads") or ccfg.a
         # Transformers exposes head_dim explicitly and it is not always
         # hidden_size / num_attention_heads (Qwen3 has h/a = 64, head_dim 128).
@@ -212,10 +187,6 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.n_chosen_exp = 1
         ccfg.n_shared_exp = 0
         ccfg.hff_exp = ccfg.hff
-        ccfg.cap_fact = 1
-        ccfg.t_exp = ccfg.t
-        ccfg.d_exp = ccfg.d
-        ccfg.gmm = False
         ccfg.k_1st_dense = 0
         num_exp = self._spec_int(spec, "num_experts", 1)
         if num_exp <= 1:
@@ -227,20 +198,10 @@ class CostModelParserHyperV2(_CostModelParser):
         if moe_inter:
             ccfg.hff_exp = moe_inter
         ccfg.k_1st_dense = self._spec_int(spec, "first_k_dense_replace")
-        cap_val = spec.get("capacity_factor", spec.get("cap_fact"))
-        if cap_val is not None:
-            ccfg.cap_fact = max(1, float(cap_val))
-        ccfg.gmm = bool(spec.get("use_gmm", spec.get("gmm", True)))
 
     def _apply_scaling_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map MTP and feed-forward scaling fields."""
         ccfg.n_mtp = self._spec_int(spec, "mtp_depth")
-        # Match the MF parser: when the model declares MTP layers they
-        # participate in pipeline offset balancing (default True); when there
-        # is none they are excluded, mirroring the MF parser's
-        # ``num_nextn_predict_layers`` fallback which sets
-        # ``is_mtp_in_offset = False``.
-        ccfg.is_mtp_in_offset = bool(ccfg.n_mtp)
         ccfg.multiple_of = self._spec_int(spec, "multiple_of", 256)
         ccfg.fdm = float(spec.get("ffn_dim_multiplier", 1.0) or 1.0)
 
@@ -315,17 +276,19 @@ class CostModelParserHyperV2(_CostModelParser):
         self.config_op_counts(cc)
         cc.inherited_arch, cc.arch = cc.arch, VISION_ARCH
         cc.v = 0  # patch embedding, not a vocabulary table
-        cc.vocab_emb_dp = False
         cc.n_mtp = 0
-        cc.is_mtp_in_offset = False
-        # The tower's own facts set its derived fields, not the language
-        # model's it was cloned from.
-        derive(cc, strict=False)
         cc.layer_binding = None
         self.config_layer_stack(cc, resolve_layers(
             VISION_ARCH, layers_from_list(vision_spec.get("layers"), "vision.layers"),
         ))
-        cc.offset = self._front_loaded_offset(cc.n_lay)
+        # The tower runs the language model's strategy with no vocabulary
+        # embedding, no MTP layer and no experts, all on the first stage.
+        # Its own facts set its derived fields, not those of the language
+        # model it was cloned from.
+        apply_exec(cc, ExecSpec(
+            vocab_emb_dp=False, mtp_in_offset=False, grouped_gemm=False, capacity_factor=1,
+            offset=self._front_loaded_offset(cc.n_lay),
+        ), strict=False)
         return cc
 
     def _even_offset(self):
@@ -346,8 +309,12 @@ class CostModelParserHyperV2(_CostModelParser):
         stages[0] = head
         return stages
 
-    def _resolve_sequence_length(self) -> None:
-        """Prefer the Trainer dataset sequence length over the model limit."""
+    def _resolve_sequence_length(self) -> int:
+        """The training sequence length: the dataset's, else the model's limit.
+
+        A model section that states no limit falls back on
+        ``config_overrides.seq_length``, then on 4096.
+        """
         data_raw = self._get_cfg_attr(self.config, "data", Config({}))
         legacy_seq_len = self._get_cfg_attr(data_raw, "max_seq_len", 0)
 
@@ -356,21 +323,48 @@ class CostModelParserHyperV2(_CostModelParser):
             dataset_raw, "data_transform", Config({}),
         )
         trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
-        seq_len = int(trainer_seq_len or legacy_seq_len or self.ccfg.s or 4096)
-        self.ccfg.s = seq_len
+        model_seq_len = self._model_seq_len or int(
+            self._get_cfg_attr(self._config_overrides(), "seq_length", 0) or 0
+        )
+        return int(trainer_seq_len or legacy_seq_len or model_seq_len or 4096)
 
-    def _resolve_device_capacity(self) -> None:
-        """Set device capacity from config or default (64 GB)."""
+    def _resolve_device_capacity(self) -> str:
+        """The device's memory: ``context.max_device_memory``, else 64 GB."""
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         device_mem_str = (
             ctx.__dict__.get("max_device_memory", None)
             if isinstance(ctx, (Config, YamlObject))
             else None
         )
-        if device_mem_str:
-            self.ccfg.device_capacity = Memory.from_string(str(device_mem_str))
-        else:
-            self.ccfg.device_capacity = Memory.from_string("64GB")
+        return str(device_mem_str) if device_mem_str else "64GB"
+
+    def _exec_spec(self) -> ExecSpec:
+        """State the run the train yaml describes.
+
+        Read after the model, whose expert count, MTP depth and context limit
+        set the run's defaults.
+        """
+        stated = self._parse_parallelism()
+        stated.update(self._parse_batch(stated["dp"], stated["pp"]))
+        stated.update(self._parse_feature_flags(stated["cp"]))
+        stated.update(self._parse_recompute())
+        stated.update(self._init_bytes())
+        stated.update(self._init_moe_run(stated["etp"]))
+        stated.update(self._init_shard())
+        stated["offset"] = self._init_offset(stated["pp"])
+        stated["seq_split"] = 1
+        # Match the MF parser: MTP layers the model declares take part in
+        # pipeline offset balancing, and without any the offset leaves them
+        # out, as the MF parser's num_nextn_predict_layers fallback does.
+        stated["mtp_in_offset"] = bool(self.ccfg.n_mtp)
+        stated["seq_length"] = self._resolve_sequence_length()
+        stated["device_memory"] = self._resolve_device_capacity()
+        return ExecSpec(**stated)
+
+    def _config_overrides(self) -> Any:
+        """The model section's ``config_overrides``, empty when it has none."""
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        return self._get_cfg_attr(model_raw, "config_overrides", Config({}))
 
     # ── Private helpers ───────────────────────────────────────────────
 
@@ -414,19 +408,20 @@ class CostModelParserHyperV2(_CostModelParser):
             return max(1, int(m.group(1)) // 8)
         return 4
 
-    def _parse_parallelism(self):
-        """Extract parallelism from the AutoModels or legacy Trainer schema."""
+    def _parse_parallelism(self) -> Dict[str, Any]:
+        """The degrees and sharding the AutoModels or legacy Trainer schema states."""
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         legacy_accel = self._get_cfg_attr(train_raw, "accelerator", Config({}))
         accel = self._get_cfg_attr(self.config, "accelerator", legacy_accel)
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
 
-        dp_shard = self._parse_parallel_dimensions(accel, fsdp)
-        self._parse_sequence_parallelism(accel)
-        self._parse_optimizer_parallelism(accel, dp_shard)
+        stated, dp_shard = self._parse_parallel_dimensions(accel, fsdp)
+        stated.update(self._parse_sequence_parallelism(accel))
+        stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"], stated["tp"]))
+        return stated
 
-    def _parse_parallel_dimensions(self, accel, fsdp) -> int:
-        """Populate mesh dimensions and return the data shard degree."""
+    def _parse_parallel_dimensions(self, accel, fsdp) -> Tuple[Dict[str, Any], int]:
+        """Return the mesh's degrees, and the data shard degree."""
 
         dp_shard = int(
             self._get_cfg_attr(fsdp, "dp_shard_size", 0)
@@ -457,18 +452,17 @@ class CostModelParserHyperV2(_CostModelParser):
         etp = int(self._get_cfg_attr(accel, "expert_tensor_parallel_degree", 0) or 0)
         ep = max(ep, 1)
 
-        self.ccfg.t = max(1, tp)
-        self.ccfg.p = max(1, pp)
-        self.ccfg.cp = max(1, cp)
-        self.ccfg.ep = max(1, ep)
-        self.ccfg.d = self._resolve_data_parallel(dp_replicate, dp_shard)
-        self.ccfg.etp = etp
-        self.ccfg.vp = max(1, int(
+        degrees = {"tp": max(1, tp), "pp": max(1, pp), "cp": max(1, cp), "ep": max(1, ep)}
+        degrees["dp"] = self._resolve_data_parallel(
+            dp_replicate, dp_shard, degrees["tp"] * degrees["pp"] * degrees["cp"]
+        )
+        degrees["etp"] = etp
+        degrees["vpp"] = max(1, int(
             self._get_cfg_attr(accel, "pp_interleave_num", 1) or 1
         ))
-        return dp_shard
+        return degrees, dp_shard
 
-    def _resolve_data_parallel(self, dp_replicate: int, dp_shard: int) -> int:
+    def _resolve_data_parallel(self, dp_replicate: int, dp_shard: int, denom: int) -> int:
         """Return the data-parallel degree, preferring an explicit device count.
 
         ND reads ``d * t * cp * p`` back as the cluster size whenever no
@@ -476,6 +470,11 @@ class CostModelParserHyperV2(_CostModelParser):
         has no replicate field, since the runtime derives it from the world
         size, so without ``context.device_num`` an HSDP run would understate
         the cluster by exactly its replicate factor.
+
+        Args:
+            dp_replicate: The replicate degree the config states.
+            dp_shard: The shard degree the config states.
+            denom: The product ``t * p * cp`` of the other degrees.
         """
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         device_num = int(self._get_cfg_attr(ctx, "device_num", 0) or 0)
@@ -487,7 +486,6 @@ class CostModelParserHyperV2(_CostModelParser):
                     "for HSDP runs.", dp_shard,
                 )
             return max(1, dp_replicate * dp_shard)
-        denom = self.ccfg.t * self.ccfg.p * self.ccfg.cp
         if denom < 1 or device_num % denom:
             raise ValueError(
                 f"context.device_num={device_num} is not divisible by "
@@ -495,62 +493,56 @@ class CostModelParserHyperV2(_CostModelParser):
             )
         return max(1, device_num // denom)
 
-    def _parse_sequence_parallelism(self, accel) -> None:
-        """Populate sequence-parallel and pipeline scheduler settings."""
+    def _parse_sequence_parallelism(self, accel) -> Dict[str, Any]:
+        """Sequence parallelism and the pipeline scheduler."""
         use_sp = bool(
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
         )
-        self.ccfg.sequence_parallel = use_sp
-        self.ccfg.pp_sched = str(
-            self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
-        )
+        return {
+            "sequence_parallel": use_sp,
+            "pp_schedule": str(self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")),
+        }
 
-    def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
-        """Populate optimizer and gradient sharding settings."""
+    def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int, tp: int) -> Dict[str, Any]:
+        """Optimizer and gradient sharding."""
         is_auto_models = is_auto_models_schema(self.config)
-        self.ccfg.has_op = (
+        optimizer_parallel = (
             dp_shard > 1
             if is_auto_models
             else bool(self._get_cfg_attr(
                 accel, "enable_parallel_optimizer", True,
             ))
         )
-        self.ccfg.op_weight_shard = max(1, int(
+        weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (dp_shard if is_auto_models else self.ccfg.d * self.ccfg.t))
-        self.ccfg.has_grad_shard = bool(self._get_cfg_attr(accel,
-                                                             "gradient_accumulation_shard",
-                                                             False))
-        self.ccfg.os_max_shard = (
-            self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
-            else self.ccfg.d * self.ccfg.t
-        )
+        ) or (dp_shard if is_auto_models else dp * tp))
+        return {
+            "optimizer_parallel": optimizer_parallel,
+            "optimizer_shard": weight_shard if weight_shard >= 1 else dp * tp,
+            "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
+        }
 
-    def _parse_batch(self):
-        """Extract batch settings from ``training`` or legacy ``train``."""
+    def _parse_batch(self, dp: int, pp: int) -> Dict[str, Any]:
+        """Batch settings from ``training`` or legacy ``train``."""
         legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
         train_raw = self._get_cfg_attr(self.config, "training", legacy_train)
-        self.ccfg.b = max(1, int(self._get_cfg_attr(train_raw, "micro_batch_size", 1) or 1))
-        m = int(self._get_cfg_attr(train_raw, "micro_batch_num", 0) or 0)
+        micro = max(1, int(self._get_cfg_attr(train_raw, "micro_batch_size", 1) or 1))
+        num = int(self._get_cfg_attr(train_raw, "micro_batch_num", 0) or 0)
         gbs = int(self._get_cfg_attr(train_raw, "global_batch_size", 0) or 0)
-        if m > 0:
-            self.ccfg.m = m
-        elif gbs > 0 and gbs % (self.ccfg.b * self.ccfg.d) == 0:
-            self.ccfg.m = max(1, gbs // (self.ccfg.b * self.ccfg.d))
-        else:
-            self.ccfg.m = self.ccfg.p
-        if gbs > 0:
-            self.ccfg.gbs = gbs
-        else:
-            self.ccfg.gbs = self.ccfg.b * self.ccfg.d * self.ccfg.m
+        if num <= 0:
+            if gbs > 0 and gbs % (micro * dp) == 0:
+                num = max(1, gbs // (micro * dp))
+            else:
+                num = pp
+        return {
+            "micro_batch_size": micro,
+            "micro_batch_num": num,
+            "global_batch_size": gbs if gbs > 0 else micro * dp * num,
+        }
 
-    def _parse_feature_flags(self):
-        """Set training feature flags."""
-        self.ccfg.has_fa = True
-        self.ccfg.vocab_emb_dp = True
-        self.ccfg.tie_emb_out = False
-        self.ccfg.freeze = False
+    def _parse_feature_flags(self, cp: int) -> Dict[str, Any]:
+        """Training features: attention kernel, clipping, CP algorithm, optimizer."""
         legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
         training = self._get_cfg_attr(self.config, "training", legacy_train)
         optimizer = self._get_cfg_attr(
@@ -563,38 +555,41 @@ class CostModelParserHyperV2(_CostModelParser):
             or self._get_cfg_attr(optimizer, "max_grad_norm", 0.0)
             or 0.0
         )
-        self.ccfg.has_clip = max_grad_norm > 0
-        self.ccfg.vp_less_mem = False
         accel = self._get_cfg_attr(
             self.config,
             "accelerator",
             self._get_cfg_attr(legacy_train, "accelerator", Config({})),
         )
         cp_algo = self._get_cfg_attr(accel, "context_parallel_algo", None)
-        if cp_algo:
-            self.ccfg.cp_algo = cp_algo
-        else:
-            self.ccfg.cp_algo = "colossalai_cp"
-            if self.ccfg.cp and self.ccfg.cp > 1:
+        if not cp_algo:
+            cp_algo = "colossalai_cp"
+            if cp and cp > 1:
                 logger.warning(
                     "context_parallel_algo not set; defaulting to "
                     "'colossalai_cp' (Ring CP). Set "
                     "train.accelerator.context_parallel_algo explicitly "
                     "to 'ulysses_cp' if Ulysses CP is intended."
                 )
-        # Optimizer type — used by GlobalConfig.max_op to detect muon-based
-        # optimizers.  Matches the MF parser's
-        # ``self.ccfg.optimizer = self.config.optimizer.type``.
+        # Optimizer type, which GlobalConfig.max_op reads to detect muon-based
+        # optimizers, as the MF parser's config.optimizer.type.
         opt_type = (
             self._get_cfg_attr(optimizer, "_target_", None)
             or self._get_cfg_attr(optimizer, "type", None)
         )
-        # Always a string: GlobalConfig.max_op only bounds OP by the data
-        # parallel degree when this reads as a non-muon optimizer name, and
-        # the generated cost-model yaml carries no optimizer section.
-        self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
+        return {
+            "flash_attention": True,
+            "vocab_emb_dp": True,
+            "tie_embeddings": False,
+            "frozen": False,
+            "grad_clip": max_grad_norm > 0,
+            "cp_algo": cp_algo,
+            # Always a string: GlobalConfig.max_op only bounds OP by the data
+            # parallel degree when this reads as a non-muon optimizer name,
+            # and the generated cost-model yaml carries no optimizer section.
+            "optimizer": str(opt_type) if opt_type else "adamw",
+        }
 
-    def _parse_recompute(self):
+    def _parse_recompute(self) -> Dict[str, Any]:
         """Parse recompute mode.
 
         Reads ``activation_checkpoint.mode`` from the AutoModels schema, with
@@ -605,8 +600,7 @@ class CostModelParserHyperV2(_CostModelParser):
         precedence so that Hyper YAML demo files can express per-stage
         recompute lists for side-by-side comparisons with MindFormers.
         """
-        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
-        overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
+        overrides = self._config_overrides()
         full_rec_override = self._get_cfg_attr(overrides, "full_rec", None)
         sel_rec_override = self._get_cfg_attr(overrides, "sel_rec", None)
 
@@ -621,20 +615,14 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         if ac_mode == "off":
             ac_mode = "none"
+        return {
+            "full_recompute": full_rec_override if full_rec_override is not None else ac_mode == "full",
+            "selective_recompute": sel_rec_override if sel_rec_override is not None else ac_mode == "selective",
+            "selective_rule": "hyperparallel",
+        }
 
-        if full_rec_override is not None:
-            self.ccfg.full_rec = full_rec_override
-        else:
-            self.ccfg.full_rec = ac_mode == "full"
-
-        if sel_rec_override is not None:
-            self.ccfg.sel_rec = sel_rec_override
-        else:
-            self.ccfg.sel_rec = ac_mode == "selective"
-        self.ccfg.sel_rec_rule = "hyperparallel"
-
-    def _init_bytes(self):
-        """Set FP byte sizes from AutoModels or legacy dtype fields.
+    def _init_bytes(self) -> Dict[str, Any]:
+        """FP byte sizes from AutoModels or legacy dtype fields.
 
         ``model_init_dtype`` is a top-level AutoModels key applied after the
         weights are loaded, so it outranks ``model.torch_dtype`` for the
@@ -645,36 +633,51 @@ class CostModelParserHyperV2(_CostModelParser):
         mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
         model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
         init_dtype = self._get_cfg_attr(self.config, "model_init_dtype", None)
-        self.ccfg.bytes_p = self._bytes_from_dtype(
-            self._get_cfg_attr(mix_precision, "param_dtype", None)
-            or init_dtype
-            or model_dtype
-            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
-        )
-        self.ccfg.bytes_compute = self._bytes_from_dtype(
-            model_dtype
-            or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")
-        )
-        self.ccfg.bytes_softmax = self._bytes_from_dtype(
-            self._get_cfg_attr(model_raw, "softmax_compute_type", "float32"))
-        self.ccfg.bytes_grad = 4
-        self.ccfg.bytes_os = 4
-        self.ccfg.bytes_norm = 4
+        return {
+            "param_bytes": self._bytes_from_dtype(
+                self._get_cfg_attr(mix_precision, "param_dtype", None)
+                or init_dtype
+                or model_dtype
+                or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+            ),
+            "compute_bytes": self._bytes_from_dtype(
+                model_dtype
+                or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")
+            ),
+            "softmax_bytes": self._bytes_from_dtype(
+                self._get_cfg_attr(model_raw, "softmax_compute_type", "float32")),
+            "grad_bytes": 4,
+            "optimizer_state_bytes": 4,
+            "norm_bytes": 4,
+        }
 
-    def _init_moe_strategy(self):
-        """Default a MoE model's expert tensor-parallel degree.
+    def _init_moe_run(self, etp: int) -> Dict[str, Any]:
+        """The run of the expert layers: grouped GEMM, capacity, expert TP.
 
-        For MoE models (``n_exp > 1``), ``etp`` defaults to 1 when
-        absent from the YAML, matching the MF parser's
-        ``expert_model_parallel`` default.  For dense models the
-        existing ``etp=0`` path continues to produce ``t_exp = t,
-        d_exp = d``.
+        A dense model runs no grouped GEMM and a capacity factor of 1.  For
+        a MoE model (``n_exp > 1``) both come from ``config_overrides``, and
+        ``etp`` defaults to 1 when the YAML states none, matching the MF
+        parser's ``expert_model_parallel`` default; a dense model's ``etp=0``
+        leaves ``t_exp = t, d_exp = d``.
         """
-        if self.ccfg.n_exp > 1 and self.ccfg.etp == 0:
-            self.ccfg.etp = 1
+        if self.ccfg.n_exp <= 1:
+            return {"grouped_gemm": False, "capacity_factor": 1}
+        overrides = self._config_overrides()
+        cap_val = self._get_cfg_attr(
+            overrides, "capacity_factor", self._get_cfg_attr(overrides, "cap_fact", None),
+        )
+        run = {
+            "grouped_gemm": bool(self._get_cfg_attr(
+                overrides, "use_gmm", self._get_cfg_attr(overrides, "gmm", True),
+            )),
+            "capacity_factor": 1 if cap_val is None else max(1, float(cap_val)),
+        }
+        if etp == 0:
+            run["etp"] = 1
+        return run
 
-    def _init_offset(self):
-        """Initialize the pipeline offset.
+    def _init_offset(self, pp: int) -> Any:
+        """The pipeline offset.
 
         The MF parser reads ``model.model_config.offset`` directly from the
         YAML.  When it is a list (e.g. ``[1, 1, ..., -1]``),
@@ -685,28 +688,23 @@ class CostModelParserHyperV2(_CostModelParser):
 
         To match the MF parser's *list*-based filtering behaviour (used by
         DeepSeek-V3 and other models that declare an explicit offset), this
-        parser emits a list offset of length ``pp`` (all zeros = even
+        parser states a list offset of length ``pp`` (all zeros = even
         balancing) by default.  An explicit offset supplied via
-        ``config_overrides.offset`` overrides this — a list is used as-is,
+        ``config_overrides.offset`` overrides this: a list is used as-is,
         and a non-zero int is broadcast to ``[int] * pp``.
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
-        overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
-        explicit = self._get_cfg_attr(overrides, "offset", None)
+        explicit = self._get_cfg_attr(self._config_overrides(), "offset", None)
         if explicit is None:
             explicit = self._get_cfg_attr(model_raw, "offset", None)
         if isinstance(explicit, list):
-            self.ccfg.offset = list(explicit)
-        elif isinstance(explicit, int):
-            if explicit == 0:
-                self.ccfg.offset = 0
-            else:
-                self.ccfg.offset = [explicit] * self.ccfg.p
-        else:
-            self.ccfg.offset = [0] * self.ccfg.p
+            return list(explicit)
+        if isinstance(explicit, int):
+            return 0 if explicit == 0 else [explicit] * pp
+        return [0] * pp
 
-    def _init_shard(self):
-        """State how the embedding and the recompute input are sharded.
+    def _init_shard(self) -> Dict[str, Any]:
+        """How the embedding and the recompute input are sharded.
 
         The embedding is sharded over data parallelism, as under the MF
         parser.  ``recompute_slice_activation`` mirrors the MF parser's
@@ -716,18 +714,20 @@ class CostModelParserHyperV2(_CostModelParser):
         them; the ``custom_qwen`` arch hook then shards the activations of
         Qwen-family models over ``ccfg.t``.
         """
-        self.ccfg.emb_dp_sharded = True
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
         ac = self._get_cfg_attr(self.config, "activation_checkpoint", Config({}))
-        self.ccfg.recompute_slice_activation = bool(self._get_cfg_attr(
-            ac,
-            "recompute_slice_activation",
-            self._get_cfg_attr(
-                fsdp,
+        return {
+            "emb_dp_sharded": True,
+            "recompute_slice_activation": bool(self._get_cfg_attr(
+                ac,
                 "recompute_slice_activation",
-                self._get_cfg_attr(gc, "recompute_slice_activation", False),
-            ),
-        ))
-        self.ccfg.is_shard_mtp_param = True
+                self._get_cfg_attr(
+                    fsdp,
+                    "recompute_slice_activation",
+                    self._get_cfg_attr(gc, "recompute_slice_activation", False),
+                ),
+            )),
+            "shard_mtp_param": True,
+        }
