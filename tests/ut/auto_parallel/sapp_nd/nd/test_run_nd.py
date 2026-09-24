@@ -1831,6 +1831,39 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertFalse(ms_ccfg.multimodal)
         self.assertEqual(ms_ccfg.n_lay, 0)
 
+    def test_a_mindspeed_model_counts_its_mtp_layers(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: A MindSpeed text module of 4 layers and one MTP layer, beside a vision tower.
+        Expectation: The text module's layer group covers its MTP layer too, as MindFormers' and
+            hyper_v2's groups do.
+        """
+        def module(model_id: str, layers: int, mtp: int) -> dict:
+            """One MindSpeed submodule."""
+            return {
+                "model_id": model_id, "freeze": False, "moe_grouped_gemm": False,
+                "tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1,
+                "expert_model_parallel_size": 1, "sequence_parallel": False,
+                "num_layers": layers, "hidden_size": 16, "ffn_hidden_size": 32, "vocab_size": 64,
+                "num_attention_heads": 2, "num_query_groups": 0, "kv_channels": 0, "k_lora_rank": 0,
+                "q_lora_rank": 0, "qk_rope_head_dim": 0, "num_moe_experts": 1, "moe_router_topk": 1,
+                "n_shared_exp": 0, "moe_intermediate_size": 0, "first_k_dense_replace": 0,
+                "recompute_num_layers": 1, "params_dtype": "bfloat16", "attention_softmax_in_fp32": True,
+                "mtp_num_layers": mtp,
+            }
+
+        ms_ccfg = _ParserCostModelConfig()
+        ms_ccfg.config = Config({
+            "model_id": "multi-unit",
+            "tmp": {"pp": 2, "mbs": 1, "dp": 2, "tp": 1, "cp": 1, "vpp": 1, "ep": 1, "seqlen": 8, "etp": 0},
+            "image_encoder": module("vit", 2, 0),
+            "text_decoder": module("qwen3", 4, 1),
+        })
+        ms_ccfg.hooks_dict = {"vit": None, "qwen3": None}
+        CostModelParserMindspeed(ms_ccfg).parse()
+        self.assertEqual(ms_ccfg.mm_ccfgs["qwen3"].layer_custom_config, [(5, None)])
+        self.assertEqual(ms_ccfg.mm_ccfgs["vit"].layer_custom_config, [(2, None)])
+
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.

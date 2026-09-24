@@ -300,7 +300,9 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation
         self.__config_parse_json_op_recompute(cc)
-        cc.layer_custom_config = [(cc.n_lay, None)]
+        # One group of every layer, the MTP layers included, as under the
+        # other parsers: a partition that places an MTP layer prices it.
+        cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
         # By default, 100% of layers use a unique custom config (if specified)
         cc.overwrite_eval_functions = {}
         return cc  # mod_hook
