@@ -886,8 +886,8 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.offset = [0] * self.ccfg.p
 
-    def config_shard_emb(self) -> None:
-        """Configure embedding sharding based on current parallelism.
+    def config_shard_emb(self, ccfg: Any) -> None:
+        """Configure embedding sharding based on current parallelism, on *ccfg*.
 
         Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
         ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
@@ -899,16 +899,18 @@ class CostModelParserHyperV2(_CostModelParser):
         Without this method, ``CostModelConfig.set_strategy`` skips the
         ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
         ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
-        producing an embedding-memory mismatch versus the MF parser.
+        producing an embedding-memory mismatch versus the MF parser.  A
+        multimodal submodule shares this parser, so the config to refresh is
+        passed in.
         """
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
+        ccfg.shard_embed = (
+            ccfg.d
+            if (ccfg.vocab_emb_dp and ccfg.p == 1)
+            else (ccfg.t * ccfg.d)
         )
 
-    def config_shard_recompute(self) -> None:
-        """Recompute ``shard_recompute_input`` after strategy changes.
+    def config_shard_recompute(self, ccfg: Any) -> None:
+        """Recompute ``shard_recompute_input`` after strategy changes, on *ccfg*.
 
         When ``recompute_slice_activation`` is ``True``, the recompute input
         is sharded by the current tensor-parallel degree ``t``; otherwise it
@@ -921,8 +923,8 @@ class CostModelParserHyperV2(_CostModelParser):
         YAML), causing memory-estimation errors when the search explores
         strategies with different ``t`` values.
         """
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t if self._recompute_slice_activation else 1
+        ccfg.shard_recompute_input = (
+            ccfg.t if self._recompute_slice_activation else 1
         )
 
     def _init_shard(self):
@@ -945,7 +947,7 @@ class CostModelParserHyperV2(_CostModelParser):
         (e.g. ``custom_qwen``) may override this during ``EvaluatorV2``
         initialisation.
         """
-        self.config_shard_emb()
+        self.config_shard_emb(self.ccfg)
         self.ccfg.shard_output_activ = 1
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
@@ -960,5 +962,5 @@ class CostModelParserHyperV2(_CostModelParser):
                 self._get_cfg_attr(gc, "recompute_slice_activation", False),
             ),
         ))
-        self.config_shard_recompute()
+        self.config_shard_recompute(self.ccfg)
         self.ccfg.is_shard_mtp_param = True

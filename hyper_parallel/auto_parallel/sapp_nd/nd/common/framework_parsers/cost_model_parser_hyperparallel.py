@@ -288,9 +288,13 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.m = self.ccfg.p
         self.ccfg.gbs = self.ccfg.b * self.ccfg.d * self.ccfg.m
 
+    def config_shard_emb(self, ccfg):
+        """Set how the embedding table is sharded, on *ccfg*: over TP alone."""
+        ccfg.shard_embed = ccfg.t
+
     def __init_shard(self):
         """sharding vars"""
-        self.ccfg.shard_embed = self.ccfg.t
+        self.config_shard_emb(self.ccfg)
         self.ccfg.shard_output_activ = True
         self.ccfg.shard_recompute_input = True
         self.ccfg.is_shard_mtp_param = True
