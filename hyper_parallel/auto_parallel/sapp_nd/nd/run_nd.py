@@ -26,6 +26,45 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 
 
+def _apply_cli_overrides(search_cfg, cli_args):
+    """Override the search config's batch, memory budget and devices from the CLI.
+
+    Args:
+        search_cfg: The search config read from ``-s/--search-config``.
+        cli_args: The parsed CLI namespace.
+    """
+    if cli_args.global_batch_size is not None:
+        search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
+    if cli_args.max_mem is not None:
+        # -M sets the device budget the search checks against, exactly as it
+        # does on the CLI path, instead of being silently ignored here.
+        search_cfg.cluster_spec["device_memory_gb"] = (
+            Memory.from_string(cli_args.max_mem.strip()).to_gb().size
+        )
+    if cli_args.devices is not None:
+        cards_per_node = search_cfg.cluster_spec.get("cards_per_node")
+        if not cards_per_node:
+            # The device type knows its node size (A3: 16); defaulting to 8
+            # silently halves an A3 node and invalidates every candidate.
+            device = Hard.device_map.get(cli_args.device_type)
+            cards_per_node = device.intra_node_num() if device else 8
+            search_cfg.cluster_spec["cards_per_node"] = cards_per_node
+            logger.info(
+                "cluster.cards_per_node not set, using %d from device type %s",
+                cards_per_node, cli_args.device_type,
+            )
+        cards_per_node = max(1, cards_per_node)
+        if cli_args.devices % cards_per_node:
+            logger.warning(
+                "devices=%d is not a multiple of cards_per_node=%d: "
+                "%d device(s) will not be placed",
+                cli_args.devices, cards_per_node,
+                cli_args.devices % cards_per_node,
+            )
+        search_cfg.cluster_spec["num_nodes"] \
+            = max(1, cli_args.devices // cards_per_node)
+
+
 def _compare_with_real_csv(runner, cli_args):
     """Print ND's estimate next to the configurations measured in a classified CSV.
 
@@ -36,6 +75,8 @@ def _compare_with_real_csv(runner, cli_args):
     """
     if cli_args.output_dir is not None:
         os.makedirs(cli_args.output_dir, exist_ok=True)
+    # Keep debug.csv beside the plot rather than inside the installed package.
+    Debug.set_output_dir(cli_args.output_dir)
     configs_estimated, metrics = runner.compare_with_csv(
         cli_args.real_csv, output_path=cli_args.output_dir, plot_idle=True
     )
@@ -74,15 +115,13 @@ def _run_hyper_v2_search(cli_parser, cli_args):
         cli_parser.error(f"yaml-config not found: {cli_args.yaml_config}")
 
     set_verbose_level(cli_args.verbosity)
+    Debug.set_output_dir(cli_args.output_dir)
 
     search_cfg = read_search_config(cli_args.search_config)
+    _apply_cli_overrides(search_cfg, cli_args)
 
-    if cli_args.global_batch_size is not None:
-        search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
-    if cli_args.devices is not None:
-        search_cfg.cluster_spec["num_nodes"] = max(
-            1, cli_args.devices // max(1, search_cfg.cluster_spec.get("cards_per_node", 8))
-        )
+    if getattr(search_cfg, "parallelism_summary", ""):
+        logger.output("Parallelism: %s", search_cfg.parallelism_summary)
 
     errors = validate(search_cfg)
     hard_errors = [e for e in errors if e.severity == "error"]
@@ -241,8 +280,9 @@ if __name__ == "__main__":
         "--mem_for_ppb",
         type=str,
         default="0GB",
-        help="Memory to reserve for pipeline balancing. "
-        "Will be decreased from the memory budget allowed by ND (default 0GB)",
+        help="Device memory budget the search must fit in, e.g. '58GB'. "
+        "Overrides the yaml capacity and cluster.device_memory_gb. "
+        "To RESERVE memory instead of capping it, use -mem/--mem_for_ppb.",
     )
     parser.add_argument(
         "-c",
@@ -333,6 +373,7 @@ if __name__ == "__main__":
         )
 
     set_verbose_level(args.verbosity)
+    Debug.set_output_dir(args.output_dir)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
     machine = Hard.Machine(args.devices, args.device_type)
