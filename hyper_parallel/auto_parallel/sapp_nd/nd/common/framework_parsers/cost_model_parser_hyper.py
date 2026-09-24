@@ -69,6 +69,7 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
@@ -128,8 +129,9 @@ class CostModelParserHyperV2(_CostModelParser):
 
         # --- Post-processing ---
         self._init_moe_strategy()
-        self.config_optimizer_shard(self.ccfg)
-        self.config_comm_flag(self.ccfg)
+        # An expert layout the degrees cannot hold is clamped rather than
+        # refused: the search can still reach it, and rejects it by memory.
+        derive(self.ccfg, strict=False)
         self._init_shard()
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
@@ -666,33 +668,16 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.bytes_norm = 4
 
     def _init_moe_strategy(self):
-        """Initialize MoE strategy variables via base helper.
+        """Default a MoE model's expert tensor-parallel degree.
 
         For MoE models (``n_exp > 1``), ``etp`` defaults to 1 when
         absent from the YAML, matching the MF parser's
         ``expert_model_parallel`` default.  For dense models the
         existing ``etp=0`` path continues to produce ``t_exp = t,
         d_exp = d``.
-
-        Catches invalid MoE combinations (e.g., ``d_exp = 0`` when
-        ``dp < ep``) so the search engine can proceed — invalid combos
-        will later be filtered by the memory budget check.
         """
         if self.ccfg.n_exp > 1 and self.ccfg.etp == 0:
             self.ccfg.etp = 1
-        try:
-            self.config_dp_tp_exp(self.ccfg)
-        except TypeError:
-            logger.warning(
-                "MoE config_dp_tp_exp failed for d=%d t=%d ep=%d etp=%d "
-                "n_exp=%d — clamping to minimum values.",
-                self.ccfg.d, self.ccfg.t, self.ccfg.ep,
-                self.ccfg.etp, self.ccfg.n_exp,
-            )
-            self.ccfg.d_exp = max(1, self.ccfg.d_exp)
-            self.ccfg.t_exp = max(1, self.ccfg.t_exp)
-            self.ccfg.hff_exp = max(1, self.ccfg.hff_exp)
-            self.ccfg.n_exp = max(1, self.ccfg.n_exp)
 
     def _init_offset(self):
         """Initialize the pipeline offset.

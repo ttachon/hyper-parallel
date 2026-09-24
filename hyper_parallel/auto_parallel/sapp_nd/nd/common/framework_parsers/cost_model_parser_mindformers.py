@@ -17,6 +17,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class CostModelParserMindformers(_CostModelParser):
@@ -149,7 +150,6 @@ class CostModelParserMindformers(_CostModelParser):
             )  # Capacity factor
             self.ccfg.k_1st_dense = self.config.moe_config.first_k_dense_replace
             self.ccfg.etp = self.config.moe_config.expert_model_parallel
-            self.config_dp_tp_exp(self.ccfg)
             self.ccfg.gmm = self.config.moe_config.use_gmm
         else:
             cfg = self.config.model.model_config
@@ -159,7 +159,6 @@ class CostModelParserMindformers(_CostModelParser):
             if cfg.moe_intermediate_size:
                 self.ccfg.hff_exp = cfg.moe_intermediate_size
             self.ccfg.k_1st_dense = max(self.ccfg.k_1st_dense, cfg.first_k_dense_replace)
-            self.config_dp_tp_exp(self.ccfg)
             self.ccfg.gmm = cfg.moe_grouped_gemm
 
     def __config_parse_yaml_op_recompute(self):
@@ -239,7 +238,7 @@ class CostModelParserMindformers(_CostModelParser):
             self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
         else:
             self.ccfg.os_max_shard = 1
-        self.config_optimizer_shard(self.ccfg)
+        derive(self.ccfg)
 
         # Other factors
         self.config_shard_emb()
@@ -254,7 +253,6 @@ class CostModelParserMindformers(_CostModelParser):
             if not self.config.model.model_config.use_flash_attention
             else self.ccfg.s / self.ccfg.a
         )  # flash attention factor [HYPOTHESIS]
-        self.config_comm_flag(self.ccfg)
 
     def __config_parse_yaml(self):
         """MindFormer format for unimodal"""

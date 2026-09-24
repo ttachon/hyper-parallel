@@ -16,7 +16,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-import math
 from abc import ABC
 from abc import abstractmethod
 
@@ -115,38 +114,6 @@ class _CostModelParser(ABC):
             return dict(HYPER_SELECTIVE_REC_OP)
         return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
 
-    def config_optimizer_shard(self, ccfg):
-        """OP related variables"""
-        # Non expert params
-        ccfg.shard_p_os_non_exp_partial = (
-            ccfg.os_max_shard if ccfg.has_op else ccfg.t
-        ) * ccfg.cp
-        ccfg.shard_p_os_non_exp = (
-            (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
-        )
-        ccfg.shard_grad_non_exp = (
-            ccfg.shard_p_os_non_exp if ccfg.has_grad_shard else ccfg.t
-        )
-
-        # Expert params
-        ccfg.shard_p_os_exp_partial = math.gcd(
-            ccfg.n_exp,
-            (ccfg.os_max_shard if ccfg.has_op else 1) * ccfg.t_exp,
-        )
-        ccfg.shard_p_os_exp = (
-            (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
-        )
-        ccfg.shard_grad_exp = (
-            ccfg.shard_p_os_exp
-            if ccfg.has_grad_shard
-            else ccfg.t_exp
-        )
-        ccfg.shard_grad_exp_partial = (
-            ccfg.shard_p_os_exp_partial
-            if ccfg.has_grad_shard
-            else ccfg.t_exp
-        )
-
     # def config_op_level(self, ccfg, strategy):
     #     def full_partial():
     #         return Config({"full":0, "partial":0})
@@ -180,48 +147,3 @@ class _CostModelParser(ABC):
         hff = int(2 * hff / 3)
         hff = multiple_of * ((hff + multiple_of - 1) // multiple_of)
         return hff
-
-    def config_comm_flag(self, ccfg):
-        """comm flag variables"""
-        ccfg.comm_d_non_exp = (
-            0
-            if ((ccfg.d == 1) or not ccfg.has_op)
-            else (2 if not ccfg.has_grad_shard else 3)
-        )  # data parallel comm factor
-        ccfg.comm_d_exp = (
-            0
-            if ((ccfg.d_exp == 1) or not ccfg.has_op)
-            else (2 if not ccfg.has_grad_shard else 3)
-        )  # data parallel comm factor
-        ccfg.comm_t = float(ccfg.t > 1)  # tensor parallel comm factor
-        ccfg.comm_ep = float(
-            ccfg.ep > 1 or ccfg.n_exp > 1
-        )  # expert parallel comm factor
-        ccfg.comm_cp = float(ccfg.cp > 1)  # context parallel comm factor
-        ccfg.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
-        ccfg.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
-
-    def config_dp_tp_exp(self, ccfg):
-        """MoE strategy variables"""
-        if ccfg.etp > 1:
-            ccfg.t_exp = ccfg.etp
-            # d * t = inner dp * outer dp * etp
-            # inner dp = EP, outer dp = the rest
-            ccfg.d_exp = ccfg.d * ccfg.t * ccfg.cp // ccfg.t_exp // ccfg.ep
-        else:
-            ccfg.t_exp = ccfg.t
-            if ccfg.d >= ccfg.ep:
-                ccfg.d_exp = ccfg.d // ccfg.ep
-            else:
-                ccfg.d_exp = ccfg.d * ccfg.t // ccfg.ep
-            if ccfg.t_exp * ccfg.ep > ccfg.d * ccfg.t:
-                ccfg.t_exp = 1
-
-        exp_group1_invalid = ccfg.d_exp < 1 or ccfg.t_exp < 1
-        exp_group2_invalid = ccfg.hff_exp < 1 or ccfg.n_exp < 1
-        if exp_group1_invalid or exp_group2_invalid:
-            raise TypeError(
-                f"MoE parsing error: d_exp({ccfg.d_exp})/t_exp({ccfg.t_exp})/"
-                f"hff_exp({ccfg.hff_exp})/n_exp({ccfg.n_exp})/"
-                f"DP = {ccfg.d}, TP = {ccfg.t}, EP = {ccfg.ep}/"
-            )

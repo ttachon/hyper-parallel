@@ -17,6 +17,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlOb
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class CostModelParserMindspeed(_CostModelParser):
@@ -254,7 +255,6 @@ class CostModelParserMindspeed(_CostModelParser):
 
         # MoE infos
         self.__config_parse_json_moe(cc, mod)
-        self.config_dp_tp_exp(cc)
 
         # FP byte storages
         cc.bytes_p = self.ccfg.fp_bytes(mod.params_dtype)  # parameters
@@ -268,7 +268,7 @@ class CostModelParserMindspeed(_CostModelParser):
 
         # Optimizer parallel factors
         cc.os_max_shard = cc.d * cc.t
-        self.config_optimizer_shard(cc)
+        derive(cc)
 
         # Other factors
         cc.shard_embed = cc.t * cc.d
@@ -277,23 +277,6 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.s_fa = (
             cc.s if not cc.has_fa else cc.s / cc.a
         )  # flash attention factor [HYPOTHESIS]
-        cc.comm_d_non_exp = (
-            0
-            if ((cc.d == 1) or not cc.has_op)
-            else (2 if not cc.has_grad_shard else 3)
-        )  # data parallel comm factor
-        cc.comm_d_exp = (
-            0
-            if ((cc.d_exp == 1) or not cc.has_op)
-            else (2 if not cc.has_grad_shard else 3)
-        )  # data parallel comm factor
-        cc.comm_t = float(cc.t > 1)  # tensor parallel comm factor
-        cc.comm_ep = float(
-            cc.ep > 1 or cc.n_exp > 1
-        )  # expert parallel comm factor
-        cc.comm_cp = float(cc.cp > 1)  # context parallel comm factor
-        cc.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
-        cc.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
         cc.gbs = cc.b * cc.d * cc.m
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation

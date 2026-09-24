@@ -22,6 +22,7 @@ from pprint import pformat
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.generate_partitions import PartitionGenerator
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class AttentionType(Enum):
@@ -315,9 +316,7 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.parser.config_shard_emb()
         if hasattr(target_ccfg.parser, "config_shard_recompute"):
             target_ccfg.parser.config_shard_recompute()
-        target_ccfg.parser.config_dp_tp_exp(target_ccfg)
-        target_ccfg.parser.config_optimizer_shard(target_ccfg)
-        target_ccfg.parser.config_comm_flag(target_ccfg)
+        derive(target_ccfg)
         if fr is not None:
             target_ccfg.full_rec = fr
         if sr is not None:

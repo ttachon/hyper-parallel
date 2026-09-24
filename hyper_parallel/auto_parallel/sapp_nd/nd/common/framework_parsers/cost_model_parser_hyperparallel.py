@@ -23,6 +23,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class CostModelParserHyperparallel(_CostModelParser):
@@ -144,8 +145,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.__parse_hyperparam()
         self.__parse_strat()
         self.__parse_moe()
-        self.config_optimizer_shard(self.ccfg)  # need to adapt FSDP
-        self.config_comm_flag(self.ccfg)
+        derive(self.ccfg)  # optimizer sharding needs adapting to FSDP
         self.__parse_batch()
         self.__init_shard()
         self.__init_bytes()
@@ -261,7 +261,6 @@ class CostModelParserHyperparallel(_CostModelParser):
             self.ccfg.n_shared_exp = 0
         self.ccfg.cap_fact = 1  # Assuming
         self.ccfg.etp = self.config.parallelism.expert_tensor_parallel_degree
-        self.config_dp_tp_exp(self.ccfg)  # need verification in code
 
     def __parse_feature_flag(self):
         """training feature vars"""
