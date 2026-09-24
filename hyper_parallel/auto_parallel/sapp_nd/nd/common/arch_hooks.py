@@ -159,6 +159,12 @@ def custom_t5(ccfg):
             e = CWrap(e)
         e.set_ccfg(decode)
 
+    # The model takes the byte widths every layer takes: the embedding and
+    # the output layer are priced on it, before and after any layer.
+    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
+    ccfg.bytes_os = 4  # optimizer states
+    ccfg.bytes_dropout = 1  # dropout mask
+    ccfg.bytes_norm = 4  # normalization input
     ccfg.layer_custom_config = [
         (ccfg.n_lay // 2, hook_encode),
         (ccfg.n_lay // 2, hook_decode),
