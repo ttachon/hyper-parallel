@@ -165,6 +165,10 @@ def launch(sweep: Sweep, ep: int) -> Optional[str]:
         f"--profiling.end_step={end}",
         f"--profiling.trace_dir=./{REMOTE_PROFILES}/ep{ep}",
     )
+    # Re-profiling into a directory that already holds a run leaves both, and
+    # the classifier then refuses rather than guess which one is fresh.
+    _run(sweep.kit("exec", "--no-env",
+                   f"rm -rf ./{REMOTE_PROFILES}/ep{ep}"), check=False)
     found = RUN_ID_PATTERN.search(_run(command, capture=True))
     return found.group(1) if found else None
 
@@ -214,17 +218,29 @@ def stage_fetch(sweep: Sweep) -> None:
 
 
 def classify(sweep: Sweep, ep: int) -> Optional[Path]:
-    """Split one profiled run into ND's parts, returning its CSV."""
-    found = sorted((sweep.profiles / f"ep{ep}").glob("*_ascend_pt"))
-    if not found:
+    """Split one profiled run into ND's parts, returning its CSV.
+
+    The run directory is passed whole rather than a chosen ``*_ascend_pt``
+    inside it, so ``trace_classify`` locates the run and refuses a directory
+    holding two. Reading either of two silently makes a stale profile look
+    like a fresh one, with numbers that are identical for no visible reason.
+    """
+    config_dir = sweep.profiles / f"ep{ep}"
+    runs = sorted(config_dir.glob("*_ascend_pt"))
+    if not runs:
         print(f"ep{ep}: no profiling output, skipped", flush=True)
+        return None
+    if len(runs) > 1:
+        listed = "".join(f"\n  {run.name}" for run in runs)
+        print(f"ep{ep}: {len(runs)} profiling runs, refusing to guess:{listed}",
+              flush=True)
         return None
     dims = {"DP": sweep.world, "MP": 1, "PP": 1, "CP": 1,
             "EP": ep, "MB": 1, "OP": sweep.world}
     part = sweep.out / f"real_ep{ep}.csv"
     command = [
         sys.executable, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify",
-        str(found[0]),
+        str(config_dir),
         "--dims", ",".join(f"{name}={value}" for name, value in dims.items()),
         "--csv", str(part), "--detail", str(sweep.out / f"detail_ep{ep}.csv"),
     ]
@@ -267,20 +283,20 @@ def stage_classify(sweep: Sweep) -> None:
 def write_nd_config(config: Path, nd_yaml: Path) -> None:
     """Write the ND input yaml for the model the demo config builds.
 
-    ND reads the training sequence length from ``data.max_seq_len``, while the
-    demo feeds an Indexed Dataset whose length lives in
-    ``dataset.data_config.seq_length``. Without carrying it across, the model
-    would be costed at its context limit instead of what ran.
+    The sequence length is carried across explicitly: an Indexed Dataset states
+    it as ``dataset.data_config.seq_length``, and without it ND falls back to
+    the model's context limit, 262144 here against a real 128. The attention
+    term is quadratic, so that alone makes compute swamp every other part.
     """
     import yaml  # pylint: disable=import-outside-toplevel
 
     raw = yaml.safe_load(config.read_text(encoding="utf-8"))
     model = dict(raw["model"])
     model.pop("validate_placement", None)
+    seq_len = raw["dataset"]["data_config"]["seq_length"]
     nd_yaml.write_text(
         yaml.safe_dump(
-            {"model": model,
-             "data": {"max_seq_len": raw["dataset"]["data_config"]["seq_length"]}},
+            {"model": model, "dataset": {"data_config": {"seq_length": seq_len}}},
             sort_keys=False),
         encoding="utf-8",
     )
