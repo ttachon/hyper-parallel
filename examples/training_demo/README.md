@@ -182,3 +182,38 @@ the relative path and the interpreter resolve correctly.
 
 Read the kit's node logs first when a multinode launch fails. A node whose
 environment setup fails exits before training starts and reports it only there.
+
+### Sweeping expert parallelism against ND
+
+`sweep_qwen3_5_moe_ep.py` profiles one run per `ep_size`, classifies each into
+ND's parts and prints ND's estimate beside the measurement:
+
+```bash
+python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 1,2,4,8,16,32,64
+```
+
+Each degree must divide both the world size and the routed expert count, which
+the script checks before launching anything. `edp_shard_size` is derived as
+`world / ep`, so the shards stay consistent across the sweep.
+
+Stages run in order and any can be run alone, so a sweep can be re-classified
+without re-profiling and a changed cost model re-scored without re-running:
+
+```bash
+python examples/training_demo/sweep_qwen3_5_moe_ep.py --only classify --only compare
+```
+
+| stage | what it does |
+|---|---|
+| `mirror` | makes every node's tree identical, excluding `output/` |
+| `run` | launches each degree and waits on the kit's rc file, not the pid |
+| `fetch` | copies the profiles from the node holding `profiling.rank` |
+| `classify` | `nd.trace_classify` per run, merged into one CSV |
+| `compare` | `run_nd --real_csv`, printing measured against estimated shares |
+
+The ND input yaml is generated rather than reused: ND reads the training
+sequence length from `data.max_seq_len`, while the demo feeds an Indexed
+Dataset whose length lives in `dataset.data_config.seq_length`. Without
+carrying it across, the model would be costed at its 262144 context limit.
+`--framework` defaults to `hyper_v2`, the parser that reads this schema;
+run_nd's own default reads a different one.
