@@ -439,6 +439,60 @@ def _one_layer_of(stack: Optional[LayerStack], kind: Optional[LayerKind]) -> Opt
     return replace(stack, groups=(StackGroup(kind, 1),) + tuple(replace(group, count=0) for group in stack.groups))
 
 
+class PlainTimes(NamedTuple):
+    """What a layer costs before any recompute, the same for every option of its kind.
+
+    Attributes:
+        compute: The compute estimate without recompute.
+        comm: The communication estimate without recompute.
+        config: The config the communication estimate leaves, which the stage
+            estimate reads.
+    """
+
+    compute: float
+    comm: float
+    config: CostModelConfig
+
+
+def _layer_alone(
+    cfg: CostModelConfig, kind: Optional[LayerKind], layer_type: LayerType, switches: Optional[Dict[str, int]]
+) -> Tuple[CostModelConfig, list]:
+    """One *layer_type* layer of *kind*, alone in the first stage of a fresh copy of *cfg*.
+
+    A fresh copy each time: the estimates leave state on the config they are
+    given.
+    """
+    single = deepcopy(cfg)
+    if switches is not None:
+        single.rec_op = Config(dict(switches))
+    single.layer_stack = _one_layer_of(single.layer_stack, kind)
+    single.n = single.d * single.t * single.p
+    stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]
+    stages[0][0] = [layer_type]
+    return single, stages
+
+
+def plain_layer_times(
+    cfg: CostModelConfig,
+    kind: Optional[LayerKind],
+    layer_type: LayerType,
+    device_type: Any,
+    ccfg: Optional[CustomConfig] = None,
+) -> PlainTimes:
+    """The compute and communication of one layer of *kind* alone, without recompute.
+
+    They do not depend on which recompute option the layer runs, so every
+    option of a kind can share them; the embedding and the output layer have
+    their own.
+    """
+    ccfg = ccfg if ccfg is not None else CustomConfig()
+    single, stages = _layer_alone(cfg, kind, layer_type, None)
+    compute = estimate_comp(single, ccfg, stages)[0]
+    grouped, stages = _layer_alone(cfg, kind, layer_type, None)
+    comm = estimate_comm(grouped, ccfg, stages, device_type)[0]
+    return PlainTimes(compute, comm, grouped)
+
+
 def estimate_layer_times(
     cfg: CostModelConfig,
     kind: Optional[LayerKind],
@@ -446,6 +500,7 @@ def estimate_layer_times(
     device_type: Any,
     ccfg: Optional[CustomConfig] = None,
     switches: Optional[Dict[str, int]] = None,
+    plain: Optional[PlainTimes] = None,
 ) -> Tuple[float, float]:
     """Forward and backward time of one layer, priced as a stage prices it.
 
@@ -469,38 +524,27 @@ def estimate_layer_times(
         ccfg: Estimator options; the search's defaults when omitted.
         switches: The recompute switches a selective layer runs with, 1 to
             keep an op and 0 to recompute it; the config's own when omitted.
+        plain: The layer's :func:`plain_layer_times`, when already priced.
 
     Returns:
         ``(forward, backward)``, *backward* including the layer's recompute.
     """
     ccfg = ccfg if ccfg is not None else CustomConfig()
-
-    def _alone() -> Tuple[CostModelConfig, list]:
-        # A fresh copy each time: the estimates leave state on the config
-        # they are given.
-        single = deepcopy(cfg)
-        if switches is not None:
-            single.rec_op = Config(dict(switches))
-        single.layer_stack = _one_layer_of(single.layer_stack, kind)
-        single.n = single.d * single.t * single.p
-        stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]
-        stages[0][0] = [layer_type]
-        return single, stages
-
-    single, stages = _alone()
-    comp = estimate_comp(single, ccfg, stages)[0]
+    if plain is None:
+        plain = plain_layer_times(cfg, kind, layer_type, device_type, ccfg)
+    comp, comm, grouped = plain
+    # A layer that recomputes nothing runs nothing again.
+    recomputes = layer_type in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER)
     recomp = comp
-    if ccfg.retype in {RecType.COMPUTE_ONLY, RecType.WITH}:
+    if recomputes and ccfg.retype in {RecType.COMPUTE_ONLY, RecType.WITH}:
+        single, stages = _layer_alone(cfg, kind, layer_type, switches)
         recomp = estimate_comp(single, ccfg, stages, with_recomp=True)[0]
-
-    # The stage estimate weighs the config the communication estimate leaves.
-    grouped, stages = _alone()
-    comm = estimate_comm(grouped, ccfg, stages, device_type)[0]
     recomm = comm
-    if ccfg.retype in {RecType.COMM_ONLY, RecType.WITH}:
-        fresh, fresh_stages = _alone()
+    if recomputes and ccfg.retype in {RecType.COMM_ONLY, RecType.WITH}:
+        fresh, fresh_stages = _layer_alone(cfg, kind, layer_type, switches)
         recomm = estimate_comm(fresh, ccfg, fresh_stages, device_type, with_recomp=True)[0]
 
+    # The stage estimate weighs the config the communication estimate leaves.
     once = estimate_stage(grouped, ccfg, [comp], [comm], [comp], [comm])[0]
     total = estimate_stage(grouped, ccfg, [comp], [comm], [recomp], [recomm])[0]
     forward = once / (1 + BACKWARD_RATIO)
@@ -513,7 +557,8 @@ class LayerTimes:
     The memory backbone calls it for every layer it describes, with the config
     it walks and the layer's kind. A config is copied the first time it is
     seen, at its embedding layer, before the walk applies any layer kind to
-    it, and each kind, layer type and set of switches is priced once.
+    it, and each kind, layer type and set of switches is priced once. What a
+    kind costs without recompute is priced once for all its options.
     """
 
     def __init__(self, device_type: Any, ccfg: Optional[CustomConfig] = None) -> None:
@@ -522,6 +567,7 @@ class LayerTimes:
         self._ccfg = ccfg
         self._base = {}
         self._times = {}
+        self._plain = {}
 
     def __call__(
         self,
@@ -535,8 +581,17 @@ class LayerTimes:
             self._base[id(cfg)] = deepcopy(cfg)
         key = (id(cfg), kind, layer_type, None if switches is None else tuple(sorted(switches.items())))
         if key not in self._times:
+            # Every body option of a kind shares its plain times; the
+            # embedding and the output layer have their own.
+            role = layer_type if layer_type in (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER) else None
+            plain_key = (id(cfg), kind, role)
+            if plain_key not in self._plain:
+                self._plain[plain_key] = plain_layer_times(
+                    self._base[id(cfg)], kind, layer_type, self._device_type, self._ccfg
+                )
             self._times[key] = estimate_layer_times(
-                self._base[id(cfg)], kind, layer_type, self._device_type, self._ccfg, switches
+                self._base[id(cfg)], kind, layer_type, self._device_type, self._ccfg, switches,
+                plain=self._plain[plain_key],
             )
         return self._times[key]
 

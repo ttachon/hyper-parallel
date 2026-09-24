@@ -265,6 +265,28 @@ class TestLayerTimes(unittest.TestCase):
         self.assertEqual(again, first)
         self.assertNotEqual(gather, first)
 
+    def test_a_kinds_options_share_their_plain_times(self):
+        """
+        Feature: LayerTimes plain times.
+        Description: Price a MoE layer plain, fully recomputed and with two
+            sets of switches, then the embedding.
+        Expectation: The MoE options share one plain pricing, the embedding
+            has its own, and each option's time is what pricing it alone
+            gives.
+        """
+        times = LayerTimes(Hard.Device_A2)
+        options = ((LayerType.NOT_REC_LAYER, None), (LayerType.FULL_REC_LAYER, None),
+                   (LayerType.SEL_REC_LAYER, dict(dict.fromkeys(_SWITCHES, 1), softmax=0)),
+                   (LayerType.SEL_REC_LAYER, dict(dict.fromkeys(_SWITCHES, 1), gather=0, ffAct=0)))
+        with patch.object(Estimate, "plain_layer_times", wraps=Estimate.plain_layer_times) as spy:
+            priced = [times(self.ccfg, self.groups[1], layer_type, switches) for layer_type, switches in options]
+            times(self.ccfg, None, LayerType.EMBEDDING_LAYER)
+        self.assertEqual(spy.call_count, 2)
+        for (layer_type, switches), both in zip(options, priced):
+            alone = estimate_layer_times(copy.deepcopy(self.ccfg), self.groups[1], layer_type, Hard.Device_A2,
+                                         switches=switches)
+            self.assertEqual(both, alone)
+
 
 if __name__ == "__main__":
     unittest.main()
