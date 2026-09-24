@@ -124,14 +124,15 @@ class _Backbone:
             self._ccfg.update_config(new_config, self.hook_cls, self.framework, self.source_code)
         else:
             self._ccfg = CostModelConfig(new_config, self.hook_cls, self.framework, self.source_code)
-        if isinstance(new_config, str):
-            if not self.config_path:
-                logger.info(
-                    "%s Process config file: %s",
-                    "=" * 30,
-                    new_config.split("/")[-1],
-                )
-            self.config_path = new_config
+        if isinstance(new_config, str) and not self.config_path:
+            logger.info(
+                "%s Process config file: %s",
+                "=" * 30,
+                new_config.split("/")[-1],
+            )
+        # Kept whatever its form, so reset_config() can parse a config handed
+        # over in memory again rather than read one from a path.
+        self.config_path = new_config
         self.evaluator_instances = None
         self.ppb = None
 

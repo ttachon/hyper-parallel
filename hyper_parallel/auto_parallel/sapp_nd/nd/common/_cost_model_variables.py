@@ -256,28 +256,26 @@ class _CostModVar:
         """process input config"""
         self.hooks_dict = None if not hook_cls else hook_cls.get_hooks()
         self.source_code = source_code
-        if isinstance(input_config, str):
-            self.config = Config(input_config)
-            # get parser
-            if framework:
-                logger.debug("Find parser module based on input framework name")
-                parser_cls = self.get_framework_parser(framework.lower())
-            else:
-                logger.debug("Naive way to find parser module")
-                parser_cls = self.get_framework_parser_naive(input_config)
-            if parser_cls:
-                self.parser = parser_cls(self)
-                logger.debug("Parser module: %s", self.parser.__class__)
-                self.parser.parse()
-            return
-        if isinstance(input_config, dict):
+        if isinstance(input_config, (str, dict)):
             self.config = Config(input_config)
         elif isinstance(input_config, Config):
             self.config = input_config
         else:
             raise TypeError(
-                f"Expecting path string or Config object for {input_config}"
+                f"Expecting path string, dict or Config object for {input_config}"
             )
-        #MindFormers format by default
-        self.parser = self.get_framework_parser_naive("yaml")(self)
-        self.parser.parse()
+        # An in-memory config names its framework the same way a file does:
+        # the framework selects the parser whatever form the config takes.
+        if framework:
+            logger.debug("Find parser module based on input framework name")
+            parser_cls = self.get_framework_parser(framework.lower())
+        elif isinstance(input_config, str):
+            logger.debug("Naive way to find parser module")
+            parser_cls = self.get_framework_parser_naive(input_config)
+        else:
+            # MindFormers format by default
+            parser_cls = self.get_framework_parser_naive("yaml")
+        if parser_cls:
+            self.parser = parser_cls(self)
+            logger.debug("Parser module: %s", self.parser.__class__)
+            self.parser.parse()
