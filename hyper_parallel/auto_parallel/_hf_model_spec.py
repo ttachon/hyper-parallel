@@ -38,6 +38,11 @@ _CONFIG_KWARG_NAMES = (
     "token", "trust_remote_code",
 )
 
+# Where the model directory is named. A from_config recipe builds the model
+# through a factory (``_target_`` plus ``config_path``) and never loads a
+# checkpoint, so it carries no pretrained path.
+_MODEL_PATH_ALIASES = ("pretrained_model_name_or_path", "config_path")
+
 # Canonical text-tower fields, with the Transformers aliases that carry them.
 # First populated alias wins, so Hyper-internal names keep priority over the
 # Hugging Face spelling when a config happens to define both.
@@ -181,17 +186,38 @@ def _get_hf_config(model_raw: Mapping[str, Any]) -> Any:
         if model_raw.get(name) is not None
     }
     return get_hf_config(
-        str(model_raw.get("pretrained_model_name_or_path")),
+        str(_model_path(model_raw)),
         str(model_raw.get("attn_implementation", "sdpa")),
         model_raw.get("torch_dtype", "auto"),
         **config_kwargs,
     )
 
 
+def _model_path(model_raw: Mapping[str, Any]) -> Optional[str]:
+    """Return the model directory the section names, under any accepted key."""
+    for alias in _MODEL_PATH_ALIASES:
+        value = model_raw.get(alias)
+        if value:
+            return str(value)
+    return None
+
+
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return the ``config_overrides`` fallback as a plain dict."""
+    """Return the fields the model section states itself, as a plain dict.
+
+    ``config_overrides`` is the declared form. A from_config recipe instead
+    passes the shape it builds as factory arguments beside ``_target_``, such as
+    a ``num_hidden_layers`` that crops the released model; those name canonical
+    fields, so they are overrides too, and the released config must not win over
+    them. ``config_overrides`` keeps priority where both are present.
+    """
     overrides = model_raw.get("config_overrides")
-    return dict(overrides) if isinstance(overrides, Mapping) else {}
+    explicit = dict(overrides) if isinstance(overrides, Mapping) else {}
+    for field in _TEXT_FIELD_ALIASES:
+        value = model_raw.get(field)
+        if value is not None:
+            explicit.setdefault(field, value)
+    return explicit
 
 
 def resolve_hf_model_spec(
@@ -222,15 +248,15 @@ def resolve_hf_model_spec(
             the model dimensions.
     """
     explicit = _explicit_overrides(model_raw)
-    model_path = model_raw.get("pretrained_model_name_or_path")
+    model_path = _model_path(model_raw)
 
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
             return explicit
         raise ValueError(
-            "AutoModels train.yaml requires model.pretrained_model_name_or_path "
-            "or model.config_overrides for Auto Parallel search"
+            "AutoModels train.yaml requires model.pretrained_model_name_or_path, "
+            "model.config_path or model.config_overrides for Auto Parallel search"
         )
 
     try:
