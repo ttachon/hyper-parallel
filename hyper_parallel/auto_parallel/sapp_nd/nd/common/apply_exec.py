@@ -44,6 +44,7 @@ CONFIG_FIELDS = {
     "optimizer_parallel": "has_op",
     "optimizer_shard": "os_max_shard",
     "grad_shard": "has_grad_shard",
+    "grad_shard_as_params": "grad_shard_as_params",
     "grad_accumulation": "grad_accumulation",
     "pp_schedule": "pp_sched",
     "offset": "offset",

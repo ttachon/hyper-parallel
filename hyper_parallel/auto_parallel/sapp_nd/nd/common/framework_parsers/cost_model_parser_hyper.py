@@ -506,7 +506,12 @@ class CostModelParserHyperV2(_CostModelParser):
         }
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int, tp: int) -> Dict[str, Any]:
-        """Optimizer and gradient sharding."""
+        """Optimizer and gradient sharding.
+
+        HyperParallel's FSDP holds every gradient sharded as its parameter,
+        from the first backward to the optimizer step, whatever the pipeline
+        degree.
+        """
         is_auto_models = is_auto_models_schema(self.config)
         optimizer_parallel = (
             dp_shard > 1
@@ -522,6 +527,8 @@ class CostModelParserHyperV2(_CostModelParser):
             "optimizer_parallel": optimizer_parallel,
             "optimizer_shard": weight_shard if weight_shard >= 1 else dp * tp,
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
+            "grad_shard_as_params": True,
+            "grad_accumulation": True,
         }
 
     def _parse_batch(self, dp: int, pp: int) -> Dict[str, Any]:
@@ -634,13 +641,16 @@ class CostModelParserHyperV2(_CostModelParser):
         mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
         model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
         init_dtype = self._get_cfg_attr(self.config, "model_init_dtype", None)
+        param_bytes = self._bytes_from_dtype(
+            self._get_cfg_attr(mix_precision, "param_dtype", None)
+            or init_dtype
+            or model_dtype
+            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+        )
         return {
-            "param_bytes": self._bytes_from_dtype(
-                self._get_cfg_attr(mix_precision, "param_dtype", None)
-                or init_dtype
-                or model_dtype
-                or self._get_cfg_attr(model_raw, "param_init_type", "float32")
-            ),
+            "param_bytes": param_bytes,
+            # FSDP keeps each gradient in its parameter's dtype.
+            "grad_bytes": param_bytes,
             "compute_bytes": self._bytes_from_dtype(
                 model_dtype
                 or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")

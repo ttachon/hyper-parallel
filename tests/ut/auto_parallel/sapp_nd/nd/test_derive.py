@@ -125,6 +125,31 @@ class TestDerive(unittest.TestCase):
         self.assertEqual(got, (0, 4, 4, 0, None), f"byte widths and layer_fields={got}")
 
 
+class TestGradientSharding(unittest.TestCase):
+    """Gradients are sharded by one of three rules."""
+
+    def test_gradient_sharding(self):
+        """
+        Feature: derive_optimizer_sharding.
+        Description: At d=4, t=2 and an optimizer shard of 4: gradients
+            sharded as the parameters are, as FSDP holds them; over the whole
+            optimizer shard; and neither.
+        Expectation: The non-expert, expert and partial expert gradient
+            factors: the parameters' (4, 8, 1), the optimizer's (8, 8, 1),
+            and TP alone.
+        """
+        cases = [
+            ({"grad_shard_as_params": True}, (4, 8, 1)),
+            ({"has_grad_shard": True}, (8, 8, 1)),
+            ({}, (2, 2, 2)),
+        ]
+        for facts, want in cases:
+            ccfg = _config(os_max_shard=4, **facts)
+            derive(ccfg)
+            got = (ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial)
+            self.assertEqual(got, want, f"{facts}: shard_grad_non_exp, shard_grad_exp, shard_grad_exp_partial={got}")
+
+
 class TestDeriveFamily(unittest.TestCase):
     """What the run does not state, the model's family says."""
 

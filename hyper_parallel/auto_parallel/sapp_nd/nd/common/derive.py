@@ -99,16 +99,19 @@ def derive_expert_degrees(ccfg: Any, strict: bool = True) -> None:
 
 
 def derive_optimizer_sharding(ccfg: Any) -> None:
-    """Set how parameters, optimizer states and gradients are sharded."""
+    """Set how parameters, optimizer states and gradients are sharded.
+
+    Gradients are sharded as the parameters are when the run says so
+    (``grad_shard_as_params``), as FSDP shards them; else over the whole
+    optimizer shard when the run shards them (``has_grad_shard``), and over
+    TP alone otherwise.
+    """
     # Non expert params
     ccfg.shard_p_os_non_exp_partial = (
         ccfg.os_max_shard if ccfg.has_op else ccfg.t
     ) * ccfg.cp
     ccfg.shard_p_os_non_exp = (
         (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
-    )
-    ccfg.shard_grad_non_exp = (
-        ccfg.shard_p_os_non_exp if ccfg.has_grad_shard else ccfg.t
     )
 
     # Expert params
@@ -119,16 +122,15 @@ def derive_optimizer_sharding(ccfg: Any) -> None:
     ccfg.shard_p_os_exp = (
         (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
     )
-    ccfg.shard_grad_exp = (
-        ccfg.shard_p_os_exp
-        if ccfg.has_grad_shard
-        else ccfg.t_exp
-    )
-    ccfg.shard_grad_exp_partial = (
-        ccfg.shard_p_os_exp_partial
-        if ccfg.has_grad_shard
-        else ccfg.t_exp
-    )
+
+    # Gradients
+    if getattr(ccfg, "grad_shard_as_params", False):
+        grads = (ccfg.shard_p_os_non_exp_partial, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
+    elif ccfg.has_grad_shard:
+        grads = (ccfg.shard_p_os_non_exp, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
+    else:
+        grads = (ccfg.t, ccfg.t_exp, ccfg.t_exp)
+    ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial = grads
 
 
 def derive_comm_flags(ccfg: Any) -> None:

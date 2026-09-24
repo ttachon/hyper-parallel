@@ -70,7 +70,7 @@ class TestExecSpec(unittest.TestCase):
         for data in ({"dp": 0}, {"micro_batch_size": -1}, {"grad_bytes": -1}, {"tp": 2.5},
                      {"sequence_parallel": "yes"}, {"selective_rule": "megatron"},
                      {"capacity_factor": 0}, {"dropout_bytes": -1}, {"shard_activations": 1},
-                     {"grad_accumulation": "no"}):
+                     {"grad_accumulation": "no"}, {"grad_shard_as_params": "yes"}):
             with self.assertRaises(ExecSpecError, msg=f"{data} was accepted"):
                 ExecSpec.from_dict(data)
 

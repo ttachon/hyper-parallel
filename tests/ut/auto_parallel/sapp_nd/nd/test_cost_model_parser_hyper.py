@@ -1345,6 +1345,39 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(parser._bytes_from_dtype(""), 4)
 
 
+class TestGradientsAsFsdpHoldsThem(unittest.TestCase):
+    """A HyperParallel run holds each gradient as its parameter."""
+
+    @staticmethod
+    def _stages(pp: int) -> list:
+        """The per-stage memory of a MoE model under FSDP at *pp* stages."""
+        config = _moe_overrides(train={"accelerator": {
+            "dp_shard": 4, "dp_replicate": 1, "tp_degree": 2, "pipeline_parallel_degree": pp,
+            "expert_parallel_degree": 2,
+        }})
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(config, handle)
+            evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        return evaluator.estimate_peak_insight()
+
+    def test_gradients_weigh_what_the_parameters_do(self):
+        """
+        Feature: HyperParallel's gradient memory.
+        Description: A MoE model sharded over 4 ranks at TP 2 and EP 2,
+            without pipeline parallelism and on two stages.
+        Expectation: On every stage the gradients take exactly the
+            parameters' memory: their dtype and their sharding, at any
+            pipeline degree.
+        """
+        for pp in (1, 2):
+            for stage in self._stages(pp):
+                with self.subTest(pp=pp):
+                    self.assertGreater(stage["ModelParameters"], 0)
+                    self.assertEqual(stage["AccumulGradients"], stage["ModelParameters"])
+
+
 class TestHybridLayerStack(unittest.TestCase):
     """A hybrid stack prices each layer with its own attention flavour."""
 

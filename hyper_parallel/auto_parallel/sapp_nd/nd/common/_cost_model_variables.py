@@ -179,6 +179,8 @@ class _CostModVar:
     # feature flag
     has_op: bool = False
     has_grad_shard: bool = False
+    # Whether each gradient is sharded as its parameter is, as FSDP holds it.
+    grad_shard_as_params: bool = False
     freeze: bool = False
     has_fa: bool = False
     attn_output_gate: bool = False
