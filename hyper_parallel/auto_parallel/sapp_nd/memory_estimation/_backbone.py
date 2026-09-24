@@ -27,6 +27,11 @@ from PIL import Image
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    apply_layer_kind,
+    check_and_apply_custom_hook,
+    layer_kinds,
+)
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -41,10 +46,6 @@ if TYPE_CHECKING:
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 EVAL_YML = os.path.join(current_dir, "configs_eval/default.yaml")
-
-
-def _no_hook(_) -> None:
-    """The hook recorded for a layer whose group has none."""
 
 
 class _Backbone:
@@ -366,11 +367,9 @@ class _Backbone:
             val = self._ctx.accu_mem_type[mem_type]
             stage_logs[stage_id].accu_mem_type[mem_type] += val
 
-    def __preprocess_layer_custom_config_list(self, stages: list) -> list:
-        """flatten layer_custom_config for backbone estimation"""
-        flatten = sum(
-            [[f[1]] * f[0] for f in self._ccfg.layer_custom_config], []
-        )
+    def __order_layer_kinds(self, stages: list, kinds: list) -> list:
+        """Check the layers' kinds against the partition, in the order the stages visit them."""
+        flatten = list(kinds)
         total_n_lay = self._ccfg.n_lay + self._ccfg.n_mtp
         total_n_lay_stages = self._ccfg.count_layers(stages)
         if not self._ccfg.multimodal and total_n_lay != total_n_lay_stages:
@@ -381,7 +380,7 @@ class _Backbone:
             ))
         if self._ccfg.n_lay > 0 and len(flatten) != total_n_lay:
             raise AttributeError(
-                f"layer_custom_config occurrences ({len(flatten)})"
+                f"layer kinds ({len(flatten)})"
                 f" != num_layers ({total_n_lay})"
             )
         if self._ccfg.pp_sched == "zero_bubble_v":
@@ -408,13 +407,13 @@ class _Backbone:
             # )
         if not self._ccfg.multimodal:
             return self.__estimate_stages_backbone(
-                stages, args[1], args[2], spec_stage_id, args[4]
+                stages, args[1], args[2], spec_stage_id, args[4], layer_kinds(self._ccfg)
             )
         res = []
         original_ccfg = self._ccfg
-        common_lc = []
+        kinds = []
         self.evaluator_instances = []
-        # Build common layer_custom_config + Build temporary evaluators
+        # Build the layers' kinds, submodule after submodule + Build temporary evaluators
         for m in self._ccfg.mm_order:
             self._ccfg.mm_ccfgs[m].config = original_ccfg.config
             if not self._child_cls:
@@ -430,7 +429,12 @@ class _Backbone:
             strategy = tmp_evaluator.get_strategy()
             full_rec = strategy["full_rec"]
             offset = strategy["offset"]
-            self._ccfg.hooks_dict[m](tmp_evaluator)
+            # A user hook class names one hook per submodule; built-in
+            # submodules are dispatched by their arch.
+            if self._ccfg.hooks_dict:
+                self._ccfg.hooks_dict[m](tmp_evaluator)
+            else:
+                check_and_apply_custom_hook(tmp_evaluator)
             strategy = tmp_evaluator.get_strategy()
             if (
                 tmp_evaluator.get_num_layers() != num_layer
@@ -441,19 +445,19 @@ class _Backbone:
                 stages[m] = (
                     tmp_evaluator.ccfg.generate_partitions_vpp_unimodal()
                 )
-                tmp_evaluator.set_layer_custom(None)
-            common_lc += self._ccfg.mm_ccfgs[m].layer_custom_config
+                # Its layers are priced plain, as the hook left them.
+                tmp_evaluator.ccfg.layer_stack = None
+            kinds += layer_kinds(self._ccfg.mm_ccfgs[m])
             self.evaluator_instances += [tmp_evaluator]
             if args[1]:
                 logger.info("Submodule %s", self._ccfg.mm_ccfgs[m].model_name)
                 tmp_evaluator.print_ctx()
                 self.print_stages(stages[m])
-        self.set_layer_custom(common_lc)
         if args[1]:
             logger.info(
-                "Combined layer_custom_config for %s\n%s",
+                "Combined layer kinds for %s\n%s",
                 self._ccfg.model_name,
-                pprint.pformat(self._ccfg.layer_custom_config, compact=True),
+                pprint.pformat([kind.name if kind else None for kind in kinds], compact=True),
             )
             logger.info(
                 "Sub evaluator instances for  %s\n%s",
@@ -467,6 +471,7 @@ class _Backbone:
             args[2],
             spec_stage_id,
             args[4],
+            kinds,
         )
         self._ccfg = original_ccfg
         return res
@@ -483,12 +488,12 @@ class _Backbone:
             self._ccfg.print_stages(stages, spec_stage_id)
         insights = []
         # Compute peak memory
-        flatten = self.__preprocess_layer_custom_config_list(stages)
+        flatten = self.__order_layer_kinds(stages, args[5])
         if verbose:
             logger.info(
-                "Flatten layer_custom_config\n%s",
+                "Layer kinds in stage order\n%s",
                 pprint.pformat(
-                    [f if not f else f.__name__ for f in flatten], compact=True
+                    [kind.name if kind else None for kind in flatten], compact=True
                 ),
             )
 
@@ -540,35 +545,24 @@ class _Backbone:
                     self._ccfg.model_name,
                 )
 
-    def __update_next_layer_custom_function(self, *args):
-        """Apply the next layer custom hook before evaluating a layer."""
+    def __apply_next_layer_kind(self, *args):
+        """Give the next regular layer its kind before evaluating it."""
         flatten, verbose = args[0], args[1]
         record_lay_types = args[2]
         stage_id, chunk_id, lay_id = args[3], args[4], args[5]
         node = args[6]
+        kind = None
         if self.is_regular_layer(node) and flatten:
-            hook = flatten.pop(0)
-            if hook:
-                if verbose:
-                    logger.info("Apply hook %s", hook.__name__)
-                record_lay_types[(stage_id, chunk_id, lay_id)] = (
-                    self._ccfg,
-                    self._ctx,
-                    hook,
-                )
-                hook(self)
-            else:
-                record_lay_types[(stage_id, chunk_id, lay_id)] = (
-                    self._ccfg,
-                    self._ctx,
-                    _no_hook,
-                )
-        else:
-            record_lay_types[(stage_id, chunk_id, lay_id)] = (
-                self._ccfg,
-                self._ctx,
-                _no_hook,
-            )
+            kind = flatten.pop(0)
+        record_lay_types[(stage_id, chunk_id, lay_id)] = (
+            self._ccfg,
+            self._ctx,
+            kind,
+        )
+        if kind is not None:
+            if verbose:
+                logger.info("Apply layer kind %s", kind.name)
+            apply_layer_kind(self, kind)
         if verbose:
             logger.info(
                 "stage_id=%s, chunk_id=%s, lay_id=%s, node=%s",
@@ -600,8 +594,8 @@ class _Backbone:
                         self._ctx.real_lay_ids[chunk_id][stage_id] += [""]
                     # Update evaluator (multimodal)
                     self.__update_evaluator(node, verbose)
-                    # Update next layer custom function
-                    self.__update_next_layer_custom_function(
+                    # Give the next layer its kind
+                    self.__apply_next_layer_kind(
                         flatten,
                         verbose,
                         record_lay_types,
@@ -734,15 +728,12 @@ class _Backbone:
             pprint.pformat(ins["Node Log"], width=300),
         )
 
-    def apply_hook(self, hook, ccfg=None, ctx=None):
-        """apply hook on evaluator"""
+    def apply_kind(self, kind, ccfg=None, ctx=None):
+        """Evaluate with a recorded layer's config and context, giving it its kind again."""
         self._ccfg = ccfg if ccfg else self._ccfg
         self._ctx = ctx if ctx else self._ctx
-        hook(self)
-
-    def set_layer_custom(self, _):
-        """child implement"""
-        pass  # pylint: disable=unnecessary-pass
+        if kind is not None:
+            apply_layer_kind(self, kind)
 
     def is_regular_layer(self, _):
         """child implement"""

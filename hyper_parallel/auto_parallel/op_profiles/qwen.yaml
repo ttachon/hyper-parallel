@@ -2,12 +2,14 @@
 # activations, which is strategy rather than op counts.
 kinds:
   decoder:
-    attMM: 4
-    attBMM: 2
-    ffMM: 3
-    softmax: 1
-    dropout: 0
-    normOp: 2
-    gather: 4
-    headCast: 1
-    ffAct: 1
+    ops:
+      attMM: 4
+      attBMM: 2
+      ffMM: 3
+      softmax: 1
+      dropout: 0
+      normOp: 2
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0

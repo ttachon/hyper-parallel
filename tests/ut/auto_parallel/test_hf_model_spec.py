@@ -138,6 +138,7 @@ class TestVisualSequenceLength(unittest.TestCase):
         with _stub_registry(recorder):
             result = resolve_hf_model_spec({"pretrained_model_name_or_path": "x"})
         self.assertEqual(result["vision"]["max_position_embeddings"], 576)
+        self.assertEqual(result["vision"]["layers"], [{"kind": "encoder", "count": 27}])
 
     def test_override_wins(self) -> None:
         """context.visual_seq_len replaces the derived bound."""

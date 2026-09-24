@@ -30,7 +30,11 @@ from unittest.mock import patch
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate as Estimate
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    check_and_apply_custom_hook,
+    layer_groups,
+    layer_kinds,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -52,7 +56,7 @@ DEEPSEEK_YAML = os.path.join(
 
 
 def _plain_values(ccfg: CostModelConfig) -> Dict[str, Any]:
-    """The config's plain fields, the ones layer hooks overwrite."""
+    """The config's plain fields, the ones layer kinds overwrite."""
     return {name: value for name, value in vars(ccfg).items()
             if isinstance(value, (bool, int, float, str))}
 
@@ -103,11 +107,9 @@ class TestLayerTimes(unittest.TestCase):
         cls.ccfg = CostModelConfig(DEEPSEEK_YAML)
         check_and_apply_custom_hook(cls.ccfg)
         cls.stages = cls.ccfg.generate_partitions_vpp()
-        flat = sum(([hook] * count for count, hook in cls.ccfg.layer_custom_config), [])
-        cls.hooks = dict(zip(get_model_order(cls.ccfg, cls.stages), flat))
-        # In a list, not a class attribute: a function read through ``self``
-        # would come back as a method bound to the test case.
-        cls.groups = [hook for _, hook in cls.ccfg.layer_custom_config]
+        cls.kinds = dict(zip(get_model_order(cls.ccfg, cls.stages), layer_kinds(cls.ccfg)))
+        # The kinds of the stack's groups: dense, MoE, and the MTP layer's MoE.
+        cls.groups = [kind for kind, _ in layer_groups(cls.ccfg)]
 
     def _times(self, layer_type: LayerType, **switches: int):
         """``(forward, backward)`` of a MoE layer, with these recompute switches."""
@@ -133,10 +135,10 @@ class TestLayerTimes(unittest.TestCase):
         checked = 0
         for s, stage in enumerate(self.stages):
             positions = [(s, c, i) for c, chunk in enumerate(stage) for i, _ in enumerate(chunk)]
-            if len({self.hooks.get(position) for position in positions} - {None}) != 1 or any(
-                    position not in self.hooks for position in positions):
+            if len({self.kinds.get(position) for position in positions} - {None}) != 1 or any(
+                    position not in self.kinds for position in positions):
                 continue
-            total = sum(sum(times(self.ccfg, self.hooks[p], stage[p[1]][p[2]])) for p in positions)
+            total = sum(sum(times(self.ccfg, self.kinds[p], stage[p[1]][p[2]])) for p in positions)
             self.assertAlmostEqual(total / search[s], 1.0, places=12, msg=f"stage {s}: {total} vs {search[s]}")
             checked += 1
         self.assertGreater(checked, 0)
@@ -192,7 +194,7 @@ class TestLayerTimes(unittest.TestCase):
     def test_a_config_is_copied_once_and_each_layer_priced_once(self):
         """
         Feature: LayerTimes.
-        Description: Price a layer, change the config the way a hook would,
+        Description: Price a layer, change the config the way a kind would,
             then price the same layer and another type.
         Expectation: The change is not seen, and the repeated layer is not
             priced again.
@@ -200,7 +202,7 @@ class TestLayerTimes(unittest.TestCase):
         cfg = copy.deepcopy(self.ccfg)
         times = LayerTimes(Hard.Device_A2)
         first = times(cfg, self.groups[1], LayerType.NOT_REC_LAYER)
-        cfg.s *= 2  # a field no layer hook sets
+        cfg.s *= 2  # a field no layer kind sets
         with patch.object(Estimate, "estimate_layer_times", wraps=Estimate.estimate_layer_times) as spy:
             self.assertEqual(times(cfg, self.groups[1], LayerType.NOT_REC_LAYER), first)
             full = times(cfg, self.groups[1], LayerType.FULL_REC_LAYER)

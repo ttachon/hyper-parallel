@@ -77,17 +77,17 @@ class _Pricer:
         """No call yet."""
         self.calls = []
 
-    def __call__(self, cfg: Any, hook: Any, layer_type: LayerType,
+    def __call__(self, cfg: Any, kind: Any, layer_type: LayerType,
                  switches: Optional[dict] = None) -> Tuple[float, float]:
         """Record the call, answer from ``_TIMES``."""
-        self.calls.append((cfg, hook, layer_type, switches))
+        self.calls.append((cfg, kind, layer_type, switches))
         forward, backward = _TIMES[layer_type]
         if layer_type == LayerType.SEL_REC_LAYER:
             backward += sum(3 if op == "gather" else 1 for op, keep in switches.items() if not keep)
         return forward, backward
 
 
-def _describe(node: Any, switches: dict, pricer: Optional[_Pricer] = None, hook: Any = None,
+def _describe(node: Any, switches: dict, pricer: Optional[_Pricer] = None, kind: Any = None,
               dp: int = 0, model: str = "unit") -> Tuple[dict, SimpleNamespace]:
     """The description ``lay_ppb`` builds for one *node*, and the config it read."""
     ctx = Context()
@@ -96,7 +96,7 @@ def _describe(node: Any, switches: dict, pricer: Optional[_Pricer] = None, hook:
     ccfg = SimpleNamespace(model_name=model, rec_op=SimpleNamespace(**switches))
     ppb = _PPB(SimpleNamespace(ppb_combined=[]), _Memory(ctx, ccfg, dp))
     ppb.layer_times = pricer
-    return ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE, hook), ccfg
+    return ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE, kind), ccfg
 
 
 def _options(desc: dict) -> dict:
@@ -120,17 +120,17 @@ class TestTimedDescription(unittest.TestCase):
         Description: A body whose config recomputes its softmax, with a pricer.
         Expectation: SLCT recomputes the softmax, COMM the gathers and BOTH
             both, each priced with its own switches on the layer's config
-            and hook; the forward time replaces the placeholder.
+            and kind; the forward time replaces the placeholder.
         """
-        hook, pricer = object(), _Pricer()
-        desc, ccfg = _describe(LayerType.NOT_REC_LAYER, dict(_KEEP_ALL, softmax=0), pricer, hook)
+        kind, pricer = object(), _Pricer()
+        desc, ccfg = _describe(LayerType.NOT_REC_LAYER, dict(_KEEP_ALL, softmax=0), pricer, kind)
         self.assertEqual(_options(desc), {"NONE": (10, 20.0), "SLCT": (9, 21.0), "COMM": (8, 23.0),
                                           "BOTH": (7, 24.0), "FULL": (1, 30.0)})
         self.assertEqual((desc["memory_parameter"], desc["forward_time"], desc["time"]), (4, 10.0, 10.0))
         selective = {tuple(sorted(op for op, keep in switches.items() if not keep))
-                     for _, _, kind, switches in pricer.calls if kind == LayerType.SEL_REC_LAYER}
+                     for _, _, layer_type, switches in pricer.calls if layer_type == LayerType.SEL_REC_LAYER}
         self.assertEqual(selective, {("softmax",), ("gather",), ("gather", "softmax")})
-        self.assertTrue(all(cfg is ccfg and got is hook for cfg, got, _, _ in pricer.calls), pricer.calls)
+        self.assertTrue(all(cfg is ccfg and got is kind for cfg, got, _, _ in pricer.calls), pricer.calls)
 
     def test_the_config_switches_come_back_unchanged(self):
         """
@@ -146,15 +146,15 @@ class TestTimedDescription(unittest.TestCase):
     def test_head_and_tail_are_priced_as_embedding_and_output(self):
         """
         Feature: _PPB.lay_ppb.
-        Description: Describe the head and the tail with a pricer and a hook.
-        Expectation: No hook reaches them, since they belong to no layer group.
+        Description: Describe the head and the tail with a pricer and a kind.
+        Expectation: No kind reaches them: they are no layer of the stack.
         """
         pricer = _Pricer()
-        head, _ = _describe("head", _KEEP_ALL, pricer, hook=object())
-        tail, _ = _describe("tail", _KEEP_ALL, pricer, hook=object())
+        head, _ = _describe("head", _KEEP_ALL, pricer, kind=object())
+        tail, _ = _describe("tail", _KEEP_ALL, pricer, kind=object())
         self.assertEqual((head["forward_time"], head["backward_time"]), (1.0, 2.0))
         self.assertEqual((tail["forward_time"], tail["backward_time"]), (3.0, 6.0))
-        self.assertEqual([(hook, kind) for _, hook, kind, _ in pricer.calls],
+        self.assertEqual([(kind, layer_type) for _, kind, layer_type, _ in pricer.calls],
                          [(None, LayerType.EMBEDDING_LAYER), (None, LayerType.OUTPUT_LAYER)])
 
     def test_without_a_pricer_only_the_configured_options_are_described(self):

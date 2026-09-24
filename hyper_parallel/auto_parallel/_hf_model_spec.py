@@ -28,6 +28,7 @@ import dataclasses
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel._op_profiles import infer_arch, resolve_ops
 
@@ -248,14 +249,23 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     Parsing and re-serialising is what makes the schema load-bearing rather
     than advisory: a field the model declares but the IR does not know would
-    be dropped here, and an incoherent one raises by name.  The op profile is
-    settled here too, so the serialised spec states what it will be priced
-    with even when the family was only inferred from the model name.
+    be dropped here, and an incoherent one raises by name.  The op profile
+    and the layer stack are settled here too, so the serialised spec states
+    what it will be priced with and which kind each layer is, even when the
+    family was only inferred from the model name and the stack from
+    ``layer_types`` or ``first_k_dense_replace``.  ``layer_types`` is
+    consumed: ``layers`` says the same, checked against the profile.  A
+    vision tower states its stack likewise.
     """
     typed = ModelSpec.from_dict(spec)
-    arch = typed.arch or infer_arch(typed.name)
-    resolve_ops(arch, typed.ops)
-    return dataclasses.replace(typed, arch=arch).to_dict()
+    typed = dataclasses.replace(typed, arch=typed.arch or infer_arch(typed.name))
+    resolve_ops(typed.arch, typed.ops)
+    layers = spec_layer_stack(typed).to_layers()
+    vision = typed.vision
+    if vision is not None:
+        vision = dataclasses.replace(vision, layers=tower_layer_stack(vision).to_layers())
+    extra = {key: value for key, value in typed.extra.items() if key != "layer_types"}
+    return dataclasses.replace(typed, layers=layers, vision=vision, extra=extra).to_dict()
 
 
 def resolve_hf_model_spec(

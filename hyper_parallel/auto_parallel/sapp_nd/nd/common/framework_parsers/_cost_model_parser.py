@@ -20,10 +20,13 @@ import math
 from abc import ABC
 from abc import abstractmethod
 
-from hyper_parallel.auto_parallel._op_profiles import infer_arch, resolve_ops
+from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
+from hyper_parallel.auto_parallel._op_profiles import infer_arch, load_op_profile, resolve_ops
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 if TYPE_CHECKING:
     from typing import Mapping, Optional
+    from hyper_parallel.auto_parallel._layer_stack import LayerStack
     from hyper_parallel.auto_parallel._model_spec import OpCounts
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
 
@@ -73,6 +76,28 @@ class _CostModelParser(ABC):
         """
         ccfg.arch = arch or infer_arch(ccfg.model_name)
         ccfg.op_counts = resolve_ops(ccfg.arch, ops)
+
+    @staticmethod
+    def config_layer_stack(ccfg: _CostModVar, stack: Optional[LayerStack] = None) -> None:
+        """Settle the layer stack the estimators price.
+
+        Args:
+            ccfg: The config, with its arch, op counts and layer counts parsed.
+            stack: The stack the model states.  By default, the one its layer
+                counts imply: dense layers first, two halves, or one kind.
+        """
+        if stack is None:
+            layers = derive_layers(
+                load_op_profile(ccfg.arch), int(ccfg.n_lay), int(ccfg.n_mtp or 0),
+                first_k_dense=int(ccfg.k_1st_dense or 0),
+            )
+            stack = resolve_layers(ccfg.arch, layers, ccfg.op_counts)
+        ccfg.layer_stack = stack
+        if len(stack.groups) > 1:
+            logger.info(
+                "%s layer stack: %s", ccfg.model_name,
+                ", ".join(f"{group.count}x{group.kind.name}" for group in stack.groups),
+            )
 
     @staticmethod
     def hyper_rec_op(selective: bool | list) -> dict[str, int]:

@@ -15,6 +15,7 @@
 """performance estimation"""
 import json
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 import numpy as np
 
@@ -22,6 +23,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
+from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, RealParts, estimation_in_real_parts
@@ -423,9 +426,22 @@ def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
     return p2p
 
 
+def _one_layer_of(stack: Optional[LayerStack], kind: Optional[LayerKind]) -> Optional[LayerStack]:
+    """The model's stack, reduced to one layer of *kind*.
+
+    Its other groups stay, with no layer, so the estimates apply the layer's
+    kind exactly when they would for the whole model: to a copy of the config
+    for the compute, whose op tables come from the model's own config, and in
+    place for the communication. A layer with no kind has no stack.
+    """
+    if kind is None or stack is None:
+        return None
+    return replace(stack, groups=(StackGroup(kind, 1),) + tuple(replace(group, count=0) for group in stack.groups))
+
+
 def estimate_layer_times(
     cfg: CostModelConfig,
-    hook: Optional[Callable],
+    kind: Optional[LayerKind],
     layer_type: LayerType,
     device_type: Any,
     ccfg: Optional[CustomConfig] = None,
@@ -434,18 +450,19 @@ def estimate_layer_times(
     """Forward and backward time of one layer, priced as a stage prices it.
 
     Runs the compute, communication and stage estimates of
-    :func:`estimate_performance` on one layer of the group *hook* makes, alone
-    in the first stage of a copy of *cfg*. For a stage whose layers all belong
-    to one group, the sum of their times is what the search charges the stage
-    before pipeline bubbles and point-to-point communication. The search
-    prices each layer on a config the previous layers' hooks have run on, so a
-    stage that mixes groups, or holds the embedding or output layer, can
-    differ by a few percent; here every layer is priced in its own group's
-    state, wherever it sits.
+    :func:`estimate_performance` on one layer of *kind*, alone in the first
+    stage of a copy of *cfg*. For a stage whose layers are all of one kind,
+    the sum of their times is what the search charges the stage before
+    pipeline bubbles and point-to-point communication. The search prices each
+    layer on a config the previous layers' kinds have been applied to, so a
+    stage that mixes kinds, or holds the embedding or output layer, can
+    differ by a few percent; here every layer is priced on its own kind,
+    wherever it sits.
 
     Args:
-        cfg: The model's cost-model config, before its layer hooks run.
-        hook: The layer group's hook; ``None`` for the embedding and output.
+        cfg: The model's cost-model config, before any layer kind is applied.
+        kind: The layer's kind; ``None`` for the embedding and output, and
+            for a layer priced on the config as it stands.
         layer_type: How the layer runs: plain, selective or full recompute,
             embedding or output.
         device_type: The device the communication is priced on.
@@ -459,12 +476,12 @@ def estimate_layer_times(
     ccfg = ccfg if ccfg is not None else CustomConfig()
 
     def _alone() -> Tuple[CostModelConfig, list]:
-        # A fresh copy each time: the communication estimate applies the
-        # layer's hook to the config it is given.
+        # A fresh copy each time: the estimates leave state on the config
+        # they are given.
         single = deepcopy(cfg)
         if switches is not None:
             single.rec_op = Config(dict(switches))
-        single.layer_custom_config = [(1, hook)]
+        single.layer_stack = _one_layer_of(single.layer_stack, kind)
         single.n = single.d * single.t * single.p
         stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]
         stages[0][0] = [layer_type]
@@ -476,8 +493,7 @@ def estimate_layer_times(
     if ccfg.retype in {RecType.COMPUTE_ONLY, RecType.WITH}:
         recomp = estimate_comp(single, ccfg, stages, with_recomp=True)[0]
 
-    # After this call *grouped* carries the layer's hook, as a layer of its
-    # group would when the stage estimate weighs it.
+    # The stage estimate weighs the config the communication estimate leaves.
     grouped, stages = _alone()
     comm = estimate_comm(grouped, ccfg, stages, device_type)[0]
     recomm = comm
@@ -495,9 +511,9 @@ class LayerTimes:
     """Prices the layers of a pipeline balancer's layer description.
 
     The memory backbone calls it for every layer it describes, with the config
-    it walks and the layer's hook. A config is copied the first time it is
-    seen, at its embedding layer, before the walk runs any layer hook on it,
-    and each hook, layer type and set of switches is priced once.
+    it walks and the layer's kind. A config is copied the first time it is
+    seen, at its embedding layer, before the walk applies any layer kind to
+    it, and each kind, layer type and set of switches is priced once.
     """
 
     def __init__(self, device_type: Any, ccfg: Optional[CustomConfig] = None) -> None:
@@ -510,17 +526,17 @@ class LayerTimes:
     def __call__(
         self,
         cfg: CostModelConfig,
-        hook: Optional[Callable],
+        kind: Optional[LayerKind],
         layer_type: LayerType,
         switches: Optional[Dict[str, int]] = None,
     ) -> Tuple[float, float]:
-        """``(forward, backward)`` of a *layer_type* layer of *hook*'s group, run with *switches*."""
+        """``(forward, backward)`` of a *layer_type* layer of *kind*, run with *switches*."""
         if id(cfg) not in self._base:
             self._base[id(cfg)] = deepcopy(cfg)
-        key = (id(cfg), hook, layer_type, None if switches is None else tuple(sorted(switches.items())))
+        key = (id(cfg), kind, layer_type, None if switches is None else tuple(sorted(switches.items())))
         if key not in self._times:
             self._times[key] = estimate_layer_times(
-                self._base[id(cfg)], hook, layer_type, self._device_type, self._ccfg, switches
+                self._base[id(cfg)], kind, layer_type, self._device_type, self._ccfg, switches
             )
         return self._times[key]
 
@@ -584,7 +600,7 @@ def _resolve_estimate_args(args, kwargs):
         device_type, memory).
     """
     cfg_input = args[0]
-    # A copy: the estimate applies layer hooks to its config in place, and the
+    # A copy: the estimate applies layer kinds to its config in place, and the
     # caller's config is the one the next estimate starts from.
     cfg = (
         deepcopy(cfg_input)

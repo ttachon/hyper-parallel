@@ -5,14 +5,19 @@
 # Each layer kind declares how many times one layer runs every op the cost
 # model prices; the estimators multiply these counts by per-op costs.  A layer
 # that does not run an op declares 0: an op left out is an error, not a zero.
+# A kind may also state its flavours: attention (full or linear) and ffn
+# (dense or moe).  A profile with several kinds may name a default, the kind
+# a layer takes when nothing says otherwise.
 kinds:
   decoder:
-    attMM: 4      # q, k, v and o projections
-    attBMM: 2     # QK^T and AV
-    ffMM: 3       # gate, up and down projections
-    softmax: 1
-    dropout: 0
-    normOp: 2
-    gather: 4     # tensor-parallel gathers
-    headCast: 1   # casts of the per-head score tensor
-    ffAct: 1      # feed-forward activation
+    ops:
+      attMM: 4      # q, k, v and o projections
+      attBMM: 2     # QK^T and AV
+      ffMM: 3       # gate, up and down projections
+      softmax: 1
+      dropout: 0
+      normOp: 2
+      gather: 4     # tensor-parallel gathers
+      headCast: 1   # casts of the per-head score tensor
+      ffAct: 1      # feed-forward activation
+      linrec: 0     # linear-attention state updates

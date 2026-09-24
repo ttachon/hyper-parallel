@@ -150,7 +150,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.__init_shard()
         self.__init_bytes()
         self.ccfg.n_mtp = 0
-        self.ccfg.layer_custom_config = [(self.ccfg.n_lay, None)]
+        self.config_layer_stack(self.ccfg)
         self.ccfg.overwrite_eval_functions = {}
 
     def __parse_strat(self):

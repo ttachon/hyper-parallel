@@ -44,7 +44,7 @@ absent.  Anything a producer supplies that is not model shape rides in
 execution IR exists to take it.
 """
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 class ModelSpecError(ValueError):
@@ -101,6 +101,7 @@ class OpCounts:
     gather: int    # tensor-parallel gathers
     headCast: int  # casts of the per-head score tensor
     ffAct: int     # feed-forward activation functions
+    linrec: int    # linear-attention state updates: the delta rule's recurrence
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], where: str = "ops") -> "OpCounts":
@@ -142,6 +143,87 @@ def ops_from_dict(data: Any) -> Dict[str, OpCounts]:
 
 
 @dataclass(frozen=True)
+class LayerGroup:
+    """Consecutive layers of one kind, in model order.
+
+    A model's stack is a tuple of groups: DeepSeek-V3 is three dense layers,
+    58 MoE layers and one MTP layer; Qwen3.5 alternates groups of linear- and
+    full-attention layers.  ``kind`` names a kind of the model's op profile.
+    MTP layers are body-shaped layers after the body, marked so that nothing
+    has to count them from the end.
+    """
+
+    kind: str
+    count: int
+    mtp: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], where: str = "layers") -> "LayerGroup":
+        """Build a group from ``{kind, count, mtp}``, refusing anything else.
+
+        Raises:
+            ModelSpecError: If the kind is missing, the count is not a
+                positive whole number, or an unknown key is present.
+        """
+        if not isinstance(data, Mapping):
+            raise ModelSpecError(f"{where} must be a mapping of kind and count, got {data!r}")
+        unknown = sorted(set(data) - {"kind", "count", "mtp"})
+        if unknown:
+            raise ModelSpecError(f"{where} declares unknown keys {unknown}; the keys are kind, count, mtp")
+        kind = data.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise ModelSpecError(f"{where}.kind must name a layer kind, got {kind!r}")
+        count = _as_count(data.get("count"), f"{where}.count")
+        if count == 0:
+            raise ModelSpecError(f"{where}.count must be positive; leave out a group with no layers")
+        mtp = data.get("mtp", False)
+        if not isinstance(mtp, bool):
+            raise ModelSpecError(f"{where}.mtp must be true or false, got {mtp!r}")
+        return cls(kind=kind, count=count, mtp=mtp)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the group as a mapping, omitting ``mtp`` when it is false."""
+        out: Dict[str, Any] = {"kind": self.kind, "count": self.count}
+        if self.mtp:
+            out["mtp"] = True
+        return out
+
+
+def layers_from_list(data: Any, where: str = "layers") -> Tuple[LayerGroup, ...]:
+    """Parse a list of groups, the serialised form of ``ModelSpec.layers``."""
+    if not isinstance(data, (list, tuple)) or not data:
+        raise ModelSpecError(f"{where} must list at least one group, got {data!r}")
+    return tuple(LayerGroup.from_dict(group, f"{where}[{index}]") for index, group in enumerate(data))
+
+
+def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_depth: int,
+                       where: str = "layers") -> None:
+    """Raise unless *layers* covers exactly the body and the MTP layers, in order.
+
+    Args:
+        layers: The groups, in model order.
+        num_layers: The number of body layers the model declares.
+        mtp_depth: The number of MTP layers the model declares.
+        where: The field the groups were read from, for the message.
+
+    Raises:
+        ModelSpecError: If a body group follows an MTP group, or either
+            part does not sum to its declared count.
+    """
+    seen_mtp = False
+    for index, group in enumerate(layers):
+        if seen_mtp and not group.mtp:
+            raise ModelSpecError(f"{where}[{index}] is a body group after an MTP group; MTP layers come last")
+        seen_mtp = seen_mtp or group.mtp
+    body = sum(group.count for group in layers if not group.mtp)
+    mtp = sum(group.count for group in layers if group.mtp)
+    if body != num_layers:
+        raise ModelSpecError(f"{where} list {body} body layers, but num_hidden_layers is {num_layers}")
+    if mtp != mtp_depth:
+        raise ModelSpecError(f"{where} list {mtp} MTP layers, but mtp_depth is {mtp_depth}")
+
+
+@dataclass(frozen=True)
 class VisionSpec:
     """The vision tower of a multimodal model.
 
@@ -149,7 +231,9 @@ class VisionSpec:
     more than one and a consumer can ask whether there is one at all.
     ``max_position_embeddings`` here is the encoder sequence length in merged
     visual tokens, which depends on the images the dataset serves and is
-    therefore an input, not a property of the checkpoint.
+    therefore an input, not a property of the checkpoint.  ``layers`` is the
+    tower's stack, groups of kinds of the vision profile; a producer states
+    one encoder group when the config states none.
     """
 
     hidden_size: int
@@ -162,6 +246,7 @@ class VisionSpec:
     spatial_merge_size: Optional[int] = None
     num_position_embeddings: Optional[int] = None
     max_position_embeddings: Optional[int] = None
+    layers: Optional[Tuple[LayerGroup, ...]] = None
 
     def validate(self) -> None:
         """Raise :class:`ModelSpecError` if the tower cannot be costed."""
@@ -171,6 +256,20 @@ class VisionSpec:
                 raise ModelSpecError(
                     f"vision.{name} is required and must be positive, got {value!r}"
                 )
+        if self.layers is not None:
+            if any(group.mtp for group in self.layers):
+                raise ModelSpecError("vision.layers marks MTP layers; a tower has none")
+            check_layer_counts(self.layers, self.num_hidden_layers, 0, "vision.layers")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the tower as a plain mapping, unset fields omitted."""
+        out: Dict[str, Any] = {}
+        for spec_field in fields(self):
+            value = getattr(self, spec_field.name)
+            if value is None:
+                continue
+            out[spec_field.name] = [group.to_dict() for group in value] if spec_field.name == "layers" else value
+        return out
 
 
 @dataclass(frozen=True)
@@ -188,6 +287,10 @@ class ModelSpec:
             is resolved.
         ops: Per-layer-kind op counts that replace the profile's own, for a
             model no profile describes.  Its kinds must be the profile's.
+        layers: The layer stack: groups of consecutive layers of one kind of
+            the profile, body first and MTP layers last.  A producer derives
+            it from ``layer_types``, ``first_k_dense_replace`` and
+            ``mtp_depth`` when the config does not state it.
         extra: Producer-supplied keys that are not model shape (precision,
             batch, runtime knobs).  Carried verbatim so nothing is lost while
             the execution IR does not yet exist to receive it.
@@ -220,8 +323,16 @@ class ModelSpec:
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
 
+    # Gated DeltaNet linear attention (Qwen3.5), for the layers a linear kind prices.
+    linear_num_key_heads: Optional[int] = None
+    linear_key_head_dim: Optional[int] = None
+    linear_num_value_heads: Optional[int] = None
+    linear_value_head_dim: Optional[int] = None
+    linear_conv_kernel_dim: Optional[int] = None
+
     arch: Optional[str] = None
     ops: Optional[Dict[str, OpCounts]] = None
+    layers: Optional[Tuple[LayerGroup, ...]] = None
 
     vision: Optional[VisionSpec] = None
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -310,6 +421,8 @@ class ModelSpec:
                 "num_shared_experts is set but no width resolves for it; declare "
                 "shared_expert_intermediate_size or moe_intermediate_size"
             )
+        if self.layers is not None:
+            check_layer_counts(self.layers, self.num_hidden_layers, self.mtp_depth or 0)
         if self.vision is not None:
             self.vision.validate()
         return self
@@ -325,20 +438,17 @@ class ModelSpec:
         """
         out: Dict[str, Any] = {}
         for spec_field in fields(self):
-            if spec_field.name in ("vision", "extra", "ops"):
+            if spec_field.name in ("vision", "extra", "ops", "layers"):
                 continue
             value = getattr(self, spec_field.name)
             if value is not None:
                 out[spec_field.name] = value
         if self.ops is not None:
             out["ops"] = {kind: counts.to_dict() for kind, counts in self.ops.items()}
+        if self.layers is not None:
+            out["layers"] = [group.to_dict() for group in self.layers]
         if self.vision is not None:
-            vision: Dict[str, Any] = {}
-            for vision_field in fields(self.vision):
-                value = getattr(self.vision, vision_field.name)
-                if value is not None:
-                    vision[vision_field.name] = value
-            out["vision"] = vision
+            out["vision"] = self.vision.to_dict()
         out.update(self.extra)
         return out
 
@@ -392,6 +502,8 @@ class ModelSpec:
             return str(value)
         if key == "ops":
             return ops_from_dict(value)
+        if key == "layers":
+            return layers_from_list(value)
         if key == "ffn_dim_multiplier":
             return float(value)
         return _as_int(value, key)
@@ -404,7 +516,10 @@ class ModelSpec:
         for key, value in data.items():
             if key not in known:
                 continue
-            kwargs[key] = str(value) if key == "name" else _as_int(value, f"vision.{key}")
+            if key == "layers":
+                kwargs[key] = None if value is None else layers_from_list(value, "vision.layers")
+            else:
+                kwargs[key] = str(value) if key == "name" else _as_int(value, f"vision.{key}")
         missing = [
             name for name in ("hidden_size", "num_hidden_layers", "num_attention_heads")
             if name not in kwargs

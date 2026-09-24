@@ -26,7 +26,11 @@ import unittest
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    apply_layer_kind,
+    check_and_apply_custom_hook,
+    layer_groups,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -49,17 +53,15 @@ class TestRecomputedComm(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """The fixture's config, its layer hooks applied."""
+        """The fixture's config, its family hook applied, and the kinds of its layers."""
         cls.ccfg = CostModelConfig(DEEPSEEK_YAML)
         check_and_apply_custom_hook(cls.ccfg)
-        # In a list, not a class attribute: a function read through ``self``
-        # would come back as a method bound to the test case.
-        cls.groups = [hook for _, hook in cls.ccfg.layer_custom_config]
+        cls.groups = [kind for kind, _ in layer_groups(cls.ccfg)]
 
     def _moe_layer(self, **switches: int) -> CostModelConfig:
         """A MoE layer's config, every op kept but for *switches*."""
         cfg = copy.deepcopy(self.ccfg)
-        self.groups[1](cfg)
+        apply_layer_kind(cfg, self.groups[1])
         cfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), **switches))
         return cfg
 

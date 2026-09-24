@@ -23,6 +23,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Cont
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
 if TYPE_CHECKING:
+    from hyper_parallel.auto_parallel._op_profiles import LayerKind
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 
 # The recompute switches; 1 keeps an op's activation, 0 recomputes the op.
@@ -59,7 +60,7 @@ class _PPB:
         self.eval_cfg = eval_cfg
         self._inner_dynamic_mem = inner_dyn_fun
         self.mb = EvalUtils.mb
-        # Prices a layer as ``(forward, backward)`` from its config, hook,
+        # Prices a layer as ``(forward, backward)`` from its config, kind,
         # layer type and recompute switches; set while a description with
         # times is being built.
         self.layer_times: Optional[Callable] = None
@@ -98,13 +99,13 @@ class _PPB:
         return {"SLCT": configured, "COMM": dict(keep, gather=0), "BOTH": dict(configured, gather=0)}
 
     def lay_ppb(
-        self, ccfg: CostModelConfig, ctx: Context, res_stat: float, hook: Optional[Callable] = None
+        self, ccfg: CostModelConfig, ctx: Context, res_stat: float, kind: Optional[LayerKind] = None
     ) -> dict:
         """layer description preparation
 
         With ``layer_times`` set, a body also offers COMM and BOTH, and the
-        description carries the layer's times, priced with *hook*, the hook
-        of the layer's group.
+        description carries the layer's times, priced on *kind*, the
+        layer's kind.
         """
         desc = {"model_name": ccfg.model_name}
         timed = self.layer_times is not None
@@ -126,7 +127,7 @@ class _PPB:
         finally:
             ctx.enable_node_log = original_enable_node_log
         if timed:
-            self._time_ppb(desc, ccfg, hook)
+            self._time_ppb(desc, ccfg, kind)
         return desc
 
     def _body_memory(self, desc: dict, ccfg: CostModelConfig, ctx: Context, res_stat: float, timed: bool) -> None:
@@ -188,18 +189,18 @@ class _PPB:
                 else:
                     delattr(rec_op, name)
 
-    def _time_ppb(self, desc: dict, ccfg: CostModelConfig, hook: Optional[Callable]) -> None:
+    def _time_ppb(self, desc: dict, ccfg: CostModelConfig, kind: Optional[LayerKind]) -> None:
         """Add the layer's forward time and the backward time of each option, where the balancer reads them."""
         end = {"HEAD": LayerType.EMBEDDING_LAYER, "TAIL": LayerType.OUTPUT_LAYER}.get(desc["type"])
         if end is not None:
             desc["forward_time"], desc["backward_time"] = self.layer_times(ccfg, None, end)
         else:
             desc["forward_time"], desc["backward_time"] = self.layer_times(
-                ccfg, hook, LayerType.NOT_REC_LAYER
+                ccfg, kind, LayerType.NOT_REC_LAYER
             )
             for name, switches in self.selective_switches(ccfg).items():
-                desc[_TIME_KEY[name]] = self.layer_times(ccfg, hook, LayerType.SEL_REC_LAYER, switches)[1]
-            desc["recompute_time"] = self.layer_times(ccfg, hook, LayerType.FULL_REC_LAYER)[1]
+                desc[_TIME_KEY[name]] = self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, switches)[1]
+            desc["recompute_time"] = self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]
         desc["time"] = desc["forward_time"]
 
     @staticmethod

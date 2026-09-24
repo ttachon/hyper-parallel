@@ -223,7 +223,8 @@ class CostModelParserNewFramework(_CostModelParser):
 | MoE | `n_exp`, `n_chosen_exp`, `n_shared_exp`, `hff_exp`, `cap_fact`, `etp` |
 | Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`, `bytes_grad`, `bytes_os`, `bytes_norm` |
 | Batch | `b`, `m`, `gbs` |
-| Hooks | `layer_custom_config`, `overwrite_eval_functions` |
+| Layer stack | `layer_stack`, through `config_layer_stack()` |
+| Formula overrides | `overwrite_eval_functions` |
 
 ## 6. CostModelConfig Fields
 
@@ -235,8 +236,9 @@ and the memory module.
 | --- | --- | --- |
 | Input | `config`, `config_format`, `parser` | Original config object, normalized source format, and active parser instance |
 | Model | `model_name`, `device_capacity` | Model identifier and per-device memory capacity |
-| Op profile | `arch`, `op_counts` | Architecture family that selects the arch hook, and its op counts per layer kind |
-| Multimodal | `multimodal`, `mm_ccfgs`, `mm_order` | Used when one config is split into multiple model components |
+| Op profile | `arch`, `op_counts`, `inherited_arch` | Architecture family that selects the arch hook, and its op counts per layer kind; a vision tower's arch is `vision`, and `inherited_arch` names the family whose hook it runs first |
+| Layer stack | `layer_stack`, `layer_binding`, `layer_fields` | The kind of every layer, as data; the fields each kind assigns, bound when the arch hook runs; the fields a family gives every layer on top of its kind's |
+| Multimodal | `multimodal`, `mm_ccfgs`, `mm_order`, `hooks_dict` | Used when one config is split into multiple model components, each priced by its own `arch` unless a hook class names its hook in `hooks_dict` |
 | Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |
 | Recompute | `full_rec`, `sel_rec`, `rec_op` | Full and selective recomputation controls |
@@ -251,7 +253,7 @@ and the memory module.
 | Batch | `b`, `m`, `gbs` | Micro batch size, number of micro batches, and global batch size |
 | Activation shard | `shard_embed`, `shard_output_activ`, `shard_recompute_input` | Embedding, output activation, and recompute input sharding factors |
 | Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`, `bytes_grad`, `bytes_os`, `bytes_norm` | Byte widths for parameters, compute, softmax, gradients, optimizer states, and norm |
-| Customization | `layer_custom_config`, `overwrite_eval_functions` | Heterogeneous layer hooks and function overrides resolved by the hook manager |
+| Customization | `overwrite_eval_functions` | Function overrides resolved by the hook manager |
 
 Strategy fields should be updated through `e.set_strategy()` after evaluator
 construction. Non-strategy fields can be changed in hooks with `e.set_ccfg()`.
@@ -368,10 +370,16 @@ It is possible to directly set the total layer memory to `0`, the total static
 memory to `stat=0`, or the total dynamic memory to `dyn=0`. Other constant
 values are ignored for layer categorization.
 
-For heterogeneous layers, `ccfg.layer_custom_config` is a list of pairs
-`(occurrence, subhook)`. For each pair, `subhook` is a callable and `occurrence`
-is an `int` indicating how many consecutive layers are affected. The sum of all
-occurrences must match `n_lay + n_mtp` for non-multimodal models.
+For heterogeneous layers, `ccfg.layer_stack` states the kind of every layer as
+data: groups of consecutive layers of one kind of the model's op profile, body
+first and MTP layers last, `n_lay + n_mtp` layers in all. A parser settles it
+with `config_layer_stack()`, from the stack the model spec states or from the
+layer counts: `k_1st_dense` dense layers then MoE layers, the two halves of an
+encoder-decoder, or one kind. Each estimator gives a layer its kind with
+`arch_hooks.apply_layer_kind()`: the kind's op counts, then the fields of its
+attention and feed-forward flavours, bound from the config as the arch hook
+left it. A stack whose one kind is what the arch hook already sets applies
+nothing per layer.
 
 When calling hooks, the following input function signatures are expected:
 

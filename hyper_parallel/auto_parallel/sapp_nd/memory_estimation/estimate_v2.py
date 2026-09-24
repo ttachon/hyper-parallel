@@ -111,7 +111,7 @@ class EvaluatorV2(_Utils, _HookManager):
 
         Args:
             layer_times: Prices a layer as ``(forward, backward)`` from its
-                config, hook, layer type and recompute switches, such as
+                config, kind, layer type and recompute switches, such as
                 ``perf_estimation.estimate.LayerTimes``. With it, every layer
                 description carries its times, in units of the first body's
                 forward time, instead of a placeholder and offers the

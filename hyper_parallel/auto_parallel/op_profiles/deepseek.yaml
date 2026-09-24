@@ -1,13 +1,21 @@
-# DeepSeek V3: the default decoder op counts in every layer.  Its dense and
-# MoE layers differ in feed-forward shape, not in the ops they run.
+# DeepSeek V3: the default decoder op counts in every layer.  Its first
+# layers run a dense feed-forward and the rest routed experts; the ops are
+# the same, and the feed-forward flavour of each kind says which is which.
+default: moe
 kinds:
-  decoder:
-    attMM: 4
-    attBMM: 2
-    ffMM: 3
-    softmax: 1
-    dropout: 0
-    normOp: 2
-    gather: 4
-    headCast: 1
-    ffAct: 1
+  dense:
+    ffn: dense
+    ops: &ops
+      attMM: 4
+      attBMM: 2
+      ffMM: 3
+      softmax: 1
+      dropout: 0
+      normOp: 2
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0
+  moe:
+    ffn: moe
+    ops: *ops
