@@ -190,16 +190,9 @@ def custom_pangualpha(ccfg):
 def custom_deepseek3(ccfg):
     """deepseekv3"""
     saved = Config({})
-    if ccfg.config_format == "yaml":
-        saved.hff = int(ccfg.hff)
-    elif ccfg.config_format == "json":
-        saved.hff = ccfg.ffn_hidden_size
-    else:
-        saved.hff = ccfg.specs.inter_dim
-        if not saved.hff:
-            saved.hff = ccfg.specs.hidden_dim
-        if not saved.hff:
-            saved.hff = ccfg.h
+    # A dense layer runs the model's feed-forward width, the parser's hff,
+    # whatever the config format.
+    saved.hff = ccfg.hff
     saved.n_chosen_exp = ccfg.n_chosen_exp
     saved.n_exp = ccfg.n_exp
     saved.n_shared_exp = ccfg.n_shared_exp

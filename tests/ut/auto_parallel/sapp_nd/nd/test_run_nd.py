@@ -1307,6 +1307,17 @@ class TestSappNDRunND(unittest.TestCase):
         deepseek_cfg.layer_custom_config[1][1](deepseek_wrap)
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
+        # A dense layer runs the parser's feed-forward width in every format:
+        # MindFormers and hyper_v2 (yaml), MindSpeed (json) and TorchTitan
+        # (toml), none of which sets ffn_hidden_size.
+        for config_format in ("yaml", "json", "toml"):
+            with self.subTest(config_format=config_format):
+                dense_cfg = _make_arch_cfg(model_name="deepseek", config_format=config_format,
+                                           ffn_hidden_size=0, specs=SimpleNamespace(inter_dim=64, hidden_dim=0))
+                ArchHooks.custom_deepseek3(dense_cfg)
+                dense_cfg.layer_custom_config[0][1](ArchHooks.CWrap(dense_cfg))
+                self.assertEqual((dense_cfg.hff, dense_cfg.n_exp), (32, 1))
+
         cm_cfg = _make_arch_cfg(model_name="cm")
         ArchHooks.custom_cm(cm_cfg)
         self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
