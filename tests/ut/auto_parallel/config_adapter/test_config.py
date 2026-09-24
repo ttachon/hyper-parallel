@@ -1268,7 +1268,9 @@ class TestWriter(unittest.TestCase):
         written = {}
         for name, path in (("legacy", legacy), ("auto_models", auto_models)):
             out = os.path.join(self.tmpdir, f"resolved_{name}.yaml")
-            write_resolved_yaml(config, path, out)
+            with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+                write_resolved_yaml(config, path, out)
+            self.assertIn("full in the train yaml, off in the search", " ".join(logs.output))
             with open(out, "r", encoding="utf-8") as fh:
                 written[name] = yaml.safe_load(fh)
         self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "none")

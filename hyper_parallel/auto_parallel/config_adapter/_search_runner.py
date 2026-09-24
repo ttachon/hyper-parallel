@@ -537,6 +537,10 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     result = _format_result(best, config)
     if auto:
         result.update(_recompute_result(nd_runner, best))
+    else:
+        # Without "auto" the search prices every candidate fully recomputed,
+        # whatever the search yaml says, so the trainer runs what was priced.
+        result["activation_checkpoint"] = "full"
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "

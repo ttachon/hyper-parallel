@@ -165,12 +165,19 @@ def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
         section = data.get("activation_checkpoint")
         if not isinstance(section, dict):
             section = data["activation_checkpoint"] = {}
+        before = section.get("mode", "off")
         section["mode"] = mode
-        return
-    checkpointing = data["train"].get("gradient_checkpointing")
-    if not isinstance(checkpointing, dict):
-        checkpointing = data["train"]["gradient_checkpointing"] = {}
-    checkpointing["activation_checkpoint"] = "none" if mode == "off" else mode
+    else:
+        checkpointing = data["train"].get("gradient_checkpointing")
+        if not isinstance(checkpointing, dict):
+            checkpointing = data["train"]["gradient_checkpointing"] = {}
+        before = checkpointing.get("activation_checkpoint", "none")
+        checkpointing["activation_checkpoint"] = "none" if mode == "off" else mode
+    if {"none": "off"}.get(before, before) != mode:
+        logger.info(
+            "activation checkpoint mode %s in the train yaml, %s in the search: writing the searched mode",
+            before, mode,
+        )
 
 
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
