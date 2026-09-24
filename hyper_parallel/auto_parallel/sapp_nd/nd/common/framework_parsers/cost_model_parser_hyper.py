@@ -494,7 +494,23 @@ class CostModelParserHyperV2(_CostModelParser):
             dataset_raw, "data_transform", Config({}),
         )
         trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
-        seq_len = int(trainer_seq_len or legacy_seq_len or self.ccfg.s or 4096)
+        # Only the Online path carries data_transform.max_seq_len; an Indexed
+        # Dataset states its length as data_config.seq_length.
+        data_config_raw = self._get_cfg_attr(dataset_raw, "data_config", Config({}))
+        indexed_seq_len = self._get_cfg_attr(data_config_raw, "seq_length", 0)
+
+        stated = trainer_seq_len or indexed_seq_len or legacy_seq_len
+        seq_len = int(stated or self.ccfg.s or 4096)
+        if not stated:
+            # The fallback is the model's context limit, orders of magnitude
+            # above any real training length on a long-context model, which
+            # makes the quadratic attention term meaningless.
+            logger.warning(
+                "no training sequence length in the config; costing the model "
+                "context limit of %d. Set dataset.data_transform.max_seq_len "
+                "(Online) or dataset.data_config.seq_length (Indexed).",
+                seq_len,
+            )
         self.ccfg.s = seq_len
 
     def _resolve_device_capacity(self) -> None:
