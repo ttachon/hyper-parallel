@@ -18,13 +18,14 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_apply_exec.py -v
 """
 import copy
+import dataclasses
 import os
 import unittest
 from typing import Any, Dict
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
-from hyper_parallel.auto_parallel._exec_spec import ExecSpec
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec, RecomputeRange
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import (
     apply_exec,
     apply_layer_strategy,
@@ -32,6 +33,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import (
     strategy_exec,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     STRATEGY_GUARDED,
     CostModelConfig,
@@ -49,9 +52,11 @@ _SOURCES = (
 
 
 def _state(ccfg: Any) -> Dict[str, Any]:
-    """The config's fields, with the ones held in objects read as values."""
+    """The config's fields, declared or set, with the ones held in objects read as values."""
     state = {}
-    for key, value in vars(ccfg).items():
+    names = set(vars(ccfg)) | {spec_field.name for spec_field in dataclasses.fields(type(ccfg))}
+    for key in sorted(names):
+        value = getattr(ccfg, key)
         if isinstance(value, Config):
             value = vars(value)
         elif isinstance(value, Memory):
@@ -68,15 +73,17 @@ class TestApplyExec(unittest.TestCase):
         Feature: exec_of and apply_exec.
         Description: Read back the ExecSpec of a parsed MindFormers config and
             of two Hyper configs, and apply it to the config it came from.
-        Expectation: No field changes.
+        Expectation: No field changes but the recompute, which comes back
+            stated as ranges, and every layer recomputes as before.
         """
         for path, framework in _SOURCES:
             ccfg = CostModelConfig(path, framework=framework)
-            before = _state(ccfg)
+            before, layers = _state(ccfg), ccfg.generate_partitions_vpp()
             apply_exec(ccfg, exec_of(ccfg))
             after = _state(ccfg)
-            changed = sorted(key for key, value in before.items() if value != after.get(key))
-            self.assertEqual(changed, [], f"{os.path.basename(path)}: fields changed {changed}")
+            changed = sorted(key for key, value in before.items() if value != after[key])
+            self.assertEqual(changed, ["recompute_ranges"], f"{os.path.basename(path)}: fields changed {changed}")
+            self.assertEqual(ccfg.generate_partitions_vpp(), layers, os.path.basename(path))
 
     def test_a_partial_spec_changes_what_it_states(self):
         """
@@ -136,6 +143,100 @@ class TestApplyExec(unittest.TestCase):
                         sequence_parallel=True, global_batch_size=ccfg.b * 4 * 8, offset=[0, 0],
                         full_recompute=True)
         self.assertEqual(spec, want, f"strategy_exec gave {spec}")
+
+
+def _unit(pp: int = 2) -> CostModelConfig:
+    """A small dense Hyper model of 8 layers at *pp* stages, fully recomputed."""
+    return CostModelConfig({
+        "model": {"name": "unit", "config_overrides": {
+            "hidden_size": 1024, "num_hidden_layers": 8, "num_attention_heads": 8,
+            "num_key_value_heads": 8, "intermediate_size": 2816, "vocab_size": 32000,
+            "max_position_embeddings": 2048,
+        }},
+        "training": {"global_batch_size": 8, "micro_batch_size": 1},
+        "accelerator": {"tp_size": 2, "pp_size": pp},
+        "fsdp_config": {"dp_shard_size": 2},
+        "activation_checkpoint": {"mode": "full"},
+        "dataset": {"data_transform": {"max_seq_len": 2048}},
+        "context": {"max_device_memory": "64GB", "device_num": 4 * pp},
+    }, framework="hyper_v2")
+
+
+def _layers(ccfg: Any) -> list:
+    """Each layer's recompute type, in model order."""
+    stages = ccfg.generate_partitions_vpp()
+    return [stages[stage][chunk][lay].name[:3] for stage, chunk, lay in get_model_order(ccfg, stages)]
+
+
+class TestRecomputeRanges(unittest.TestCase):
+    """A config's recompute as ranges over its layers, S2's shape."""
+
+    def test_every_config_reads_back_its_recompute_as_ranges(self):
+        """
+        Feature: recompute_of.
+        Description: A model recomputed in full, then only the first layer of
+            each of its two stages, as a search's per-stage count states it.
+        Expectation: One full range over every layer, then one range per
+            stage, at the first layer of each.
+        """
+        ccfg = _unit()
+        layers = int(ccfg.n_lay + ccfg.n_mtp)
+        self.assertEqual(exec_of(ccfg).recompute, (RecomputeRange(first=0, count=layers, option="full"),))
+        apply_exec(ccfg, ExecSpec(full_recompute=[1, 1]))
+        self.assertEqual(exec_of(ccfg).recompute, (
+            RecomputeRange(first=0, count=1, option="full"), RecomputeRange(first=4, count=1, option="full"),
+        ))
+
+    def test_stated_ranges_give_each_layer_its_option(self):
+        """
+        Feature: apply_exec and the partition generator.
+        Description: State two layers recomputed in full from layer 1, and
+            selective recompute of ffAct from layer 5 on; then a per-stage
+            form.
+        Expectation: Each layer in model order takes its range's option, the
+            selective switches are the stated ones, and the per-stage form
+            replaces the ranges.
+        """
+        ccfg = _unit()
+        apply_exec(ccfg, ExecSpec(recompute=(
+            RecomputeRange(first=1, count=2, option="full"),
+            RecomputeRange(first=5, option="selective", ops={"ffAct": "recompute"}),
+        )))
+        self.assertEqual(_layers(ccfg), ["NOT", "FUL", "FUL", "NOT", "NOT", "SEL", "SEL", "SEL"])
+        self.assertEqual(sorted(op for op, keep in vars(ccfg.rec_op).items() if not keep), ["ffAct"])
+        apply_exec(ccfg, ExecSpec(full_recompute=True))
+        self.assertIsNone(ccfg.recompute_ranges)
+        self.assertEqual(_layers(ccfg), ["FUL"] * 8)
+
+    def test_one_range_states_one_mode_for_every_layer(self):
+        """
+        Feature: one mode for every layer, as HyperParallel's trainer runs.
+        Description: One selective range from the first layer on, with the
+            rule's switches.
+        Expectation: Every layer is selective, with HyperParallel's own
+            selective switches.
+        """
+        ccfg = _unit()
+        apply_exec(ccfg, ExecSpec(recompute=(RecomputeRange(option="selective"),)))
+        self.assertEqual(_layers(ccfg), ["SEL"] * 8)
+        self.assertEqual(vars(ccfg.rec_op), HYPER_SELECTIVE_REC_OP)
+
+    def test_what_a_config_cannot_price_is_refused(self):
+        """
+        Feature: derive.
+        Description: Two selective settings in one config, and a range past
+            the model's last layer.
+        Expectation: ValueError for each: a config prices one selective
+            setting, and every range covers layers the model has.
+        """
+        ccfg = _unit()
+        with self.assertRaises(ValueError):
+            apply_exec(ccfg, ExecSpec(recompute=(
+                RecomputeRange(first=0, count=4, option="selective", ops={"ffAct": "recompute"}),
+                RecomputeRange(first=4, option="selective", ops={"normOp": "recompute"}),
+            )))
+        with self.assertRaises(ValueError):
+            apply_exec(_unit(), ExecSpec(recompute=(RecomputeRange(first=6, count=4, option="full"),)))
 
 
 class TestStrategyGuard(unittest.TestCase):

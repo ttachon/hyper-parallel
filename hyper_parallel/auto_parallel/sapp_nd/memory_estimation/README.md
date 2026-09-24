@@ -253,7 +253,7 @@ and the memory module.
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order`, `hooks_dict` | Used when one config is split into multiple model components, each priced by its own `arch` unless a hook class names its hook in `hooks_dict` |
 | Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |
-| Recompute | `full_rec`, `sel_rec`, `sel_comm_rec`, `sel_rec_rule`, `recompute_slice_activation`, `rec_op` | Full and selective recomputation controls; `rec_op` holds the switches of the selective recompute that `sel_rec_rule` names |
+| Recompute | `full_rec`, `sel_rec`, `sel_comm_rec`, `sel_rec_rule`, `recompute_slice_activation`, `recompute_ranges`, `rec_op` | Full and selective recomputation controls; `recompute_ranges`, when an ExecSpec states them, give each layer its option in model order and replace `full_rec` and `sel_rec`; `rec_op` holds the switches of the one selective setting a config prices |
 | Model shape | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh`, `v_head_dim`, `dc_kv`, `dc_q`, `dhr` | Layer count, hidden sizes, sequence sizes, attention heads, and MLA-related dimensions |
 | FFN shape | `k_1st_dense`, `multiple_of`, `fdm` | Feedforward hidden-size derivation helpers |
 | MoE shape | `n_exp`, `n_chosen_exp`, `n_shared_exp`, `hff_exp`, `cap_fact`, `etp`, `t_exp`, `d_exp` | Expert count, expert selection, capacity factor, expert TP, and derived expert DP |

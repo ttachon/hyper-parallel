@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Mapping, Union
 
 from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, family_profile
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import stated_recompute
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +182,7 @@ def hyper_rec_op(selective: Union[bool, list]) -> dict[str, int]:
     return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
 
 
-def mindformers_rec_op(ccfg: Any) -> dict[str, int]:
+def mindformers_rec_op(ccfg: Any, selective: Any = None) -> dict[str, int]:
     """Recompute switches of MindFormers' selective recompute.
 
     What ``select_recompute`` recomputes depends on flash attention and
@@ -191,20 +192,42 @@ def mindformers_rec_op(ccfg: Any) -> dict[str, int]:
     Args:
         ccfg: The config, with ``sel_rec``, ``sel_comm_rec``, ``has_fa`` and
             ``sp`` set.
+        selective: Whether the run recomputes selectively, ``sel_rec`` by
+            default.
 
     Returns:
         The switches for ``ccfg.rec_op``: 1 keeps the op's activation and 0
         recomputes it.
     """
+    selective = ccfg.sel_rec if selective is None else selective
     return {
-        "attBMM": int(not (ccfg.sel_rec and not ccfg.has_fa and ccfg.sp > 1)),
-        "headCast": int(not (ccfg.sel_rec and ccfg.has_fa)),
+        "attBMM": int(not (selective and not ccfg.has_fa and ccfg.sp > 1)),
+        "headCast": int(not (selective and ccfg.has_fa)),
         "dropout": 1,
-        "softmax": int(not (ccfg.sel_rec and not ccfg.has_fa)),
-        "normOp": int(not (ccfg.sel_rec and ccfg.sp > 1)),
+        "softmax": int(not (selective and not ccfg.has_fa)),
+        "normOp": int(not (selective and ccfg.sp > 1)),
         "gather": int(not (ccfg.sel_comm_rec and ccfg.sp > 1)),
-        "ffAct": int(not (ccfg.sel_rec and ccfg.sp > 1)),
+        "ffAct": int(not (selective and ccfg.sp > 1)),
     }
+
+
+def derive_recompute_ranges(ccfg: Any) -> None:
+    """Check the recompute ranges a config states against its layers.
+
+    Raises:
+        ValueError: When a range reaches past the model's last layer.
+    """
+    ranges = stated_recompute(ccfg)
+    if not ranges:
+        return
+    layers = int(ccfg.n_lay + ccfg.n_mtp)
+    for item in ranges:
+        last = item.first + (item.count or 1) - 1
+        if last >= layers:
+            raise ValueError(
+                f"{ccfg.model_name}: recompute range {item.to_dict()} reaches layer {last}, "
+                f"past the model's {layers} layers"
+            )
 
 
 def derive_recompute_switches(ccfg: Any) -> None:
@@ -212,17 +235,32 @@ def derive_recompute_switches(ccfg: Any) -> None:
 
     ``sel_rec_rule`` names the framework whose selective recompute the run
     uses: HyperParallel's recomputes a fixed set of ops, MindFormers' a set
-    that depends on flash attention and sequence parallelism.
+    that depends on flash attention and sequence parallelism.  A selective
+    recompute range that states its ops sets them instead.  A config holds
+    one selective setting: pricing several at once in one config is the
+    search's per-layer channel.
 
     Raises:
-        ValueError: When the config names no known rule.
+        ValueError: When the config names no known rule, or its recompute
+            ranges state more than one selective setting.
     """
+    ranges = stated_recompute(ccfg)
+    selective = [item for item in ranges or () if item.option == "selective"]
+    run_selective = ccfg.sel_rec if ranges is None else bool(selective)
     if ccfg.sel_rec_rule == "hyperparallel":
-        switches = hyper_rec_op(ccfg.sel_rec)
+        switches = hyper_rec_op(run_selective)
     elif ccfg.sel_rec_rule == "mindformers":
-        switches = mindformers_rec_op(ccfg)
+        switches = mindformers_rec_op(ccfg, run_selective)
     else:
         raise ValueError(f"Unknown selective recompute rule {ccfg.sel_rec_rule!r}")
+    settings = {tuple(sorted((item.switches() or switches).items())) for item in selective}
+    if len(settings) > 1:
+        raise ValueError(
+            f"{ccfg.model_name}: its recompute ranges state {len(settings)} selective settings; "
+            "a config prices one"
+        )
+    if settings:
+        switches = dict(next(iter(settings)))
     ccfg.rec_op = Config(switches)
 
 
@@ -349,6 +387,7 @@ def derive(ccfg: Any, strict: bool = True) -> None:
     derive_optimizer_sharding(ccfg)
     derive_comm_flags(ccfg)
     derive_embedding_sharding(ccfg)
+    derive_recompute_ranges(ccfg)
     derive_recompute_switches(ccfg)
     derive_flash_attention_factor(ccfg)
     derive_family(ccfg)

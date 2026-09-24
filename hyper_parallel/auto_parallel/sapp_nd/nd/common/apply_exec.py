@@ -22,10 +22,12 @@ ExecSpec a search's keyword strategy states.  A config a search owns refuses
 any other write of a degree, but :func:`apply_layer_strategy`, which gives
 the layer about to be priced the degrees its kind runs with.
 """
-from typing import Any, Mapping
+from typing import Any, List, Mapping, Optional, Tuple
 
-from hyper_parallel.auto_parallel._exec_spec import ExecSpec
+from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS, ExecSpec, RecomputeRange
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order, stated_recompute
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 # Each ExecSpec field, and the config field that holds it.
 CONFIG_FIELDS = {
@@ -57,6 +59,7 @@ CONFIG_FIELDS = {
     "selective_comm_recompute": "sel_comm_rec",
     "selective_rule": "sel_rec_rule",
     "recompute_slice_activation": "recompute_slice_activation",
+    "recompute": "recompute_ranges",
     "param_bytes": "bytes_p",
     "compute_bytes": "bytes_compute",
     "softmax_bytes": "bytes_softmax",
@@ -94,9 +97,62 @@ STRATEGY_KEYS = (
 )
 
 
+# The recompute option of each layer type the partition generator places.
+_OPTIONS = {LayerType.FULL_REC_LAYER: "full", LayerType.SEL_REC_LAYER: "selective"}
+
+
+def _ranges(options: List[str], ops: Mapping[str, str]) -> Tuple[RecomputeRange, ...]:
+    """Return the runs of *options*, one layer each in model order, as ranges.
+
+    A layer that does not recompute is left out, since a layer no range
+    covers is not recomputed.
+    """
+    out = []
+    first = 0
+    for index in range(1, len(options) + 1):
+        if index < len(options) and options[index] == options[first]:
+            continue
+        if options[first] != "none":
+            out.append(RecomputeRange(
+                first=first, count=index - first, option=options[first],
+                ops=dict(ops) if options[first] == "selective" else None,
+            ))
+        first = index
+    return tuple(out)
+
+
+def recompute_of(ccfg: Any) -> Optional[Tuple[RecomputeRange, ...]]:
+    """Return how a config's layers recompute, as ranges in model order.
+
+    The ranges it states, else the option its partition gives each layer
+    from ``full_rec`` and ``sel_rec``, with the switches of its selective
+    recompute as each op's state.  ``None`` for a config the partition
+    generator does not lay out alone, such as a multimodal parent.
+    """
+    stated = stated_recompute(ccfg)
+    if stated is not None:
+        return stated
+    layout = getattr(ccfg, "generate_partitions_vpp_unimodal", None)
+    if not callable(layout) or getattr(ccfg, "multimodal", False) or not ccfg.n_lay:
+        return None
+    stages = layout()
+    options = [
+        _OPTIONS.get(stages[stage_id][chunk_id][lay_id], "none")
+        for stage_id, chunk_id, lay_id in get_model_order(ccfg, stages)
+    ]
+    ops = {op: "keep" if getattr(ccfg.rec_op, op, 1) else "recompute" for op in RECOMPUTE_OPS}
+    return _ranges(options, ops)
+
+
 def exec_of(ccfg: Any) -> ExecSpec:
-    """Read back the ExecSpec a config holds, every field it states."""
-    return ExecSpec(**{name: getattr(ccfg, field) for name, field in CONFIG_FIELDS.items()})
+    """Read back the ExecSpec a config holds, every field it states.
+
+    Its recompute comes back as ranges too (:func:`recompute_of`), whichever
+    form the config states it in.
+    """
+    stated = {name: getattr(ccfg, field) for name, field in CONFIG_FIELDS.items()}
+    stated["recompute"] = recompute_of(ccfg)
+    return ExecSpec(**stated)
 
 
 def apply_exec(ccfg: Any, exec_spec: ExecSpec, strict: bool = True) -> None:
@@ -117,6 +173,11 @@ def apply_exec(ccfg: Any, exec_spec: ExecSpec, strict: bool = True) -> None:
             value = _memory(value)
         # The one sanctioned write of a strategy field, past the guard.
         object.__setattr__(ccfg, field, value)
+    if exec_spec.recompute is None and (
+        exec_spec.full_recompute is not None or exec_spec.selective_recompute is not None
+    ):
+        # A per-stage recompute replaces the ranges the config states.
+        object.__setattr__(ccfg, "recompute_ranges", None)
     derive(ccfg, strict)
 
 

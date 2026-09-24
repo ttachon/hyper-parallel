@@ -86,6 +86,10 @@ class _CostModVar:
     sel_rec_rule: str = "hyperparallel"
     # Whether a recomputed layer keeps its input sliced over tensor parallelism.
     recompute_slice_activation: bool = False
+    # How each layer recomputes, as ranges over the layers in model order
+    # (ExecSpec.recompute), when a spec states them; they replace full_rec
+    # and sel_rec, and the partition generator places them.
+    recompute_ranges: tuple = None
     pp_sched: str = None
     n_s_split: float = 0
     cp_algo: str = "colossalai_cp"
