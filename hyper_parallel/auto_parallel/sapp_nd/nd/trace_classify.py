@@ -545,7 +545,7 @@ def split_ascend_output(path: str, dims: Dict[str, str]) -> List[StepSplit]:
         splits.append(StepSplit(int(row["device"]), f"step{step_number}", row["stage"] / 1e3,
                                 comp, waits, dict(sites)))
     if ignored:
-        logger.info("%s: ignored %d summary entrie(s): %s", base, len(ignored), ", ".join(sorted(ignored)))
+        logger.info("%s: ignored %d summary entries: %s", base, len(ignored), ", ".join(sorted(ignored)))
     return splits
 
 
