@@ -145,13 +145,13 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.__parse_hyperparam()
         self.__parse_strat()
         self.__parse_moe()
-        derive(self.ccfg)  # optimizer sharding needs adapting to FSDP
         self.__parse_batch()
         self.__init_shard()
         self.__init_bytes()
         self.ccfg.n_mtp = 0
         self.config_layer_stack(self.ccfg)
         self.ccfg.overwrite_eval_functions = {}
+        derive(self.ccfg)  # optimizer sharding needs adapting to FSDP
 
     def __parse_strat(self):
         """strategy vars"""
@@ -206,7 +206,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.emb_out_in_offset = True
         self.ccfg.n_s_split = 1
         self.ccfg.cp_algo = "colossalai_cp"
-        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
+        self.ccfg.sel_rec_rule = "hyperparallel"
         self.ccfg.pp_partition = None
 
     def __parse_hyperparam(self):
@@ -225,9 +225,6 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.v = self.ccfg.specs.vocab_size
         self.ccfg.s = self.config.training.seq_len
         self.ccfg.a = self.ccfg.specs.n_heads
-        self.ccfg.s_fa = (
-            (self.ccfg.s / self.ccfg.a) if self.ccfg.has_fa else self.ccfg.s
-        )
         self.ccfg.n_lay = self.ccfg.specs.n_layers
         self.ccfg.n_kv = self.ccfg.specs.n_kv_heads
         if not self.ccfg.n_kv:
@@ -271,7 +268,6 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.vp_less_mem = False
         self.ccfg.has_clip = False
         self.ccfg.gmm = True
-        self.ccfg.vocab_emb_dp = True
         self.ccfg.tie_emb_out = self.ccfg.specs.enable_weight_tying
 
     def __parse_batch(self):
@@ -282,9 +278,10 @@ class CostModelParserHyperparallel(_CostModelParser):
 
     def __init_shard(self):
         """sharding vars"""
-        self.ccfg.shard_embed = self.ccfg.t
-        self.ccfg.shard_output_activ = True
-        self.ccfg.shard_recompute_input = True
+        # The embedding is priced split over tensor parallelism alone: FSDP's
+        # sharding of it over data parallelism is not modelled yet.
+        self.ccfg.vocab_emb_dp = False
+        self.ccfg.emb_dp_sharded = False
         self.ccfg.is_shard_mtp_param = True
 
     def __init_bytes(self):

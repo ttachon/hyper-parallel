@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """parser child class"""
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -201,19 +201,6 @@ class CostModelParserMindspeed(_CostModelParser):
         # temporary
         cc.etp = self.config.tmp.etp  # ETP
 
-    def __config_parse_json_op_recompute(self, cc):
-        """MindSpeed format for select recompute"""
-        cc.rec_op = Config(
-            {}
-        )  # recomputed operators (selective recompute only)
-        cc.rec_op.attBMM = 1
-        cc.rec_op.headCast = 1
-        cc.rec_op.dropout = 1
-        cc.rec_op.softmax = 1
-        cc.rec_op.normOp = 1
-        cc.rec_op.gather = 1
-        cc.rec_op.ffAct = 1
-
     def __config_parse_json(self, mod):
         """MindSpeed format for unimodal"""
         # def mod_hook(M) :
@@ -231,13 +218,15 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.cp_algo = "colossalai_cp"
         cc.gmm = mod.moe_grouped_gemm
         cc.vocab_emb_dp = False
+        cc.emb_dp_sharded = True
 
         cc.offset = 0
         # Parallel dimensions
         self.__config_parse_json_parallelism(cc, mod)
 
         cc.full_rec = mod.recompute_num_layers
-        cc.sel_rec = False
+        cc.sel_rec = False  # selective recompute is not parsed
+        cc.sel_rec_rule = "hyperparallel"
         if mod.recompute_num_layers and isinstance(
             mod.recompute_num_layers, int
         ):
@@ -268,19 +257,10 @@ class CostModelParserMindspeed(_CostModelParser):
 
         # Optimizer parallel factors
         cc.os_max_shard = cc.d * cc.t
-        derive(cc)
 
-        # Other factors
-        cc.shard_embed = cc.t * cc.d
-        cc.shard_output_activ = 1
-        cc.shard_recompute_input = 1
-        cc.s_fa = (
-            cc.s if not cc.has_fa else cc.s / cc.a
-        )  # flash attention factor [HYPOTHESIS]
         cc.gbs = cc.b * cc.d * cc.m
         cc.n_mtp = mod.mtp_num_layers
-        # Recomputation
-        self.__config_parse_json_op_recompute(cc)
         self.config_layer_stack(cc)
         cc.overwrite_eval_functions = {}
+        derive(cc)
         return cc  # mod_hook

@@ -174,9 +174,10 @@ To add a parser for a new input format:
 4. Implement `parse()` and assign normalized values to `self.ccfg`.
 5. Settle the op profile with `config_op_counts()`: pass the arch when the
    input declares one, and let it be inferred from `model_name` otherwise.
-6. Run the common post-processing helpers after parsing strategy fields:
-   `config_dp_tp_exp()`, `config_optimizer_shard()`, and
-   `config_comm_flag()`.
+6. State facts only, and call `derive()` (`nd/common/derive.py`) at the
+   end of `parse()`. It computes every derived field from them: the expert
+   degrees, the sharding factors, the communication flags, `rec_op` and
+   `s_fa`.
 
 The op counts of each architecture family (how many attention projections,
 softmaxes, norms and so on one layer runs, per layer kind) are data, in
@@ -191,6 +192,7 @@ parallel strategy, recomputation settings, precision bytes, and device capacity.
 Parser skeleton:
 
 ```python
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 
 
@@ -205,10 +207,9 @@ class CostModelParserNewFramework(_CostModelParser):
         ccfg.d = cfg.parallel.dp
         ccfg.t = cfg.parallel.tp
         ccfg.p = cfg.parallel.pp
+        # ... and every other fact of the output contract below
 
-        self.config_dp_tp_exp(ccfg)
-        self.config_optimizer_shard(ccfg)
-        self.config_comm_flag(ccfg)
+        derive(ccfg)
 ```
 
 ### Parser Output Contract
@@ -218,13 +219,18 @@ class CostModelParserNewFramework(_CostModelParser):
 | Model metadata | `model_name`, `device_capacity`, `config_format`, optional multimodal metadata |
 | Op profile | `arch`, `op_counts` |
 | Parallel strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `pp_sched` |
-| Pipeline layout | `offset`, `pp_partition`, `full_rec`, `sel_rec`, `rec_op` |
-| Model size | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh` |
+| Pipeline layout | `offset`, `pp_partition` |
+| Recompute | `full_rec`, `sel_rec`, `sel_rec_rule`, `recompute_slice_activation`, and `sel_comm_rec` under the MindFormers rule |
+| Features | `has_op`, `has_grad_shard`, `has_fa`, `vocab_emb_dp`, `emb_dp_sharded` |
+| Model size | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `a`, `n_kv`, `dh` |
 | MoE | `n_exp`, `n_chosen_exp`, `n_shared_exp`, `hff_exp`, `cap_fact`, `etp` |
 | Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`, `bytes_grad`, `bytes_os`, `bytes_norm` |
 | Batch | `b`, `m`, `gbs` |
 | Layer stack | `layer_stack`, through `config_layer_stack()` |
 | Formula overrides | `overwrite_eval_functions` |
+
+`derive()` computes the rest: `t_exp`, `d_exp`, the `shard_*` factors, the
+`comm_*` flags, `rec_op` and `s_fa`.
 
 ## 6. CostModelConfig Fields
 
@@ -241,14 +247,14 @@ and the memory module.
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order`, `hooks_dict` | Used when one config is split into multiple model components, each priced by its own `arch` unless a hook class names its hook in `hooks_dict` |
 | Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |
-| Recompute | `full_rec`, `sel_rec`, `rec_op` | Full and selective recomputation controls |
+| Recompute | `full_rec`, `sel_rec`, `sel_comm_rec`, `sel_rec_rule`, `recompute_slice_activation`, `rec_op` | Full and selective recomputation controls; `rec_op` holds the switches of the selective recompute that `sel_rec_rule` names |
 | Model shape | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh`, `dc_kv`, `dc_q`, `dhr` | Layer count, hidden sizes, sequence sizes, attention heads, and MLA-related dimensions |
 | FFN shape | `k_1st_dense`, `multiple_of`, `fdm` | Feedforward hidden-size derivation helpers |
 | MoE shape | `n_exp`, `n_chosen_exp`, `n_shared_exp`, `hff_exp`, `cap_fact`, `etp`, `t_exp`, `d_exp` | Expert count, expert selection, capacity factor, expert TP, and derived expert DP |
 | Optimizer shard | `shard_p_os_non_exp_partial`, `shard_p_os_non_exp`, `shard_grad_non_exp` | Non-expert parameter, optimizer-state, and gradient sharding factors |
 | Expert shard | `shard_p_os_exp_partial`, `shard_p_os_exp`, `shard_grad_exp` | Expert parameter, optimizer-state, and gradient sharding factors |
 | Communication | `comm_d_non_exp`, `comm_d_exp`, `comm_t`, `comm_ep`, `comm_cp` | Formula switches for DP, TP, EP, and CP communication memory |
-| Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches |
+| Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `emb_dp_sharded`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches |
 | MTP flags | `n_mtp`, `is_mtp_in_offset`, `is_shard_mtp_param` | Multi-token prediction layer placement and sharding controls |
 | Batch | `b`, `m`, `gbs` | Micro batch size, number of micro batches, and global batch size |
 | Activation shard | `shard_embed`, `shard_output_activ`, `shard_recompute_input` | Embedding, output activation, and recompute input sharding factors |

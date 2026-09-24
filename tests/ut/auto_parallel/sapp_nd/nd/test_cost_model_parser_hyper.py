@@ -35,9 +35,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     layer_groups,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    HYPER_SELECTIVE_REC_OP,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -440,7 +438,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: Regression — etp default is 0 (not 1).
         Description: When etp is absent, it defaults to 0 so that
-            ``config_dp_tp_exp`` does not enter the ``if ccfg.etp`` branch
+            ``derive_expert_degrees`` does not enter the ``if ccfg.etp`` branch
             and correctly sets ``t_exp = t``.
         Expectation: etp=0, t_exp=t=2.
         """
@@ -1297,7 +1295,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.k_1st_dense, 2)
         self.assertEqual(ccfg.cap_fact, 1)
 
-        # d_exp, t_exp via config_dp_tp_exp
+        # d_exp, t_exp via derive_expert_degrees
         # d=4, t=2, ep=4, etp=1 (MoE default)
         # Upstream EP PR changed `if ccfg.etp:` to `if ccfg.etp > 1:`,
         # so etp=1 now falls into the else branch:

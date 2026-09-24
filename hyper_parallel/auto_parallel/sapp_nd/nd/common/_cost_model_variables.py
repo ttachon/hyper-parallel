@@ -73,6 +73,13 @@ class _CostModVar:
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
+    # MindFormers' select_comm_recompute, which its selective recompute reads.
+    sel_comm_rec: Union[list, bool] = None
+    # The framework whose selective recompute rec_op follows, "hyperparallel"
+    # or "mindformers".
+    sel_rec_rule: str = "hyperparallel"
+    # Whether a recomputed layer keeps its input sliced over tensor parallelism.
+    recompute_slice_activation: bool = False
     pp_sched: str = None
     n_s_split: float = 0
     cp_algo: str = "colossalai_cp"
@@ -171,6 +178,8 @@ class _CostModVar:
     has_clip: bool = False
     gmm: bool = False
     vocab_emb_dp: float = 0
+    # Whether the embedding table is sharded over data parallelism too.
+    emb_dp_sharded: bool = True
     tie_emb_out: bool = False
     emb_out_in_offset: bool = False
 

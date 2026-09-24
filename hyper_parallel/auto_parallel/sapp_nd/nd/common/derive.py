@@ -16,14 +16,31 @@
 
 A parser states primary facts: the model's dimensions, the parallel strategy
 and the fixed facts of the run.  :func:`derive` computes what follows from
-them, once when a config is parsed and again whenever its strategy changes,
-where each parser used to compute it.
+them, where each parser used to compute it.
 """
 import logging
 import math
-from typing import Any
+from typing import Any, Union
+
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 
 logger = logging.getLogger(__name__)
+
+# The recompute switches of HyperParallel's selective activation checkpointing
+# (hyper_parallel/distributed/activation_checkpoint.py). It keeps the outputs of
+# matmul and attention kernels and of reduce-scatter, all-to-all and all-reduce,
+# and recomputes everything else, all-gathers included. A switch at 1 keeps the
+# op's activation and 0 recomputes it. The policy also recomputes every other
+# projection matmul, which has no switch, so that part is not priced.
+HYPER_SELECTIVE_REC_OP = {
+    "attBMM": 1,
+    "headCast": 0,
+    "dropout": 0,
+    "softmax": 0,
+    "normOp": 0,
+    "gather": 0,
+    "ffAct": 0,
+}
 
 
 def derive_expert_degrees(ccfg: Any, strict: bool = True) -> None:
@@ -127,6 +144,96 @@ def derive_comm_flags(ccfg: Any) -> None:
     ccfg.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
 
 
+def derive_embedding_sharding(ccfg: Any) -> None:
+    """Set how the embedding table is sharded, ``shard_embed``.
+
+    The table is split over tensor parallelism unless the vocabulary
+    embedding runs data parallel without pipelining, and over data
+    parallelism unless the config says it is not.
+    """
+    tp = 1 if (ccfg.vocab_emb_dp and ccfg.p == 1) else ccfg.t
+    ccfg.shard_embed = (ccfg.d if ccfg.emb_dp_sharded else 1) * tp
+
+
+def derive_recompute_sharding(ccfg: Any) -> None:
+    """Set how a recomputed layer's input is sharded, ``shard_recompute_input``.
+
+    It stays sliced over tensor parallelism when the run keeps sliced
+    activations for recompute, and is whole otherwise.
+    """
+    ccfg.shard_recompute_input = ccfg.t if ccfg.recompute_slice_activation else 1
+
+
+def hyper_rec_op(selective: Union[bool, list]) -> dict[str, int]:
+    """Recompute switches for a HyperParallel activation checkpoint mode.
+
+    Args:
+        selective: The parsed ``sel_rec``: truthy when the run uses
+            selective activation checkpointing.
+
+    Returns:
+        The switches for ``ccfg.rec_op``: :data:`HYPER_SELECTIVE_REC_OP`
+        for a selective run, and every op kept otherwise.
+    """
+    if selective:
+        return dict(HYPER_SELECTIVE_REC_OP)
+    return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
+
+
+def mindformers_rec_op(ccfg: Any) -> dict[str, int]:
+    """Recompute switches of MindFormers' selective recompute.
+
+    What ``select_recompute`` recomputes depends on flash attention and
+    sequence parallelism; ``select_comm_recompute`` recomputes the
+    sequence-parallel all-gather.
+
+    Args:
+        ccfg: The config, with ``sel_rec``, ``sel_comm_rec``, ``has_fa`` and
+            ``sp`` set.
+
+    Returns:
+        The switches for ``ccfg.rec_op``: 1 keeps the op's activation and 0
+        recomputes it.
+    """
+    return {
+        "attBMM": int(not (ccfg.sel_rec and not ccfg.has_fa and ccfg.sp > 1)),
+        "headCast": int(not (ccfg.sel_rec and ccfg.has_fa)),
+        "dropout": 1,
+        "softmax": int(not (ccfg.sel_rec and not ccfg.has_fa)),
+        "normOp": int(not (ccfg.sel_rec and ccfg.sp > 1)),
+        "gather": int(not (ccfg.sel_comm_rec and ccfg.sp > 1)),
+        "ffAct": int(not (ccfg.sel_rec and ccfg.sp > 1)),
+    }
+
+
+def derive_recompute_switches(ccfg: Any) -> None:
+    """Set which activations a recomputed layer keeps, ``rec_op``.
+
+    ``sel_rec_rule`` names the framework whose selective recompute the run
+    uses: HyperParallel's recomputes a fixed set of ops, MindFormers' a set
+    that depends on flash attention and sequence parallelism.
+
+    Raises:
+        ValueError: When the config names no known rule.
+    """
+    if ccfg.sel_rec_rule == "hyperparallel":
+        switches = hyper_rec_op(ccfg.sel_rec)
+    elif ccfg.sel_rec_rule == "mindformers":
+        switches = mindformers_rec_op(ccfg)
+    else:
+        raise ValueError(f"Unknown selective recompute rule {ccfg.sel_rec_rule!r}")
+    ccfg.rec_op = Config(switches)
+
+
+def derive_flash_attention_factor(ccfg: Any) -> None:
+    """Set the flash attention factor, ``s_fa``.
+
+    The attention scores are priced over ``s / a`` rather than ``s`` when
+    flash attention is on.
+    """
+    ccfg.s_fa = ccfg.s / ccfg.a if ccfg.has_fa and ccfg.a > 0 else ccfg.s
+
+
 def derive(ccfg: Any, strict: bool = True) -> None:
     """Compute the config's derived fields from its primary ones.
 
@@ -136,7 +243,14 @@ def derive(ccfg: Any, strict: bool = True) -> None:
 
     Raises:
         TypeError: When *strict* and the degrees cannot hold the experts.
+        ValueError: When the config names no known selective recompute rule.
     """
     derive_expert_degrees(ccfg, strict)
     derive_optimizer_sharding(ccfg)
     derive_comm_flags(ccfg)
+    derive_embedding_sharding(ccfg)
+    derive_recompute_sharding(ccfg)
+    # The output layer's activation is kept whole; Qwen's family hook shards it.
+    ccfg.shard_output_activ = 1
+    derive_recompute_switches(ccfg)
+    derive_flash_attention_factor(ccfg)

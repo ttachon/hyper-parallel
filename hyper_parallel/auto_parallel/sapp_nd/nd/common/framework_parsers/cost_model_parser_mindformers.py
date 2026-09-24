@@ -13,11 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """parser child class"""
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive, derive_embedding_sharding
 
 
 class CostModelParserMindformers(_CostModelParser):
@@ -33,6 +32,7 @@ class CostModelParserMindformers(_CostModelParser):
         if op_cfg:
             self.ccfg.has_grad_shard = op_cfg.gradient_accumulation_shard
         self.ccfg.vocab_emb_dp = self.config.parallel_config.vocab_emb_dp
+        self.ccfg.emb_dp_sharded = True
         self.ccfg.tie_emb_out = self.config.model.model_config.tie_word_embeddings
         self.ccfg.cp_algo = (
             self.config.parallel_config.context_parallel_algo
@@ -161,49 +161,18 @@ class CostModelParserMindformers(_CostModelParser):
             self.ccfg.k_1st_dense = max(self.ccfg.k_1st_dense, cfg.first_k_dense_replace)
             self.ccfg.gmm = cfg.moe_grouped_gemm
 
-    def __config_parse_yaml_op_recompute(self):
-        """MindFormer format for select recompute"""
-        # [HYPOTHESIS]
-        self.ccfg.rec_op = Config(
-            {}
-        )  # recomputed operators (selective recompute only)
-        self.ccfg.rec_op.attBMM = int(
-            not (
-                self.config.recompute_config.select_recompute
-                and not self.ccfg.has_fa
-                and self.ccfg.sp > 1
-            )
-        )
-        self.ccfg.rec_op.headCast = int(
-            not (self.config.recompute_config.select_recompute and self.ccfg.has_fa)
-        )
-        self.ccfg.rec_op.dropout = 1
-        self.ccfg.rec_op.softmax = int(
-            not (
-                self.config.recompute_config.select_recompute
-                and not self.ccfg.has_fa
-            )
-        )
-        self.ccfg.rec_op.normOp = int(
-            not (self.config.recompute_config.select_recompute and self.ccfg.sp > 1)
-        )
-        self.ccfg.rec_op.gather = int(
-            not (
-                self.config.recompute_config.select_comm_recompute
-                and self.ccfg.sp > 1
-            )
-        )
-        self.ccfg.rec_op.ffAct = int(
-            not (self.config.recompute_config.select_recompute and self.ccfg.sp > 1)
-        )
+    def __config_parse_yaml_recompute(self):
+        """MindFormer format for recompute"""
+        rc = self.config.recompute_config
+        self.ccfg.sel_rec = rc.select_recompute
+        self.ccfg.sel_comm_rec = rc.select_comm_recompute
+        self.ccfg.sel_rec_rule = "mindformers"
+        self.ccfg.full_rec = rc.recompute
+        self.ccfg.recompute_slice_activation = bool(rc.recompute_slice_activation)
 
     def config_shard_emb(self):
-        """Configure embedding and output activation sharding."""
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
-        )
+        """Refresh the embedding's sharding after a strategy change."""
+        derive_embedding_sharding(self.ccfg)
 
     def __config_parse_yaml_fp_bytes(self):
         """FP byte storages of parameters, activations and softmax outputs."""
@@ -229,30 +198,14 @@ class CostModelParserMindformers(_CostModelParser):
         if not self.ccfg.bytes_compute:
             raise AttributeError("bytes_compute not positive")
 
-    def __config_parse_yaml_shard_factors(self):
-        """Optimizer, embedding, recompute and flash attention factors."""
-        # Optimizer parallel factors
+    def __config_parse_yaml_optimizer_shard(self):
+        """Optimizer parallel factors."""
         if self.ccfg.op_weight_shard:
             self.ccfg.os_max_shard = self.ccfg.op_weight_shard
         elif self.ccfg.has_op:
             self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
         else:
             self.ccfg.os_max_shard = 1
-        derive(self.ccfg)
-
-        # Other factors
-        self.config_shard_emb()
-        self.ccfg.shard_output_activ = 1
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t
-            if self.config.recompute_config.recompute_slice_activation
-            else 1
-        )
-        self.ccfg.s_fa = (
-            self.ccfg.s
-            if not self.config.model.model_config.use_flash_attention
-            else self.ccfg.s / self.ccfg.a
-        )  # flash attention factor [HYPOTHESIS]
 
     def __config_parse_yaml(self):
         """MindFormer format for unimodal"""
@@ -291,7 +244,7 @@ class CostModelParserMindformers(_CostModelParser):
         self.__config_parse_yaml_hyperparameters()
         self.__config_parse_yaml_moe()
         self.__config_parse_yaml_fp_bytes()
-        self.__config_parse_yaml_shard_factors()
+        self.__config_parse_yaml_optimizer_shard()
         self.ccfg.gbs = self.ccfg.b * self.ccfg.d * self.ccfg.m
         self.ccfg.n_mtp = (
             self.config.model.model_config.mtp_depth
@@ -306,9 +259,8 @@ class CostModelParserMindformers(_CostModelParser):
 
         self.config_layer_stack(self.ccfg)
 
-        self.__config_parse_yaml_op_recompute()
         # By default, 100% of layers use a unique custom config (if specified)
         self.ccfg.offset = self.config.model.model_config.offset
-        self.ccfg.sel_rec = self.config.recompute_config.select_recompute
-        self.ccfg.full_rec = self.config.recompute_config.recompute
+        self.__config_parse_yaml_recompute()
         self.ccfg.overwrite_eval_functions = {}
+        derive(self.ccfg)
