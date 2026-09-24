@@ -340,12 +340,18 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         cases = [
             ({"data": {"max_seq_len": 2048}}, 2048),
             ({}, 4096),  # default
+            # An Indexed Dataset states its length here and nowhere else; without
+            # it the model context limit is costed instead, which on a
+            # long-context model is orders of magnitude too large.
+            ({"dataset": {"data_config": {"seq_length": 128}}}, 128),
+            ({"dataset": {"data_transform": {"max_seq_len": 512},
+                          "data_config": {"seq_length": 128}}}, 512),
         ]
         for extra, expected in cases:
             cfg = _dense_overrides()
             _deep_update(cfg, extra)
             ccfg = _make_ccfg(cfg)
-            self.assertEqual(ccfg.s, expected)
+            self.assertEqual(ccfg.s, expected, msg=f"extra={extra}")
 
     def test_overrides_missing_kv_heads_fallback(self):
         """
