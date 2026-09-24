@@ -462,7 +462,6 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.cp = max(1, cp)
         self.ccfg.ep = max(1, ep)
         self.ccfg.d = self._resolve_data_parallel(dp_replicate, dp_shard)
-        self.ccfg.sp = self.ccfg.t  # Sequence parallel factor
         self.ccfg.etp = etp
         self.ccfg.vp = max(1, int(
             self._get_cfg_attr(accel, "pp_interleave_num", 1) or 1
@@ -502,7 +501,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
         )
-        self.ccfg.sp = self.ccfg.t if use_sp else 1
+        self.ccfg.sequence_parallel = use_sp
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
         )

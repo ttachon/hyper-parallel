@@ -22,7 +22,7 @@ from pprint import pformat
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.generate_partitions import PartitionGenerator
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec, strategy_exec
 
 
 class AttentionType(Enum):
@@ -249,12 +249,6 @@ class CostModelConfig(PartitionGenerator):
             and is_valid_cfg(self.sel_rec)
         )
 
-    @staticmethod
-    def __maybe_set_int(target, attr, value):
-        """Set an integer strategy attribute when an override is supplied."""
-        if isinstance(value, int):
-            setattr(target, attr, value)
-
     def __strategy_target(self, model_name):
         """Get the config object targeted by a strategy update."""
         if not self.multimodal:
@@ -266,7 +260,12 @@ class CostModelConfig(PartitionGenerator):
         )
 
     def set_strategy(self, **kwargs: Any) -> None:
-        """overwrite parallelism"""
+        """Apply a keyword strategy: the ExecSpec it states, and what follows.
+
+        The keywords are ``strategy_exec``'s; ``model_name`` picks the
+        submodule of a multimodal config, and without it every submodule
+        takes the strategy.
+        """
         model_name = kwargs.get("model_name", None)
         if self.multimodal and model_name is None:
             # Submodules share one pipeline, so a strategy update with no
@@ -276,30 +275,8 @@ class CostModelConfig(PartitionGenerator):
                     **{**kwargs, "model_name": None}
                 )
             model_name = self.mm_main if self.mm_main else self.mm_order[-1]
-        op = kwargs.get("op", None)
-        off = kwargs.get("offset", None)
-        fr = kwargs.get("full_rec", None)
-        sr = kwargs.get("sel_rec", None)
         target_ccfg = self.__strategy_target(model_name)
-
-        for attr, key in (
-            ("d", "dp"),
-            ("t", "mp"),
-            ("ep", "ep"),
-            ("etp", "etp"),
-            ("cp", "cp"),
-            ("vp", "vpp"),
-            ("p", "pp"),
-            ("m", "mb"),
-            ("b", "mbs"),
-        ):
-            self.__maybe_set_int(target_ccfg, attr, kwargs.get(key, None))
-        target_ccfg.sp = target_ccfg.t
-        if op is not None and isinstance(op, int):
-            target_ccfg.os_max_shard = op
-            # Sync has_op with os_max_shard: op<=1 means no optimizer sharding
-            target_ccfg.has_op = op > 1
-        target_ccfg.gbs = target_ccfg.b * target_ccfg.d * target_ccfg.m
+        apply_exec(target_ccfg, strategy_exec(target_ccfg, kwargs))
         logger.debug(
             "in ccfg: DP = %d, TP = %d, EP = %d, CP = %d, "
             "PP = %d, MB = %d, MBS = %d, VPP = %d",
@@ -312,15 +289,6 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.b,
             target_ccfg.vp,
         )
-        if fr is not None:
-            target_ccfg.full_rec = fr
-        if sr is not None:
-            target_ccfg.sel_rec = sr
-        if isinstance(off, (int, list)):
-            target_ccfg.offset = off
-        # Every derived field follows the new strategy, on the config it
-        # changed.
-        derive(target_ccfg)
         if not target_ccfg.is_consistent_pp_config():
             raise AttributeError(
                 f"{target_ccfg.model_name}: "
@@ -330,7 +298,6 @@ class CostModelConfig(PartitionGenerator):
                 f"full_rec {target_ccfg.full_rec} "
                 f"sel_rec {target_ccfg.sel_rec}"
             )
-        self.__maybe_set_int(target_ccfg, "cp", kwargs.get("cp", None))
 
     def get_strategy(self) -> Any:
         """return parallelism/recompute strategies"""

@@ -44,6 +44,11 @@ HYPER_SELECTIVE_REC_OP = {
 }
 
 
+def derive_sequence_parallel(ccfg: Any) -> None:
+    """Set the sequence-parallel factor ``sp``: the TP degree, or 1 without."""
+    ccfg.sp = ccfg.t if ccfg.sequence_parallel else 1
+
+
 def derive_expert_degrees(ccfg: Any, strict: bool = True) -> None:
     """Set the degrees an expert layer runs with, ``t_exp`` and ``d_exp``.
 
@@ -246,6 +251,7 @@ def derive(ccfg: Any, strict: bool = True) -> None:
         TypeError: When *strict* and the degrees cannot hold the experts.
         ValueError: When the config names no known selective recompute rule.
     """
+    derive_sequence_parallel(ccfg)
     derive_expert_degrees(ccfg, strict)
     derive_optimizer_sharding(ccfg)
     derive_comm_flags(ccfg)

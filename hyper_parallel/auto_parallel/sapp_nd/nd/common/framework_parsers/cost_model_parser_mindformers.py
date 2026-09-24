@@ -54,10 +54,8 @@ class CostModelParserMindformers(_CostModelParser):
         self.ccfg.ep = max(
             1, self.config.parallel_config.expert_parallel
         )  # Expert parallel
-        self.ccfg.sp = (
-            self.ccfg.t if self.config.parallel_config.use_seq_parallel else 1
-        )  # Sequence parallel factor
-        if self.ccfg.cp > 1 and self.ccfg.sp > 1:
+        self.ccfg.sequence_parallel = bool(self.config.parallel_config.use_seq_parallel)
+        if self.ccfg.cp > 1 and self.ccfg.sequence_parallel and self.ccfg.t > 1:
             logger.warning(
                 "sequence parallelism and context parallelism are both enabled"
             )

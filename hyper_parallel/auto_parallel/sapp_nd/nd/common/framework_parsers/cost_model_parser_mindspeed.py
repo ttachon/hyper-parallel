@@ -154,8 +154,8 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.cp = self.config.tmp.cp
         cc.d = self.config.tmp.dp
         cc.ep = max(cc.expert_model_parallel_size, self.config.tmp.ep)
-        cc.sp = cc.t if mod.sequence_parallel else 1
-        if cc.cp > 1 and cc.sp > 1:
+        cc.sequence_parallel = bool(mod.sequence_parallel)
+        if cc.cp > 1 and cc.sequence_parallel and cc.t > 1:
             logger.warning(
                 "sequence parallelism and context parallelism are both enabled"
             )

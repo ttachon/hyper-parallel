@@ -66,6 +66,9 @@ class _CostModVar:
     p: float = 0
     cp: float = 0
     ep: float = 1
+    # Whether activations are split along the sequence over the TP group;
+    # derive sets the factor sp from it.
+    sequence_parallel: bool = False
     sp: float = 0
     vp: float = 0
     os_max_shard: float = 0

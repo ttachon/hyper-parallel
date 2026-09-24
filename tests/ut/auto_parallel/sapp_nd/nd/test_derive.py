@@ -37,7 +37,7 @@ def _config(**fields: Any) -> SimpleNamespace:
         "has_op": True, "has_grad_shard": False, "os_max_shard": 8,
         "vocab_emb_dp": False, "emb_dp_sharded": True, "recompute_slice_activation": False,
         "sel_rec": False, "sel_comm_rec": False, "sel_rec_rule": "hyperparallel",
-        "has_fa": True, "sp": 1, "s": 4096, "a": 32,
+        "has_fa": True, "sequence_parallel": False, "sp": 1, "s": 4096, "a": 32,
     }
     facts.update(fields)
     return SimpleNamespace(**facts)

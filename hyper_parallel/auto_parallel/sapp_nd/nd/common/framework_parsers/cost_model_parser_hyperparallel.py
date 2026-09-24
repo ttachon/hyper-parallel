@@ -164,7 +164,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.p = max(1, self.config.parallelism.pipeline_parallel_degree)
         self.ccfg.cp = max(1, self.config.parallelism.context_parallel_degree)
         self.ccfg.ep = max(1, self.config.parallelism.expert_parallel_degree)
-        self.ccfg.sp = self.ccfg.t
+        self.ccfg.sequence_parallel = True
         self.ccfg.vp = 1
         self.ccfg.op_weight_shard = (
             self.config.parallelism.data_parallel_shard_degree * self.ccfg.t
