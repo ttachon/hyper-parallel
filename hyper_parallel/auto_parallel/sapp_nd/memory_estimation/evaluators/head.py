@@ -82,10 +82,13 @@ class EvalHead:
 
     @staticmethod
     def tp_comm_embed(ccfg: CostModelConfig, _) -> float:
-        """TP Communication size"""
+        """TP Communication size.
+
+        The embedding is never recomputed, so it keeps its buffer whatever
+        the gather switch says: a switch acts only in a selective layer.
+        """
         return (
-            ccfg.rec_op.gather
-            * ccfg.comm_t
+            ccfg.comm_t
             * ccfg.s
             * ccfg.h
             * ccfg.b
