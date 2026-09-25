@@ -47,6 +47,12 @@ HYPER_SELECTIVE_REC_OP = {
 }
 
 
+def runs_hyper_selective(ccfg: Any) -> bool:
+    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches are its switches."""
+    switches = vars(ccfg.rec_op) if getattr(ccfg, "rec_op", None) is not None else {}
+    return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
+
+
 def derive_sequence_parallel(ccfg: Any) -> None:
     """Set the sequence-parallel factor ``sp``: the TP degree, or 1 without."""
     ccfg.sp = ccfg.t if ccfg.sequence_parallel else 1

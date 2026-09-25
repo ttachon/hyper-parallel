@@ -231,7 +231,10 @@ class KindActivations:
     tokens under the runtime's kernels: the part no tensor-parallel rank
     splits, and the part it splits, of which a layer at TP 2 holds half.  The
     backward's working set leaves out the parameters and their gradients,
-    which the memory model counts on its own.
+    which the memory model counts on its own.  ``selective`` and
+    ``selective_tp`` are what the layer keeps under HyperParallel's selective
+    activation checkpointing, whose backward recomputes the rest and holds
+    the same working set; a record states both or neither.
     """
 
     saved: float
@@ -239,10 +242,13 @@ class KindActivations:
     working: float
     working_tp: float
     seq_length: int
+    selective: Optional[float] = None
+    selective_tp: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return the record as a plain mapping."""
-        return {spec_field.name: getattr(self, spec_field.name) for spec_field in fields(self)}
+        """Return the record as a plain mapping, the selective part only when stated."""
+        return {spec_field.name: getattr(self, spec_field.name) for spec_field in fields(self)
+                if getattr(self, spec_field.name) is not None}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
@@ -250,11 +256,14 @@ class KindActivations:
         if not isinstance(data, Mapping):
             raise ModelSpecError(f"{where} must map the record's fields to their values, got {data!r}")
         names = [spec_field.name for spec_field in fields(cls)]
+        optional = ("selective", "selective_tp")
         unknown = sorted(set(data) - set(names))
-        missing = [name for name in names if name not in data]
+        missing = [name for name in names if name not in data and name not in optional]
         if unknown or missing:
             raise ModelSpecError(f"{where} has unknown keys {unknown} and lacks {missing}")
-        sizes = {name: float(data[name]) for name in names if name != "seq_length"}
+        if len({data.get(name) is None for name in optional}) > 1:
+            raise ModelSpecError(f"{where} states one of {list(optional)} without the other")
+        sizes = {name: float(data[name]) for name in names if name != "seq_length" and data.get(name) is not None}
         if any(size < 0 for size in sizes.values()):
             raise ModelSpecError(f"{where}: bytes per token cannot be negative, got {sizes}")
         return cls(seq_length=_as_count(data["seq_length"], f"{where}.seq_length"), **sizes)

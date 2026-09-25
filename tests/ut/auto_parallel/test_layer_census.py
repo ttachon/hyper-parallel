@@ -25,12 +25,15 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
     _measure,
+    _selective_contexts,
     census_activations,
     census_layer,
     census_output_activations,
     tp_config,
 )
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
+from hyper_parallel.core.activation_memory import api as activation_memory
+from hyper_parallel.core.activation_memory import sac
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import bind_layer_stack
 
@@ -137,23 +140,71 @@ class TestLayerCensus(unittest.TestCase):
                                       lambda out: out.backward(torch.ones_like(out)))
         self.assertEqual((saved, working), (size, 3 * size))
 
+    def test_selective_checkpointing_keeps_every_other_matmul(self):
+        """
+        Feature: _measure of a forward under HyperParallel's selective
+            activation checkpointing.
+        Description: Two projections of a 64-wide input of 64 tokens with
+            an activation between them, checkpointed as the trainer
+            checkpoints a layer.
+        Expectation: The forward keeps its input and the first projection's
+            output, which the policy saves; it recomputes the activation
+            and the second projection.
+        """
+        with FakeTensorMode():
+            first, second = (torch.nn.Parameter(torch.empty(64, 64, dtype=torch.bfloat16)) for _ in range(2))
+            hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
+            size = hidden.untyped_storage().nbytes()
+            kept, _ = _measure(
+                [first, second], (hidden,),
+                lambda: activation_memory.checkpoint(lambda states: torch.relu(states @ first.t()) @ second.t(),
+                                                     hidden, swap_inputs=False, context_fn=_selective_contexts),
+                lambda out: out.backward(torch.ones_like(out)), checkpointed=True)
+        self.assertEqual(kept, 2 * size)
+
+    def test_a_selective_layer_keeps_what_the_policy_saves(self):
+        """
+        Feature: census_layer under HyperParallel's selective checkpointing.
+        Description: Each kind's layer checkpointed selectively; the
+            full-attention one also with SAC ignoring the ops that build
+            empty tensors, as the trainer's selective setup has it.
+        Expectation: A layer keeps less than without recompute and more
+            than its input; the full-attention one keeps the attention's
+            output and two statistics, 24 KiB at 64 tokens, whatever SAC
+            ignores.
+        """
+        config = _qwen35_text()
+        size = 64 * 64 * 2
+        for index in (0, 1):
+            (saved, _), (kept, _) = (census_layer(config, index, 64, selective=each) for each in (False, True))
+            self.assertLess(kept, saved)
+            self.assertGreater(kept, size)
+        self.assertGreaterEqual(kept, size + 24 * 1024)
+        ignored = set(sac.SAC_IGNORED_OPS) | {torch.ops.aten.empty.memory_format, torch.ops.aten.empty_like.default}
+        with patch.object(sac, "SAC_IGNORED_OPS", ignored):
+            self.assertEqual(census_layer(config, 1, 64, selective=True)[0], kept)
+
     def test_each_kind_gets_its_record(self):
         """
         Feature: census_activations.
         Description: The census of a stack of one linear-attention layer and
             one full-attention layer.
         Expectation: A record per kind, at the census's length, splitting
-            each layer's bytes between what TP splits and what it does not.
+            each layer's bytes between what TP splits and what it does not,
+            with and without selective checkpointing.
         """
         got = census_activations(_qwen35_text(), _STACK, 64)
         self.assertEqual(sorted(got), ["full_attention", "linear_attention"])
         for kind, index in (("linear_attention", 0), ("full_attention", 1)):
             record = got[kind]
             saved, working = census_layer(_qwen35_text(), index, 64)
+            kept, _ = census_layer(_qwen35_text(), index, 64, selective=True)
             self.assertEqual(record.seq_length, 64)
             self.assertAlmostEqual((record.saved + record.saved_tp) * 64, saved)
             self.assertAlmostEqual((record.working + record.working_tp) * 64, working)
+            self.assertAlmostEqual((record.selective + record.selective_tp) * 64, kept)
             self.assertGreater(record.saved_tp, 0)
+            self.assertGreater(record.selective_tp, 0)
 
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """
@@ -183,8 +234,11 @@ class TestKindActivations(unittest.TestCase):
         """
         record = {"saved": 2036.25, "saved_tp": 3812.5, "working": 2162.375, "working_tp": 3812.5,
                   "seq_length": 64}
-        spec = ModelSpec.from_dict(dict(_spec(linear_attention=record, full_attention=record),
+        selective = dict(record, selective=512.0, selective_tp=1024.5)
+        spec = ModelSpec.from_dict(dict(_spec(linear_attention=selective, full_attention=record),
                                          output_activations=record))
+        self.assertEqual(spec.activations["linear_attention"].to_dict(), selective)
+        self.assertEqual(spec.activations["full_attention"].to_dict(), record)
         self.assertIsInstance(spec.activations["linear_attention"], KindActivations)
         self.assertIsInstance(spec.output_activations, KindActivations)
         self.assertEqual(ModelSpec.from_dict(yaml.safe_load(yaml.safe_dump(spec.to_dict()))), spec)
@@ -201,6 +255,8 @@ class TestKindActivations(unittest.TestCase):
             ModelSpec.from_dict(_spec(linear_attention=dict(record, saved=-1.0)))
         with self.assertRaisesRegex(ModelSpecError, "lacks"):
             ModelSpec.from_dict(_spec(linear_attention={"saved": 1.0}))
+        with self.assertRaisesRegex(ModelSpecError, "without the other"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, selective=1.0)))
         with self.assertRaisesRegex(ModelSpecError, "decoder"):
             ModelSpec.from_dict(_spec(decoder=record))
         with self.assertRaisesRegex(ModelSpecError, "output_activations must map"):
@@ -284,6 +340,22 @@ class TestCensusPricing(unittest.TestCase):
         working = [value["_activ"] for key, value in log.items() if str(key[2]).startswith("rec_")]
         linear = census["linear_attention"]
         self.assertAlmostEqual(working[0], 4096 * (linear.working + linear.working_tp) / 2 ** 20, delta=1)
+
+    def test_a_selective_layer_is_priced_with_its_kinds_census(self):
+        """
+        Feature: the census on the memory path, under HyperParallel's
+            selective activation checkpointing.
+        Description: The hybrid model checkpointed selectively on one stage,
+            with a census.
+        Expectation: Each layer keeps what its kind keeps under the
+            trainer's selective policy for the micro-batch's 4096 tokens.
+        """
+        evaluator = _evaluator(_qwen35_text(), mode="selective", census=True)
+        census = evaluator.ccfg.census
+        log = evaluator.estimate_peak_insight()[0]["Node Log"]
+        for index, kind in enumerate(("linear_attention", "full_attention")):
+            kept = 4096 * (census[kind].selective + census[kind].selective_tp) / 2 ** 20
+            self.assertAlmostEqual(log[(0, 0, index, "S")]["_activ"], kept, delta=1)
 
 
 if __name__ == "__main__":
