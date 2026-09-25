@@ -1567,6 +1567,35 @@ class TestFsdpResharding(unittest.TestCase):
         kept = self._insight(1, reshards=False)["Node Log"]
         self.assertEqual(kept[(0, 0, "G_", "O")]["ag_comm"], kept[(0, 0, "", "O")]["ag_comm"])
 
+    def test_the_loss_runs_on_the_logits_the_trainer_gathers(self):
+        """
+        Feature: loss_parallel, stated by the Hyper parser and read by the
+            Qwen family's hook.
+        Description: A Qwen model at TP 2 with sequence parallelism, as
+            HyperParallel's trainer runs it by default, and with
+            accelerator.loss_parallel.
+        Expectation: By default every TP rank holds the logits whole: the
+            output layer's activations are not split; with loss_parallel
+            they are, over TP.
+        """
+        got = []
+        for accelerator in ({}, {"loss_parallel": True}):
+            config = _auto_models_config(accelerator=dict(
+                {"tp_size": 2, "ep_size": 1, "pp_size": 1, "sequence_parallel": True}, **accelerator))
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+                mock_hf.return_value = SimpleNamespace(
+                    model_type="qwen3", hidden_size=1024, num_hidden_layers=4, num_attention_heads=8,
+                    num_key_value_heads=8, intermediate_size=2816, vocab_size=32000,
+                    max_position_embeddings=4096,
+                )
+                with tempfile.TemporaryDirectory() as folder:
+                    path = os.path.join(folder, "train.yaml")
+                    with open(path, "w", encoding="utf-8") as handle:
+                        yaml.safe_dump(config, handle)
+                    ccfg = EvaluatorV2(path, framework="hyper_v2", log_level=0).ccfg
+            got.append((ccfg.loss_parallel, ccfg.shard_output_activ))
+        self.assertEqual(got, [(False, 1), (True, 2)])
+
     def test_the_root_gathers_both_tables(self):
         """
         Feature: gather_embed, the embedding table FSDP gathers.

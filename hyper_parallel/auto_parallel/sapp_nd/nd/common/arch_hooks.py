@@ -276,7 +276,9 @@ def custom_qwen(ccfg):
     # if "72b" in ccfg.model_name :
     #     ccfg.s = ccfg.s * 3/4
     ccfg.shard_recompute_input = ccfg.t
-    ccfg.shard_output_activ = ccfg.t
+    # The output layer's logits split over TP only where the loss runs on
+    # them sharded; otherwise every rank gathers them whole.
+    ccfg.shard_output_activ = ccfg.t if getattr(ccfg, "shards_logits", True) else 1
     # ccfg.bytes_grad = 4
 
 

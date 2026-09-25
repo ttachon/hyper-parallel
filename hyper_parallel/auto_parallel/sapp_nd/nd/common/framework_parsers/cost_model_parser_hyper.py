@@ -548,8 +548,10 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
         cc.layer_custom_config = [(cc.n_lay, None)]
-        # The language model's census is not the tower's.
+        # The language model's census is not the tower's, and the tower has
+        # no loss: its output keeps its family's sharding.
         cc.census = cc.kind_activations = cc.output_census = None
+        cc.loss_parallel, cc.shards_logits = None, True
         cc.offset = self._front_loaded_offset(cc.n_lay)
         return cc
 
@@ -840,6 +842,10 @@ class CostModelParserHyperV2(_CostModelParser):
             "accelerator",
             self._get_cfg_attr(legacy_train, "accelerator", Config({})),
         )
+        # The trainer's lm_head gathers the logits whole on every TP rank
+        # unless the loss runs on them sharded.
+        self.ccfg.loss_parallel = bool(self._get_cfg_attr(accel, "loss_parallel", False))
+        self.ccfg.shards_logits = self.ccfg.loss_parallel
         cp_algo = self._get_cfg_attr(accel, "context_parallel_algo", None)
         if cp_algo:
             self.ccfg.cp_algo = cp_algo
