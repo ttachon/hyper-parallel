@@ -473,8 +473,40 @@ def prepare_context():
     return ctx
 
 
+def _recomputed_comm(cfg, ctx, layer):
+    """TP, EP and CP volume a recomputed layer transfers again.
+
+    It is the communication whose buffers the layer's memory no longer keeps:
+    all of it for a fully recomputed layer, and for a selective one what its
+    switches drop, which the memory model's own terms give as the plain
+    volume less the selective one. Parameter traffic is not recomputed.
+    """
+    def _volumes(node):
+        ctx.current_node = node
+        return (
+            EvalLayerComm.tp_comm_layer(cfg, ctx, 1),
+            EvalLayerComm.ep_comm_layer(cfg, ctx, 1),
+            cp_comm_layer_detailed(cfg, ctx).comm_volume,
+        )
+
+    kept = ctx.current_node
+    try:
+        plain = _volumes(LayerType.NOT_REC_LAYER)
+        if layer == LayerType.FULL_REC_LAYER:
+            return plain
+        selective = _volumes(LayerType.SEL_REC_LAYER)
+        return tuple(whole - left for whole, left in zip(plain, selective))
+    finally:
+        ctx.current_node = kept
+
+
 def _accumulate_stage_comm(param, stage, stage_id):
-    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage."""
+    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage.
+
+    With ``param["with_recomp"]``, a recomputed layer also adds the volume its
+    recompute transfers again, the way the compute estimate counts a
+    recomputed op twice.
+    """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
     for chunk_id, chunk in enumerate(stage):
         for lay_id, layer in enumerate(chunk):
@@ -505,6 +537,11 @@ def _accumulate_stage_comm(param, stage, stage_id):
             # min(device_type.level_bound_number[0], param["cfg"].ep)
             # comm_cp += EvalLayerComm.cp_comm_layer
             # (param["cfg"], param["ctx"])
+            if param["with_recomp"] and layer in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER):
+                tp_again, ep_again, cp_again = _recomputed_comm(param["cfg"], param["ctx"], layer)
+                comm[Dim.TP] += tp_again
+                comm[Dim.EP] += ep_again
+                comm[Dim.CP] += cp_again
     return comm
 
 
@@ -519,6 +556,9 @@ def estimate_from_mem_comm(*args, **kwargs):
     }
     param["debugger"] = kwargs.get(
         "debugger", args[5] if len(args) > 5 else None
+    )
+    param["with_recomp"] = kwargs.get(
+        "with_recomp", args[4] if len(args) > 4 else False
     )
     param["ctx"] = prepare_context()
 
