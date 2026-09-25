@@ -266,11 +266,23 @@ python examples/training_demo/sweep_qwen3_5_moe.py --only classify --only compar
 |---|---|
 | `mirror` | makes every node's tree identical, excluding `output/` |
 | `data` | rebuilds the Indexed Dataset on every node at `--seq-len` |
-| `run` | launches each degree and waits on the kit's rc file, not the pid |
+| `run` | launches each strategy, waits on the kit's rc file, stops on the first dead node |
 | `fetch` | copies the profiles from the node holding `profiling.rank` |
 | `classify` | `nd.trace_classify` per run, merged into one CSV |
 | `compare` | `run_nd --real_csv`, printing measured against estimated shares |
 | `plot` | `sweep.pdf`/`.png`: the step split and the peak memory across the sweep |
+
+A strategy that dies is not waited out. One dead rank ends the job, but it
+does not end the other ranks: they wait in the collective it never joins until
+`HCCL_EXEC_TIMEOUT`, half an hour on this cluster. So the sweep watches for a
+node the kit reports as `DEAD` rather than for every node to stop running,
+kills what is left of that run, which is also what frees the devices for the
+next strategy, and moves on. It prints the exception it found in the failed
+nodes' logs, deduplicated across ranks, since the status line carries only
+each node's last log line and after a crash that is a stack frame rather than
+the cause. Failed strategies are listed together at the end of the pass and
+marked in `run_states.json`; the classify stage already skips a strategy that
+produced no profile.
 
 Memory is measured in its own pass. Recording the allocator history brackets
 the profiled window and moves both step time and idle, so `--profile-memory`

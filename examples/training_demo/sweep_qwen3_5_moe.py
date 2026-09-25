@@ -55,6 +55,10 @@ REPO_ROOT = DEMO_DIR.parent.parent
 DEFAULT_ENV = DEMO_DIR / "cluster_qwen3_5_moe.env"
 DEFAULT_CONFIG = DEMO_DIR / "train_qwen3_5_moe.yaml"
 RUN_ID_PATTERN = re.compile(r"run id\s*:\s*(\S+)")
+# One status line per node: "node0   192.168.0.55   DEAD (exit 1) | <last line>".
+NODE_STATE_PATTERN = re.compile(r"^node(\d+)\s+(\S+)\s+([^|]+?)\s*\|", re.MULTILINE)
+# Rank tag, stripped so one exception raised on 16 ranks collapses to one line.
+RANK_PREFIX_PATTERN = re.compile(r"^\[rank\d+\]:\s*")
 PEAK_PATTERN = re.compile(
     r"memory/device_max_allocated_gb=([0-9.]+).*?"
     r"memory/device_max_reserved_gb=([0-9.]+)"
@@ -335,12 +339,69 @@ def launch(sweep: Sweep, point: Point, memory: bool = False) -> Optional[str]:
     return found.group(1) if found else None
 
 
+def _node_states(text: str) -> List[Sequence[Any]]:
+    """Return ``(index, host, state)`` for every node in a status table."""
+    return [(int(m.group(1)), m.group(2), m.group(3).strip())
+            for m in NODE_STATE_PATTERN.finditer(text)]
+
+
+def _failure_reason(sweep: Sweep, run_id: Optional[str],
+                    indices: Sequence[int]) -> str:
+    """Return the distinct exceptions the failed nodes logged.
+
+    The status table carries each node's LAST log line, which after a crash is
+    a stack frame or a shutdown warning rather than the cause. The line that
+    says what happened is far above it, so find it here rather than leave the
+    reader to open a log on a node they would have to work out first.
+    """
+    if not run_id:
+        return ""
+    lines: List[str] = []
+    seen = set()
+    for index in indices:
+        if index >= len(sweep.env["nodes"]) or len(lines) >= 5:
+            break
+        log = f"{sweep.env['log_dir']}/{run_id}.node{index}.log"
+        # Case sensitive on purpose: it keeps out CANN's "[ERROR]" banners and
+        # "Inner Error!" lines, which repeat once per rank and say less than
+        # the Python exception they accompany.
+        found = subprocess.run(
+            ["ssh", f"{sweep.env['ssh_user']}@{sweep.env['nodes'][index]}",
+             f"grep -aE '(Error|Exception):' {shlex.quote(log)} | head -n 40"],
+            check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ).stdout or ""
+        for line in found.splitlines():
+            stripped = RANK_PREFIX_PATTERN.sub("", line.strip())
+            if not stripped or stripped in seen:
+                continue
+            seen.add(stripped)
+            lines.append(f"  node{index}: {stripped[:200]}")
+            if len(lines) >= 5:
+                break
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+def _stop_run(sweep: Sweep, run_id: Optional[str]) -> None:
+    """Stop what is left of a run so the next strategy gets the devices back."""
+    if run_id:
+        _run(sweep.kit("kill", run_id), check=False)
+
+
 def wait_for(sweep: Sweep, run_id: Optional[str]) -> str:
-    """Block until no node reports RUNNING, and return the final status text.
+    """Block until the run is over, and return the final status text.
 
     The kit detaches, so a launch returning says nothing about the job. Status
     is decided from the run's rc file before the pid, so a finished run cannot
     read as RUNNING again through pid reuse.
+
+    One dead rank ends the job, but it does not end the other ranks: they wait
+    in the collective it never joins until HCCL_EXEC_TIMEOUT, half an hour on
+    this cluster. Blocking until every node stops RUNNING therefore costs that
+    timeout for each failed strategy, and a sweep broken the same way at every
+    point pays it at every point. So a DEAD node ends the wait at the next
+    poll instead, and the survivors are killed rather than left to time out,
+    which is also what frees the devices for the next strategy.
     """
     command = sweep.kit("status", *([run_id] if run_id else []))
     deadline = time.monotonic() + sweep.args.timeout
@@ -349,10 +410,18 @@ def wait_for(sweep: Sweep, run_id: Optional[str]) -> str:
             command, check=False, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         ).stdout or ""
+        dead = [(index, state) for index, _host, state in _node_states(text)
+                if state.startswith("DEAD")]
+        if dead:
+            named = ", ".join(f"node{index} {state}" for index, state in dead)
+            reason = _failure_reason(sweep, run_id, [index for index, _ in dead])
+            _stop_run(sweep, run_id)
+            return f"{text}\nFAILED: {named}{reason}\n"
         if "RUNNING" not in text:
             return text
         if time.monotonic() > deadline:
-            return f"{text}\nTIMED OUT after {sweep.args.timeout}s\n"
+            _stop_run(sweep, run_id)
+            return f"{text}\nTIMED OUT after {sweep.args.timeout}s, run stopped\n"
         time.sleep(sweep.args.poll)
 
 
@@ -386,8 +455,14 @@ def run_pass(sweep: Sweep, memory: bool) -> Dict[str, Any]:
         run_id = launch(sweep, point, memory=memory)
         status = wait_for(sweep, run_id)
         print(status, flush=True)
-        results[point.tag] = {"run_id": run_id, "status": status,
-                              **point.dims, **harvest_peaks(sweep, run_id)}
+        results[point.tag] = {
+            "run_id": run_id, "status": status,
+            "failed": "\nFAILED:" in status or "TIMED OUT" in status,
+            **point.dims, **harvest_peaks(sweep, run_id)}
+    failed = [tag for tag, data in results.items() if data.get("failed")]
+    if failed:
+        print(f"\n{len(failed)} of {len(sweep.points)} strategies failed the "
+              f"{label} pass: {', '.join(failed)}", flush=True)
     return results
 
 
