@@ -58,6 +58,19 @@ class EvalUtils:
         return whole * ccfg.bytes_grad, sharded * ccfg.bytes_grad
 
     @staticmethod
+    def census_bytes(ctx: Context, tokens: float, kept: float, held: float) -> float:
+        """What a census states for *tokens*: what a layer keeps, *kept* bytes per token, or its working set.
+
+        As its backward's working set, the most that backward holds, *held*
+        per token; less what the layer keeps, and never below it, where the
+        stage's dynamic memory counts that already, as for a layer that
+        does not recompute.
+        """
+        if not ctx.working_set:
+            return tokens * kept
+        return tokens * (max(0.0, held - kept) if ctx.working_on_saved else held)
+
+    @staticmethod
     def mb(x: Union[float, dict, tuple]) -> int:
         """Convert Byte to MB"""
         if isinstance(x, dict):

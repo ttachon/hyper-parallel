@@ -29,7 +29,7 @@ import dataclasses
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from hyper_parallel.auto_parallel._layer_census import census_activations
+from hyper_parallel.auto_parallel._layer_census import census_activations, census_output_activations
 from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel._op_profiles import infer_arch, infer_qk_norm, resolve_ops
@@ -306,16 +306,18 @@ _CENSUSES: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
 
 def _census(text_config: Any, layers: Any, seq_length: int) -> Dict[str, Any]:
-    """The spec's ``activations``: a census of each layer kind of *layers*, once per config and length."""
+    """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
     key = (
         text_config.to_json_string(),
         tuple((group["kind"], int(group["count"]), bool(group.get("mtp"))) for group in layers),
         int(seq_length),
     )
     if key not in _CENSUSES:
-        logger.info("census of each layer kind at %d tokens", seq_length)
+        logger.info("census of each layer kind and of the output layer at %d tokens", seq_length)
+        kinds = census_activations(text_config, layers, seq_length)
         _CENSUSES[key] = {
-            kind: record.to_dict() for kind, record in census_activations(text_config, layers, seq_length).items()
+            "activations": {kind: record.to_dict() for kind, record in kinds.items()},
+            "output_activations": census_output_activations(text_config, seq_length).to_dict(),
         }
     return copy.deepcopy(_CENSUSES[key])
 
@@ -349,8 +351,10 @@ def resolve_hf_model_spec(
         model_raw: The ``model`` section, as a plain mapping.
         visual_seq_len: Optional override for the encoder sequence length.
         census_seq_len: The tokens to run a census of each layer kind of
-            the language model at (:mod:`hyper_parallel.auto_parallel._layer_census`),
-            which the spec states as ``"activations"``; 0 runs none.  The
+            the language model at, and of its output layer
+            (:mod:`hyper_parallel.auto_parallel._layer_census`), which the
+            spec states as ``"activations"`` and ``"output_activations"``;
+            0 runs none.  The
             census builds its layers from the checkpoint's config: a spec
             from ``config_overrides`` alone gets none, and an override of a
             model field does not reach it.
@@ -407,7 +411,7 @@ def resolve_hf_model_spec(
     spec.update(explicit)
     resolved = _validated(spec)
     if census_seq_len:
-        resolved["activations"] = _census(_text_tower(model_config), resolved["layers"], census_seq_len)
+        resolved.update(_census(_text_tower(model_config), resolved["layers"], census_seq_len))
         resolved = ModelSpec.from_dict(resolved).to_dict()
     return resolved
 

@@ -77,7 +77,12 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     resolve_hf_model_spec,
 )
 from hyper_parallel.auto_parallel._layer_stack import LinearAttentionDims, resolve_layers
-from hyper_parallel.auto_parallel._model_spec import activations_from_dict, layers_from_list, ops_from_dict
+from hyper_parallel.auto_parallel._model_spec import (
+    KindActivations,
+    activations_from_dict,
+    layers_from_list,
+    ops_from_dict,
+)
 from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH
 
 logger = logging.getLogger(__name__)
@@ -149,14 +154,16 @@ class CostModelParserHyperV2(_CostModelParser):
         self._model_seq_len = self._spec_int(spec, "max_position_embeddings")
 
     def _config_census(self, spec: Dict[str, Any]) -> None:
-        """Hold the census the spec states, and the record of a stack of one kind.
+        """Hold the census the spec states, the record of a stack of one kind, and the output layer's.
 
         The memory model prices a layer whose kind has a record with it,
-        rather than with its formulas.  A stack of several kinds binds each
-        kind's record as the layer priced becomes one of it (``arch_hooks``).
+        rather than with its formulas, and the output layer with its own.
+        A stack of several kinds binds each kind's record as the layer
+        priced becomes one of it (``arch_hooks``).
         """
-        census = spec.get("activations")
+        census, output = spec.get("activations"), spec.get("output_activations")
         self.ccfg.census = activations_from_dict(census) if census else None
+        self.ccfg.output_census = KindActivations.from_dict(output, "output_activations") if output else None
         kinds = self.ccfg.layer_stack.distinct_kinds()
         single = len(kinds) == 1 and self.ccfg.census
         self.ccfg.kind_activations = self.ccfg.census.get(kinds[0].name) if single else None
@@ -356,7 +363,7 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.n_mtp = 0
         cc.layer_binding = None
         # The language model's census is not the tower's.
-        cc.census = cc.kind_activations = None
+        cc.census = cc.kind_activations = cc.output_census = None
         self.config_layer_stack(cc, resolve_layers(
             VISION_ARCH, layers_from_list(vision_spec.get("layers"), "vision.layers"),
         ))

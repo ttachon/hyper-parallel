@@ -63,6 +63,8 @@ class _CostModVar:
     # parser or the arch hook binds; with none, the formulas price it.
     census: dict = None
     kind_activations: any = None
+    # The output layer's record, as the census states it.
+    output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
 

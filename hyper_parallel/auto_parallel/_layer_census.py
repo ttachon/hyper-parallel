@@ -26,6 +26,12 @@ keys, values, the cumulated gates, beta and one chunk matrix.  A layer built
 with half the heads and half the feed-forward widths, as a tensor-parallel
 rank of 2 holds it, tells the bytes tensor parallelism splits from those it
 does not.
+
+The output layer's census runs the final norm, the output projection and
+Transformers' causal-LM loss, which casts the logits to fp32, as
+HyperParallel's trainer runs them by default, dropping the model's logits
+before the backward as the trainer does; half the vocabulary tells the
+bytes a vocabulary-parallel loss splits.
 """
 from __future__ import annotations
 
@@ -302,6 +308,61 @@ def census_layer(config: Any, layer_index: int, seq_length: int) -> Tuple[int, i
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         return _measure(list(layer.parameters()), (hidden, grad),
                         lambda: _run(layer, hidden, rotary, seq_length), lambda out: out.backward(grad))
+
+
+def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
+    """Bytes the output layer of *config* keeps for its backward, and the most its backward holds.
+
+    Args:
+        config: The language model's Transformers config.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+
+    Returns:
+        As :func:`census_layer`: the final norm's input included, the
+        output table and its gradient left out.
+    """
+    modeling = _modeling(config)
+    layer_cls, _ = _classes(modeling)
+    loss_function = importlib.import_module("transformers.loss.loss_utils").ForCausalLMLoss
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        default = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            # The final norm is of the class of a layer's input norm.
+            norm = layer_cls(config, 0).input_layernorm
+            head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        finally:
+            torch.set_default_dtype(default)
+        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+        labels = torch.randint(0, config.vocab_size, (1, seq_length))
+        # The loss alone holds the logits: the trainer drops the model's
+        # output before the backward.
+        return _measure([*norm.parameters(), *head.parameters()], (hidden,),
+                        lambda: loss_function(head(norm(hidden)), labels, config.vocab_size),
+                        lambda loss: loss.backward())
+
+
+def census_output_activations(config: Any, seq_length: int = 4096) -> KindActivations:
+    """What the output layer of *config* keeps and holds, per token, with its vocabulary and half of it.
+
+    Args:
+        config: The language model's Transformers config.
+        seq_length: The tokens the census runs the layer at.
+
+    Returns:
+        The layer's :class:`KindActivations`, whose TP part is the part a
+        vocabulary-parallel loss over two ranks halves.
+    """
+    half = copy.deepcopy(config)
+    half.vocab_size = max(1, config.vocab_size // 2)
+    (saved_1, working_1), (saved_2, working_2) = (census_output(each, seq_length) for each in (config, half))
+    return KindActivations(
+        saved=max(0.0, 2 * saved_2 - saved_1) / seq_length,
+        saved_tp=max(0.0, 2 * (saved_1 - saved_2)) / seq_length,
+        working=max(0.0, 2 * working_2 - working_1) / seq_length,
+        working_tp=max(0.0, 2 * (working_1 - working_2)) / seq_length,
+        seq_length=int(seq_length),
+    )
 
 
 def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],

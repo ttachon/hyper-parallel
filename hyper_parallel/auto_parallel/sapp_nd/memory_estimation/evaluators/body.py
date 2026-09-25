@@ -194,20 +194,16 @@ class EvalBody:
     def census_activ(ccfg: CostModelConfig, ctx: Context, census: KindActivations) -> float:
         """A layer's activations, as the census of its kind measured them.
 
-        What the layer keeps between its passes; as its backward's working
-        set, the most its backward holds, less what it keeps where the
-        stage's dynamic memory counts that already, as for a layer that
-        does not recompute.  The census gives bytes per token of a CP
-        rank's share of the sequence: TP splits one part, sequence
-        parallelism the other.  A selective layer's switches drop parts the
-        census does not tell apart: its formulas price it.
+        What the layer keeps between its passes, or its backward's working
+        set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
+        of the sequence: TP splits one part, sequence parallelism the
+        other.  A selective layer's switches drop parts the census does not
+        tell apart: its formulas price it.
         """
         tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
         kept = census.saved / max(1, ccfg.sp) + census.saved_tp / max(1, ccfg.t)
-        if not ctx.working_set:
-            return tokens * kept
         held = census.working / max(1, ccfg.sp) + census.working_tp / max(1, ccfg.t)
-        return tokens * (max(0.0, held - kept) if ctx.working_on_saved else held)
+        return EvalUtils.census_bytes(ctx, tokens, kept, held)
 
     # Full recompute
 

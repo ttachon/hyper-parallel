@@ -27,6 +27,7 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     _measure,
     census_activations,
     census_layer,
+    census_output_activations,
     tp_config,
 )
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
@@ -155,6 +156,22 @@ class TestLayerCensus(unittest.TestCase):
             self.assertGreater(record.saved_tp, 0)
 
 
+    def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
+        """
+        Feature: census_output_activations.
+        Description: The output layer of the model with a vocabulary of
+            4096, which its logits outweigh.
+        Expectation: Per token and vocabulary entry, the layer keeps the
+            loss's fp32 log-probabilities and its backward holds three such
+            tensors: the part a vocabulary-parallel loss splits.
+        """
+        config = _qwen35_text()
+        config.vocab_size = 4096
+        record = census_output_activations(config, 48)
+        self.assertEqual((record.saved_tp, record.working_tp, record.seq_length), (4 * 4096, 12 * 4096, 48))
+        self.assertGreater(record.saved, 0)
+
+
 class TestKindActivations(unittest.TestCase):
     """The model spec states a census's records."""
 
@@ -167,8 +184,10 @@ class TestKindActivations(unittest.TestCase):
         """
         record = {"saved": 2036.25, "saved_tp": 3812.5, "working": 2162.375, "working_tp": 3812.5,
                   "seq_length": 64}
-        spec = ModelSpec.from_dict(_spec(linear_attention=record, full_attention=record))
+        spec = ModelSpec.from_dict(dict(_spec(linear_attention=record, full_attention=record),
+                                         output_activations=record))
         self.assertIsInstance(spec.activations["linear_attention"], KindActivations)
+        self.assertIsInstance(spec.output_activations, KindActivations)
         self.assertEqual(ModelSpec.from_dict(yaml.safe_load(yaml.safe_dump(spec.to_dict()))), spec)
 
     def test_a_record_is_checked(self):
@@ -185,6 +204,8 @@ class TestKindActivations(unittest.TestCase):
             ModelSpec.from_dict(_spec(linear_attention={"saved": 1.0}))
         with self.assertRaisesRegex(ModelSpecError, "decoder"):
             ModelSpec.from_dict(_spec(decoder=record))
+        with self.assertRaisesRegex(ModelSpecError, "output_activations must map"):
+            ModelSpec.from_dict(dict(_spec(), output_activations=[1.0]))
 
 
 class TestCensusPricing(unittest.TestCase):
@@ -206,32 +227,38 @@ class TestCensusPricing(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(sorted(spec["activations"]), ["full_attention", "linear_attention"])
         self.assertEqual(spec["activations"]["linear_attention"]["seq_length"], 48)
+        self.assertEqual(spec["output_activations"]["seq_length"], 48)
         overrides = {"name": "llama", "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
                      "intermediate_size": 128, "vocab_size": 128}
         with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING"):
             plain = resolve_hf_model_spec({"config_overrides": overrides}, census_seq_len=48)
         self.assertNotIn("activations", plain)
+        self.assertNotIn("output_activations", plain)
 
     def test_each_kind_binds_its_record(self):
         """
         Feature: the Hyper parser's context.census.
         Description: The hybrid model parsed with a census and without, and
             its vision-language checkpoint trained with its tower.
-        Expectation: With it, the config holds each kind's record at the
-            dataset's length and each kind binds its own, the tower none;
-            without it, there is none.
+        Expectation: With it, the config holds each kind's record and the
+            output layer's at the dataset's length, and each kind binds its
+            own; the tower holds none; without it, there is none.
         """
         ccfg = _evaluator(_qwen35_text(), census=True).ccfg
         self.assertEqual({record.seq_length for record in ccfg.census.values()}, {4096})
+        self.assertEqual(ccfg.output_census.seq_length, 4096)
         self.assertIsNone(ccfg.kind_activations)
         bind_layer_stack(ccfg)
         for kind, fields in ccfg.layer_binding.items():
             self.assertIs(fields["kind_activations"], ccfg.census[kind])
-        self.assertIsNone(_evaluator(_qwen35_text()).ccfg.census)
+        plain = _evaluator(_qwen35_text()).ccfg
+        self.assertIsNone(plain.census)
+        self.assertIsNone(plain.output_census)
         towers = _evaluator(_qwen35(_qwen35_text()), target=_IMAGE_TEXT, census=True).ccfg.mm_ccfgs
         self.assertEqual(towers["text"].census, ccfg.census)
-        self.assertIsNone(towers["vision"].census)
-        self.assertIsNone(towers["vision"].kind_activations)
+        self.assertEqual(towers["text"].output_census, ccfg.output_census)
+        for name in ("census", "kind_activations", "output_census"):
+            self.assertIsNone(getattr(towers["vision"], name))
 
     def test_a_layer_is_priced_with_its_kinds_census(self):
         """
@@ -239,15 +266,21 @@ class TestCensusPricing(unittest.TestCase):
         Description: The hybrid model without recompute on one stage, and
             fully recomputed on two, each with a census.
         Expectation: Each layer keeps its kind's census bytes for the
-            micro-batch's 4096 tokens; the first stage's last layer, which
-            recomputes, holds its kind's working set in its backward.
+            micro-batch's 4096 tokens, and the output layer its own; the
+            output layer's backward holds what its census states beyond
+            that; the first stage's last layer, which recomputes, holds its
+            kind's working set in its backward.
         """
         evaluator = _evaluator(_qwen35_text(), census=True)
-        census = evaluator.ccfg.census
+        census, output = evaluator.ccfg.census, evaluator.ccfg.output_census
         log = evaluator.estimate_peak_insight()[0]["Node Log"]
         for index, kind in enumerate(("linear_attention", "full_attention")):
             kept = 4096 * (census[kind].saved + census[kind].saved_tp) / 2 ** 20
             self.assertAlmostEqual(log[(0, 0, index, "N")]["_activ"], kept, delta=1)
+        kept = output.saved + output.saved_tp
+        self.assertAlmostEqual(log[(0, 0, "", "O")]["_activ"], 4096 * kept / 2 ** 20, delta=1)
+        held = output.working + output.working_tp - kept
+        self.assertAlmostEqual(log[(0, 0, "G_", "O")]["_activ"], 4096 * held / 2 ** 20, delta=1)
         log = _evaluator(_qwen35_text(), mode="full", pp=2, census=True).estimate_peak_insight()[0]["Node Log"]
         working = [value["_activ"] for key, value in log.items() if str(key[2]).startswith("rec_")]
         linear = census["linear_attention"]

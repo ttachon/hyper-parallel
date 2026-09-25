@@ -247,6 +247,8 @@ class KindActivations:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
         """Build a record, refusing a key it does not know, a missing one or a negative size."""
+        if not isinstance(data, Mapping):
+            raise ModelSpecError(f"{where} must map the record's fields to their values, got {data!r}")
         names = [spec_field.name for spec_field in fields(cls)]
         unknown = sorted(set(data) - set(names))
         missing = [name for name in names if name not in data]
@@ -346,6 +348,9 @@ class ModelSpec:
             holds in it, per token, as a census measures them; the memory
             model prices a layer of a kind stated here with them rather
             than its formulas.
+        output_activations: The same record for the output layer, the final
+            norm, the output projection and the loss; its TP part is the
+            part a vocabulary-parallel loss splits.
     """
 
     name: str
@@ -392,6 +397,7 @@ class ModelSpec:
     layers: Optional[Tuple[LayerGroup, ...]] = None
     layer_types: Optional[Tuple[str, ...]] = None
     activations: Optional[Dict[str, KindActivations]] = None
+    output_activations: Optional[KindActivations] = None
 
     vision: Optional[VisionSpec] = None
 
@@ -503,7 +509,7 @@ class ModelSpec:
         """
         out: Dict[str, Any] = {}
         for spec_field in fields(self):
-            if spec_field.name in ("vision", "ops", "layers", "layer_types", "activations"):
+            if spec_field.name in ("vision", "ops", "layers", "layer_types", "activations", "output_activations"):
                 continue
             value = getattr(self, spec_field.name)
             if value is not None:
@@ -516,6 +522,8 @@ class ModelSpec:
             out["layer_types"] = list(self.layer_types)
         if self.activations is not None:
             out["activations"] = {kind: record.to_dict() for kind, record in self.activations.items()}
+        if self.output_activations is not None:
+            out["output_activations"] = self.output_activations.to_dict()
         if self.vision is not None:
             out["vision"] = self.vision.to_dict()
         return out
@@ -578,6 +586,8 @@ class ModelSpec:
             return layers_from_list(value)
         if key == "activations":
             return activations_from_dict(value)
+        if key == "output_activations":
+            return KindActivations.from_dict(value, key)
         if key == "ffn_dim_multiplier":
             return float(value)
         if key in ("attn_output_gate", "tie_word_embeddings", "qk_norm"):
