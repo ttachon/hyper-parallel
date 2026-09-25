@@ -155,7 +155,6 @@ class TestLayerCensus(unittest.TestCase):
             self.assertAlmostEqual((record.working + record.working_tp) * 64, working)
             self.assertGreater(record.saved_tp, 0)
 
-
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """
         Feature: census_output_activations.

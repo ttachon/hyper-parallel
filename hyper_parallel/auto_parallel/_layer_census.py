@@ -39,12 +39,12 @@ import copy
 import importlib
 import inspect
 import weakref
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_flatten
+import torch  # pylint: disable=forbidden-backend-import
+from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forbidden-backend-import
+from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
+from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.auto_parallel._model_spec import KindActivations
 
@@ -66,7 +66,9 @@ class _FlashAttention(torch.autograd.Function):
     """Flash attention's saved set, shapes only: its inputs, its output and two fp32 statistics."""
 
     @staticmethod
-    def forward(ctx, query, key, value):  # pylint: disable=arguments-differ
+    def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor,  # pylint: disable=arguments-differ
+                value: torch.Tensor) -> torch.Tensor:
+        """Save the inputs, an output of the queries' shape and the statistics; return that output."""
         out = torch.empty_like(query)
         batch, heads, seq, _ = query.shape
         stats = [torch.empty(batch, heads, seq, _FLASH_STATS, dtype=torch.float32, device=query.device)
@@ -75,7 +77,10 @@ class _FlashAttention(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad):  # pylint: disable=arguments-differ,unused-argument
+    def backward(ctx: Any,  # pylint: disable=arguments-differ
+                 grad: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return gradients of the inputs' shapes."""
+        del grad
         query, key, value = ctx.saved_tensors[:3]
         return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
 
@@ -89,7 +94,9 @@ class _GatedDeltaRule(torch.autograd.Function):
     """HyperParallel's chunked gated-delta-rule kernel's saved set, shapes only."""
 
     @staticmethod
-    def forward(ctx, query, key, value, gate, beta, chunk):  # pylint: disable=arguments-differ
+    def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor,  # pylint: disable=arguments-differ
+                value: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor, chunk: int) -> torch.Tensor:
+        """Save the inputs, the cumulated gates, beta and a chunk matrix; return an output of the values' shape."""
         batch, seq, heads, _ = key.shape
         gates = torch.empty(batch, seq, heads, dtype=torch.float32, device=query.device)
         chunks = torch.empty(batch, seq, heads, chunk, dtype=key.dtype, device=query.device)
@@ -98,17 +105,23 @@ class _GatedDeltaRule(torch.autograd.Function):
         return torch.empty_like(value)
 
     @staticmethod
-    def backward(ctx, grad):  # pylint: disable=arguments-differ,unused-argument
+    def backward(ctx: Any,  # pylint: disable=arguments-differ
+                 grad: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
+        """Return gradients of the inputs' shapes, and none of the chunk size."""
+        del grad
         query, key, value, gates, beta, _ = ctx.saved_tensors
         return (torch.empty_like(query), torch.empty_like(key), torch.empty_like(value),
                 torch.empty_like(gates), torch.empty_like(beta), None)
 
 
-def _gated_delta_rule(modeling: Any):
+def _gated_delta_rule(modeling: Any) -> Callable[..., Tuple[torch.Tensor, None]]:
     """The drop-in for a Transformers ``chunk_gated_delta_rule`` running :class:`_GatedDeltaRule`."""
     l2norm = getattr(modeling, "l2norm", None)
 
-    def run(query, key, value, g, beta, chunk_size=64, use_qk_l2norm_in_kernel=False, **_kwargs):
+    def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
+            chunk_size: int = 64, use_qk_l2norm_in_kernel: bool = False,
+            **_kwargs: Any) -> Tuple[torch.Tensor, None]:
+        """Run the kernel's contract as Transformers calls its kernel, with no final state."""
         if use_qk_l2norm_in_kernel and l2norm is not None:
             query, key = l2norm(query, dim=-1, eps=1e-6), l2norm(key, dim=-1, eps=1e-6)
         return _GatedDeltaRule.apply(query, key, value, g, beta, chunk_size), None
@@ -119,7 +132,8 @@ def _gated_delta_rule(modeling: Any):
 class _LiveBytes(TorchDispatchMode):
     """The storages the ops it sees allocate, and the bytes they hold while they live."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Start with no storage counted."""
         super().__init__()
         self.sizes: Dict[Tuple[int, int], int] = {}
         self.generation: Dict[int, int] = {}
