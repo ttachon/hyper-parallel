@@ -235,7 +235,7 @@ and the memory module.
 | Optimizer shard | `shard_p_os_non_exp_partial`, `shard_p_os_non_exp`, `shard_grad_non_exp` | Non-expert parameter, optimizer-state, and gradient sharding factors |
 | Expert shard | `shard_p_os_exp_partial`, `shard_p_os_exp`, `shard_grad_exp` | Expert parameter, optimizer-state, and gradient sharding factors |
 | Communication | `comm_d_non_exp`, `comm_d_exp`, `comm_t`, `comm_ep`, `comm_cp` | Formula switches for DP, TP, EP, and CP communication memory |
-| Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches |
+| Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches; a tied embedding (`tie_emb_out`) shares the output layer's table only without pipeline parallelism, where both run on one stage |
 | MTP flags | `n_mtp`, `is_mtp_in_offset`, `is_shard_mtp_param` | Multi-token prediction layer placement and sharding controls |
 | Batch | `b`, `m`, `gbs` | Micro batch size, number of micro batches, and global batch size |
 | Activation shard | `shard_embed`, `shard_output_activ`, `shard_recompute_input` | Embedding, output activation, and recompute input sharding factors |
