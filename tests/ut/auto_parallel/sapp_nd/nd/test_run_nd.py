@@ -1506,6 +1506,30 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(len(bulk_comm), 2)
         self.assertIn(Debug.PerfParts.EP_COMM, bulk_debugger.info)
 
+    def test_time_path_counts_a_moe_layers_experts(self) -> None:
+        """
+        Feature: comm_time.prepare_context.
+        Description: Count a MoE layer's parameters through the time path's
+            context, on the DeepSeek yaml, whose experts run on two
+            data-parallel ranks with optimizer sharding.
+        Expectation: The routed and shared experts are counted as the memory
+            path counts them, and the layer's DP term carries them.
+        """
+        ccfg = CostModelConfig(config_path)
+        ArchHooks.check_and_apply_custom_hook(ccfg)
+        # DeepSeek's layer groups are its dense layers, its MoE layers and its MTP layer.
+        _, hook_moe = ccfg.layer_custom_config[1]
+        hook_moe(ccfg)
+        ctx = CommTime.prepare_context()
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        _, routed, shared = CommTime.EvalBody.num_params_layer(ccfg, ctx)
+        self.assertGreater(routed, 0)
+        self.assertEqual(routed, CommTime.EvalFFn.num_params_routed_expert(ccfg, ctx))
+        self.assertEqual(shared, CommTime.EvalFFn.num_params_shared_expert(ccfg, ctx))
+        self.assertGreater(
+            CommTime.EvalLayerComm.dp_comm_layer(ccfg, ctx), CommTime.EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
+        )
+
     def test_comm_overlap_fields_in_parsers(self) -> None:
         """
         Feature: TestSappNDRunND.

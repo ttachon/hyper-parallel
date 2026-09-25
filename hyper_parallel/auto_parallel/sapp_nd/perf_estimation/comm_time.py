@@ -455,6 +455,9 @@ def prepare_context():
     ctx = Context()
     ctx.attn_num_p = EvalAttn.num_params_attn
     ctx.ffn_num_p = EvalFFn.num_params_ffn
+    # A MoE layer's experts, counted as the memory path's eval config counts them.
+    ctx.ffn_routed_num_p = EvalFFn.num_params_routed_expert
+    ctx.ffn_shared_num_p = EvalFFn.num_params_shared_expert
     ctx.norm_num_p = EvalNorm.num_params_norm
 
     ctx.node_eval[LayerType.EMBEDDING_LAYER] = NodeEval(
