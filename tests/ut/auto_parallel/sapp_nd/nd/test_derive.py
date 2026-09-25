@@ -229,6 +229,21 @@ class TestDeriveFamily(unittest.TestCase):
             got.append(ccfg.reshards)
         self.assertEqual(got, [False, True, False])
 
+    def test_accumulates_grads(self):
+        """
+        Feature: derive_byte_widths, gradient accumulation without a pipeline.
+        Description: A run that states nothing, and one that states it holds
+            its gradients without pipeline parallelism.
+        Expectation: The family accumulates only in a pipeline; what a run
+            states wins, and at PP 1 its gradients then take memory.
+        """
+        got = []
+        for facts in ({}, {"grad_accumulation": True}):
+            ccfg = _config(p=1, **facts)
+            derive(ccfg)
+            got.append((ccfg.accumulates_grads, ccfg.bytes_grad > 0))
+        self.assertEqual(got, [(False, False), (True, True)])
+
     def test_deferred_grad_accumulation(self):
         """
         Feature: derive_resharding, the gradients FSDP holds back.

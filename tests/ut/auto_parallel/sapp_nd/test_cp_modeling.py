@@ -3171,6 +3171,24 @@ class TestDimensionsValidationBranches(unittest.TestCase):
         plat_marks=["cpu_linux"], level_mark="level0",
         card_mark="onecard", essential_mark="unessential",
     )
+    def test_accumulating_run_takes_micro_batches_without_pipeline(self):
+        """PP=1 & MBN>1 → valid in a run that accumulates gradients, its accumulation steps."""
+        dims = [(Dim.MBN, 2), (Dim.PP, 1)]
+        self.assertTrue(Dim.Dimensions(dims, accumulates=True).is_valid())
+        self.assertFalse(Dim.Dimensions(dims).is_valid())
+
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="unessential",
+    )
+    def test_accumulating_run_keeps_a_micro_batch_per_stage(self):
+        """MBN < PP stays invalid whether the run accumulates or not."""
+        self.assertFalse(Dim.Dimensions([(Dim.MBN, 1), (Dim.PP, 2)], accumulates=True).is_valid())
+
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="unessential",
+    )
     def test_check_power_of_two_rejects_non_power(self):
         """value=3 (not power of 2) → _check_power_of_two returns False."""
         self.assertFalse(Dim.Dimensions._check_power_of_two(Dim.TP, 3))
