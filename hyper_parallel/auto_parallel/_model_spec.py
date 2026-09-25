@@ -222,6 +222,12 @@ def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_dept
         raise ModelSpecError(f"{where} list {mtp} MTP layers, but mtp_depth is {mtp_depth}")
 
 
+# The fields a census record states in pairs: what a layer keeps under
+# HyperParallel's selective activation checkpointing, and the shares of its
+# matmul FLOPs that recomputes.
+_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"))
+
+
 @dataclass(frozen=True)
 class KindActivations:
     """What one layer of a kind keeps for its backward, and the most its backward holds, per token.
@@ -234,7 +240,10 @@ class KindActivations:
     which the memory model counts on its own.  ``selective`` and
     ``selective_tp`` are what the layer keeps under HyperParallel's selective
     activation checkpointing, whose backward recomputes the rest and holds
-    the same working set; a record states both or neither.
+    the same working set, and ``selective_attention_mm`` and
+    ``selective_ffn_mm`` the shares of the FLOPs of its attention's
+    projections and of the rest of its matmuls that recomputes; a record
+    states each pair whole or not at all.
     """
 
     saved: float
@@ -244,28 +253,37 @@ class KindActivations:
     seq_length: int
     selective: Optional[float] = None
     selective_tp: Optional[float] = None
+    selective_attention_mm: Optional[float] = None
+    selective_ffn_mm: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Return the record as a plain mapping, the selective part only when stated."""
         return {spec_field.name: getattr(self, spec_field.name) for spec_field in fields(self)
                 if getattr(self, spec_field.name) is not None}
 
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
-        """Build a record, refusing a key it does not know, a missing one or a negative size."""
-        if not isinstance(data, Mapping):
-            raise ModelSpecError(f"{where} must map the record's fields to their values, got {data!r}")
-        names = [spec_field.name for spec_field in fields(cls)]
-        optional = ("selective", "selective_tp")
+    @staticmethod
+    def _check_keys(data: Mapping[str, Any], names: Tuple[str, ...], where: str) -> None:
+        """Raise unless *data* states the fields of *names*, each of :data:`_PAIRED` whole or not at all."""
         unknown = sorted(set(data) - set(names))
-        missing = [name for name in names if name not in data and name not in optional]
+        missing = [name for name in names if name not in data and all(name not in pair for pair in _PAIRED)]
         if unknown or missing:
             raise ModelSpecError(f"{where} has unknown keys {unknown} and lacks {missing}")
-        if len({data.get(name) is None for name in optional}) > 1:
-            raise ModelSpecError(f"{where} states one of {list(optional)} without the other")
+        for pair in _PAIRED:
+            if len({data.get(name) is None for name in pair}) > 1:
+                raise ModelSpecError(f"{where} states one of {list(pair)} without the other")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
+        """Build a record, refusing a key it does not know, a missing one, a negative size or a share above 1."""
+        if not isinstance(data, Mapping):
+            raise ModelSpecError(f"{where} must map the record's fields to their values, got {data!r}")
+        names = tuple(spec_field.name for spec_field in fields(cls))
+        cls._check_keys(data, names, where)
         sizes = {name: float(data[name]) for name in names if name != "seq_length" and data.get(name) is not None}
         if any(size < 0 for size in sizes.values()):
             raise ModelSpecError(f"{where}: bytes per token cannot be negative, got {sizes}")
+        if any(sizes.get(name, 0) > 1 for name in _PAIRED[1]):
+            raise ModelSpecError(f"{where}: a share of FLOPs cannot exceed 1, got {sizes}")
         return cls(seq_length=_as_count(data["seq_length"], f"{where}.seq_length"), **sizes)
 
 

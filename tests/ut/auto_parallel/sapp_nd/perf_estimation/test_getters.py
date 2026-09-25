@@ -27,7 +27,7 @@ from unittest.mock import patch
 import yaml
 
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
-from hyper_parallel.auto_parallel._model_spec import OpCounts
+from hyper_parallel.auto_parallel._model_spec import KindActivations, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
@@ -37,6 +37,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils imp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_comp
@@ -45,6 +46,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_model_order,
     get_recomp_factor,
     get_table_quantity,
+    selective_shares,
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
@@ -376,6 +378,27 @@ class TestSelectiveRecompute(unittest.TestCase):
         once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False)
         again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True)
         self.assertEqual(again - once, 10.0, f"without recompute {once}, with recompute {again}")
+
+    def test_a_census_prices_the_matmuls_hyperparallels_policy_runs_again(self):
+        """
+        A selective layer of HyperParallel's policy, whose kind's census
+        states the shares of its attention's and feed-forward's matmul FLOPs
+        the policy runs again, prices that share of each again, beside the
+        ops its switches recompute; a full layer, and a selective one of
+        other switches, have no shares.
+        """
+        census = KindActivations(1.0, 1.0, 1.0, 1.0, 4096, selective_attention_mm=0.25, selective_ffn_mm=0.5)
+        lccfg = SimpleNamespace(n_softmax=1, n_attMM=1, n_ffMM=1, kind_activations=census,
+                                rec_op=Config(dict(HYPER_SELECTIVE_REC_OP)))
+        table = {"n_softmax": 10.0, "n_attMM": 1000.0, "n_ffMM": 100.0}
+        shares = selective_shares(lccfg, LayerType.SEL_REC_LAYER)
+        self.assertEqual(shares, {"attMM": 0.25, "ffMM": 0.5})
+        once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False, shares=shares)
+        again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True, shares=shares)
+        self.assertEqual(again - once, 10.0 + 250.0 + 50.0)
+        self.assertEqual(selective_shares(lccfg, LayerType.FULL_REC_LAYER), {})
+        lccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP, ffAct=1))
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER), {})
 
 
 if __name__ == "__main__":

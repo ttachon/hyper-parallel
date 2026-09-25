@@ -28,7 +28,8 @@ rank of 2 holds it, tells the bytes tensor parallelism splits from those it
 does not.  Run again under HyperParallel's selective activation checkpointing,
 its own checkpoint and policy, a layer keeps its input and the outputs the
 policy saves: every other matmul's, the attention kernel's and the
-convolution's.
+convolution's; the matmuls it does not save its backward runs again, a share
+of the attention's projections and of the rest of the layer.
 
 The output layer's census runs the final norm, the output projection and
 Transformers' causal-LM loss, which casts the logits to fp32, as
@@ -38,12 +39,13 @@ bytes a vocabulary-parallel loss splits.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import importlib
 import inspect
 import weakref
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forbidden-backend-import
@@ -271,8 +273,47 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
     return kept if checkpointed else sum(saved.values()), live.peak(start, left_out, grads)
 
 
-def _selective_contexts() -> Tuple[Any, Any]:
-    """HyperParallel's selective checkpointing contexts, its policy saving the census's flash attention."""
+def _matmul_flops(func: Any, args: Sequence[Any]) -> int:
+    """The FLOPs of *func* on *args* where it is a matmul, and 0 otherwise."""
+    if func not in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default,
+                    torch.ops.aten._grouped_mm.default):  # pylint: disable=protected-access
+        return 0
+    first, second = args[1:3] if func is torch.ops.aten.addmm.default else args[:2]
+    return 2 * first.numel() * second.shape[-1]
+
+
+class _RecomputedMatmuls:
+    """The matmul FLOPs a layer's selective forward saves and leaves to run again, its attention's and the rest's."""
+
+    def __init__(self, layer: Any) -> None:
+        """Tell the attention's parameters, those of a child named for it, from the rest of *layer*'s."""
+        self.attention = {param.untyped_storage()._cdata  # pylint: disable=protected-access
+                          for name, param in layer.named_parameters()
+                          if "attn" in name.split(".")[0] or "attention" in name.split(".")[0]}
+        self.flops: Dict[Tuple[bool, bool], int] = {}
+
+    def note(self, func: Any, args: Sequence[Any], policy: CheckpointPolicy) -> None:
+        """Count the FLOPs of a matmul the policy decided on, by part and by whether it runs again."""
+        flops = _matmul_flops(func, args)
+        if flops:
+            attention = any(isinstance(arg, torch.Tensor)
+                            and arg.untyped_storage()._cdata in self.attention  # pylint: disable=protected-access
+                            for arg in args)
+            key = (attention, policy == CheckpointPolicy.MUST_RECOMPUTE)
+            self.flops[key] = self.flops.get(key, 0) + flops
+
+    def share(self, attention: bool) -> float:
+        """The share of the attention's matmul FLOPs, or of the rest's, that runs again."""
+        again = self.flops.get((attention, True), 0)
+        total = again + self.flops.get((attention, False), 0)
+        return again / total if total else 0.0
+
+
+def _selective_contexts(ledger: Optional[_RecomputedMatmuls] = None) -> Tuple[Any, Any]:
+    """HyperParallel's selective checkpointing contexts, its policy saving the census's flash attention.
+
+    Its forward decisions on matmuls go to *ledger*, if given.
+    """
     # HyperParallel's distributed package, which holds the policy, takes as
     # long to import as the rest of the cost model: it loads only when a
     # census runs.
@@ -282,8 +323,12 @@ def _selective_contexts() -> Tuple[Any, Any]:
     def census_policy(ctx: Any, func: Any, *args: Any, **kwargs: Any) -> CheckpointPolicy:
         """The trainer's policy, which saves the census's flash attention as it saves the runtime's."""
         if func is torch.ops.nd_census.flash_attention.default:
-            return CheckpointPolicy.MUST_SAVE
-        return policy(ctx, func, *args, **kwargs)
+            decision = CheckpointPolicy.MUST_SAVE
+        else:
+            decision = policy(ctx, func, *args, **kwargs)
+        if ledger is not None and not ctx.is_recompute:
+            ledger.note(func, args, decision)
+        return decision
 
     return activation_memory.create_selective_checkpoint_contexts(census_policy)
 
@@ -344,22 +389,9 @@ def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
     return out[0] if isinstance(out, tuple) else out
 
 
-def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False) -> Tuple[int, int]:
-    """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
-
-    Args:
-        config: The language model's Transformers config.
-        layer_index: The layer to build, which settles its kind.
-        seq_length: Tokens of the micro-batch of one sequence it runs.
-        selective: Whether the layer runs under HyperParallel's selective
-            activation checkpointing, as its trainer wraps a layer.
-
-    Returns:
-        The bytes the forward keeps for the backward, its input included,
-        and the bytes of activations the backward holds when it holds the
-        most, its own gradients included, less the parameters and those
-        gradients.
-    """
+@contextlib.contextmanager
+def _fake_layer(config: Any, layer_index: int) -> Iterator[Tuple[Any, Any]]:
+    """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels."""
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
     config = copy.deepcopy(config)
@@ -378,6 +410,26 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
             if hasattr(module, "chunk_gated_delta_rule"):
                 module.chunk_gated_delta_rule = _gated_delta_rule(modeling)
         layer.train()
+        yield layer, rotary
+
+
+def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False) -> Tuple[int, int]:
+    """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+        selective: Whether the layer runs under HyperParallel's selective
+            activation checkpointing, as its trainer wraps a layer.
+
+    Returns:
+        The bytes the forward keeps for the backward, its input included,
+        and the bytes of activations the backward holds when it holds the
+        most, its own gradients included, less the parameters and those
+        gradients.
+    """
+    with _fake_layer(config, layer_index) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         if not selective:
@@ -392,6 +444,29 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         return _measure(list(layer.parameters()), (hidden,), lambda: _run(layer, hidden, positions, call),
                         lambda out: out.backward(grad), grad_inputs=(grad,), checkpointed=True,
                         shared=tree_flatten(positions)[0])
+
+
+def census_recomputed(config: Any, layer_index: int, seq_length: int) -> Tuple[float, float]:
+    """The shares of layer *layer_index*'s matmul FLOPs its backward runs again under selective checkpointing.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+
+    Returns:
+        The share of its attention's projections' FLOPs, and of the rest of
+        the layer's, that HyperParallel's selective policy recomputes: it
+        saves every other matmul's output, in the order the layer runs
+        them, and a biased projection's always.
+    """
+    with _fake_layer(config, layer_index) as (layer, rotary):
+        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+        ledger = _RecomputedMatmuls(layer)
+        call = functools.partial(activation_memory.checkpoint, layer, swap_inputs=False,
+                                 context_fn=functools.partial(_selective_contexts, ledger))
+        _run(layer, hidden, _positions(rotary, hidden, seq_length), call)
+    return ledger.share(attention=True), ledger.share(attention=False)
 
 
 def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
@@ -462,7 +537,8 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
         holds, the part TP splits is half the part at TP 1; what it keeps
-        under HyperParallel's selective activation checkpointing too.
+        under HyperParallel's selective activation checkpointing too, and
+        the shares of its matmul FLOPs that recomputes.
     """
     firsts: Dict[str, int] = {}
     index = 0
@@ -477,6 +553,7 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
             census_layer(tp_config(config, tp), layer_index, seq_length) for tp in (1, 2))
         (kept_1, _), (kept_2, _) = (
             census_layer(tp_config(config, tp), layer_index, seq_length, selective=True) for tp in (1, 2))
+        attention_mm, ffn_mm = census_recomputed(config, layer_index, seq_length)
         out[kind] = KindActivations(
             saved=max(0.0, 2 * saved_2 - saved_1) / seq_length,
             saved_tp=max(0.0, 2 * (saved_1 - saved_2)) / seq_length,
@@ -485,5 +562,7 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
             seq_length=int(seq_length),
             selective=max(0.0, 2 * kept_2 - kept_1) / seq_length,
             selective_tp=max(0.0, 2 * (kept_1 - kept_2)) / seq_length,
+            selective_attention_mm=attention_mm,
+            selective_ffn_mm=ffn_mm,
         )
     return out
