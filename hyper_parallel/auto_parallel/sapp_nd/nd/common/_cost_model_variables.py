@@ -124,6 +124,9 @@ class _CostModVar:
     # Recurrent-state update and readout, the linear-attention op. Zero for
     # every other flavour.
     n_linrec: float = 0
+    # The QK-norm a layer runs: 1 where the model normalizes each head's
+    # queries and keys (derive, from qk_norm), 0 on a linear-attention layer.
+    n_qknorm: float = 0
     n_mtp: float = 0
     is_mtp_in_offset: bool = True
     multiple_of: float = 0
@@ -188,6 +191,8 @@ class _CostModVar:
     freeze: bool = False
     has_fa: bool = False
     attn_output_gate: bool = False
+    # Whether attention normalizes each head's queries and keys (Qwen3).
+    qk_norm: bool = False
     # vp_less_mem: bool = False
     has_clip: bool = False
     gmm: bool = False

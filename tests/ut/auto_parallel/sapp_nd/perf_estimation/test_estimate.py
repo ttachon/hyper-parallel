@@ -74,6 +74,18 @@ class TestOpTable(unittest.TestCase):
         for op in ("n_attMM", "n_ffMM", "n_gather", "n_normOp", "n_ffAct"):
             self.assertEqual(long[op], 2 * short[op], f"{op}: s=128 gives {short[op]}, s=256 gives {long[op]}")
 
+    def test_a_qk_norm_runs_over_every_head(self):
+        """
+        Feature: the load of a QK-norm.
+        Description: The same model with a QK-norm and without, 8 query and 8
+            key heads 64 wide, TP 2.
+        Expectation: Only the first has the entry: 30 per element over every
+            head of a token, each TP rank its half, in the parameters' bytes.
+        """
+        normed = SimpleNamespace(**vars(_cfg(128)), n_qknorm=1)
+        self.assertEqual((op_table(normed)["n_qknorm"], "n_qknorm" in op_table(_cfg(128))),
+                         (30 * 128 * (8 + 8) * 64 * 2 / 2, False))
+
 
 if __name__ == "__main__":
     unittest.main()

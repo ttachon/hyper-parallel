@@ -88,6 +88,10 @@ def op_table(cfg, attn=None):
     table["n_ffAct"] = 21 * cfg.b * cfg.s * cfg.hff
 
     table["n_normOp"] = 30 * cfg.b * cfg.s * cfg.h * cfg.t / cfg.sp
+    # A QK-norm runs over every head's queries and keys, which TP splits.
+    # The entry exists only for a model that has one.
+    if getattr(cfg, "n_qknorm", 0):
+        table["n_qknorm"] = 30 * cfg.b * cfg.s * (att.a + att.n_kv) * d_h
     table["n_dropout"] = (
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )

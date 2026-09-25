@@ -295,6 +295,10 @@ class ModelSpec:
             them and drops them.
         tie_word_embeddings: Whether the output head shares the embedding's
             table, as a Transformers config states it.
+        qk_norm: Whether attention normalizes each head's queries and keys
+            over the head width before the scores, as Qwen3's ``q_norm`` and
+            ``k_norm`` do.  A Transformers config does not state it; its
+            producer infers it from the model's name.
     """
 
     name: str
@@ -327,6 +331,7 @@ class ModelSpec:
     # Qwen3.5 fuses an output gate into the query projection, doubling its width.
     attn_output_gate: Optional[bool] = None
     tie_word_embeddings: Optional[bool] = None
+    qk_norm: Optional[bool] = None
 
     # Gated DeltaNet linear attention (Qwen3.5), for the layers a linear kind prices.
     linear_num_key_heads: Optional[int] = None
@@ -516,7 +521,7 @@ class ModelSpec:
             return layers_from_list(value)
         if key == "ffn_dim_multiplier":
             return float(value)
-        if key in ("attn_output_gate", "tie_word_embeddings"):
+        if key in ("attn_output_gate", "tie_word_embeddings", "qk_norm"):
             if not isinstance(value, bool):
                 raise ModelSpecError(f"{key} must be true or false, got {value!r}")
             return value

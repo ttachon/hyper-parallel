@@ -440,6 +440,23 @@ class TestStackAsData(unittest.TestCase):
             ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16),
         )
 
+    def test_only_a_full_layer_normalizes_queries_and_keys(self):
+        """
+        Feature: the QK-norm of a hybrid stack.
+        Description: Apply the linear kind, then the full kind, of a
+            Qwen3.5-shaped model.
+        Expectation: The model has a QK-norm, which its full layers run and
+            its linear layers, whose kernel normalizes without weights, do not.
+        """
+        ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _F]))
+        check_and_apply_custom_hook(ccfg)
+        kinds = {kind.name: kind for kind in ccfg.layer_stack.distinct_kinds()}
+        runs = []
+        for name in (_L, _F):
+            apply_layer_kind(ccfg, kinds[name])
+            runs.append(ccfg.n_qknorm)
+        self.assertEqual((ccfg.qk_norm, runs), (True, [0, 1]))
+
     def test_a_one_kind_stack_needs_no_kind(self):
         """
         Feature: layer groups.

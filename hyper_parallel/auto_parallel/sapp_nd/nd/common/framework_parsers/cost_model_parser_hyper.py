@@ -183,6 +183,8 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
         # Qwen3.5 fuses the output gate into q_proj, doubling its width.
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
+        # Qwen3 normalizes each head's queries and keys.
+        ccfg.qk_norm = bool(spec.get("qk_norm", False))
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""

@@ -209,6 +209,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.dc_kv = mod.k_lora_rank  # KV compression dimension #NOT SURE
         cc.dc_q = mod.q_lora_rank  # Q compression dimension
         cc.dhr = mod.qk_rope_head_dim  # decoupled QK per head dimension
+        cc.qk_norm = bool(mod.qk_layernorm)  # Megatron's --qk-layernorm
 
     def __config_parse_json_moe(self, cc, mod):
         """MindSpeed format for MoE infos"""
