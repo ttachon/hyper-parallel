@@ -228,6 +228,11 @@ class Sweep:
         """The one classified CSV covering every configuration."""
         return self.out / "real_all.csv"
 
+    @property
+    def python(self) -> str:
+        """Interpreter for the analysis steps, which must import hyper_parallel."""
+        return self.args.python or sys.executable
+
     def kit(self, *command: str) -> List[str]:
         """Build a cluster-kit invocation bound to this sweep's config."""
         return [self.args.cluster, "-c", str(self.args.cluster_env), *command]
@@ -410,7 +415,7 @@ def classify(sweep: Sweep, point: Point) -> Optional[Path]:
         return None
     part = sweep.out / f"real_{point.tag}.csv"
     command = [
-        sys.executable, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify",
+        sweep.python, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify",
         str(config_dir),
         "--dims", ",".join(f"{name}={value}" for name, value in point.dims.items()),
         "--csv", str(part), "--detail", str(sweep.out / f"detail_{point.tag}.csv"),
@@ -444,8 +449,31 @@ def merge_csv(parts: Sequence[Path], merged: Path) -> int:
     return len(rows)
 
 
+def require_importable(sweep: Sweep) -> None:
+    """Fail once, early, when the analysis interpreter cannot import the package.
+
+    The sweep itself needs nothing but the standard library, so it runs happily
+    under whichever python is on PATH; the classifier and the cost model import
+    hyper_parallel and therefore torch. Checking here turns one unusable
+    interpreter into a single instruction rather than a traceback per strategy.
+    """
+    probe = subprocess.run(
+        [sweep.python, "-c", "import hyper_parallel"],
+        check=False, cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if probe.returncode:
+        last = (probe.stderr or "").strip().splitlines()[-1:]
+        raise SystemExit(
+            f"{sweep.python} cannot import hyper_parallel: "
+            f"{last[0] if last else 'unknown error'}. "
+            "Point --python at the interpreter the training runs use, "
+            "for example --python /home/tt/envs/hp2/bin/python3.11")
+
+
 def stage_classify(sweep: Sweep) -> None:
     """Classify every profiled strategy into one combined CSV."""
+    require_importable(sweep)
     parts = [part for part in (classify(sweep, p) for p in sweep.points) if part]
     count = merge_csv(parts, sweep.merged_csv)
     print(f"\n{count} configuration(s) in {sweep.merged_csv}", flush=True)
@@ -480,12 +508,13 @@ def stage_compare(sweep: Sweep) -> None:
     ``mindformers``, which reads a different schema, and the deprecated
     ``hyperparallel`` wants a TorchTitan TOML plus a source path.
     """
+    require_importable(sweep)
     if not sweep.merged_csv.is_file():
         raise SystemExit(f"nothing to compare: {sweep.merged_csv} does not exist")
     nd_yaml = sweep.out / "nd_model.yaml"
     write_nd_config(sweep.args.config, nd_yaml)
     _run([
-        sys.executable, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+        sweep.python, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
         "-y", str(nd_yaml), "-f", sweep.args.framework,
         "-d", str(sweep.world), "-A", sweep.args.arch,
         "--real_csv", str(sweep.merged_csv), "-o", str(sweep.out / "nd"),
@@ -519,6 +548,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--cluster", default="cluster",
                         help="the kit entry point (path or name on PATH)")
     parser.add_argument("--arch", default="A3", help="hardware name passed to ND")
+    parser.add_argument("--python", default="",
+                        help="interpreter for the classify and compare steps; it "
+                             "must import hyper_parallel, so it is the training "
+                             "environment's python, not necessarily this one")
     parser.add_argument("--framework", default="hyper_v2",
                         help="run_nd parser; hyper_v2 reads the AutoModels schema")
     parser.add_argument("--profile-memory", choices=("none", "separate", "same"),
