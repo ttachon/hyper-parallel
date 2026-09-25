@@ -226,6 +226,10 @@ class _CostModVar:
     norm_bytes: float = None
     dropout_bytes: float = None
     grad_accumulation: bool = None
+    # Whether FSDP frees a layer's gathered parameters once it has run, as
+    # the run states it, None taking its family's; and as derive gives it.
+    reshard_params: bool = None
+    reshards: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the optimizer keeps per parameter: a layer's, and the embedding

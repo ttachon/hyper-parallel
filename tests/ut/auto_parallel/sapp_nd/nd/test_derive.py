@@ -214,6 +214,21 @@ class TestDeriveFamily(unittest.TestCase):
             derive(ccfg)
             self.assertEqual((ccfg.bytes_optim, ccfg.bytes_optim_table), want, f"{facts}")
 
+    def test_resharding(self):
+        """
+        Feature: derive_resharding.
+        Description: A run that states nothing, and runs that state their
+            FSDP frees a layer's gathered parameters, or keeps them.
+        Expectation: The family keeps them, as MindSpore's optimizer
+            parallelism does; what a run states wins.
+        """
+        got = []
+        for facts in ({}, {"reshard_params": True}, {"reshard_params": False}):
+            ccfg = _config(**facts)
+            derive(ccfg)
+            got.append(ccfg.reshards)
+        self.assertEqual(got, [False, True, False])
+
     def test_activation_sharding(self):
         """
         Feature: derive_activation_sharding.

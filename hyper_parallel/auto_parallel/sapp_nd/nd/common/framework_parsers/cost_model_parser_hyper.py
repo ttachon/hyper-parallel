@@ -533,7 +533,20 @@ class CostModelParserHyperV2(_CostModelParser):
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
             "grad_shard_as_params": True,
             "grad_accumulation": True,
+            "reshard_params": self._reshards_params(),
         }
+
+    def _reshards_params(self) -> bool:
+        """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
+
+        It does after the layer's forward and after its backward, unless the
+        run keeps them gathered through either.
+        """
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
+        return bool(
+            self._get_cfg_attr(fsdp, "reshard_after_forward", True)
+            and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
+        )
 
     def _parse_batch(self, dp: int, pp: int) -> Dict[str, Any]:
         """Batch settings from ``training`` or legacy ``train``."""

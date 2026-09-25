@@ -51,6 +51,14 @@ class _BackwardOverhead:
         # print("here11",id(self.backbone._ccfg))
         return stages[stage_id][chunk_id][lay_id]
 
+    def _working_set(self) -> float:
+        """The dynamic memory of the node set up, as the working set of its backward."""
+        self._ctx.working_set = True
+        try:
+            return sum(self._inner_dynamic_mem(default_micro_factor=1))
+        finally:
+            self._ctx.working_set = False
+
     def estimate(
         self, stages: list, stage_id: int, record_lay_types: dict
     ) -> float:
@@ -128,11 +136,11 @@ class _BackwardOverhead:
             if last_node == LayerType.FULL_REC_LAYER:
                 self._ctx.current_lay_id = f"rec_{self._ctx.current_lay_id}"
                 self._ctx.current_node = LayerType.NOT_REC_LAYER
-                res = sum(self._inner_dynamic_mem(default_micro_factor=1))
+                res = self._working_set()
             else:
                 self._ctx.current_node = last_node
                 self._ctx.current_lay_id = f"G_{self._ctx.current_lay_id}"
-                res = sum(self._inner_dynamic_mem(default_micro_factor=1))
+                res = self._working_set()
                 if (
                     last_node == LayerType.OUTPUT_LAYER
                     and self._ccfg.n_mtp > 0
@@ -150,7 +158,7 @@ class _BackwardOverhead:
                             f"G_{self._ctx.current_lay_id}"
                         )
                         self._ctx.current_node = last_mtp
-                    res += sum(self._inner_dynamic_mem(default_micro_factor=1))
+                    res += self._working_set()
         return res
 
     def __stage_bwd_overhead_zbv(
@@ -177,10 +185,7 @@ class _BackwardOverhead:
             if result is None:
                 raise RuntimeError("_fetch_node_and_switch_env returned None.")
             if lay == LayerType.FULL_REC_LAYER:
-                bwd_last = max(
-                    bwd_last,
-                    sum(self._inner_dynamic_mem(default_micro_factor=1)),
-                )
+                bwd_last = max(bwd_last, self._working_set())
         # fwd last + bwd first
         fwd_last, bwd_first = 0, 0
         for lay_id, _ in enumerate(stages[stage_id][1]):
@@ -199,10 +204,7 @@ class _BackwardOverhead:
             if result is None:
                 raise RuntimeError("_fetch_node_and_switch_env returned None.")
             if lay == LayerType.FULL_REC_LAYER:
-                bwd_first = max(
-                    bwd_first,
-                    sum(self._inner_dynamic_mem(default_micro_factor=1)),
-                )
+                bwd_first = max(bwd_first, self._working_set())
 
         # print(self.mb(overlap1),self.mb(overlap2))
         res = max(fwd_first + bwd_last, fwd_last + bwd_first)

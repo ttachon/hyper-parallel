@@ -224,6 +224,12 @@ class _Backbone:
                 else:
                     comm = fun(self._ccfg, self._ctx)
                 comm_mem[k] = comm
+            # FSDP that reshards frees a layer's gathered parameters once it
+            # has run: a layer keeps none between its passes, and its
+            # backward holds its own and the next layer's, prefetched.  The
+            # root's, the embedding and output tables, stay gathered.
+            if "dp" in comm_mem and self._ccfg.reshards and self.is_regular_layer(self._ctx.current_node):
+                comm_mem["dp"] *= 2 if self._ctx.working_set else 0
             res = EvalUtils.eval_expr_insight(
                 expr=self._ctx.comm_expr,
                 ctx=self._ctx,

@@ -75,6 +75,7 @@ DEFAULT_RUN = MappingProxyType({
     "dropout_bytes": 0,
     "grad_accumulation": False,
     "shard_activations": False,
+    "reshard_params": False,
 })
 
 # The model facts a profile's ``model`` may give a model that states none.

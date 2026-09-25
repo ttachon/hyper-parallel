@@ -320,6 +320,11 @@ def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
     ccfg.bytes_dropout = _stated(ccfg, "dropout_bytes", run)
 
 
+def derive_resharding(ccfg: Any, run: Mapping[str, Any]) -> None:
+    """Set whether FSDP frees a layer's gathered parameters once it has run, ``reshards``."""
+    ccfg.reshards = bool(_stated(ccfg, "reshard_params", run))
+
+
 def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:
     """Set how tensor parallelism shards what a layer keeps.
 
@@ -382,12 +387,13 @@ def derive_layer_fields(ccfg: Any) -> None:
 def derive_family(ccfg: Any) -> None:
     """Set what the config's family decides where its producer states nothing.
 
-    The byte widths and the activation sharding, from the run facts the
-    config states and else its family's (:func:`family_run`); an MLA
+    The byte widths, the resharding and the activation sharding, from the
+    run facts the config states and else its family's (:func:`family_run`); an MLA
     family's head width; and the fields cm gives every layer.
     """
     run = family_run(ccfg)
     derive_byte_widths(ccfg, run)
+    derive_resharding(ccfg, run)
     derive_activation_sharding(ccfg, run)
     derive_head_dim(ccfg)
     derive_layer_fields(ccfg)
