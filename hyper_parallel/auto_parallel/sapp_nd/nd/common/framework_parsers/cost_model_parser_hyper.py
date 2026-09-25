@@ -147,6 +147,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.mm_ccfgs = None
         self.ccfg.mm_order = None
         self._vision_spec = None
+        self._tie_word_embeddings = False
 
         # Resolve model hyperparameters via AutoModels' Transformers pipeline.
         self._resolve_model_config_pipeline()
@@ -201,6 +202,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override()
         )
         self._vision_spec = spec.pop("vision", None)
+        self._tie_word_embeddings = bool(spec.get("tie_word_embeddings", False))
         self._layer_types = spec.get("layer_types") or []
         self._linear_attn = {
             "n_k": self._spec_int(spec, "linear_num_key_heads"),
@@ -459,6 +461,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self._apply_spec(cc, vision_spec)
         cc.v = 0  # patch embedding, not a vocabulary table
         cc.vocab_emb_dp = False
+        cc.tie_emb_out = False
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
@@ -709,7 +712,7 @@ class CostModelParserHyperV2(_CostModelParser):
         """Set training feature flags."""
         self.ccfg.has_fa = True
         self.ccfg.vocab_emb_dp = True
-        self.ccfg.tie_emb_out = False
+        self.ccfg.tie_emb_out = self._tie_word_embeddings
         self.ccfg.freeze = False
         legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
         training = self._get_cfg_attr(self.config, "training", legacy_train)

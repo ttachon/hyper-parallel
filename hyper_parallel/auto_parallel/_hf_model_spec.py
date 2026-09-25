@@ -68,6 +68,7 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "q_lora_rank": ("q_lora_rank",),
     "qk_rope_head_dim": ("qk_rope_head_dim",),
     "attn_output_gate": ("attn_output_gate",),
+    "tie_word_embeddings": ("tie_word_embeddings",),
     # A hybrid stack states its layers; without this every layer is costed
     # as full attention, which is quadratic in the sequence length.
     "layer_types": ("layer_types",),
