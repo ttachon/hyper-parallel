@@ -349,12 +349,13 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertEqual(custom_layers[0][0].marker, "custom")
         self.assertFalse(hasattr(cfg_with_hooks, "marker"))
 
-        lccfg = SimpleNamespace(opfoo=5, rec_op=SimpleNamespace(foo=2))
+        lccfg = SimpleNamespace(opfoo=5, rec_op=SimpleNamespace(foo=0, bar=1))
         self.assertEqual(get_recomp_factor(lccfg, LayerType.FULL_REC_LAYER, "foo"), 1)
         self.assertEqual(get_recomp_factor(lccfg, LayerType.NOT_REC_LAYER, "foo"), 0)
-        self.assertEqual(get_recomp_factor(lccfg, LayerType.SEL_REC_LAYER, "foo"), 2)
+        self.assertEqual(get_recomp_factor(lccfg, LayerType.SEL_REC_LAYER, "foo"), 1)
+        self.assertEqual(get_recomp_factor(lccfg, LayerType.SEL_REC_LAYER, "bar"), 0)
         self.assertEqual(get_recomp_factor(lccfg, LayerType.OUTPUT_LAYER, "foo"), 0)
-        self.assertEqual(get_table_quantity(lccfg, {"opfoo": 3}, LayerType.SEL_REC_LAYER, True), 45)
+        self.assertEqual(get_table_quantity(lccfg, {"opfoo": 3}, LayerType.SEL_REC_LAYER, True), 30)
 
     def test_context_logging_helpers(self) -> None:
         """

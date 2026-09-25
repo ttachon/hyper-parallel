@@ -30,7 +30,9 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
@@ -38,6 +40,8 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estima
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_configs_by_position,
     get_model_order,
+    get_recomp_factor,
+    get_table_quantity,
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
@@ -265,6 +269,56 @@ class TestPerformanceAgreesWithMemory(unittest.TestCase):
             memory backbone gives it.
         """
         self._check("zero_bubble_v")
+
+
+_SWITCHES = {"softmax": 0, "normOp": 1}
+
+
+def _factor(rec_op: Any, op_name: str, layer: LayerType = LayerType.SEL_REC_LAYER) -> int:
+    """The recompute factor of *op_name* in a layer with these switches."""
+    return get_recomp_factor(SimpleNamespace(rec_op=rec_op), layer, op_name)
+
+
+class TestSelectiveRecompute(unittest.TestCase):
+    """A switch at 0 recomputes its op, as the memory model reads it."""
+
+    def test_a_switch_at_zero_is_recomputed(self):
+        """softmax is switched to 0 and normOp to 1."""
+        rec_op = Config(_SWITCHES)
+        self.assertEqual(_factor(rec_op, "softmax"), 1)
+        self.assertEqual(_factor(rec_op, "normOp"), 0)
+
+    def test_an_op_without_a_switch_is_kept(self):
+        """A Config answers 0 for an attribute it lacks; that must not read as recompute."""
+        for rec_op in (Config(_SWITCHES), SimpleNamespace(**_SWITCHES), None):
+            self.assertEqual(_factor(rec_op, "attMM"), 0, f"rec_op={rec_op}")
+
+    def test_full_and_plain_layers_ignore_the_switches(self):
+        """Full recompute runs every op again; a plain layer runs none."""
+        rec_op = Config(_SWITCHES)
+        for op in ("softmax", "normOp", "attMM"):
+            self.assertEqual(_factor(rec_op, op, LayerType.FULL_REC_LAYER), 1, op)
+            self.assertEqual(_factor(rec_op, op, LayerType.NOT_REC_LAYER), 0, op)
+
+    def test_time_and_memory_agree_on_every_switch(self):
+        """In a selective layer an op is kept in memory or recomputed in time, never both or neither."""
+        for switch in (0, 1):
+            kept = EvalUtils.rec_coeff(True, switch)
+            recomputed = _factor(Config({"softmax": switch}), "softmax")
+            self.assertEqual(kept + recomputed, 1, f"switch={switch}: kept={kept}, recomputed={recomputed}")
+
+    def test_a_qk_norm_is_recomputed_with_the_norms(self):
+        """A QK-norm has no switch of its own: the normOp switch recomputes it, as it drops its inputs."""
+        for switch in (0, 1):
+            self.assertEqual(_factor(Config({"normOp": switch}), "qknorm"), 1 - switch, f"normOp={switch}")
+
+    def test_only_recomputed_ops_are_charged_twice(self):
+        """The recompute pass adds the load of softmax alone."""
+        lccfg = SimpleNamespace(n_softmax=1, n_normOp=1, n_attMM=1, rec_op=Config(_SWITCHES))
+        table = {"n_softmax": 10.0, "n_normOp": 100.0, "n_attMM": 1000.0}
+        once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False)
+        again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True)
+        self.assertEqual(again - once, 10.0, f"without recompute {once}, with recompute {again}")
 
 
 if __name__ == "__main__":

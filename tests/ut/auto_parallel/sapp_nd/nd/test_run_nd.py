@@ -18,6 +18,7 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_run_nd.py
 """
 import copy
+import csv
 import json
 import os
 import runpy
@@ -28,6 +29,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import matplotlib.pyplot as plt
+import yaml
+
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook, hook_runner
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
@@ -38,6 +43,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHoo
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
+    HYPER_SELECTIVE_REC_OP,
     _CostModelParser,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
@@ -332,6 +338,29 @@ def _make_arch_cfg(**kwargs: Any) -> SimpleNamespace:
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
+
+
+def _torchtitan_flavor(name: str, args: str, **parallelism: Any) -> CostModelConfig:
+    """Parse a TorchTitan flavor of model *name* stating *args*, as the TOML parser reads one."""
+    toml = Config({
+        "model": {"name": name, "flavor": "tiny"},
+        "parallelism": {
+            "data_parallel_replicate_degree": 1, "data_parallel_shard_degree": 2,
+            "tensor_parallel_degree": 1, "pipeline_parallel_degree": 1, "context_parallel_degree": 1,
+            "expert_parallel_degree": 1, "expert_tensor_parallel_degree": 0,
+            "pipeline_parallel_schedule": "1F1B", **parallelism,
+        },
+        "activation_checkpoint": {"mode": "full"},
+        "training": {"seq_len": 128, "local_batch_size": 1},
+    })
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        source_path = os.path.join(tmp_dir, "__init__.py")
+        with open(source_path, "w", encoding="utf-8") as source_file:
+            source_file.write(
+                "def get_train_spec():\n    return TrainSpec(model_args=model_args)\n"
+                f"model_args = {{'tiny': ModelArgs({args})}}\n"
+            )
+        return CostModelConfig(toml, framework="hyperparallel", source_code=source_path)
 
 
 class TestSappNDRunND(unittest.TestCase):
@@ -1371,6 +1400,90 @@ class TestSappNDRunND(unittest.TestCase):
                 plot_idle=True,
             )
 
+    def test_the_degree_table_reads_a_boolean_dimension(self) -> None:
+        """
+        Feature: the degree table under ND's plot of a search.
+        Description: A search that varied SP, whose degrees print as True or False.
+        Expectation: The table is drawn instead of failing on the boolean cell.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.SP, True)], all_dims=[Dim.DP, Dim.SP])
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        plot.parse_data([(dims, 128, 10.0, [10.0])])
+        figure = plt.figure()
+        try:
+            plot.make_table()
+        finally:
+            plt.close(figure)
+        self.assertEqual(plot.cell_text, [["8"], ["True"], [128]])
+
+    def test_the_ranking_keeps_nd_order_and_every_digit(self) -> None:
+        """
+        Feature: the CSV of a search's configurations in ND's order.
+        Description: Two configurations, one with its score split into parts and
+            one without.
+        Expectation: Rows keep ND's order and rank, scores keep full precision,
+            and missing parts are blank.
+        """
+        first = Dim.Dimensions([(Dim.DP, 8), (Dim.SP, False), (Dim.OP, 4)],
+                               all_dims=[Dim.DP, Dim.SP, Dim.OP])
+        second = Dim.Dimensions([(Dim.DP, 4), (Dim.SP, True), (Dim.OP, 2)],
+                                all_dims=[Dim.DP, Dim.SP, Dim.OP])
+        parts = [str(part) for part in Debug.PerfParts][:-2]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "nested", "ranking.csv")
+            Debug.write_ranking_csv(
+                [(first, 100, 91599458344632.31, [1.5] * len(parts)), (second, 120, 1e14, [])], path)
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+        self.assertEqual(rows[0], ["rank", "DP", "SP", "OP", "memory_mb", "score"] + parts)
+        self.assertEqual(rows[1][:6], ["1", "8", "False", "4", "100", "91599458344632.31"])
+        self.assertEqual(float(rows[1][5]), 91599458344632.31)
+        self.assertEqual(rows[1][6:], ["1.5"] * len(parts))
+        self.assertEqual(rows[2][:6], ["2", "4", "True", "2", "120", "100000000000000.0"])
+        self.assertEqual(rows[2][6:], [""] * len(parts))
+
+    def test_the_ranking_is_written_before_the_plot(self) -> None:
+        """
+        Feature: a search asked to write its ranking.
+        Description: The search orders one configuration and its plot then fails.
+        Expectation: The ranking is on disk all the same.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.OP, 4)], all_dims=[Dim.DP, Dim.OP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = True
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False),
+                                        dimensions=[Dim.DP, Dim.OP])
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Debug, "plot_nd", side_effect=ValueError("plot")), \
+                patch.object(Debug, "output_dir", return_value=tmp_dir):
+            path = os.path.join(tmp_dir, "ranking.csv")
+            with self.assertRaises(ValueError):
+                runner.run_generation_to_ordering(None, ranking_csv=path)
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+        self.assertEqual(rows[1][:5], ["1", "8", "4", "100", "2.5"])
+
+    def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
+        """
+        Feature: run_nd --ranking_csv.
+        Description: Run the CLI search on a fake Parallelize with and without the flag.
+        Expectation: The search receives the path, and None when the flag is absent.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            ranking = os.path.join(tmp_dir, "ranking.csv")
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"]
+            for extra, expected in (([], None), (["--ranking_csv", ranking], ranking)):
+                with patch.object(sys, "argv", argv + extra):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(_FakeParallelize.instances[-1].last_run_kwargs()["ranking_csv"], expected)
+
     def test_arch_hook_variants(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1384,6 +1497,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(cfg.bytes_grad, 2)
         ArchHooks.custom_mixtral(cfg)
         self.assertEqual(cfg.hff, cfg.hff_exp)
+        self.assertEqual((cfg.n_ffMM, cfg.n_ffBMM, cfg.n_ffParamCast), (3, 0, 3))
         ArchHooks.custom_pangualpha(cfg)
         self.assertEqual(cfg.n_normOp, 4)
         ArchHooks.custom_qwen(cfg)
@@ -1392,6 +1506,9 @@ class TestSappNDRunND(unittest.TestCase):
         t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
         ArchHooks.custom_t5(t5_cfg)
         self.assertEqual(len(t5_cfg.layer_custom_config), 2)
+        # The model takes the widths its layers take, for the embedding and the output layer.
+        widths = (t5_cfg.bytes_grad, t5_cfg.bytes_os, t5_cfg.bytes_dropout, t5_cfg.bytes_norm)
+        self.assertEqual(widths, (4, 4, 1, 4))
         t5_wrap = ArchHooks.CWrap(t5_cfg)
         t5_cfg.layer_custom_config[0][1](t5_wrap)
         self.assertEqual(t5_cfg.n_attBMM, 1)
@@ -1407,10 +1524,43 @@ class TestSappNDRunND(unittest.TestCase):
         deepseek_cfg.layer_custom_config[1][1](deepseek_wrap)
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
+        # A dense layer runs the parser's feed-forward width in every format:
+        # MindFormers and hyper_v2 (yaml), MindSpeed (json) and TorchTitan
+        # (toml), none of which sets ffn_hidden_size.
+        for config_format in ("yaml", "json", "toml"):
+            with self.subTest(config_format=config_format):
+                dense_cfg = _make_arch_cfg(model_name="deepseek", config_format=config_format,
+                                           ffn_hidden_size=0, specs=SimpleNamespace(inter_dim=64, hidden_dim=0))
+                ArchHooks.custom_deepseek3(dense_cfg)
+                dense_cfg.layer_custom_config[0][1](ArchHooks.CWrap(dense_cfg))
+                self.assertEqual((dense_cfg.hff, dense_cfg.n_exp), (32, 1))
+
         cm_cfg = _make_arch_cfg(model_name="cm")
         ArchHooks.custom_cm(cm_cfg)
         self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
         self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
+
+    def test_an_fsdp_run_keeps_gradients_as_its_parameters(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: A family hook applied to a run whose FSDP holds each gradient as its
+            parameter, without pipeline parallelism, and to one that does not.
+        Expectation: The first keeps gradients in the parameters' width at PP 1; the second keeps
+            none, but llama2's two-byte ones.
+        """
+        for hook, grads_as_params, want in (
+            (ArchHooks.custom_default_transformer, True, 2),
+            (ArchHooks.custom_llama2, True, 2),
+            (ArchHooks.custom_default_transformer, False, 0),
+            (ArchHooks.custom_llama2, False, 2),
+        ):
+            with self.subTest(hook=hook.__name__, grads_as_params=grads_as_params):
+                cfg = _make_arch_cfg(p=1, bytes_p=2, grads_as_params=grads_as_params)
+                hook(cfg)
+                self.assertEqual(cfg.bytes_grad, want)
+        fp32 = _make_arch_cfg(p=1, bytes_p=4, grads_as_params=True)
+        ArchHooks.custom_llama2(fp32)
+        self.assertEqual(fp32.bytes_grad, 4)
 
     def test_performance_formula_helpers(self) -> None:
         """
@@ -1567,6 +1717,136 @@ class TestSappNDRunND(unittest.TestCase):
             )
         self.assertEqual(len(bulk_comm), 2)
         self.assertIn(Debug.PerfParts.EP_COMM, bulk_debugger.info)
+
+    def test_time_path_counts_a_moe_layers_experts(self) -> None:
+        """
+        Feature: comm_time.prepare_context.
+        Description: Count a MoE layer's parameters through the time path's
+            context, on the DeepSeek yaml, whose experts run on two
+            data-parallel ranks with optimizer sharding.
+        Expectation: The routed and shared experts are counted as the memory
+            path counts them, and the layer's DP term carries them.
+        """
+        ccfg = CostModelConfig(config_path)
+        ArchHooks.check_and_apply_custom_hook(ccfg)
+        # DeepSeek's layer groups are its dense layers, its MoE layers and its MTP layer.
+        _, hook_moe = ccfg.layer_custom_config[1]
+        hook_moe(ccfg)
+        ctx = CommTime.prepare_context()
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        _, routed, shared = CommTime.EvalBody.num_params_layer(ccfg, ctx)
+        self.assertGreater(routed, 0)
+        self.assertEqual(routed, CommTime.EvalFFn.num_params_routed_expert(ccfg, ctx))
+        self.assertEqual(shared, CommTime.EvalFFn.num_params_shared_expert(ccfg, ctx))
+        self.assertGreater(
+            CommTime.EvalLayerComm.dp_comm_layer(ccfg, ctx), CommTime.EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
+        )
+
+    def test_comm_walk_leaves_the_model_as_it_found_it(self) -> None:
+        """
+        Feature: comm_time.estimate_from_mem_comm.
+        Description: Walk the DeepSeek yaml's stages, dense and MoE layers,
+            twice on one config, as an estimate does for its communication and
+            again for its recompute's.
+        Expectation: The config leaves the walk as it entered it, and both
+            walks price every stage alike, its embedding and output layers
+            included.
+        """
+        ccfg = CostModelConfig(config_path)
+        ArchHooks.check_and_apply_custom_hook(ccfg)
+        stages = ccfg.generate_partitions_vpp()
+        before = {k: v for k, v in vars(ccfg).items() if isinstance(v, (bool, int, float, str))}
+        first = CommTime.estimate_from_mem_comm(ccfg, CustomConfig(), stages, Hard.Device_A2)
+        after = {k: v for k, v in vars(ccfg).items() if isinstance(v, (bool, int, float, str))}
+        second = CommTime.estimate_from_mem_comm(ccfg, CustomConfig(), stages, Hard.Device_A2)
+        self.assertEqual(after, before)
+        self.assertEqual(first, second)
+
+    def test_toml_flavors_as_torchtitan_states_them(self) -> None:
+        """
+        Feature: the TOML parser, on the fields a TorchTitan flavor may leave out.
+        Description: A DeepSeek-style flavor that states its experts and no
+            moe_enabled, the same flavor with moe_enabled False, and one that
+            states ffn_dim_multiplier as None, TorchTitan's default.
+        Expectation: The first runs its experts, the second is dense, and the
+            third parses with no multiplier.
+        """
+        experts = ("dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=4, n_kv_heads=0, "
+                   "kv_lora_rank=0, q_lora_rank=0, qk_rope_head_dim=0, n_dense_layers=1, moe_inter_dim=32, "
+                   "moe_args=MoEArgs(num_experts=8, top_k=2, num_shared_experts=1), multiple_of=1")
+        cases = (
+            (experts + ", ffn_dim_multiplier=1", (8, 2, 1, 1)),
+            (experts + ", moe_enabled=False, ffn_dim_multiplier=1", (1, 1, 0, 1)),
+            (experts + ", ffn_dim_multiplier=None", (8, 2, 1, 1)),
+        )
+        for args, want in cases:
+            ccfg = _torchtitan_flavor("deepseek_v3", args)
+            got = (ccfg.n_exp, ccfg.n_chosen_exp, ccfg.n_shared_exp, ccfg.fdm)
+            self.assertEqual(got, want, args)
+
+    def test_each_parser_states_whether_queries_and_keys_are_normalized(self) -> None:
+        """
+        Feature: the QK-norm, as the MindFormers and TOML parsers read it.
+        Description: MindFormers' Qwen3 yaml, which states qk_layernorm, and
+            the DeepSeek yaml, which does not; TorchTitan flavors of Qwen3
+            without qk_norm and with it False, and of Llama.
+        Expectation: Qwen3 runs one QK-norm per layer wherever its config
+            does not say otherwise, and the others none.
+        """
+        qwen3 = os.path.join(os.path.dirname(Par.__file__), "yamls", "pretrain_qwen3_72b.yaml")
+        got = [(ccfg.qk_norm, ccfg.n_qknorm) for ccfg in (CostModelConfig(qwen3), CostModelConfig(config_path))]
+        flavor = "dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=2, n_kv_heads=2"
+        for name, args in (("qwen3", flavor), ("qwen3", flavor + ", qk_norm=False"), ("llama3", flavor)):
+            ccfg = _torchtitan_flavor(name, args)
+            got.append((ccfg.qk_norm, ccfg.n_qknorm))
+        self.assertEqual(got, [(True, 1), (False, 0), (True, 1), (False, 0), (False, 0)])
+
+    def test_torchtitan_reshards_as_its_policy_says(self) -> None:
+        """
+        Feature: the TOML parser's FSDP resharding.
+        Description: TorchTitan's default policy without pipelining and at
+            PP 2, and its always and never policies at PP 2.
+        Expectation: The default reshards only without pipelining; always
+            and never do as they say.
+        """
+        flavor = "dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=4, n_kv_heads=4"
+        cases = ({}, {"pipeline_parallel_degree": 2},
+                 {"pipeline_parallel_degree": 2, "fsdp_reshard_after_forward": "always"},
+                 {"fsdp_reshard_after_forward": "never"})
+        got = [_torchtitan_flavor("llama3", flavor, **case).reshards for case in cases]
+        self.assertEqual(got, [True, False, True, False])
+
+    def test_a_hook_class_prices_time_as_it_prices_memory(self) -> None:
+        """
+        Feature: estimate_performance, on a config priced through a hook class.
+        Description: A hook class whose hook applies the DeepSeek yaml's family
+            and then doubles its sequence, priced through the hook and through
+            the family alone.
+        Expectation: The time estimate applies the config's own hook, as the
+            memory estimate does, so the two differ.
+        """
+        old_registry = MemEvalHook.hook_registry.copy()
+        try:
+            MemEvalHook.hook_registry = {}
+
+            class _LongerSequence(MemEvalHook):
+                """The family, then twice the sequence."""
+
+                @staticmethod
+                @hook_runner("deepseek_longer")
+                def run_hooks(e: Any) -> None:
+                    """Apply the family, then double the sequence."""
+                    ArchHooks.check_and_apply_custom_hook(e)
+                    e.set_ccfg(lambda c: setattr(c, "s", 2 * c.s))
+
+            ccfg = CostModelConfig(config_path, hook_cls=_LongerSequence())
+        finally:
+            MemEvalHook.hook_registry = old_registry
+        hooked = PerfEstimate.estimate_performance(ccfg, device_type=Hard.Device_A2)
+        family = PerfEstimate.estimate_performance(
+            ccfg, device_type=Hard.Device_A2, extra_custom_func=ArchHooks.check_and_apply_custom_hook
+        )
+        self.assertGreater(hooked, family)
 
     def test_comm_overlap_fields_in_parsers(self) -> None:
         """
@@ -1748,6 +2028,15 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.model_name, "llama-unit")
             self.assertEqual(hp_ccfg.vp, 2)
             self.assertEqual(hp_ccfg.layer_custom_config, [(2, None)])
+            self.assertEqual(vars(hp_ccfg.rec_op), dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1))
+
+            hp_config.activation_checkpoint.mode = "selective"
+            sel_ccfg = _ParserCostModelConfig()
+            sel_ccfg.config = hp_config
+            sel_ccfg.source_code = source_path
+            CostModelParserHyperparallel(sel_ccfg).parse()
+            self.assertTrue(sel_ccfg.sel_rec)
+            self.assertEqual(vars(sel_ccfg.rec_op), HYPER_SELECTIVE_REC_OP)
 
         ms_mod = {
             "model_id": "vision",
@@ -1788,9 +2077,43 @@ class TestSappNDRunND(unittest.TestCase):
         ms_ccfg = _ParserCostModelConfig()
         ms_ccfg.config = ms_config
         CostModelParserMindspeed(ms_ccfg).parse()
-        self.assertEqual(ms_ccfg.model_name, "multi-unit")
+        # A config of one module is that module.
+        self.assertEqual(ms_ccfg.model_name, "vision")
         self.assertFalse(ms_ccfg.multimodal)
-        self.assertEqual(ms_ccfg.n_lay, 0)
+        self.assertEqual(ms_ccfg.n_lay, 2)
+
+    def test_a_mindspeed_model_counts_its_mtp_layers(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: A MindSpeed text module of 4 layers and one MTP layer, beside a vision tower.
+        Expectation: The text module's layer group covers its MTP layer too, as MindFormers' and
+            hyper_v2's groups do.
+        """
+        def module(model_id: str, layers: int, mtp: int) -> dict:
+            """One MindSpeed submodule."""
+            return {
+                "model_id": model_id, "freeze": False, "moe_grouped_gemm": False,
+                "tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1,
+                "expert_model_parallel_size": 1, "sequence_parallel": False,
+                "num_layers": layers, "hidden_size": 16, "ffn_hidden_size": 32, "vocab_size": 64,
+                "num_attention_heads": 2, "num_query_groups": 0, "kv_channels": 0, "k_lora_rank": 0,
+                "q_lora_rank": 0, "qk_rope_head_dim": 0, "num_moe_experts": 1, "moe_router_topk": 1,
+                "n_shared_exp": 0, "moe_intermediate_size": 0, "first_k_dense_replace": 0,
+                "recompute_num_layers": 1, "params_dtype": "bfloat16", "attention_softmax_in_fp32": True,
+                "mtp_num_layers": mtp,
+            }
+
+        ms_ccfg = _ParserCostModelConfig()
+        ms_ccfg.config = Config({
+            "model_id": "multi-unit",
+            "tmp": {"pp": 2, "mbs": 1, "dp": 2, "tp": 1, "cp": 1, "vpp": 1, "ep": 1, "seqlen": 8, "etp": 0},
+            "image_encoder": module("vit", 2, 0),
+            "text_decoder": module("qwen3", 4, 1),
+        })
+        ms_ccfg.hooks_dict = {"vit": None, "qwen3": None}
+        CostModelParserMindspeed(ms_ccfg).parse()
+        self.assertEqual(ms_ccfg.mm_ccfgs["qwen3"].layer_custom_config, [(5, None)])
+        self.assertEqual(ms_ccfg.mm_ccfgs["vit"].layer_custom_config, [(2, None)])
 
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
@@ -1800,7 +2123,7 @@ class TestSappNDRunND(unittest.TestCase):
         """
         parser_calls = []
         parser = SimpleNamespace(
-            config_shard_emb=lambda: parser_calls.append("embed"),
+            config_shard_emb=lambda cfg: parser_calls.append(("embed", cfg.d, cfg.t)),
             config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
             config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
             config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
@@ -1872,7 +2195,8 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        self.assertIn("embed", parser_calls)
+        # The refresh reaches the config the strategy changed, with its new degrees.
+        self.assertIn(("embed", 4, 2), parser_calls)
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):
@@ -1899,6 +2223,30 @@ class TestSappNDRunND(unittest.TestCase):
         wrapped_hook(evaluator)
         self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
         self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
+
+    def test_strategy_change_refreshes_mindformers_fields(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: The DeepSeek MindFormers yaml keeps its recompute input sliced at TP 4
+            (recompute_slice_activation), and MindFormers' selective recompute depends on
+            sequence parallelism, which a strategy change sets to TP.
+        Expectation: Both follow each strategy change, where they kept their parse-time values.
+        """
+        cfg = CostModelConfig(config_path)
+        self.assertEqual(cfg.shard_recompute_input, 4, f"parsed shard_recompute_input={cfg.shard_recompute_input}")
+        cfg.set_strategy(mp=1)
+        self.assertEqual(cfg.shard_recompute_input, 1, f"at TP 1 shard_recompute_input={cfg.shard_recompute_input}")
+
+        with open(config_path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        data["recompute_config"]["select_recompute"] = True
+        selective = CostModelConfig(data)
+        selective.set_strategy(mp=2)
+        dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["ffAct", "headCast", "normOp"], f"recomputed at TP 2: {dropped}")
+        selective.set_strategy(mp=1)
+        dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
+        self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""

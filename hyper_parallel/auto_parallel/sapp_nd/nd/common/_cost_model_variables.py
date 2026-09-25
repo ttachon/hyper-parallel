@@ -91,6 +91,9 @@ class _CostModVar:
     # Recurrent-state update and readout, the linear-attention op the
     # arch hooks have no counterpart for. Zero for every other flavour.
     n_linrec: float = 0
+    # The QK-norm a layer runs: 1 where the model normalizes each head's
+    # queries and keys (qk_norm), 0 on a linear-attention layer.
+    n_qknorm: float = 0
     # The attention fields a linear group displaced, kept so a later full
     # group can put them back when hooks run in place, layer after layer.
     full_attn: dict = None
@@ -113,7 +116,6 @@ class _CostModVar:
     tokens_per_expert: list = None
 
     # CP modeling
-    kv_lora_rank: float = 0
     attention_type: str = None
     device_per_node: float = 8
     bw_intra: float = 400.0
@@ -156,6 +158,8 @@ class _CostModVar:
     freeze: bool = False
     has_fa: bool = False
     attn_output_gate: bool = False
+    # Whether attention normalizes each head's queries and keys (Qwen3).
+    qk_norm: bool = False
     # vp_less_mem: bool = False
     has_clip: bool = False
     gmm: bool = False
@@ -178,8 +182,29 @@ class _CostModVar:
     bytes_p: float = 0
     bytes_compute: float = 0
     bytes_softmax: float = 0
+    # Whether each gradient is held as its parameter is: in its width and
+    # sharding, at any pipeline degree, as FSDP holds it.
+    grads_as_params: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
+    # What the run's optimizer keeps, None taking the family's: a state's
+    # width, its states per layer parameter (2 for AdamW, 1 for Muon) and
+    # the width of its copy of the parameters; and, from them, its bytes
+    # per parameter of a layer and of the embedding and output tables,
+    # which the family hooks set.
+    optimizer_state_bytes: float = None
+    optimizer_states: float = None
+    main_param_bytes: float = None
+    bytes_optim: float = 0
+    bytes_optim_table: float = 0
+    # Whether FSDP frees a layer's gathered parameters once it has run, and
+    # gathers them again when it runs next; MindSpore's optimizer
+    # parallelism keeps its gathered weights.
+    reshards: bool = False
+    # Whether FSDP holds each layer's reduce-scatter output until the
+    # backward ends, adding it to the accumulated gradient only then, as
+    # HyperParallel's does; PyTorch's FSDP2 adds it as soon as it is reduced.
+    defers_grads: bool = False
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
@@ -256,28 +281,26 @@ class _CostModVar:
         """process input config"""
         self.hooks_dict = None if not hook_cls else hook_cls.get_hooks()
         self.source_code = source_code
-        if isinstance(input_config, str):
-            self.config = Config(input_config)
-            # get parser
-            if framework:
-                logger.debug("Find parser module based on input framework name")
-                parser_cls = self.get_framework_parser(framework.lower())
-            else:
-                logger.debug("Naive way to find parser module")
-                parser_cls = self.get_framework_parser_naive(input_config)
-            if parser_cls:
-                self.parser = parser_cls(self)
-                logger.debug("Parser module: %s", self.parser.__class__)
-                self.parser.parse()
-            return
-        if isinstance(input_config, dict):
+        if isinstance(input_config, (str, dict)):
             self.config = Config(input_config)
         elif isinstance(input_config, Config):
             self.config = input_config
         else:
             raise TypeError(
-                f"Expecting path string or Config object for {input_config}"
+                f"Expecting path string, dict or Config object for {input_config}"
             )
-        #MindFormers format by default
-        self.parser = self.get_framework_parser_naive("yaml")(self)
-        self.parser.parse()
+        # An in-memory config names its framework the same way a file does:
+        # the framework selects the parser whatever form the config takes.
+        if framework:
+            logger.debug("Find parser module based on input framework name")
+            parser_cls = self.get_framework_parser(framework.lower())
+        elif isinstance(input_config, str):
+            logger.debug("Naive way to find parser module")
+            parser_cls = self.get_framework_parser_naive(input_config)
+        else:
+            # MindFormers format by default
+            parser_cls = self.get_framework_parser_naive("yaml")
+        if parser_cls:
+            self.parser = parser_cls(self)
+            logger.debug("Parser module: %s", self.parser.__class__)
+            self.parser.parse()

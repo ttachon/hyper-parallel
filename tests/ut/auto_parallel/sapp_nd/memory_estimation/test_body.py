@@ -35,6 +35,7 @@ from unittest.mock import MagicMock, PropertyMock
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 
 
 def _make_ccfg(
@@ -68,6 +69,8 @@ def _make_ccfg(
     ccfg.n_ffBMM = 0
     ccfg.bytes_p = bytes_p
     ccfg.bytes_os = bytes_os
+    # AdamW's two states and no copy of the parameters, as the hooks set them.
+    ccfg.bytes_optim = 2 * bytes_os
     ccfg.bytes_grad = bytes_grad
     ccfg.shard_p_os_non_exp_partial = shard_p_os_non_exp_partial
     ccfg.shard_p_os_exp = shard_p_os_exp
@@ -521,7 +524,7 @@ class TestActCpLayer(unittest.TestCase):
     """Test EvalBody.act_cp_layer (CP activation memory breakdown)."""
 
     def _make_ccfg_cp(self, a=32, t=1, cp=2, s=1024, b=4,
-                       kv_lora_rank=0, n_kv=32, dh=128,
+                       dc_kv=0, n_kv=32, dh=128, dhr=0,
                        cp_algo="colossalai_cp", device_per_node=8,
                        h=4096):
         """Create a mock CostModelConfig for CP activation tests."""
@@ -531,9 +534,10 @@ class TestActCpLayer(unittest.TestCase):
         ccfg.cp = cp
         ccfg.s = s
         ccfg.b = b
-        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.dc_kv = dc_kv
         ccfg.n_kv = n_kv
         ccfg.dh = dh
+        ccfg.dhr = dhr
         ccfg.h = h
         ccfg.cp_algo = cp_algo
         ccfg.device_per_node = device_per_node
@@ -593,18 +597,21 @@ class TestActCpLayer(unittest.TestCase):
         with self.assertRaises(ValueError):
             EvalBody.act_cp_layer(ccfg, ctx)
 
-    def test_mla_uses_kv_lora_rank(self):
-        """BD-CP07: MLA (kv_lora_rank > 0) uses kv_lora_rank for kv_dim."""
-        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=512,
-                                   n_kv=32, dh=128, cp_algo="colossalai_cp")
+    def test_mla_keeps_every_heads_keys_and_values(self):
+        """BD-CP07: MLA (dc_kv > 0) keeps its heads' K and V, not the latent.
+
+        Each head's key is 128 wide plus the 64-wide rotary part and its
+        value 128 wide, so each of K and V is 32 * (2 * 128 + 64) / 2 wide.
+        """
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, dc_kv=512, n_kv=32, dh=128, dhr=64,
+                                   cp_algo="colossalai_cp")
         ctx = self._make_ctx_cp()
         result = EvalBody.act_cp_layer(ccfg, ctx)
-        # kv_dim = kv_lora_rank = 512 for MLA
-        self.assertGreater(result.kv_cache_memory, 0)
+        self.assertEqual(result.kv_cache_memory, 2 * 2 * (1024 / 2) * 4 * 32 * (2 * 128 + 64) / 2)
 
     def test_gqa_kv_dim(self):
         """BD-CP08: GQA (n_kv < a) uses n_kv * dh / t for kv_dim."""
-        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=0,
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, dc_kv=0,
                                    n_kv=8, dh=128, cp_algo="colossalai_cp")
         ctx = self._make_ctx_cp()
         result = EvalBody.act_cp_layer(ccfg, ctx)
@@ -622,11 +629,13 @@ class TestConfigOptimizerShard(unittest.TestCase):
     @staticmethod
     def _make_parser_ccfg(
         n_exp=8, d_exp=4, cp=1, t_exp=1, ep=2,
-        has_op=True, has_grad_shard=True, os_max_shard=1,
+        has_op=True, has_grad_shard=True, os_max_shard=1, d=4, t=1,
     ):
         """Create a mock _CostModVar for parser-level shard tests."""
         from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
         ccfg = MagicMock(spec=_CostModVar)
+        ccfg.d = d
+        ccfg.t = t
         ccfg.n_exp = n_exp
         ccfg.d_exp = d_exp
         ccfg.cp = cp
@@ -639,7 +648,6 @@ class TestConfigOptimizerShard(unittest.TestCase):
 
     def test_has_op_true_uses_d_exp(self):
         """BD-H01: has_op=True => shard_p_os_exp = d_exp * cp * t_exp."""
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=True)
         _CostModelParser.config_optimizer_shard(None, ccfg)
         expected = 4 * 2 * 1  # d_exp * cp * t_exp
@@ -651,7 +659,6 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Without the guard, d_exp=4 would produce shard_p_os_exp=8, causing
         expert param/OS/grad memory to be underestimated by 4x.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
         _CostModelParser.config_optimizer_shard(None, ccfg)
         expected = 1 * 2 * 1  # (d_exp if has_op else 1) * cp * t_exp
@@ -664,7 +671,6 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Expert:  shard_p_os_exp     = (d_exp if has_op else 1) * cp * t_exp
         Both bypass the DP sharding factor when has_op=False.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
         ccfg.d = 4
         ccfg.t = 1
@@ -673,6 +679,41 @@ class TestConfigOptimizerShard(unittest.TestCase):
         # Expert:  (d_exp if has_op else 1) * cp * t_exp = 1 * 2 * 1 = 2
         self.assertEqual(ccfg.shard_p_os_non_exp, 2)
         self.assertEqual(ccfg.shard_p_os_exp, 2)
+
+    def test_gradient_sharding_rules(self):
+        """BD-H04: gradients are sharded by one of three rules.
+
+        At d=4, t=2, t_exp=2 and an optimizer shard of 2 data-parallel ranks:
+        as the parameters are when FSDP holds them so, over the whole
+        optimizer shard under gradient sharding, and over TP alone otherwise.
+        """
+        cases = [
+            ({"grads_as_params": True, "has_grad_shard": False}, (4, 8, 1)),
+            ({"grads_as_params": False, "has_grad_shard": True}, (8, 8, 1)),
+            ({"grads_as_params": False, "has_grad_shard": False}, (2, 2, 2)),
+        ]
+        for flags, want in cases:
+            with self.subTest(**flags):
+                ccfg = self._make_parser_ccfg(n_exp=1, d_exp=4, t_exp=2, os_max_shard=2, d=4, t=2)
+                for name, value in flags.items():
+                    setattr(ccfg, name, value)
+                _CostModelParser.config_optimizer_shard(None, ccfg)
+                got = (ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial)
+                self.assertEqual(got, want)
+
+    def test_parameters_are_sharded_over_tp_and_the_optimizer_ranks(self):
+        """BD-H05: a parameter is sharded over TP times the optimizer's data-parallel ranks.
+
+        At TP 4 and DP 8, over 2, 8, 3 and 16 ranks and without optimizer
+        sharding: never fewer than TP; a count that does not divide DP
+        shards over all of it; without optimizer sharding, over TP alone.
+        """
+        cases = [(2, True, 8), (8, True, 32), (3, True, 32), (16, True, 32), (2, False, 4)]
+        for ranks, has_op, want in cases:
+            with self.subTest(ranks=ranks, has_op=has_op):
+                ccfg = self._make_parser_ccfg(n_exp=1, os_max_shard=ranks, has_op=has_op, d=8, t=4)
+                _CostModelParser.config_optimizer_shard(None, ccfg)
+                self.assertEqual(ccfg.shard_p_os_non_exp_partial, want)
 
 
 if __name__ == "__main__":

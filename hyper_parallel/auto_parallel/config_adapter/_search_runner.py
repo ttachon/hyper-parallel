@@ -37,7 +37,7 @@ CONFIG_OVERRIDE_FIELDS = [
     "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
     "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
     "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
-    "head_dim", "vision", "attn_output_gate",
+    "head_dim", "vision", "attn_output_gate", "qk_norm", "tie_word_embeddings",
     "layer_types", "linear_num_key_heads", "linear_key_head_dim",
     "linear_num_value_heads", "linear_value_head_dim",
     "linear_conv_kernel_dim",
@@ -536,6 +536,9 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
         )
     best = filtered[0]
     result = _format_result(best, config)
+    # The search prices every candidate fully recomputed, whatever the search
+    # yaml's recompute setting says, so the trainer must run what was priced.
+    result["activation_checkpoint"] = "full"
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "

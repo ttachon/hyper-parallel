@@ -154,6 +154,14 @@ class Context:
         self.ffn_routed_num_p, self.ffn_shared_num_p = None, None
         self.norm_num_p, self.norm_activ = None, None
         self.pp_micro_eval = {}
+        # How many chunks the schedule splits a micro-batch's sequence into,
+        # as the micro factor of the node being evaluated counts them.
+        self.seq_chunks = 1
+        # Whether the node evaluated is a layer's working set in its
+        # backward, rather than what it keeps between its passes.
+        self.working_set = False
+        # The gradient bytes of the node evaluated last.
+        self.node_grad = 0
         self.head_node, self.tail_node = None, None
         self.current_node = None
         self.current_stage_id, self.current_chunk_id = -1, -1

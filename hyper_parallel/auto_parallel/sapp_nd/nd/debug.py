@@ -272,6 +272,17 @@ def set_twin_handles(ax1, data_frame, dbg_cols):
     leg.legend_handles[-1].set_facecolor(pp_color)  # type: ignore
 
 
+def _cell_number(text):
+    """Read one cell of the degree table as a number.
+
+    A boolean dimension such as SP prints as True or False, which float()
+    refuses, so every search that varied SP failed as its plot was drawn.
+    """
+    if text in ("True", "False"):
+        return float(text == "True")
+    return float(text)
+
+
 class Plot:
     """plot ND top configs"""
 
@@ -295,7 +306,7 @@ class Plot:
     def make_table(self):
         """Make table below plot with each parallelism degree"""
         self.cell_text = list(map(list, zip(*self.cell_text)))  # transpose
-        max_rows = list(map(max, map(partial(map, float), self.cell_text)))
+        max_rows = list(map(max, map(partial(map, _cell_number), self.cell_text)))
         the_table = plt.table(
             cellText=self.cell_text,
             rowLabels=self.row_title,
@@ -311,7 +322,7 @@ class Plot:
             cell.set_text_props(fontproperties=FontProperties(weight="bold"))
             for col in range(len(self.cell_text[0])):
                 cell = the_table[row + 1, col]
-                value = float(str(cell.get_text().get_text()))
+                value = _cell_number(str(cell.get_text().get_text()))
                 try:
                     ratio = 1 - (value / max_rows[row])
                 except ZeroDivisionError:
@@ -402,6 +413,32 @@ def plot_nd(
 
     plot.make_table()
     plot.close(output_path, "results")
+
+
+def write_ranking_csv(scored_space: list, path: str) -> None:
+    """Write a search's configurations in ND's order, best first.
+
+    One row per configuration that fits memory: its rank, its degrees, the
+    peak memory in MB, the score and the parts the score splits into, which
+    are blank when the search ran without debug output. Scores keep full
+    precision so that a reader can tell a tie from a near miss.
+
+    Args:
+        scored_space: ``(config, memory, score, parts)`` entries, as
+            ``ParallelizeLayer.order_search_space`` sorts them.
+        path: CSV file to write; its directory is created when missing.
+    """
+    parts = [part for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY}]
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    dims = [str(dim) for dim in scored_space[0][0].keys()] if scored_space else []
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["rank"] + dims + ["memory_mb", "score"] + [str(part) for part in parts])
+        for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
+            split = [repr(float(value)) for value in values] if values else [""] * len(parts)
+            writer.writerow([rank] + config.values() + [memory, repr(float(score))] + split)
 
 
 def plot_vs_real(

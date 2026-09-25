@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 # place, one layer after another, rather than on a copy per group.
 _LINEAR_ATTN_FIELDS = (
     "a", "dh", "n_kv", "attn_output_gate", "n_attBMM", "n_softmax",
-    "n_headCast", "n_linrec", "attn_extra_p",
+    "n_headCast", "n_linrec", "attn_extra_p", "n_qknorm",
     "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
 )
 
@@ -147,6 +147,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.mm_ccfgs = None
         self.ccfg.mm_order = None
         self._vision_spec = None
+        self._tie_word_embeddings = False
 
         # Resolve model hyperparameters via AutoModels' Transformers pipeline.
         self._resolve_model_config_pipeline()
@@ -201,6 +202,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override()
         )
         self._vision_spec = spec.pop("vision", None)
+        self._tie_word_embeddings = bool(spec.get("tie_word_embeddings", False))
         self._layer_types = spec.get("layer_types") or []
         self._linear_attn = {
             "n_k": self._spec_int(spec, "linear_num_key_heads"),
@@ -262,6 +264,8 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
         # Qwen3.5 fuses the output gate into q_proj, doubling its width.
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
+        # Qwen3 normalizes each head's queries and keys.
+        self.state_qk_norm(ccfg, spec.get("qk_norm", False))
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""
@@ -374,6 +378,8 @@ class CostModelParserHyperV2(_CostModelParser):
             lccfg.n_softmax = 0
             lccfg.n_headCast = 0
             lccfg.n_linrec = 1
+            # The kernel normalizes its queries and keys itself, with no weights.
+            lccfg.n_qknorm = 0
             # Short convolution over the projected stream, plus the two
             # per-head gates the delta rule needs.
             qkv_width = 2 * linear["n_k"] * linear["d_k"] + linear["n_v"] * linear["d_v"]
@@ -459,6 +465,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self._apply_spec(cc, vision_spec)
         cc.v = 0  # patch embedding, not a vocabulary table
         cc.vocab_emb_dp = False
+        cc.tie_emb_out = False
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
@@ -662,7 +669,11 @@ class CostModelParserHyperV2(_CostModelParser):
         )
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
-        """Populate optimizer and gradient sharding settings."""
+        """Populate optimizer and gradient sharding settings.
+
+        HyperParallel's FSDP holds every gradient as its parameter, from the
+        first backward to the optimizer step, whatever the pipeline degree.
+        """
         is_auto_models = is_auto_models_schema(self.config)
         self.ccfg.has_op = (
             dp_shard > 1
@@ -673,13 +684,18 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         self.ccfg.op_weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (dp_shard if is_auto_models else self.ccfg.d * self.ccfg.t))
+        ) or (dp_shard if is_auto_models else self.ccfg.d))
         self.ccfg.has_grad_shard = bool(self._get_cfg_attr(accel,
                                                              "gradient_accumulation_shard",
                                                              False))
+        self.ccfg.grads_as_params = True
+        self.ccfg.reshards = self._reshards_params()
+        # It adds each layer's reduce-scatter output to the accumulated
+        # gradient only in the root's backward hook.
+        self.ccfg.defers_grads = True
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
-            else self.ccfg.d * self.ccfg.t
+            else self.ccfg.d
         )
 
     def _parse_batch(self):
@@ -704,7 +720,7 @@ class CostModelParserHyperV2(_CostModelParser):
         """Set training feature flags."""
         self.ccfg.has_fa = True
         self.ccfg.vocab_emb_dp = True
-        self.ccfg.tie_emb_out = False
+        self.ccfg.tie_emb_out = self._tie_word_embeddings
         self.ccfg.freeze = False
         legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
         training = self._get_cfg_attr(self.config, "training", legacy_train)
@@ -748,6 +764,42 @@ class CostModelParserHyperV2(_CostModelParser):
         # parallel degree when this reads as a non-muon optimizer name, and
         # the generated cost-model yaml carries no optimizer section.
         self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
+        self._init_optimizer_states(optimizer, str(opt_type or ""))
+
+    def _reshards_params(self):
+        """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
+
+        It does after the layer's forward and after its backward, unless the
+        run keeps them gathered through either.
+        """
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
+        return bool(
+            self._get_cfg_attr(fsdp, "reshard_after_forward", True)
+            and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
+        )
+
+    def _init_optimizer_states(self, optimizer, target):
+        """State what HyperParallel's optimizer keeps per parameter.
+
+        Its AdamW keeps two moments and its Muon one momentum per matrix,
+        each ``zeros_like`` the gradient, which FSDP casts to the stored
+        parameter's dtype.  With ``fp32_main_params`` the optimizer keeps an
+        fp32 copy of each narrower parameter, and its states in fp32.
+        """
+        stored = self._stored_param_bytes()
+        fp32_main = bool(self._get_cfg_attr(optimizer, "fp32_main_params", False))
+        self.ccfg.optimizer_states = 1 if "muon" in target.lower() else 2
+        self.ccfg.optimizer_state_bytes = 4 if fp32_main else stored
+        self.ccfg.main_param_bytes = 4 if fp32_main and stored < 4 else 0
+
+    def _stored_param_bytes(self):
+        """The width FSDP stores the parameters in: the model's, whatever FSDP gathers them in."""
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        return self._bytes_from_dtype(
+            self._get_cfg_attr(self.config, "model_init_dtype", None)
+            or self._get_cfg_attr(model_raw, "torch_dtype", None)
+            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+        )
 
     def _parse_recompute(self):
         """Parse recompute mode.
@@ -787,15 +839,7 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.sel_rec = ac_mode == "selective"
 
-        self.ccfg.rec_op = Config({
-            "attBMM": 1,
-            "headCast": 1,
-            "dropout": 1,
-            "softmax": 1,
-            "normOp": 1,
-            "gather": 1,
-            "ffAct": 1,
-        })
+        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
 
     def _init_bytes(self):
         """Set FP byte sizes from AutoModels or legacy dtype fields.
@@ -886,8 +930,8 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.offset = [0] * self.ccfg.p
 
-    def config_shard_emb(self) -> None:
-        """Configure embedding sharding based on current parallelism.
+    def config_shard_emb(self, ccfg: Any) -> None:
+        """Configure embedding sharding based on current parallelism, on *ccfg*.
 
         Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
         ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
@@ -899,16 +943,18 @@ class CostModelParserHyperV2(_CostModelParser):
         Without this method, ``CostModelConfig.set_strategy`` skips the
         ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
         ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
-        producing an embedding-memory mismatch versus the MF parser.
+        producing an embedding-memory mismatch versus the MF parser.  A
+        multimodal submodule shares this parser, so the config to refresh is
+        passed in.
         """
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
+        ccfg.shard_embed = (
+            ccfg.d
+            if (ccfg.vocab_emb_dp and ccfg.p == 1)
+            else (ccfg.t * ccfg.d)
         )
 
-    def config_shard_recompute(self) -> None:
-        """Recompute ``shard_recompute_input`` after strategy changes.
+    def config_shard_recompute(self, ccfg: Any) -> None:
+        """Recompute ``shard_recompute_input`` after strategy changes, on *ccfg*.
 
         When ``recompute_slice_activation`` is ``True``, the recompute input
         is sharded by the current tensor-parallel degree ``t``; otherwise it
@@ -921,8 +967,8 @@ class CostModelParserHyperV2(_CostModelParser):
         YAML), causing memory-estimation errors when the search explores
         strategies with different ``t`` values.
         """
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t if self._recompute_slice_activation else 1
+        ccfg.shard_recompute_input = (
+            ccfg.t if self._recompute_slice_activation else 1
         )
 
     def _init_shard(self):
@@ -945,7 +991,7 @@ class CostModelParserHyperV2(_CostModelParser):
         (e.g. ``custom_qwen``) may override this during ``EvaluatorV2``
         initialisation.
         """
-        self.config_shard_emb()
+        self.config_shard_emb(self.ccfg)
         self.ccfg.shard_output_activ = 1
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
@@ -960,5 +1006,5 @@ class CostModelParserHyperV2(_CostModelParser):
                 self._get_cfg_attr(gc, "recompute_slice_activation", False),
             ),
         ))
-        self.config_shard_recompute()
+        self.config_shard_recompute(self.ccfg)
         self.ccfg.is_shard_mtp_param = True

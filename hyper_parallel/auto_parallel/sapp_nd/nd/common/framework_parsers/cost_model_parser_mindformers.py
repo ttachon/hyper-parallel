@@ -118,6 +118,9 @@ class CostModelParserMindformers(_CostModelParser):
             if self.config.model.model_config.qk_rope_head_dim
             else 0
         )  # decoupled QK per head dimension
+        # Whether each head's queries and keys are normalized, as MindFormers'
+        # Qwen3 states it.
+        self.state_qk_norm(self.ccfg, self.config.model.model_config.qk_layernorm)
 
         # Microbatch infos
         self.ccfg.b = max(
@@ -162,48 +165,65 @@ class CostModelParserMindformers(_CostModelParser):
             self.config_dp_tp_exp(self.ccfg)
             self.ccfg.gmm = cfg.moe_grouped_gemm
 
-    def __config_parse_yaml_op_recompute(self):
-        """MindFormer format for select recompute"""
+    def config_rec_op(self, ccfg):
+        """Set which ops selective recompute recomputes, on *ccfg*.
+
+        What ``select_recompute`` recomputes depends on flash attention and
+        on sequence parallelism, which a strategy change sets, so it is
+        called again then.
+        """
         # [HYPOTHESIS]
-        self.ccfg.rec_op = Config(
+        ccfg.rec_op = Config(
             {}
         )  # recomputed operators (selective recompute only)
-        self.ccfg.rec_op.attBMM = int(
+        ccfg.rec_op.attBMM = int(
             not (
                 self.config.recompute_config.select_recompute
-                and not self.ccfg.has_fa
-                and self.ccfg.sp > 1
+                and not ccfg.has_fa
+                and ccfg.sp > 1
             )
         )
-        self.ccfg.rec_op.headCast = int(
-            not (self.config.recompute_config.select_recompute and self.ccfg.has_fa)
+        ccfg.rec_op.headCast = int(
+            not (self.config.recompute_config.select_recompute and ccfg.has_fa)
         )
-        self.ccfg.rec_op.dropout = 1
-        self.ccfg.rec_op.softmax = int(
+        ccfg.rec_op.dropout = 1
+        ccfg.rec_op.softmax = int(
             not (
                 self.config.recompute_config.select_recompute
-                and not self.ccfg.has_fa
+                and not ccfg.has_fa
             )
         )
-        self.ccfg.rec_op.normOp = int(
-            not (self.config.recompute_config.select_recompute and self.ccfg.sp > 1)
+        ccfg.rec_op.normOp = int(
+            not (self.config.recompute_config.select_recompute and ccfg.sp > 1)
         )
-        self.ccfg.rec_op.gather = int(
+        ccfg.rec_op.gather = int(
             not (
                 self.config.recompute_config.select_comm_recompute
-                and self.ccfg.sp > 1
+                and ccfg.sp > 1
             )
         )
-        self.ccfg.rec_op.ffAct = int(
-            not (self.config.recompute_config.select_recompute and self.ccfg.sp > 1)
+        ccfg.rec_op.ffAct = int(
+            not (self.config.recompute_config.select_recompute and ccfg.sp > 1)
         )
 
-    def config_shard_emb(self):
-        """Configure embedding and output activation sharding."""
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
+    def config_shard_emb(self, ccfg):
+        """Set how the embedding table is sharded, on *ccfg*."""
+        ccfg.shard_embed = (
+            ccfg.d
+            if (ccfg.vocab_emb_dp and ccfg.p == 1)
+            else (ccfg.t * ccfg.d)
+        )
+
+    def config_shard_recompute(self, ccfg):
+        """Set how a recomputed layer's input is sharded, on *ccfg*.
+
+        Sliced over tensor parallelism when the run keeps it sliced, whole
+        otherwise.
+        """
+        ccfg.shard_recompute_input = (
+            ccfg.t
+            if self.config.recompute_config.recompute_slice_activation
+            else 1
         )
 
     def __config_parse_yaml_fp_bytes(self):
@@ -236,19 +256,15 @@ class CostModelParserMindformers(_CostModelParser):
         if self.ccfg.op_weight_shard:
             self.ccfg.os_max_shard = self.ccfg.op_weight_shard
         elif self.ccfg.has_op:
-            self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+            self.ccfg.os_max_shard = self.ccfg.d
         else:
             self.ccfg.os_max_shard = 1
         self.config_optimizer_shard(self.ccfg)
 
         # Other factors
-        self.config_shard_emb()
+        self.config_shard_emb(self.ccfg)
         self.ccfg.shard_output_activ = 1
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t
-            if self.config.recompute_config.recompute_slice_activation
-            else 1
-        )
+        self.config_shard_recompute(self.ccfg)
         self.ccfg.s_fa = (
             self.ccfg.s
             if not self.config.model.model_config.use_flash_attention
@@ -309,7 +325,7 @@ class CostModelParserMindformers(_CostModelParser):
         # [(num layers selected, layer custom config to apply)]
         self.ccfg.layer_custom_config = [(self.ccfg.n_lay + self.ccfg.n_mtp, None)]
 
-        self.__config_parse_yaml_op_recompute()
+        self.config_rec_op(self.ccfg)
         # By default, 100% of layers use a unique custom config (if specified)
         self.ccfg.offset = self.config.model.model_config.offset
         self.ccfg.sel_rec = self.config.recompute_config.select_recompute

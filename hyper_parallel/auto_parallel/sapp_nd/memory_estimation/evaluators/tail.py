@@ -55,7 +55,7 @@ class EvalMTP:
         if not ccfg.n_mtp or ctx.swap_os:
             return 0
         extra_param_size = EvalMTP.num_params_mtp(ccfg, ctx)
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim
         if ccfg.is_shard_mtp_param:
             b_os /= ccfg.shard_p_os_non_exp_partial
         extra = ccfg.n_mtp * extra_param_size * b_os
@@ -147,7 +147,7 @@ class EvalTailSingle:
         if ctx.swap_os:
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim_table
         b_os /= ccfg.shard_p_os_non_exp_partial
         return param_size * b_os
 

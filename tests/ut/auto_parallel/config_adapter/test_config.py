@@ -1223,6 +1223,38 @@ class TestWriter(unittest.TestCase):
         self.assertNotIn("train", data)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_states_the_priced_checkpoint_mode(self) -> None:
+        """The mode the search priced replaces the train yaml's, in each schema's spelling."""
+        legacy = os.path.join(self.tmpdir, "legacy_ac.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {},
+                       "gradient_checkpointing": {"activation_checkpoint": "none"}}}, fh)
+        auto_models = os.path.join(self.tmpdir, "auto_models_ac.yaml")
+        with open(auto_models, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "off", "swap_inputs": True}}, fh)
+        unstated = os.path.join(self.tmpdir, "auto_models_no_ac.yaml")
+        with open(unstated, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full"}
+        written = {}
+        for name, path, before in (("legacy", legacy, "none"), ("auto_models", auto_models, "off"),
+                                   ("unstated", unstated, "off")):
+            out = os.path.join(self.tmpdir, f"resolved_{name}.yaml")
+            with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+                write_resolved_yaml(config, path, out)
+            self.assertIn(f"{before} in the train yaml, full in the search", " ".join(logs.output))
+            with open(out, "r", encoding="utf-8") as fh:
+                written[name] = yaml.safe_load(fh)
+        self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "full")
+        self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "full", "swap_inputs": True})
+        self.assertEqual(written["unstated"]["activation_checkpoint"], {"mode": "full"})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
         """A strategy that contradicts the trainer batch derivation is refused."""
         original_yaml_path = os.path.join(self.tmpdir, "auto_models_batch.yaml")

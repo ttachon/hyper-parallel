@@ -132,7 +132,8 @@ class EvalAttn:
             * (
                 ccfg.n_softmax
                 * (
-                    ccfg.rec_op.softmax * ccfg.bytes_softmax
+                    EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.softmax)
+                    * ccfg.bytes_softmax
                     + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.dropout)
                     * ccfg.bytes_dropout
                     + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.headCast)
@@ -257,20 +258,25 @@ class EvalNorm:
     """Normalization formulas class"""
 
     @staticmethod
+    def head_dim(ccfg: CostModelConfig) -> float:
+        """The width a QK-norm normalizes over: one attention head's"""
+        return ccfg.dh or (ccfg.h / ccfg.a if ccfg.a else 0)
+
+    @staticmethod
     def num_params_norm(ccfg: CostModelConfig, _) -> float:
-        """Parameters count"""
-        return ccfg.n_normOp * 2 * ccfg.h
+        """Parameters count: the layer's norms, and a QK-norm's query and key weights"""
+        return ccfg.n_normOp * 2 * ccfg.h + getattr(ccfg, "n_qknorm", 0) * 2 * EvalNorm.head_dim(ccfg)
 
     @staticmethod
     def norm_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Activations"""
+        """Activations: the norms' inputs, a QK-norm's every head's queries and keys"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
+        qk_width = getattr(ccfg, "n_qknorm", 0) * (ccfg.a + ccfg.n_kv) * EvalNorm.head_dim(ccfg)
         norm = (
             ccfg.s
             * ccfg.b
             * ccfg.bytes_norm
-            * ccfg.h
-            * ccfg.n_normOp
+            * (ccfg.h * ccfg.n_normOp + qk_width)
             * EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.normOp)
         )
         micro_factor = ctx.micro_factor

@@ -30,9 +30,18 @@ class EvalHead:
         return ccfg.h * ccfg.v
 
     @staticmethod
+    def shares_output_table(ccfg: CostModelConfig) -> bool:
+        """Whether the embedding's table is the output layer's, priced there.
+
+        A tied table is one only where both ends run on one stage; under
+        pipeline parallelism the first and the last stage each hold a copy.
+        """
+        return bool(ccfg.tie_emb_out) and ccfg.p <= 1
+
+    @staticmethod
     def stat_embed_p(ccfg: CostModelConfig, ctx: Context) -> float:
         """model param"""
-        if ccfg.tie_emb_out:
+        if EvalHead.shares_output_table(ccfg):
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
@@ -43,18 +52,18 @@ class EvalHead:
     @staticmethod
     def stat_embed_os(ccfg: CostModelConfig, ctx: Context) -> float:
         """optim state"""
-        if ctx.swap_os or ccfg.tie_emb_out:
+        if ctx.swap_os or EvalHead.shares_output_table(ccfg):
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim_table
         b_os /= ccfg.cp
         return param_size * b_os
 
     @staticmethod
     def stat_embed_grad(ccfg: CostModelConfig, ctx: Context) -> float:
         """gradient"""
-        if ccfg.tie_emb_out:
+        if EvalHead.shares_output_table(ccfg):
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
@@ -73,10 +82,13 @@ class EvalHead:
 
     @staticmethod
     def tp_comm_embed(ccfg: CostModelConfig, _) -> float:
-        """TP Communication size"""
+        """TP Communication size.
+
+        The embedding is never recomputed, so it keeps its buffer whatever
+        the gather switch says: a switch acts only in a selective layer.
+        """
         return (
-            ccfg.rec_op.gather
-            * ccfg.comm_t
+            ccfg.comm_t
             * ccfg.s
             * ccfg.h
             * ccfg.b
