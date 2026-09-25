@@ -33,6 +33,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import (
+    cp_comm_layer_detailed,
     _recomputed_comm,
     estimate_comm,
     prepare_context,
@@ -104,6 +105,25 @@ class TestRecomputedComm(unittest.TestCase):
         again = _recomputed_comm(cfg, prepare_context(), LayerType.FULL_REC_LAYER)
         self.assertGreater(again[1], 0)
         self.assertEqual(again, self._plain(cfg))
+
+    def test_a_recompute_resends_the_forward_half_of_cp(self):
+        """
+        Feature: _recomputed_comm, under context parallelism.
+        Description: The MoE layer at CP 4, fully recomputed, and selective
+            with its gathers recomputed and kept.
+        Expectation: A recompute runs the forward's K and V exchange again,
+            half the layer's CP traffic; a selective layer only where its
+            gather switch recomputes.
+        """
+        cfg = self._moe_layer()
+        cfg.cp, cfg.comm_cp = 4, 1
+        forward = cp_comm_layer_detailed(cfg, prepare_context()).comm_volume / 2
+        self.assertGreater(forward, 0)
+        self.assertEqual(_recomputed_comm(cfg, prepare_context(), LayerType.FULL_REC_LAYER)[2], forward)
+        cfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), gather=0))
+        self.assertEqual(_recomputed_comm(cfg, prepare_context(), LayerType.SEL_REC_LAYER)[2], forward)
+        cfg.rec_op = Config(dict.fromkeys(_SWITCHES, 1))
+        self.assertEqual(_recomputed_comm(cfg, prepare_context(), LayerType.SEL_REC_LAYER)[2], 0)
 
     def test_only_recomputed_layers_add_communication(self):
         """
