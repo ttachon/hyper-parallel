@@ -16,6 +16,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import CPAlgo, _resolve_cp_algo
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
 if TYPE_CHECKING:
@@ -70,6 +71,31 @@ class EvalAttn:
         return EvalAttn.num_params_mla(ccfg, ctx)
 
     @staticmethod
+    def kv_shards(ccfg: CostModelConfig) -> float:
+        """Over how many CP ranks a layer's keys and values are split.
+
+        Colossal-AI and hybrid CP all-gather the keys and values, and the
+        attention kernel keeps them whole for the backward: none.  Ulysses
+        CP gives each rank its heads' share, and a linear-attention layer
+        passes its state rather than gathering them: all of CP.
+        """
+        if _resolve_cp_algo(ccfg) == CPAlgo.ULYSSES_CP or getattr(ccfg, "n_linrec", 0):
+            return ccfg.cp
+        return 1
+
+    @staticmethod
+    def gathered_kv_bytes(ccfg: CostModelConfig) -> float:
+        """The bytes per token of a rank's share of the sequence it keeps of the other ranks' keys and values.
+
+        Where CP gathers the keys and values (:meth:`kv_shards`), the
+        attention keeps the whole sequence's, the rank's own share and
+        ``cp - 1`` others, each split over TP.
+        """
+        if ccfg.cp <= 1 or EvalAttn.kv_shards(ccfg) > 1:
+            return 0
+        return (ccfg.cp - 1) * 2 * ccfg.n_kv * ccfg.dh * ccfg.bytes_compute / max(1, ccfg.t)
+
+    @staticmethod
     def attn_qkv_activations(ccfg: CostModelConfig, ctx: Context) -> float:
         """QKV linear Activations"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
@@ -82,7 +108,7 @@ class EvalAttn:
                 * ccfg.bytes_compute
                 * (
                     0.25 * n_op * ccfg.h
-                    + 0.5 * n_op * ccfg.dh * ccfg.n_kv
+                    + 0.5 * n_op * ccfg.dh * ccfg.n_kv * ccfg.cp / EvalAttn.kv_shards(ccfg)
                     + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.attBMM)
                     * ccfg.n_attBMM
                     * ccfg.dh
@@ -110,8 +136,7 @@ class EvalAttn:
                 * ccfg.bytes_compute
                 * (
                     q_size
-                    + k_size
-                    + v_size
+                    + (k_size + v_size) * ccfg.cp / EvalAttn.kv_shards(ccfg)
                     + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.attBMM)
                     * ccfg.n_attBMM
                     * ccfg.dh

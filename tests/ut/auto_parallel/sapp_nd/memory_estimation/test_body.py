@@ -476,6 +476,23 @@ class TestCensusActiv(unittest.TestCase):
         small = self._ccfg(KindActivations(100.0, 300.0, 50.0, 100.0, 4096))
         self.assertEqual(EvalBody.layer_activ(small, self._ctx(working_set=1, on_saved=True)), 0)
 
+    def test_gathered_keys_and_values_stay_whole(self):
+        """
+        Feature: EvalBody.census_activ under context parallelism.
+        Description: The layer at CP 2 under colossalai CP, and under
+            Ulysses CP, with 2 key heads 64 wide.
+        Expectation: A census counts a rank's share of the sequence;
+            colossalai CP keeps the other half's keys and values too, split
+            over TP, and Ulysses CP none.
+        """
+        tokens = 3 * 4096 * 2 / 2
+        record = self.RECORD
+        plain = tokens * (100 / 2 + 300 / 2)
+        for algo, extra in (("colossalai_cp", 2 * 2 * 64 * 2 / 2), ("ulysses_cp", 0)):
+            ccfg = self._ccfg(record, cp=2)
+            ccfg.cp_algo, ccfg.n_linrec, ccfg.n_kv, ccfg.dh, ccfg.bytes_compute = algo, 0, 2, 64, 2
+            self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx()), plain + tokens * extra)
+
     def test_the_formulas_price_a_layer_the_census_does_not(self):
         """
         Feature: EvalBody.layer_activ's census path.
