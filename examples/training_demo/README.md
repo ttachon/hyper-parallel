@@ -192,9 +192,40 @@ ND's parts and prints ND's estimate beside the measurement:
 python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 1,2,4,8,16,32,64
 ```
 
-Each degree must divide both the world size and the routed expert count, which
-the script checks before launching anything. `edp_shard_size` is derived as
-`world / ep`, so the shards stay consistent across the sweep.
+Every swept dimension takes a list and the sweep is their cartesian product,
+so this runs four strategies, and `--op` holds the FSDP shard width fixed
+across all of them:
+
+```bash
+python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 2,16 --cp 1,2 --op 16
+```
+
+| flag | sets | default |
+|---|---|---|
+| `--ep` | `accelerator.ep_size` | `1,2,4,8,16,32,64` |
+| `--cp` | `accelerator.cp_size` | `1` |
+| `--op` | `fsdp_config.dp_shard_size`, ND's `OP` | `dp * cp` |
+| `--tp`, `--pp` | refused above 1 on this model, see below | `1` |
+| `--global-batch-size` | `training.global_batch_size` | the world size |
+
+The derived degrees follow the trainer's own arithmetic, so a strategy is
+labelled in the classified CSV as it actually ran:
+
+- `dp = world / (tp * cp * pp)`, which is what the dataloader splits the batch
+  over and what ND calls `DP`. Raising `cp` therefore lowers `dp`.
+- `MB = global_batch_size / (micro_batch_size * dp)`. The default global batch
+  is the world size, which holds the work per step fixed, so raising `cp`
+  raises `MB` rather than shrinking the step.
+- `op` divides `dp * cp`, not `dp`: FSDP shards over the data and context axes
+  together.
+- `edp_shard_size = world / ep`, since expert weights are sharded by EP over
+  the whole device mesh.
+
+`--tp` and `--pp` above 1 are refused rather than run: TP shards the Gated
+DeltaNet `conv1d` while its `groups` and `conv_dim` stay global, so the forward
+raises, and `pp_size` above 1 neither raises nor pipelines because the Trainer
+has no pipeline schedule. Every other combination is validated against the
+trainer's startup constraints before anything launches.
 
 Stages run in order and any can be run alone, so a sweep can be re-classified
 without re-profiling and a changed cost model re-scored without re-running:
