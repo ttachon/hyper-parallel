@@ -211,6 +211,19 @@ python examples/training_demo/sweep_qwen3_5_moe_ep.py --only classify --only com
 | `classify` | `nd.trace_classify` per run, merged into one CSV |
 | `compare` | `run_nd --real_csv`, printing measured against estimated shares |
 
+Memory is measured in its own pass. Recording the allocator history brackets
+the profiled window and moves both step time and idle, so `--profile-memory`
+defaults to `separate`: the timing pass runs with it off, then the whole sweep
+repeats with it on into `ep<N>_mem` directories. Use `same` to fold it into one
+pass when the step time does not matter, or `none` to skip it.
+
+Peak device memory needs neither pass: the trainer reports it every step, so
+the sweep harvests `memory/device_max_allocated_gb` and
+`memory/device_max_reserved_gb` from the timing run's log into `memory.csv`, at
+no cost to the numbers being timed. The memory pass is for the detail that the
+peak alone does not give: `operator_memory.csv`, `memory_record.csv` and the
+allocator snapshot `.pkl`, which opens at pytorch.org/memory_viz.
+
 The ND input yaml is generated rather than reused: ND reads the training
 sequence length from `data.max_seq_len`, while the demo feeds an Indexed
 Dataset whose length lives in `dataset.data_config.seq_length`. Without

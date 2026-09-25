@@ -87,6 +87,7 @@ def read_cluster_env(env_path: Path) -> Dict[str, Any]:
         "nproc": int(out[1]),
         "repo_dir": out[2].rstrip("/"),
         "ssh_user": out[3],
+        "log_dir": out[4].rstrip("/"),
     }
 
 
@@ -146,8 +147,45 @@ def mirror_code(sweep: Sweep) -> None:
         ])
 
 
-def launch(sweep: Sweep, ep: int) -> Optional[str]:
-    """Launch one configuration and return the kit's run id."""
+def _tag(ep: int, memory: bool) -> str:
+    """Directory name for one configuration's timing or memory pass."""
+    return f"ep{ep}_mem" if memory else f"ep{ep}"
+
+
+PEAK_PATTERN = re.compile(
+    r"memory/device_max_allocated_gb=([0-9.]+).*?"
+    r"memory/device_max_reserved_gb=([0-9.]+)"
+)
+
+
+def harvest_peaks(sweep: Sweep, run_id: Optional[str]) -> Dict[str, float]:
+    """Return the peak device memory the trainer logged, in GiB.
+
+    Read from the training log rather than the profiler: the trainer reports
+    it every step at no cost, so the timing pass yields memory without the
+    allocator recording that would distort the very step it is timing.
+    """
+    if not run_id:
+        return {}
+    log = f"{sweep.env['log_dir']}/{run_id}.node0.log"
+    text = subprocess.run(
+        ["ssh", f"{sweep.env['ssh_user']}@{sweep.env['nodes'][0]}", f"cat {log}"],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    ).stdout or ""
+    found = PEAK_PATTERN.findall(text)
+    if not found:
+        return {}
+    return {"max_allocated_gb": max(float(a) for a, _ in found),
+            "max_reserved_gb": max(float(r) for _, r in found)}
+
+
+def launch(sweep: Sweep, ep: int, memory: bool = False) -> Optional[str]:
+    """Launch one configuration and return the kit's run id.
+
+    ``memory`` adds the allocator history the memory pass needs. It is off for
+    the timing pass: recording brackets the profiled window and moves both step
+    time and idle, which are the numbers that pass exists to measure.
+    """
     start, end = (int(part) for part in sweep.args.profile_steps.split(","))
     world = sweep.world
     command = sweep.kit(
@@ -160,15 +198,15 @@ def launch(sweep: Sweep, ep: int) -> Optional[str]:
         # the remaining ranks, so this is world/ep and never anything else.
         f"--fsdp_config.edp_shard_size={max(1, world // ep)}",
         "--profiling.enabled=true",
-        "--profiling.profile_memory=true",
+        f"--profiling.profile_memory={'true' if memory else 'false'}",
         f"--profiling.start_step={start}",
         f"--profiling.end_step={end}",
-        f"--profiling.trace_dir=./{REMOTE_PROFILES}/ep{ep}",
+        f"--profiling.trace_dir=./{REMOTE_PROFILES}/{_tag(ep, memory)}",
     )
     # Re-profiling into a directory that already holds a run leaves both, and
     # the classifier then refuses rather than guess which one is fresh.
     _run(sweep.kit("exec", "--no-env",
-                   f"rm -rf ./{REMOTE_PROFILES}/ep{ep}"), check=False)
+                   f"rm -rf ./{REMOTE_PROFILES}/{_tag(ep, memory)}"), check=False)
     found = RUN_ID_PATTERN.search(_run(command, capture=True))
     return found.group(1) if found else None
 
@@ -194,16 +232,42 @@ def wait_for(sweep: Sweep, run_id: Optional[str]) -> str:
         time.sleep(sweep.args.poll)
 
 
-def stage_run(sweep: Sweep) -> None:
-    """Launch every configuration in turn, waiting for each to finish."""
-    states = {}
+def run_pass(sweep: Sweep, memory: bool) -> Dict[str, Any]:
+    """Run every configuration once, returning each one's status and peaks."""
+    results: Dict[str, Any] = {}
+    label = "memory" if memory else "timing"
     for ep in sweep.eps:
-        print(f"\n===== ep_size {ep} =====", flush=True)
-        status = wait_for(sweep, launch(sweep, ep))
-        states[str(ep)] = status
+        print(f"\n===== ep_size {ep} ({label}) =====", flush=True)
+        run_id = launch(sweep, ep, memory=memory)
+        status = wait_for(sweep, run_id)
         print(status, flush=True)
+        results[str(ep)] = {"run_id": run_id, "status": status,
+                            **harvest_peaks(sweep, run_id)}
+    return results
+
+
+def write_peaks_csv(results: Dict[str, Any], path: Path) -> int:
+    """Write the measured peak device memory of every configuration."""
+    rows = [(ep, data) for ep, data in results.items()
+            if isinstance(data, dict) and "max_allocated_gb" in data]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["EP", "max_allocated_gb", "max_reserved_gb"])
+        for ep, data in rows:
+            writer.writerow([ep, data["max_allocated_gb"], data["max_reserved_gb"]])
+    return len(rows)
+
+
+def stage_run(sweep: Sweep) -> None:
+    """Run the timing pass, then the memory pass when one is asked for."""
+    results = run_pass(sweep, memory=sweep.args.profile_memory == "same")
+    count = write_peaks_csv(results, sweep.out / "memory.csv")
+    print(f"\npeak memory for {count} configuration(s) in "
+          f"{sweep.out / 'memory.csv'}", flush=True)
+    if sweep.args.profile_memory == "separate":
+        results["memory_pass"] = run_pass(sweep, memory=True)
     (sweep.out / "run_states.json").write_text(
-        json.dumps(states, indent=2), encoding="utf-8")
+        json.dumps(results, indent=2), encoding="utf-8")
 
 
 def stage_fetch(sweep: Sweep) -> None:
@@ -336,6 +400,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="run_nd parser; hyper_v2 reads the AutoModels schema")
     parser.add_argument("--num-experts", type=int, default=256,
                         help="routed experts, used to reject an ep that cannot divide them")
+    parser.add_argument("--profile-memory", choices=("none", "separate", "same"),
+                        default="separate",
+                        help="'separate' repeats the sweep with the allocator "
+                             "history on, keeping it out of the timed run; "
+                             "'same' records it in the timed run, which moves "
+                             "step time and idle")
     parser.add_argument("--profile-steps", default="3,5",
                         help="start,end of the profiling window (end exclusive)")
     parser.add_argument("--timeout", type=int, default=1800,
