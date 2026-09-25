@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Experimental : Comm time"""
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import NamedTuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
@@ -475,33 +475,36 @@ def prepare_context():
 
 
 def _accumulate_stage_comm(param, stage, stage_id):
-    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage."""
+    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage.
+
+    A body layer is priced on the walk's config, in its own kind; the
+    embedding and the output layer on the model's config, as its family left
+    it, whichever layer the walk reached last.
+    """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
     for chunk_id, chunk in enumerate(stage):
         for lay_id, layer in enumerate(chunk):
             param["ctx"].current_node = layer
             position = (stage_id, chunk_id, lay_id)
-            if (
-                layer
-                not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
-                and position in param["kinds"]
-            ):
+            is_body = layer not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
+            cfg = param["walk"] if is_body else param["cfg"]
+            if is_body and position in param["kinds"]:
                 kind = param["kinds"][position]
                 if kind is not None:
-                    apply_layer_kind(param["cfg"], kind)
-                logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
+                    apply_layer_kind(cfg, kind)
+                logger.info("is layer moe ? %s", cfg.n_exp > 1)
                 param["ctx"].current_node = LayerType.NOT_REC_LAYER
                 logger.info("param ctx %s", param["ctx"])
-                comm[Dim.DP] += EvalLayerComm.dp_comm_layer(param["cfg"], param["ctx"])
+                comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
 
             comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
-                param["cfg"], param["ctx"], 1
+                cfg, param["ctx"], 1
             )  # / 4 #* (param["cfg"].t - 1)
             comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
-                param["cfg"], param["ctx"], 1
+                cfg, param["ctx"], 1
             )  # * param["cfg"].ep
             comm[Dim.CP] += cp_comm_layer_detailed(
-                param["cfg"], param["ctx"]
+                cfg, param["ctx"]
             ).comm_volume
             # min(device_type.level_bound_number[0], param["cfg"].ep)
             # comm_cp += EvalLayerComm.cp_comm_layer
@@ -522,6 +525,9 @@ def estimate_from_mem_comm(*args, **kwargs):
         "debugger", args[5] if len(args) > 5 else None
     )
     param["ctx"] = prepare_context()
+    # The layers' kinds go on a copy: the model's config leaves the walk as
+    # it entered it, for the next walk and every read after.
+    param["walk"] = copy(param["cfg"])
 
     # Each layer's kind, in model order; layers past the stack get no entry,
     # so no kind and no DP term.
