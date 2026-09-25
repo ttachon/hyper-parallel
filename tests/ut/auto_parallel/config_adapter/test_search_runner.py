@@ -490,6 +490,10 @@ class TestSearchStrategies(unittest.TestCase):
         self.assertIn("tp", result)
         self.assertIn("dp", result)
         self.assertIn("memory_estimate_mb", result)
+        # Every candidate is priced fully recomputed, whatever the search yaml
+        # says, and the result states it.
+        self.assertEqual(config.estimator["recompute_strategy"], "selective")
+        self.assertEqual(result["activation_checkpoint"], "full")
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
