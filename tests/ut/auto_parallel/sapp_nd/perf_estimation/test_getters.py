@@ -307,6 +307,11 @@ class TestSelectiveRecompute(unittest.TestCase):
             recomputed = _factor(Config({"softmax": switch}), "softmax")
             self.assertEqual(kept + recomputed, 1, f"switch={switch}: kept={kept}, recomputed={recomputed}")
 
+    def test_a_qk_norm_is_recomputed_with_the_norms(self):
+        """A QK-norm has no switch of its own: the normOp switch recomputes it, as it drops its inputs."""
+        for switch in (0, 1):
+            self.assertEqual(_factor(Config({"normOp": switch}), "qknorm"), 1 - switch, f"normOp={switch}")
+
     def test_only_recomputed_ops_are_charged_twice(self):
         """The recompute pass adds the load of softmax alone."""
         lccfg = SimpleNamespace(n_softmax=1, n_normOp=1, n_attMM=1, rec_op=Config(_SWITCHES))

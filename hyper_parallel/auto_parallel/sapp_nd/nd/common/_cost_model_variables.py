@@ -91,6 +91,9 @@ class _CostModVar:
     # Recurrent-state update and readout, the linear-attention op the
     # arch hooks have no counterpart for. Zero for every other flavour.
     n_linrec: float = 0
+    # The QK-norm a layer runs: 1 where the model normalizes each head's
+    # queries and keys (qk_norm), 0 on a linear-attention layer.
+    n_qknorm: float = 0
     # The attention fields a linear group displaced, kept so a later full
     # group can put them back when hooks run in place, layer after layer.
     full_attn: dict = None
@@ -156,6 +159,8 @@ class _CostModVar:
     freeze: bool = False
     has_fa: bool = False
     attn_output_gate: bool = False
+    # Whether attention normalizes each head's queries and keys (Qwen3).
+    qk_norm: bool = False
     # vp_less_mem: bool = False
     has_clip: bool = False
     gmm: bool = False

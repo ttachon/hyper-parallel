@@ -338,6 +338,29 @@ def _make_arch_cfg(**kwargs: Any) -> SimpleNamespace:
     return SimpleNamespace(**defaults)
 
 
+def _torchtitan_flavor(name: str, args: str) -> CostModelConfig:
+    """Parse a TorchTitan flavor of model *name* stating *args*, as the TOML parser reads one."""
+    toml = Config({
+        "model": {"name": name, "flavor": "tiny"},
+        "parallelism": {
+            "data_parallel_replicate_degree": 1, "data_parallel_shard_degree": 2,
+            "tensor_parallel_degree": 1, "pipeline_parallel_degree": 1, "context_parallel_degree": 1,
+            "expert_parallel_degree": 1, "expert_tensor_parallel_degree": 0,
+            "pipeline_parallel_schedule": "1F1B",
+        },
+        "activation_checkpoint": {"mode": "full"},
+        "training": {"seq_len": 128, "local_batch_size": 1},
+    })
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        source_path = os.path.join(tmp_dir, "__init__.py")
+        with open(source_path, "w", encoding="utf-8") as source_file:
+            source_file.write(
+                "def get_train_spec():\n    return TrainSpec(model_args=model_args)\n"
+                f"model_args = {{'tiny': ModelArgs({args})}}\n"
+            )
+        return CostModelConfig(toml, framework="hyperparallel", source_code=source_path)
+
+
 class TestSappNDRunND(unittest.TestCase):
     """A test class for the SAPP-ND ``run_nd`` end-to-end pipeline."""
 
@@ -1665,33 +1688,32 @@ class TestSappNDRunND(unittest.TestCase):
         experts = ("dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=4, n_kv_heads=0, "
                    "kv_lora_rank=0, q_lora_rank=0, qk_rope_head_dim=0, n_dense_layers=1, moe_inter_dim=32, "
                    "moe_args=MoEArgs(num_experts=8, top_k=2, num_shared_experts=1), multiple_of=1")
-        toml = Config({
-            "model": {"name": "deepseek_v3", "flavor": "tiny"},
-            "parallelism": {
-                "data_parallel_replicate_degree": 1, "data_parallel_shard_degree": 2,
-                "tensor_parallel_degree": 1, "pipeline_parallel_degree": 1, "context_parallel_degree": 1,
-                "expert_parallel_degree": 1, "expert_tensor_parallel_degree": 0,
-                "pipeline_parallel_schedule": "1F1B",
-            },
-            "activation_checkpoint": {"mode": "full"},
-            "training": {"seq_len": 128, "local_batch_size": 1},
-        })
         cases = (
             (experts + ", ffn_dim_multiplier=1", (8, 2, 1, 1)),
             (experts + ", moe_enabled=False, ffn_dim_multiplier=1", (1, 1, 0, 1)),
             (experts + ", ffn_dim_multiplier=None", (8, 2, 1, 1)),
         )
         for args, want in cases:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                source_path = os.path.join(tmp_dir, "__init__.py")
-                with open(source_path, "w", encoding="utf-8") as source_file:
-                    source_file.write(
-                        "def get_train_spec():\n    return TrainSpec(model_args=model_args)\n"
-                        f"model_args = {{'tiny': ModelArgs({args})}}\n"
-                    )
-                ccfg = CostModelConfig(toml, framework="hyperparallel", source_code=source_path)
-                got = (ccfg.n_exp, ccfg.n_chosen_exp, ccfg.n_shared_exp, ccfg.fdm)
-                self.assertEqual(got, want, args)
+            ccfg = _torchtitan_flavor("deepseek_v3", args)
+            got = (ccfg.n_exp, ccfg.n_chosen_exp, ccfg.n_shared_exp, ccfg.fdm)
+            self.assertEqual(got, want, args)
+
+    def test_each_parser_states_whether_queries_and_keys_are_normalized(self) -> None:
+        """
+        Feature: the QK-norm, as the MindFormers and TOML parsers read it.
+        Description: MindFormers' Qwen3 yaml, which states qk_layernorm, and
+            the DeepSeek yaml, which does not; TorchTitan flavors of Qwen3
+            without qk_norm and with it False, and of Llama.
+        Expectation: Qwen3 runs one QK-norm per layer wherever its config
+            does not say otherwise, and the others none.
+        """
+        qwen3 = os.path.join(os.path.dirname(Par.__file__), "yamls", "pretrain_qwen3_72b.yaml")
+        got = [(ccfg.qk_norm, ccfg.n_qknorm) for ccfg in (CostModelConfig(qwen3), CostModelConfig(config_path))]
+        flavor = "dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=2, n_kv_heads=2"
+        for name, args in (("qwen3", flavor), ("qwen3", flavor + ", qk_norm=False"), ("llama3", flavor)):
+            ccfg = _torchtitan_flavor(name, args)
+            got.append((ccfg.qk_norm, ccfg.n_qknorm))
+        self.assertEqual(got, [(True, 1), (False, 0), (True, 1), (False, 0), (False, 0)])
 
     def test_a_hook_class_prices_time_as_it_prices_memory(self) -> None:
         """

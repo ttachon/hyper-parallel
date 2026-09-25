@@ -78,6 +78,10 @@ def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int
     }
 
 
+# The switch an op answers to where it has none of its own: a QK-norm is a norm.
+_SWITCH_OF = {"qknorm": "normOp"}
+
+
 def get_recomp_factor(lccfg, layer, op_name):
     """Whether a layer of this type runs the op again in its backward pass.
 
@@ -93,7 +97,7 @@ def get_recomp_factor(lccfg, layer, op_name):
         return 0
     if layer == LayerType.SEL_REC_LAYER:
         switches = vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
-        return int(not switches.get(op_name, 1))
+        return int(not switches.get(_SWITCH_OF.get(op_name, op_name), 1))
     logger.warning("Unrecognized recompute type %s", layer)
     return 0
 

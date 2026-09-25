@@ -110,6 +110,18 @@ class TestMindSpeedModules(unittest.TestCase):
             ccfg = _vision_language(_module("vit", 2, recompute_num_layers=layers), _module("deepseek_v3", 4, **_TEXT))
             self.assertEqual(ccfg.mm_ccfgs["vit"].full_rec, want, f"recompute_num_layers={layers}")
 
+    def test_a_module_states_its_qk_norm(self):
+        """
+        Feature: the MindSpeed parser's QK-norm.
+        Description: A text module stating qk_layernorm, beside a tower that
+            does not.
+        Expectation: Each text layer runs one QK-norm, and the tower's none.
+        """
+        ccfg = _vision_language(_module("vit", 2, pipeline_num_layers=[2, 0]),
+                                _module("deepseek_v3", 4, qk_layernorm=True, **_TEXT))
+        got = {name: (cc.qk_norm, cc.n_qknorm) for name, cc in ccfg.mm_ccfgs.items()}
+        self.assertEqual(got, {"vit": (False, 0), "deepseek_v3": (True, 1)})
+
     def test_one_module_is_the_model(self):
         """
         Feature: a MindSpeed config of one module.

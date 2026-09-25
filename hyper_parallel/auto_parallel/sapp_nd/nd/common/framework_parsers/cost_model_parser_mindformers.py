@@ -118,6 +118,9 @@ class CostModelParserMindformers(_CostModelParser):
             if self.config.model.model_config.qk_rope_head_dim
             else 0
         )  # decoupled QK per head dimension
+        # Whether each head's queries and keys are normalized, as MindFormers'
+        # Qwen3 states it.
+        self.state_qk_norm(self.ccfg, self.config.model.model_config.qk_layernorm)
 
         # Microbatch infos
         self.ccfg.b = max(
