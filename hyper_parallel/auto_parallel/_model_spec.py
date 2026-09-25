@@ -223,6 +223,49 @@ def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_dept
 
 
 @dataclass(frozen=True)
+class KindActivations:
+    """What one layer of a kind keeps for its backward, and the most its backward holds, per token.
+
+    Bytes per token at micro-batch 1, as a census measures them on one layer
+    (:mod:`hyper_parallel.auto_parallel._layer_census`) at ``seq_length``
+    tokens under the runtime's kernels: the part no tensor-parallel rank
+    splits, and the part it splits, of which a layer at TP 2 holds half.  The
+    backward's working set leaves out the parameters and their gradients,
+    which the memory model counts on its own.
+    """
+
+    saved: float
+    saved_tp: float
+    working: float
+    working_tp: float
+    seq_length: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the record as a plain mapping."""
+        return {spec_field.name: getattr(self, spec_field.name) for spec_field in fields(self)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
+        """Build a record, refusing a key it does not know, a missing one or a negative size."""
+        names = [spec_field.name for spec_field in fields(cls)]
+        unknown = sorted(set(data) - set(names))
+        missing = [name for name in names if name not in data]
+        if unknown or missing:
+            raise ModelSpecError(f"{where} has unknown keys {unknown} and lacks {missing}")
+        sizes = {name: float(data[name]) for name in names if name != "seq_length"}
+        if any(size < 0 for size in sizes.values()):
+            raise ModelSpecError(f"{where}: bytes per token cannot be negative, got {sizes}")
+        return cls(seq_length=_as_count(data["seq_length"], f"{where}.seq_length"), **sizes)
+
+
+def activations_from_dict(data: Any) -> Dict[str, KindActivations]:
+    """Parse a spec's ``activations``, a mapping of layer kind to its :class:`KindActivations`."""
+    if not isinstance(data, Mapping):
+        raise ModelSpecError(f"activations must map layer kinds to their records, got {data!r}")
+    return {str(kind): KindActivations.from_dict(record, f"activations.{kind}") for kind, record in data.items()}
+
+
+@dataclass(frozen=True)
 class VisionSpec:
     """The vision tower of a multimodal model.
 
@@ -299,6 +342,10 @@ class ModelSpec:
             over the head width before the scores, as Qwen3's ``q_norm`` and
             ``k_norm`` do.  A Transformers config does not state it; its
             producer infers it from the model's name.
+        activations: What a layer of each kind keeps for its backward and
+            holds in it, per token, as a census measures them; the memory
+            model prices a layer of a kind stated here with them rather
+            than its formulas.
     """
 
     name: str
@@ -344,6 +391,7 @@ class ModelSpec:
     ops: Optional[Dict[str, OpCounts]] = None
     layers: Optional[Tuple[LayerGroup, ...]] = None
     layer_types: Optional[Tuple[str, ...]] = None
+    activations: Optional[Dict[str, KindActivations]] = None
 
     vision: Optional[VisionSpec] = None
 
@@ -433,9 +481,16 @@ class ModelSpec:
             )
         if self.layers is not None:
             check_layer_counts(self.layers, self.num_hidden_layers, self.mtp_depth or 0)
+            self._check_activations()
         if self.vision is not None:
             self.vision.validate()
         return self
+
+    def _check_activations(self) -> None:
+        """Raise unless every kind the activations state is a kind of the stack."""
+        stated = set(self.activations or {}) - {group.kind for group in self.layers or ()}
+        if stated:
+            raise ModelSpecError(f"activations of kinds {sorted(stated)} no layer of the stack is")
 
     # ---- serialised form -----------------------------------------------
 
@@ -448,7 +503,7 @@ class ModelSpec:
         """
         out: Dict[str, Any] = {}
         for spec_field in fields(self):
-            if spec_field.name in ("vision", "ops", "layers", "layer_types"):
+            if spec_field.name in ("vision", "ops", "layers", "layer_types", "activations"):
                 continue
             value = getattr(self, spec_field.name)
             if value is not None:
@@ -459,6 +514,8 @@ class ModelSpec:
             out["layers"] = [group.to_dict() for group in self.layers]
         if self.layer_types is not None:
             out["layer_types"] = list(self.layer_types)
+        if self.activations is not None:
+            out["activations"] = {kind: record.to_dict() for kind, record in self.activations.items()}
         if self.vision is not None:
             out["vision"] = self.vision.to_dict()
         return out
@@ -519,6 +576,8 @@ class ModelSpec:
             return ops_from_dict(value)
         if key == "layers":
             return layers_from_list(value)
+        if key == "activations":
+            return activations_from_dict(value)
         if key == "ffn_dim_multiplier":
             return float(value)
         if key in ("attn_output_gate", "tie_word_embeddings", "qk_norm"):
