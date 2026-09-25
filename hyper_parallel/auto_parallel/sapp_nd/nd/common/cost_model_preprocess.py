@@ -37,7 +37,8 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
     """Detect attention type from cost model config.
 
     Detection rules:
-    1. If kv_lora_rank > 0: MLA
+    1. If the keys and values come from a compressed latent (dc_kv > 0,
+       the latent width every parser states): MLA
     2. If n_kv < a: GQA
     3. Otherwise: MHA
 
@@ -48,13 +49,13 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
         AttentionType enum.
 
     Example:
-        >>> ccfg.kv_lora_rank = 512
+        >>> ccfg.dc_kv = 512
         >>> ccfg.a = 64
         >>> ccfg.n_kv = 64
         >>> detect_attention_type(ccfg)
         <AttentionType.MLA: 'mla'>
     """
-    if ccfg.kv_lora_rank > 0:
+    if ccfg.dc_kv > 0:
         return AttentionType.MLA
     if ccfg.n_kv < ccfg.a:
         return AttentionType.GQA
@@ -62,15 +63,18 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
 
 
 def compute_kv_dim(ccfg: Any) -> float:
-    """Return effective KV dimension per TP rank based on attention type.
+    """Return the width, per TP rank, of each of the K and V that CP exchanges.
 
-    When TP is active, KV heads are split across TP ranks, so each
-    rank holds only 1/t of the total KV dimension.  MLA is an
-    exception: the compressed latent vector is not split by TP,
-    so kv_lora_rank stays unchanged.
+    Context parallelism exchanges the attention's own keys and values,
+    after the projections, whose heads TP splits.  An MLA layer builds every
+    head's key and value from its latent before attention, the key at the
+    head width plus the rotary part every head shares, the value at the
+    head width, and those are what CP exchanges, not the latent: it acts on
+    the attention's inputs.  Their mean width is returned, since K and V
+    are counted as two tensors of one width.
 
     Args:
-        ccfg: Cost model config with attributes a, n_kv, dh, h, t, kv_lora_rank.
+        ccfg: Cost model config with attributes a, n_kv, dh, dhr, h, t, dc_kv.
 
     Returns:
         Effective KV dimension per TP rank (float).
@@ -78,7 +82,7 @@ def compute_kv_dim(ccfg: Any) -> float:
     attention_type = detect_attention_type(ccfg)
     t = max(1, ccfg.t)
     if attention_type == AttentionType.MLA:
-        return float(ccfg.kv_lora_rank)
+        return ccfg.n_kv * (2 * ccfg.dh + ccfg.dhr) / 2 / t
     if attention_type == AttentionType.GQA:
         n_kv = min(ccfg.n_kv if ccfg.n_kv > 0 else ccfg.a, ccfg.a)
         return n_kv * ccfg.dh / t

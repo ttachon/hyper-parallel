@@ -146,7 +146,6 @@ class _CostModVar:
     tokens_per_expert: list = None
 
     # CP modeling
-    kv_lora_rank: float = 0
     attention_type: str = None
     device_per_node: float = 8
     bw_intra: float = 400.0
