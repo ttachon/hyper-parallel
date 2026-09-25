@@ -18,6 +18,8 @@ import argparse
 import os
 import sys
 
+import yaml
+
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
@@ -88,6 +90,41 @@ def _compare_with_real_csv(runner, cli_args):
     Debug.print_correlations_classified([metrics])
 
 
+def _priced_train_yaml(search_config: str) -> str:
+    """The train.yaml a search config names, which its search prices.
+
+    Args:
+        search_config: The search config's path.
+
+    Returns:
+        Its ``train_yaml``, or an empty string where it names none, as a
+        standalone search config does.
+    """
+    with open(search_config, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    named = raw.get("train_yaml") if isinstance(raw, dict) else None
+    return named if isinstance(named, str) else ""
+
+
+def _check_train_yaml(cli_parser: argparse.ArgumentParser, cli_args: argparse.Namespace) -> None:
+    """Refuse a -y that is not the train.yaml the search config prices.
+
+    The search prices the train.yaml its config names, and -y is the one
+    the resolved strategy is written over: two files would put one run's
+    strategy over another's run.
+
+    Args:
+        cli_parser: The parser, whose ``error()`` exits.
+        cli_args: The parsed CLI namespace, both files found.
+    """
+    priced = _priced_train_yaml(cli_args.search_config)
+    if priced and os.path.isfile(priced) and not os.path.samefile(priced, cli_args.yaml_config):
+        cli_parser.error(
+            f"-y names {cli_args.yaml_config}, but the search config prices its train_yaml, {priced}: "
+            "pass the same file"
+        )
+
+
 def _run_hyper_v2_search(cli_parser, cli_args):
     """Run the HyperParallel V2 strategy search via ``config_adapter``.
 
@@ -117,6 +154,7 @@ def _run_hyper_v2_search(cli_parser, cli_args):
         cli_parser.error(f"search-config not found: {cli_args.search_config}")
     if not os.path.isfile(cli_args.yaml_config):
         cli_parser.error(f"yaml-config not found: {cli_args.yaml_config}")
+    _check_train_yaml(cli_parser, cli_args)
 
     set_verbose_level(cli_args.verbosity)
     Debug.set_output_dir(cli_args.output_dir)
