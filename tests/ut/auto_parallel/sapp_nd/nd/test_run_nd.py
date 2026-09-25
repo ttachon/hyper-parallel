@@ -1443,6 +1443,40 @@ class TestSappNDRunND(unittest.TestCase):
                                                          ["8", "2", "12.0", "2048", "10.0"]])
         self.assertEqual(rows[1][5 + Debug.PerfParts.DP_COMM.value - 1], "4.0")
 
+    def test_a_comparison_leaves_out_what_nd_cannot_cost(self) -> None:
+        """
+        Feature: run_nd --real_csv on a strategy the cost model cannot represent.
+        Description: Two measured configurations, one refused the way the MoE parser
+            refuses expert parallelism wider than DP x TP; then both refused.
+        Expectation: The other is still estimated and the refused one is named; a
+            CSV none of whose configurations ND can cost is an error.
+        """
+        refused = {2}
+
+        def set_parallel_config(config: Any) -> bool:
+            """Refuse the configurations whose OP is in *refused*."""
+            if config.val(Dim.OP) in refused:
+                raise TypeError("MoE parsing error: d_exp(0)/t_exp(1)")
+            return True
+
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=set_parallel_config)
+        runner.memory_estim = lambda: 32
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = os.path.join(tmp_dir, "real.csv")
+            with open(csv_path, "w", encoding="utf-8") as csv_file:
+                csv_file.write("DP,OP,time,comp,dp_wait\n8,2,12,1,1\n8,4,10,5,4\n")
+            with patch.object(Par, "estimate_performance", return_value=10.0), \
+                    patch.object(Par.logger, "output") as output:
+                configs_estimated, _ = runner.compare_with_csv(csv_path)
+                self.assertEqual([entry[0].val(Dim.OP) for entry in configs_estimated], [4])
+                self.assertIn("MoE parsing error", str(output.call_args_list))
+                refused.add(4)
+                with self.assertRaises(ValueError):
+                    runner.compare_with_csv(csv_path)
+
     def test_the_measured_stack_adds_up_to_the_step(self) -> None:
         """
         Feature: the measured bars of ND's comparison plot.

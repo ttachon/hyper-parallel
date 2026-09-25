@@ -454,20 +454,29 @@ class ParallelizeLayer:
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
 
     def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
-        """Order the given space with performance estimation"""
+        """Order the given space with performance estimation.
+
+        A measured configuration the cost model cannot represent, such as
+        expert parallelism wider than DP x TP, is left out and named, so that
+        it does not end the comparison of every other one.
+        """
         scored_space = []
         debug_parts = []
         for config, real_time, real_comm_wait in space:
             # The comparison needs the per-part split at any verbosity; debug.csv stays opt-in.
             debugger = Debug.Debug(config, info_type=Debug.PerfParts, enable=True)
-            self.config.set_parallel_config(config)
-            peak_mem = self.memory_estim()
-            score = estimate_performance(
-                self.config.ccfg,
-                debugger=debugger,
-                device_type=self.machine.device,
-                stage_focused=0,
-            )  # , memory = mem)
+            try:
+                self.config.set_parallel_config(config)
+                peak_mem = self.memory_estim()
+                score = estimate_performance(
+                    self.config.ccfg,
+                    debugger=debugger,
+                    device_type=self.machine.device,
+                    stage_focused=0,
+                )  # , memory = mem)
+            except (TypeError, ValueError, ZeroDivisionError) as exc:
+                logger.output("ND cannot cost %s, left out of the comparison: %s", config, exc)
+                continue
             if self.enable_debug:
                 debugger.write()
             debug_parts = list(debugger.info.keys())
@@ -661,6 +670,8 @@ class ParallelizeLayer:
         configs_estimated, debug_parts = self.order_space_test_comm_classified(
             configs, order_by=2
         )
+        if not configs_estimated:
+            raise ValueError(f"ND cannot cost any configuration of {csv_f}")
 
         if output_path is not None:
             title = self.plot_title()
