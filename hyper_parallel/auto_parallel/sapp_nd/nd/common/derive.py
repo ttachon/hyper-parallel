@@ -182,14 +182,19 @@ def derive_comm_flags(ccfg: Any) -> None:
 
 
 def derive_embedding_sharding(ccfg: Any) -> None:
-    """Set how the embedding table is sharded, ``shard_embed``.
+    """Set how the embedding table is sharded, ``shard_embed``, and over how many of those
+    ranks it is gathered to compute with it, ``gather_embed``.
 
     The table is split over tensor parallelism unless the vocabulary
     embedding runs data parallel without pipelining, and over data
-    parallelism unless the config says it is not.
+    parallelism unless the config says it is not.  FSDP, which shards the
+    gradients as the parameters (``grad_shard_as_params``), gathers the
+    table over data parallelism to compute with it, as every parameter.
     """
     tp = 1 if (ccfg.vocab_emb_dp and ccfg.p == 1) else ccfg.t
     ccfg.shard_embed = (ccfg.d if ccfg.emb_dp_sharded else 1) * tp
+    fsdp = getattr(ccfg, "grad_shard_as_params", False)
+    ccfg.gather_embed = ccfg.d if fsdp and ccfg.emb_dp_sharded else 1
 
 
 def hyper_rec_op(selective: Union[bool, list]) -> dict[str, int]:
@@ -343,10 +348,12 @@ def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
 
 def derive_resharding(ccfg: Any, run: Mapping[str, Any]) -> None:
     """Set whether FSDP frees a layer's gathered parameters once it has run, ``reshards``,
-    and whether it holds each layer's reduce-scatter output until the backward ends,
-    ``defers_grads``."""
+    whether it holds each layer's reduce-scatter output until the backward ends,
+    ``defers_grads``, and whether it reduces a layer's gradients while the next
+    layer's backward runs, ``overlaps_grad_reduce``."""
     ccfg.reshards = bool(_stated(ccfg, "reshard_params", run))
     ccfg.defers_grads = bool(_stated(ccfg, "deferred_grad_accumulation", run))
+    ccfg.overlaps_grad_reduce = bool(_stated(ccfg, "overlapped_grad_reduce", run))
 
 
 def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:

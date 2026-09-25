@@ -36,6 +36,8 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._bwd_overhead import _BackwardOverhead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
@@ -228,10 +230,11 @@ class _Backbone:
                 comm_mem[k] = comm
             # FSDP that reshards frees a layer's gathered parameters once it
             # has run: a layer keeps none between its passes, and its
-            # backward holds its own and the next layer's, prefetched.  The
-            # root's, the embedding and output tables, stay gathered.
+            # backward holds its own and the next layer's, prefetched, as
+            # its working set counts them.  The root's, the embedding and
+            # output tables, stay gathered.
             if "dp" in comm_mem and self._ccfg.reshards and self.is_regular_layer(self._ctx.current_node):
-                comm_mem["dp"] *= 2 if self._ctx.working_set else 0
+                comm_mem["dp"] *= self._ctx.working_set
             res = EvalUtils.eval_expr_insight(
                 expr=self._ctx.comm_expr,
                 ctx=self._ctx,
@@ -506,6 +509,7 @@ class _Backbone:
             "comm": per_layer(0),
             "micro": per_layer(1),
             "grad_out": [0 for _ in stages],
+            "root_grad": [0 for _ in stages],
             "logs": [Config({}) for _ in range(pipeline)],
         }
 
@@ -645,6 +649,8 @@ class _Backbone:
                     sm["micro"][stage_id][chunk_id][lay_id] = self._ctx.micro_factor or 1
                     if self.is_regular_layer(node):
                         sm["grad_out"][stage_id] += self._ctx.node_grad
+                    elif node == LayerType.OUTPUT_LAYER and self._ccfg.overlaps_grad_reduce:
+                        sm["root_grad"][stage_id] += EvalTailSingle.reduced_grad_out_single(self._ccfg, self._ctx)[0]
                     if verbose:
                         logger.info("pp micro factor for dynamic: %s",self._ctx.micro_factor)
                     # PPB Purpose
@@ -665,17 +671,21 @@ class _Backbone:
                 self.__update_stage_logs(sm["logs"], stage_id)
 
     def __backward_end(self, stages, stage_id, sm, record_lay_types) -> float:
-        """The stage's dynamic memory as a later micro-batch's backward ends, or 0.
+        """The stage's dynamic memory as a micro-batch's backward ends, or 0.
 
         FSDP that holds each layer's reduce-scatter output until the backward
         ends, and accumulates gradients over several micro-batches, then
-        holds the outputs of all the stage's layers beside the gradients it
-        accumulated: its peak can come as the backward ends, when that
-        micro-batch keeps nothing but the other micro-batches in flight
-        still do.  The root's gathered tables stay, and the stage's first
-        layer runs its backward last.
+        holds the outputs of the stage's layers beside the gradients it
+        accumulated; FSDP that reduces a layer's gradients while the next
+        layer's backward runs holds whole gradients meanwhile, and the
+        root's, the output table's, until the backward ends.  Either's peak
+        can come as the backward ends, when that micro-batch keeps nothing
+        but the other micro-batches in flight still do.  The root's gathered
+        tables stay, and the stage's first layer runs its backward last,
+        before its own reduce-scatter starts.
         """
-        if self._ccfg.freeze or not self._ccfg.defers_grads or self._ccfg.m <= 1 or not sm["grad_out"][stage_id]:
+        held = sm["grad_out"][stage_id] if self._ccfg.defers_grads and self._ccfg.m > 1 else 0
+        if self._ccfg.freeze or not (held or self._ccfg.overlaps_grad_reduce):
             return 0
         kept = 0
         for chunk_id, chunk in enumerate(stages[stage_id]):
@@ -687,10 +697,11 @@ class _Backbone:
                     kept += sm["comm"][stage_id][chunk_id][lay_id]
         ccfg, ctx = self._ccfg, self._ctx
         try:
-            working = self._overhead_obj.first_layer_working_set(stages, stage_id, record_lay_types)
+            working, pending = self._overhead_obj.first_layer_working_set(stages, stage_id, record_lay_types)
         finally:
             self._ccfg, self._ctx = ccfg, ctx
-        return kept + sm["grad_out"][stage_id] + working
+        held = max(0, held - pending) if held else 0
+        return kept + held + working + sm["root_grad"][stage_id]
 
     def __postprocess_stages(self, *args):
         """Build memory insights from raw stage evaluation buffers."""

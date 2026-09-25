@@ -16,6 +16,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -177,6 +178,11 @@ class EvalTailSingle:
             * ctx.eval.num_p(ccfg, ctx)
             / (ccfg.t * ccfg.cp)
         )
+
+    @staticmethod
+    def reduced_grad_out_single(ccfg: CostModelConfig, ctx: Context) -> tuple:
+        """The output table's gradient FSDP reduce-scatters, whole and sharded (lmhead)."""
+        return EvalUtils.reduced_grads(ccfg, ((ctx.eval.num_p(ccfg, ctx), ccfg.t, ccfg.shard_grad_non_exp),))
 
 
 class EvalTail:
