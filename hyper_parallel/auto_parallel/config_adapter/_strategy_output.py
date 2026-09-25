@@ -153,8 +153,38 @@ def _check_batch_derivation(data: Dict[str, Any], resolved: Dict[str, Any]) -> N
         )
 
 
+def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
+    """Set the activation checkpoint mode the search priced every layer with.
+
+    The AutoModels schema states it as ``activation_checkpoint.mode``
+    (``off``, ``full`` or ``selective``), the older one as
+    ``train.gradient_checkpointing.activation_checkpoint``, where ``off``
+    is spelled ``none``. A mode the train yaml states otherwise is replaced,
+    and the replacement is logged.
+    """
+    if is_auto_models_schema(data):
+        section = data.get("activation_checkpoint")
+        if not isinstance(section, dict):
+            section = data["activation_checkpoint"] = {}
+        before = section.get("mode", "off")
+        section["mode"] = mode
+    else:
+        checkpointing = data["train"].get("gradient_checkpointing")
+        if not isinstance(checkpointing, dict):
+            checkpointing = data["train"]["gradient_checkpointing"] = {}
+        before = checkpointing.get("activation_checkpoint", "none")
+        checkpointing["activation_checkpoint"] = "none" if mode == "off" else mode
+    if {"none": "off"}.get(before, before) != mode:
+        logger.info(
+            "activation checkpoint mode %s in the train yaml, %s in the search: writing the searched mode",
+            before, mode,
+        )
+
+
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
+    if resolved.get("activation_checkpoint"):
+        _inject_activation_checkpoint(data, resolved["activation_checkpoint"])
     if is_auto_models_schema(data):
         accelerator = data["accelerator"]
         for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
