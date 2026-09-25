@@ -439,6 +439,18 @@ def plot_nd(
     plot.close(output_path, "results")
 
 
+def _score_parts() -> list:
+    """The parts a score splits into, in the order the debugger fills them."""
+    return [part for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY}]
+
+
+def _make_parent(path: str) -> None:
+    """Create the directory *path* is to be written in, when it is missing."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
 def write_ranking_csv(scored_space: list, path: str) -> None:
     """Write a search's configurations in ND's order, best first.
 
@@ -452,10 +464,8 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
             ``ParallelizeLayer.order_search_space`` sorts them.
         path: CSV file to write; its directory is created when missing.
     """
-    parts = [part for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY}]
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+    parts = _score_parts()
+    _make_parent(path)
     dims = [str(dim) for dim in scored_space[0][0].keys()] if scored_space else []
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -463,6 +473,36 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
         for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
             split = [repr(float(value)) for value in values] if values else [""] * len(parts)
             writer.writerow([rank] + config.values() + [memory, repr(float(score))] + split)
+
+
+def write_estimates_csv(configs_estimated: list, path: str) -> None:
+    """Write ND's estimate of every configuration of a classified comparison.
+
+    One row per measured configuration, in the comparison's order: its
+    degrees, the measured step, ND's peak memory in MB, its score and the
+    parts of the score. The plots show these only as bars; a sweep needs ND's
+    memory as a number, to set it beside the peak the trainer logged.
+
+    Args:
+        configs_estimated: ``(config, peak_mem, real_time, score, parts,
+            real_parts)`` entries, as ``ParallelizeLayer.compare_with_csv``
+            returns them.
+        path: CSV file to write; its directory is created when missing.
+    """
+    parts = _score_parts()
+    _make_parent(path)
+    dims = [str(dim) for dim in configs_estimated[0][0].keys()] if configs_estimated else []
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(dims + ["time", "memory_mb", "score"] + [str(part) for part in parts])
+        for config, memory, step, score, values, _ in configs_estimated:
+            split = [repr(float(value)) for value in values[:len(parts)]]
+            writer.writerow(config.values() + [step, memory, repr(float(score))] + split)
+
+
+def busy_time(entry: tuple) -> float:
+    """The measured step of a comparison entry less its idle remainder."""
+    return entry[2] - (entry[5].get("IDLE") or 0.0)
 
 
 def plot_vs_real(
@@ -491,9 +531,15 @@ def plot_vs_real_comm_classified(
     debug_parts,
     **kwargs,
 ):
-    """Plot estimation vs real detailed time"""
+    """Plot estimation vs real detailed time.
+
+    Written to ``<csv stem><suffix>.pdf`` in *output_path*: ``plot_idle`` adds
+    the measured idle remainder to the measured bars, and ``suffix`` (empty
+    by default) tells apart several plots of one CSV.
+    """
     plot_idle = kwargs.get("plot_idle", False)
     title = kwargs.get("title", None)
+    suffix = kwargs.get("suffix", "")
     real_data = []
 
     plot = Plot(title, configs_estimated[0][0].keys(), debug_parts)
@@ -526,7 +572,7 @@ def plot_vs_real_comm_classified(
     plot.make_table()
     plot.close(
         output_path,
-        Path(os.path.basename(csv_f)).stem,
+        Path(os.path.basename(csv_f)).stem + suffix,
     )
 
 
