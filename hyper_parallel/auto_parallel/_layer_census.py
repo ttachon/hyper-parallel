@@ -33,7 +33,7 @@ import copy
 import importlib
 import inspect
 import weakref
-from typing import Any, Dict, Iterable, Mapping, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -116,7 +116,6 @@ class _LiveBytes(TorchDispatchMode):
     def __init__(self):
         super().__init__()
         self.sizes: Dict[Tuple[int, int], int] = {}
-        self.numels: Dict[Tuple[int, int], int] = {}
         self.generation: Dict[int, int] = {}
         self.events: list = []
 
@@ -132,7 +131,6 @@ class _LiveBytes(TorchDispatchMode):
         if key in self.sizes:
             return
         self.sizes[key] = storage.nbytes()
-        self.numels[key] = tensor.numel()
         self.events.append((key, self.sizes[key]))
         weakref.finalize(storage, self._free, key)
 
@@ -170,6 +168,53 @@ class _LiveBytes(TorchDispatchMode):
             if live > top:
                 top, bytes_at_top = live, live - held
         return bytes_at_top
+
+
+def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
+             forward: Callable[[], torch.Tensor], backward: Callable[[torch.Tensor], None]) -> Tuple[int, int]:
+    """Bytes a forward saves for its backward, and the activations the backward holds when it holds the most.
+
+    Args:
+        params: The parameters of what runs.
+        inputs: The tensors the forward takes, which count from its start.
+        forward: Runs the forward and returns its output.
+        backward: Runs the backward from that output.
+
+    Returns:
+        The bytes the forward saves, its inputs included, and the bytes of
+        activations live when the backward peaks, its output left out.  The
+        parameters, which the forward's views of them bring into the
+        tracker, are the memory model's to count, and so are their
+        gradients, which hooks on the parameters tell apart from the
+        activations' however they are shaped: the gradients the backward
+        hands each parameter and the one it keeps.  They settle when the
+        backward peaks, and the bytes returned are the activations held then.
+    """
+    stored = {p.untyped_storage()._cdata for p in params}  # pylint: disable=protected-access
+    saved: Dict[int, int] = {}
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        """Count a tensor autograd saves, unless it is a parameter's."""
+        address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
+        if address not in stored:
+            saved[address] = tensor.untyped_storage().nbytes()
+        return tensor
+
+    live = _LiveBytes()
+    grads: List[Tuple[int, int]] = []
+    handles = [p.register_hook(lambda grad: grads.append(live.key(grad))) for p in params]
+    try:
+        with live, torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            for tensor in inputs:
+                live.track(tensor)
+            out = forward()
+            start = len(live.events)
+            backward(out)
+    finally:
+        for handle in handles:
+            handle.remove()
+    grads += [live.key(p.grad) for p in params if p.grad is not None]
+    return sum(saved.values()), live.peak(start, [live.key(out), *(live.key(p) for p in params)], grads)
 
 
 def _modeling(config: Any) -> Any:
@@ -255,31 +300,8 @@ def census_layer(config: Any, layer_index: int, seq_length: int) -> Tuple[int, i
         layer.train()
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
-        params = {p.untyped_storage()._cdata for p in layer.parameters()}  # pylint: disable=protected-access
-        saved: Dict[int, int] = {}
-
-        def pack(tensor: torch.Tensor) -> torch.Tensor:
-            address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
-            if address not in params:
-                saved[address] = tensor.untyped_storage().nbytes()
-            return tensor
-
-        live = _LiveBytes()
-        with live, torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-            live.track(hidden)
-            live.track(grad)
-            out = _run(layer, hidden, rotary, seq_length)
-            start = len(live.events)
-            out.backward(grad)
-        # The parameters, which the forward's views of them bring into the
-        # tracker, are the memory model's to count, and so are their
-        # gradients, in whatever layout the backward makes them: they settle
-        # when the backward peaks, and the bytes the census gives are the
-        # activations held then.
-        numels = {p.numel() for p in layer.parameters()}
-        grads = [key for key, size in live.events[start:] if size > 0 and live.numels.get(key) in numels]
-        weights = [live.key(p) for p in layer.parameters()]
-        return sum(saved.values()), live.peak(start, [live.key(out), *weights], grads)
+        return _measure(list(layer.parameters()), (hidden, grad),
+                        lambda: _run(layer, hidden, rotary, seq_length), lambda out: out.backward(grad))
 
 
 def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],

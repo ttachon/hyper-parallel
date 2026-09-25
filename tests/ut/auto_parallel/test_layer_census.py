@@ -18,10 +18,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import torch
 import yaml
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
-from hyper_parallel.auto_parallel._layer_census import census_activations, census_layer, tp_config
+from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
+    _measure,
+    census_activations,
+    census_layer,
+    tp_config,
+)
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import bind_layer_stack
@@ -111,6 +118,23 @@ class TestLayerCensus(unittest.TestCase):
             for full, half in zip(whole, share):
                 self.assertGreater(full, half)
                 self.assertGreater(2 * half, full)
+
+    def test_a_gradient_the_size_of_a_parameter_is_an_activations(self):
+        """
+        Feature: _measure, which tells gradients apart.
+        Description: A projection of a 64-wide input of 64 tokens, whose
+            input's gradient has as many elements as its weight.
+        Expectation: The forward keeps the input; when the backward peaks,
+            the input, the output's gradient and the input's are the
+            activations held, and the weight's gradient is not.
+        """
+        with FakeTensorMode():
+            weight = torch.nn.Parameter(torch.empty(64, 64, dtype=torch.bfloat16))
+            hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
+            size = hidden.untyped_storage().nbytes()
+            saved, working = _measure([weight], (hidden,), lambda: hidden @ weight.t(),
+                                      lambda out: out.backward(torch.ones_like(out)))
+        self.assertEqual((saved, working), (size, 3 * size))
 
     def test_each_kind_gets_its_record(self):
         """
