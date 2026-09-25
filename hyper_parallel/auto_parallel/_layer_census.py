@@ -25,7 +25,10 @@ HyperParallel's chunked gated-delta-rule kernel, which saves the queries,
 keys, values, the cumulated gates, beta and one chunk matrix.  A layer built
 with half the heads and half the feed-forward widths, as a tensor-parallel
 rank of 2 holds it, tells the bytes tensor parallelism splits from those it
-does not.
+does not.  Run again under HyperParallel's selective activation checkpointing,
+its own checkpoint and policy, a layer keeps its input and the outputs the
+policy saves: every other matmul's, the attention kernel's and the
+convolution's.
 
 The output layer's census runs the final norm, the output projection and
 Transformers' causal-LM loss, which casts the logits to fp32, as
@@ -37,6 +40,7 @@ bytes a vocabulary-parallel loss splits.  A model spec states a census as
 from __future__ import annotations
 
 import copy
+import functools
 import importlib
 import inspect
 import weakref
@@ -48,6 +52,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forb
 from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
 from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.core.activation_memory import api as activation_memory
+from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,10 @@ class KindActivations:
     tensor-parallel rank splits, and the part it splits, of which a layer at
     TP 2 holds half.  The backward's working set leaves out the parameters
     and their gradients, which the memory model counts on its own.
+    ``selective`` and ``selective_tp`` are what the layer keeps under
+    HyperParallel's selective activation checkpointing, whose backward
+    recomputes the rest and holds the same working set; a record states
+    both or neither.
     """
 
     saved: float
@@ -66,10 +76,24 @@ class KindActivations:
     working: float
     working_tp: float
     seq_length: int
+    selective: Optional[float] = None
+    selective_tp: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return the record as a plain mapping."""
-        return {record_field.name: getattr(self, record_field.name) for record_field in fields(self)}
+        """Return the record as a plain mapping, the selective part only when stated."""
+        return {record_field.name: getattr(self, record_field.name) for record_field in fields(self)
+                if getattr(self, record_field.name) is not None}
+
+    @staticmethod
+    def _check_keys(data: Mapping[str, Any], names: Sequence[str], where: str) -> None:
+        """Raise unless *data* states the fields of *names*, the selective pair both or neither, and no other."""
+        optional = ("selective", "selective_tp")
+        unknown = sorted(set(data) - set(names))
+        missing = [name for name in names if name not in data and name not in optional]
+        if unknown or missing:
+            raise ValueError(f"{where} has unknown keys {unknown} and lacks {missing}")
+        if len({data.get(name) is None for name in optional}) > 1:
+            raise ValueError(f"{where} states one of {list(optional)} without the other")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
@@ -77,11 +101,8 @@ class KindActivations:
         if not isinstance(data, Mapping):
             raise ValueError(f"{where} must map the record's fields to their values, got {data!r}")
         names = [record_field.name for record_field in fields(cls)]
-        unknown = sorted(set(data) - set(names))
-        missing = [name for name in names if name not in data]
-        if unknown or missing:
-            raise ValueError(f"{where} has unknown keys {unknown} and lacks {missing}")
-        sizes = {name: float(data[name]) for name in names if name != "seq_length"}
+        cls._check_keys(data, names, where)
+        sizes = {name: float(data[name]) for name in names if name != "seq_length" and data.get(name) is not None}
         if any(size < 0 for size in sizes.values()):
             raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
         seq_length = int(data["seq_length"])
@@ -111,32 +132,44 @@ _TP_FIELDS = (
 _FLASH_STATS = 8
 
 
-class _FlashAttention(torch.autograd.Function):
-    """Flash attention's saved set, shapes only: its inputs, its output and two fp32 statistics."""
+def _flash_outputs(query: torch.Tensor, key: torch.Tensor,
+                   value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flash attention's outputs, shapes only: one of the queries' shape and two fp32 statistics."""
+    del key, value
+    batch, heads, seq, _ = query.shape
+    stats = [torch.empty(batch, heads, seq, _FLASH_STATS, dtype=torch.float32, device=query.device)
+             for _ in range(2)]
+    return torch.empty_like(query), stats[0], stats[1]
 
-    @staticmethod
-    def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor,  # pylint: disable=arguments-differ
-                value: torch.Tensor) -> torch.Tensor:
-        """Save the inputs, an output of the queries' shape and the statistics; return that output."""
-        out = torch.empty_like(query)
-        batch, heads, seq, _ = query.shape
-        stats = [torch.empty(batch, heads, seq, _FLASH_STATS, dtype=torch.float32, device=query.device)
-                 for _ in range(2)]
-        ctx.save_for_backward(query, key, value, out, *stats)
-        return out
 
-    @staticmethod
-    def backward(ctx: Any,  # pylint: disable=arguments-differ
-                 grad: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return gradients of the inputs' shapes."""
-        del grad
-        query, key, value = ctx.saved_tensors[:3]
-        return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+# Flash attention as one op, as the runtime's kernel is: HyperParallel's
+# selective policy saves what the attention kernels it lists return, and
+# saves this one's too.
+_FLASH_KERNEL = torch.library.custom_op(
+    "nd_census::flash_attention", mutates_args=(),
+    schema="(Tensor query, Tensor key, Tensor value) -> (Tensor, Tensor, Tensor)")(_flash_outputs)
+_FLASH_KERNEL.register_fake(_flash_outputs)
+
+
+def _flash_saves(ctx: Any, inputs: Tuple[torch.Tensor, ...], output: Tuple[torch.Tensor, ...]) -> None:
+    """Keep the inputs, the output and the statistics, which no gradient reaches."""
+    ctx.mark_non_differentiable(*output[1:])
+    ctx.save_for_backward(*inputs, *output)
+
+
+def _flash_backward(ctx: Any, *grads: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gradients of the inputs' shapes."""
+    del grads
+    query, key, value = ctx.saved_tensors[:3]
+    return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
+
+_FLASH_KERNEL.register_autograd(_flash_backward, setup_context=_flash_saves)
 
 
 def _flash_attention(module, query, key, value, attention_mask, **kwargs):  # pylint: disable=unused-argument
-    """A Transformers attention function running :class:`_FlashAttention`, grouped K and V unexpanded."""
-    return _FlashAttention.apply(query, key, value).transpose(1, 2).contiguous(), None
+    """A Transformers attention function running the census's flash attention, grouped K and V unexpanded."""
+    return _FLASH_KERNEL(query, key, value)[0].transpose(1, 2).contiguous(), None
 
 
 class _GatedDeltaRule(torch.autograd.Function):
@@ -240,7 +273,9 @@ class _LiveBytes(TorchDispatchMode):
 
 
 def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
-             forward: Callable[[], torch.Tensor], backward: Callable[[torch.Tensor], None]) -> Tuple[int, int]:
+             forward: Callable[[], torch.Tensor], backward: Callable[[torch.Tensor], None],
+             grad_inputs: Iterable[torch.Tensor] = (), checkpointed: bool = False,
+             shared: Iterable[torch.Tensor] = ()) -> Tuple[int, int]:
     """Bytes a forward saves for its backward, and the activations the backward holds when it holds the most.
 
     Args:
@@ -248,16 +283,25 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         inputs: The tensors the forward takes, which count from its start.
         forward: Runs the forward and returns its output.
         backward: Runs the backward from that output.
+        grad_inputs: The tensors the backward takes, which count from its
+            start.
+        checkpointed: Whether the forward runs under activation
+            checkpointing, whose own hooks hold what it keeps.
+        shared: Tensors the model shares between its layers, which a
+            checkpointed forward's count leaves out.
 
     Returns:
         The bytes the forward saves, its inputs included, and the bytes of
-        activations live when the backward peaks, its output left out.  The
-        parameters, which the forward's views of them bring into the
+        activations live when the backward peaks, its output left out.  A
+        checkpointed forward keeps what is live once it has run, but for
+        the *shared* tensors: its inputs and the outputs its policy saves.
+        The parameters, which the forward's views of them bring into the
         tracker, are the memory model's to count, and so are their
         gradients, which hooks on the parameters tell apart from the
         activations' however they are shaped: the gradients the backward
         hands each parameter and the one it keeps.  They settle when the
-        backward peaks, and the bytes returned are the activations held then.
+        backward peaks, and the bytes returned are the activations held
+        then.
     """
     stored = {p.untyped_storage()._cdata for p in params}  # pylint: disable=protected-access
     saved: Dict[int, int] = {}
@@ -278,12 +322,34 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
                 live.track(tensor)
             out = forward()
             start = len(live.events)
+            left_out = {live.key(out), *(live.key(p) for p in params)}
+            not_kept = left_out | {live.key(tensor) for tensor in shared}
+            kept = sum(size for key, size in live.sizes.items() if key not in not_kept)
+            for tensor in grad_inputs:
+                live.track(tensor)
             backward(out)
     finally:
         for handle in handles:
             handle.remove()
     grads += [live.key(p.grad) for p in params if p.grad is not None]
-    return sum(saved.values()), live.peak(start, [live.key(out), *(live.key(p) for p in params)], grads)
+    return kept if checkpointed else sum(saved.values()), live.peak(start, left_out, grads)
+
+
+def _selective_contexts() -> Tuple[Any, Any]:
+    """HyperParallel's selective checkpointing contexts, its policy saving the census's flash attention."""
+    # HyperParallel's distributed package, which holds the policy, takes as
+    # long to import as the rest of the cost model: it loads only when a
+    # census runs.
+    checkpointing = importlib.import_module("hyper_parallel.distributed.activation_checkpoint")
+    policy = checkpointing._make_selective_checkpoint_policy_fn()  # pylint: disable=protected-access
+
+    def census_policy(ctx: Any, func: Any, *args: Any, **kwargs: Any) -> CheckpointPolicy:
+        """The trainer's policy, which saves the census's flash attention as it saves the runtime's."""
+        if func is torch.ops.nd_census.flash_attention.default:
+            return CheckpointPolicy.MUST_SAVE
+        return policy(ctx, func, *args, **kwargs)
+
+    return activation_memory.create_selective_checkpoint_contexts(census_policy)
 
 
 def _modeling(config: Any) -> Any:
@@ -323,31 +389,40 @@ def tp_config(config: Any, tp: int) -> Any:
     return config
 
 
-def _run(layer: Any, hidden: torch.Tensor, rotary: Any, seq_length: int) -> torch.Tensor:
-    """One forward of *layer*, as its model calls it."""
+def _positions(rotary: Any, hidden: torch.Tensor, seq_length: int) -> Tuple[torch.Tensor, Any]:
+    """The position ids of a sequence of *seq_length* tokens, and the embeddings *rotary* gives them."""
     position_ids = torch.arange(seq_length).unsqueeze(0)
     with torch.no_grad():
-        position_embeddings = rotary(hidden, position_ids)
+        return position_ids, rotary(hidden, position_ids)
+
+
+def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
+         call: Optional[Callable[..., Any]] = None) -> torch.Tensor:
+    """One forward of *layer*, as its model calls it at *positions*, through *call* if given."""
+    position_ids, position_embeddings = positions
     accepted = inspect.signature(layer.forward).parameters
     kwargs = {name: value for name, value in (
         ("position_embeddings", position_embeddings), ("position_ids", position_ids),
         ("attention_mask", None), ("use_cache", False)) if name in accepted}
-    out = layer(hidden, **kwargs)
+    out = (call or layer)(hidden, **kwargs)
     return out[0] if isinstance(out, tuple) else out
 
 
-def census_layer(config: Any, layer_index: int, seq_length: int) -> Tuple[int, int]:
+def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False) -> Tuple[int, int]:
     """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
 
     Args:
         config: The language model's Transformers config.
         layer_index: The layer to build, which settles its kind.
         seq_length: Tokens of the micro-batch of one sequence it runs.
+        selective: Whether the layer runs under HyperParallel's selective
+            activation checkpointing, as its trainer wraps a layer.
 
     Returns:
-        The bytes the forward saves, its input included, and the bytes of
-        activations the backward holds when it holds the most, its own
-        gradients included, less the parameters and those gradients.
+        The bytes the forward keeps for the backward, its input included,
+        and the bytes of activations the backward holds when it holds the
+        most, its own gradients included, less the parameters and those
+        gradients.
     """
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
@@ -369,8 +444,18 @@ def census_layer(config: Any, layer_index: int, seq_length: int) -> Tuple[int, i
         layer.train()
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
-        return _measure(list(layer.parameters()), (hidden, grad),
-                        lambda: _run(layer, hidden, rotary, seq_length), lambda out: out.backward(grad))
+        if not selective:
+            return _measure(list(layer.parameters()), (hidden,),
+                            lambda: _run(layer, hidden, _positions(rotary, hidden, seq_length)),
+                            lambda out: out.backward(grad), grad_inputs=(grad,))
+        # The model embeds the positions once for all its layers, outside
+        # their checkpoints, and the trainer checkpoints each layer's call.
+        positions = _positions(rotary, hidden, seq_length)
+        call = functools.partial(activation_memory.checkpoint, layer, swap_inputs=False,
+                                 context_fn=_selective_contexts)
+        return _measure(list(layer.parameters()), (hidden,), lambda: _run(layer, hidden, positions, call),
+                        lambda out: out.backward(grad), grad_inputs=(grad,), checkpointed=True,
+                        shared=tree_flatten(positions)[0])
 
 
 def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
@@ -440,7 +525,8 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
 
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
-        holds, the part TP splits is half the part at TP 1.
+        holds, the part TP splits is half the part at TP 1; what it keeps
+        under HyperParallel's selective activation checkpointing too.
     """
     firsts: Dict[str, int] = {}
     index = 0
@@ -453,11 +539,15 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
     for kind, layer_index in firsts.items():
         (saved_1, working_1), (saved_2, working_2) = (
             census_layer(tp_config(config, tp), layer_index, seq_length) for tp in (1, 2))
+        (kept_1, _), (kept_2, _) = (
+            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True) for tp in (1, 2))
         out[kind] = KindActivations(
             saved=max(0.0, 2 * saved_2 - saved_1) / seq_length,
             saved_tp=max(0.0, 2 * (saved_1 - saved_2)) / seq_length,
             working=max(0.0, 2 * working_2 - working_1) / seq_length,
             working_tp=max(0.0, 2 * (working_1 - working_2)) / seq_length,
             seq_length=int(seq_length),
+            selective=max(0.0, 2 * kept_2 - kept_1) / seq_length,
+            selective_tp=max(0.0, 2 * (kept_1 - kept_2)) / seq_length,
         )
     return out
