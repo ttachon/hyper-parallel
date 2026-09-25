@@ -167,6 +167,7 @@ class _Backbone:
     ) -> tuple[float, float]:
         """dynamic memory evaluation for backbone estimation"""
         if self._ctx.current_node in self._ctx.node_eval:
+            self._ctx.seq_chunks = 1
             if ppb:
                 micro_factor = 1
             elif default_micro_factor:
@@ -177,9 +178,17 @@ class _Backbone:
                     self._ccfg, self._ctx
                 )
             self._ctx.micro_factor = max(1, micro_factor)
-            activation = self._ctx.eval.dyn.activation(self._ccfg, self._ctx)
-            self._ctx.save2log("_activ", activation)
-            comm = self._inner_comm_mem(micro_factor)
+            # A schedule that splits the sequence evaluates the node at one
+            # chunk's length, and leaves the config's as it found it.
+            full_s = self._ccfg.s
+            if self._ctx.seq_chunks > 1:
+                self._ccfg.s = full_s / self._ctx.seq_chunks
+            try:
+                activation = self._ctx.eval.dyn.activation(self._ccfg, self._ctx)
+                self._ctx.save2log("_activ", activation)
+                comm = self._inner_comm_mem(micro_factor)
+            finally:
+                self._ccfg.s = full_s
             return activation, comm
         return 0, 0
 
