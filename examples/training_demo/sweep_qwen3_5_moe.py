@@ -30,6 +30,14 @@ compares four strategies:
 
     ... --ep 2,16 --cp 1,2
 
+Or let ND choose. This runs ND's search at the sweep's shape and profiles the
+five strategies it ranks best among those this model and trainer can run,
+which tests its ranking where a search relies on it. Naming an axis as well
+adds that grid, a known strategy to measure ND's picks against:
+
+    ... --nd-top 5
+    ... --nd-top 5 --ep 16
+
 Stages run in order and each can be run alone with ``--only``, so a failed
 sweep can be classified without re-running, and a changed cost model can be
 re-scored without re-profiling.
@@ -48,7 +56,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parent.parent
@@ -64,7 +72,12 @@ PEAK_PATTERN = re.compile(
     r"memory/device_max_reserved_gb=([0-9.]+)"
 )
 REMOTE_PROFILES = "output/sweep_profiles"
-STAGES = ("mirror", "data", "run", "fetch", "classify", "compare", "plot")
+STAGES = ("rank", "mirror", "data", "run", "fetch", "classify", "compare", "plot")
+# The degrees a strategy is named by, as ND's ranking and the classified CSV
+# both spell them. SP and VPP are left out: SP only acts with TP and VPP only
+# with PP, and neither of those runs on this model.
+STRATEGY_DIMS = ("EP", "CP", "OP", "MP", "PP", "MB", "MBS")
+RUN_ND = "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd"
 
 
 def _run(command: Sequence[str], *, capture: bool = False, check: bool = True) -> str:
@@ -125,7 +138,8 @@ class Point:
 
     ``dp`` is the data-parallel width the dataloader splits the batch over,
     ``world / (tp * cp * pp)``. ``op`` is ND's name for the FSDP shard width,
-    which covers the data AND context axes, so it divides ``dp * cp``.
+    which covers the data AND context axes, so it divides ``dp * cp``. ``mbs``
+    is the micro-batch size and ``mb`` the micro-batches per step.
     """
 
     ep: int
@@ -135,18 +149,24 @@ class Point:
     pp: int
     dp: int
     mb: int
+    mbs: int
     gbs: int
 
     @property
     def tag(self) -> str:
-        """Directory-safe name carrying every degree that can vary."""
-        return f"ep{self.ep}_cp{self.cp}_op{self.op}_tp{self.tp}_pp{self.pp}"
+        """Directory-safe name carrying every degree that can vary.
+
+        The micro-batch size appears only above 1, so a sweep that never
+        changes it keeps the names its earlier runs were profiled under.
+        """
+        tag = f"ep{self.ep}_cp{self.cp}_op{self.op}_tp{self.tp}_pp{self.pp}"
+        return f"{tag}_mbs{self.mbs}" if self.mbs > 1 else tag
 
     @property
     def dims(self) -> Dict[str, int]:
         """ND's dimension columns for this strategy."""
         return {"DP": self.dp, "MP": self.tp, "PP": self.pp, "CP": self.cp,
-                "EP": self.ep, "MB": self.mb, "OP": self.op}
+                "EP": self.ep, "MB": self.mb, "MBS": self.mbs, "OP": self.op}
 
 
 def _split_ints(text: str) -> List[int]:
@@ -154,30 +174,36 @@ def _split_ints(text: str) -> List[int]:
     return [int(part) for part in text.split(",") if part.strip()]
 
 
-def _reject(point: Point, args: argparse.Namespace, world: int,
-            fsdp_width: int) -> None:
-    """Raise when a strategy the trainer or this model could not run is asked for."""
+def _unrunnable(point: Point, args: argparse.Namespace, world: int) -> Optional[str]:
+    """Say why the trainer or this model could not run a strategy, or None."""
     if point.tp > 1:
-        raise SystemExit(
-            "tp_size > 1 shards the Gated DeltaNet conv1d while its groups and "
-            "conv_dim stay global, so the forward raises on this model")
+        return ("tp_size > 1 shards the Gated DeltaNet conv1d while its groups "
+                "and conv_dim stay global, so the forward raises on this model")
     if point.pp > 1:
-        raise SystemExit(
-            "pp_size > 1 neither raises nor pipelines: the Trainer has no "
-            "pipeline schedule, so every stage group trains a full replica")
+        return ("pp_size > 1 neither raises nor pipelines: the Trainer has no "
+                "pipeline schedule, so every stage group trains a full replica")
     if world % point.ep or args.num_experts % point.ep:
-        raise SystemExit(
-            f"ep {point.ep} must divide the world size ({world}) and the "
-            f"routed expert count ({args.num_experts})")
+        return (f"ep {point.ep} must divide the world size ({world}) and the "
+                f"routed expert count ({args.num_experts})")
+    fsdp_width = point.dp * point.cp   # FSDP shards over the data and context axes
     if fsdp_width % point.op:
-        raise SystemExit(
-            f"op {point.op} must divide dp*cp ({fsdp_width}); FSDP shards over "
-            "the data and context axes together")
-    per_step = args.micro_batch_size * point.dp
+        return (f"op {point.op} must divide dp*cp ({fsdp_width}); FSDP shards "
+                "over the data and context axes together")
+    per_step = point.mbs * point.dp
     if point.gbs % per_step:
-        raise SystemExit(
-            f"global_batch_size {point.gbs} must be a multiple of "
-            f"micro_batch_size*dp ({per_step}) at cp={point.cp}")
+        return (f"global_batch_size {point.gbs} must be a multiple of "
+                f"micro_batch_size*dp ({per_step}) at cp={point.cp}")
+    return None
+
+
+def _axis(args: argparse.Namespace, name: str) -> str:
+    """The degrees an axis was given, 1 when it was not named."""
+    return getattr(args, name) or "1"
+
+
+def named_axes(args: argparse.Namespace) -> bool:
+    """Whether the command line named any strategy axis."""
+    return any(getattr(args, name) for name in ("ep", "cp", "op", "tp", "pp"))
 
 
 def expand(args: argparse.Namespace, world: int) -> List[Point]:
@@ -188,22 +214,90 @@ def expand(args: argparse.Namespace, world: int) -> List[Point]:
     launch and a wait.
     """
     points: List[Point] = []
-    grid = itertools.product(_split_ints(args.ep), _split_ints(args.cp),
-                             _split_ints(args.tp), _split_ints(args.pp))
+    grid = itertools.product(*(_split_ints(_axis(args, name))
+                               for name in ("ep", "cp", "tp", "pp")))
     for ep, cp, tp, pp in grid:
         non_dp = tp * cp * pp
         if world % non_dp:
             raise SystemExit(
                 f"tp*cp*pp ({non_dp}) must divide the world size ({world})")
         dp = world // non_dp
-        fsdp_width = dp * cp           # FSDP shards over the data and context axes
         gbs = args.global_batch_size or world
-        for op in (_split_ints(args.op) if args.op else [fsdp_width]):
+        for op in (_split_ints(args.op) if args.op else [dp * cp]):
             point = Point(ep=ep, cp=cp, op=op, tp=tp, pp=pp, dp=dp,
-                          mb=gbs // (args.micro_batch_size * dp) or 1, gbs=gbs)
-            _reject(point, args, world, fsdp_width)
+                          mb=gbs // (args.micro_batch_size * dp) or 1,
+                          mbs=args.micro_batch_size, gbs=gbs)
+            reason = _unrunnable(point, args, world)
+            if reason:
+                raise SystemExit(reason)
             points.append(point)
     return points
+
+
+@dataclass
+class Pick:
+    """One strategy of ND's ranking that the sweep will run."""
+
+    rank: int
+    score: float
+    memory_mb: float
+    point: Point
+    tied_ops: List[int] = field(default_factory=list)
+
+
+def _row_point(row: Dict[str, str], args: argparse.Namespace, gbs: int) -> Point:
+    """The strategy one row of ND's ranking stands for, as the trainer runs it."""
+    def degree(name: str, default: int = 1) -> int:
+        """The row's degree *name*, or *default* when the ranking lacks it."""
+        return int(row.get(name) or default)
+
+    dp, mbs = degree("DP"), degree("MBS", args.micro_batch_size)
+    return Point(ep=degree("EP"), cp=degree("CP"), op=degree("OP"), tp=degree("MP"),
+                 pp=degree("PP"), dp=dp, mb=degree("MB", gbs // (mbs * dp) or 1),
+                 mbs=mbs, gbs=gbs)
+
+
+def pick_nd_top(rows: Sequence[Dict[str, str]], args: argparse.Namespace, world: int,
+                count: int) -> Tuple[List[Pick], List[Tuple[int, Point, str]]]:
+    """Return ND's ``count`` best runnable strategies, and what it ranked above them.
+
+    ND ranks configurations, several of which can be one strategy to the
+    trainer: SP on and off at TP 1 run identically. It also ties strategies
+    whose difference it does not price, which at EP 1 is every OP. A tie is one
+    prediction, so it is run once, at its widest OP: the FSDP default, and the
+    one holding the least memory. The other widths are reported with it.
+
+    Returns:
+        ``(picks, passed)``: the picks in ND's order, and ``(rank, point,
+        reason)`` for every strategy ND ranked above the last pick that this
+        model or trainer cannot run.
+    """
+    gbs = args.global_batch_size or world
+    groups: Dict[Any, Dict[str, Any]] = {}
+    passed: List[Tuple[int, Point, str]] = []
+    refused = set()
+    for row in rows:
+        point = _row_point(row, args, gbs)
+        reason = _unrunnable(point, args, world)
+        if reason:
+            if point not in refused:
+                refused.add(point)
+                passed.append((int(row["rank"]), point, reason))
+            continue
+        # Exact text of the score: ND writes it at full precision, so equal
+        # text is a tie and not a near miss.
+        key = (point.ep, point.cp, point.tp, point.pp, point.mb, point.mbs, row["score"])
+        group = groups.setdefault(key, {"rank": int(row["rank"]), "score": float(row["score"]),
+                                        "widths": {}})
+        group["widths"].setdefault(point.op, (point, float(row["memory_mb"])))
+    picks = []
+    for group in list(groups.values())[:count]:
+        widest = max(group["widths"])
+        point, memory_mb = group["widths"][widest]
+        picks.append(Pick(rank=group["rank"], score=group["score"], memory_mb=memory_mb,
+                          point=point, tied_ops=sorted(set(group["widths"]) - {widest})))
+    last = picks[-1].rank if picks else 0
+    return picks, [entry for entry in passed if entry[0] < last]
 
 
 @dataclass
@@ -235,9 +329,29 @@ class Sweep:
         return self.out / "real_all.csv"
 
     @property
+    def ranking_csv(self) -> Path:
+        """ND's order of every configuration it keeps at this sweep's shape."""
+        return self.out / "nd_ranking.csv"
+
+    @property
     def gbs(self) -> int:
         """Global batch size of every strategy, the world size unless given."""
         return self.args.global_batch_size or self.world
+
+    @property
+    def shape(self) -> Dict[str, Any]:
+        """Everything a strategy leaves fixed and ND's estimate depends on.
+
+        Stored beside ND's ranking, so a ranking made for another shape is
+        refused rather than read as this one's: the output directory is shared
+        by default, and a stale ranking would otherwise look like a fresh one.
+        """
+        return {"world": self.world, "layers": self.args.layers,
+                "seq_len": self.args.seq_len,
+                "activation_checkpoint": self.args.activation_checkpoint,
+                "global_batch_size": self.gbs,
+                "micro_batch_size": self.args.micro_batch_size,
+                "config": self.args.config.name, "arch": self.args.arch}
 
     @property
     def python(self) -> str:
@@ -320,7 +434,7 @@ def launch(sweep: Sweep, point: Point, memory: bool = False) -> Optional[str]:
         f"--dataset.data_config.seq_length={sweep.args.seq_len}",
         f"--activation_checkpoint.mode={sweep.args.activation_checkpoint}",
         f"--training.global_batch_size={point.gbs}",
-        f"--training.micro_batch_size={sweep.args.micro_batch_size}",
+        f"--training.micro_batch_size={point.mbs}",
         f"--accelerator.tp_size={point.tp}",
         f"--accelerator.cp_size={point.cp}",
         f"--accelerator.pp_size={point.pp}",
@@ -473,7 +587,7 @@ def run_pass(sweep: Sweep, memory: bool) -> Dict[str, Any]:
 
 def write_peaks_csv(results: Dict[str, Any], path: Path) -> int:
     """Write the measured peak device memory of every strategy."""
-    columns = ["DP", "MP", "PP", "CP", "EP", "MB", "OP",
+    columns = ["DP", "MP", "PP", "CP", "EP", "MB", "MBS", "OP",
                "max_allocated_gb", "max_reserved_gb"]
     rows = [data for data in results.values()
             if isinstance(data, dict) and "max_allocated_gb" in data]
@@ -619,8 +733,203 @@ def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
     nd_yaml.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
+def _shape_file(sweep: Sweep) -> Path:
+    """Where the shape ND's ranking was made for is recorded."""
+    return sweep.ranking_csv.with_suffix(".shape.json")
+
+
+def stage_rank(sweep: Sweep) -> None:
+    """Rank every configuration ND keeps at the sweep's shape, best first.
+
+    The search covers ND's whole space, TP and PP included, rather than only
+    what this model can run: a strategy ND prefers that the trainer cannot run
+    is worth seeing, so the choice among the runnable ones is left to
+    ``pick_nd_top``. Any ranking already in the directory is removed first, so
+    a search that fails cannot leave an older one looking current.
+    """
+    require_importable(sweep)
+    nd_yaml = sweep.out / "nd_model.yaml"
+    write_nd_config(sweep, nd_yaml)
+    for stale in (sweep.ranking_csv, _shape_file(sweep)):
+        stale.unlink(missing_ok=True)
+    _run([
+        sweep.python, "-m", RUN_ND,
+        "-y", str(nd_yaml), "-f", sweep.args.framework,
+        "-d", str(sweep.world), "-A", sweep.args.arch, "-b", str(sweep.gbs),
+        "-t", str(max(20, 2 * sweep.args.nd_top)),
+        "--ranking_csv", str(sweep.ranking_csv), "-o", str(sweep.out / "nd_rank"),
+    ])
+    _shape_file(sweep).write_text(json.dumps(sweep.shape, indent=2), encoding="utf-8")
+
+
+def load_ranking(sweep: Sweep) -> Tuple[List[Dict[str, str]], str]:
+    """Return ND's ranking for this sweep's shape, or no rows and why not."""
+    if not sweep.ranking_csv.is_file() or not _shape_file(sweep).is_file():
+        return [], f"no ND ranking in {sweep.out}: run the rank stage"
+    stored = json.loads(_shape_file(sweep).read_text(encoding="utf-8"))
+    differ = [f"{name} {stored.get(name)} there, {value} here"
+              for name, value in sweep.shape.items() if stored.get(name) != value]
+    if differ:
+        return [], (f"{sweep.ranking_csv} ranks another shape ({'; '.join(differ)}): "
+                    "run the rank stage again")
+    return _read_rows(sweep.ranking_csv), ""
+
+
+def _print_picks(picks: Sequence[Pick], passed: Sequence[Tuple[int, Point, str]],
+                 wanted: int, kept: int) -> None:
+    """Say which of ND's strategies the sweep runs, and which it cannot."""
+    print(f"\nND's {len(picks)} best strategies this model can run, "
+          f"of the {kept} configurations its search keeps:", flush=True)
+    for pick in picks:
+        ties = (f"   tied with OP {', '.join(map(str, pick.tied_ops))}"
+                if pick.tied_ops else "")
+        print(f"  #{pick.rank:<5d} {pick.point.tag:28s} score {pick.score:.4e}  "
+              f"{pick.memory_mb / 1024:6.1f} GiB{ties}", flush=True)
+    if len(picks) < wanted:
+        print(f"  asked for {wanted}: ND keeps no other strategy this model can run",
+              flush=True)
+    if passed:
+        print(f"ND ranks {len(passed)} strategy(ies) above its last pick that "
+              "cannot run here:", flush=True)
+        by_reason: Dict[str, List[Tuple[int, Point, str]]] = {}
+        for entry in passed:
+            by_reason.setdefault(entry[2], []).append(entry)
+        for reason, entries in by_reason.items():
+            rank, point, _ = entries[0]
+            print(f"  {len(entries)}, the best #{rank} {point.tag}: {reason}", flush=True)
+
+
+def choose_points(sweep: Sweep) -> List[Point]:
+    """Return the strategies to run: ND's best, the named grid, or both."""
+    points: List[Point] = []
+    if sweep.args.nd_top:
+        rows, why = load_ranking(sweep)
+        if not rows:
+            raise SystemExit(why)
+        picks, passed = pick_nd_top(rows, sweep.args, sweep.world, sweep.args.nd_top)
+        _print_picks(picks, passed, sweep.args.nd_top, len(rows))
+        points = [pick.point for pick in picks]
+    if not sweep.args.nd_top or named_axes(sweep.args):
+        points += [point for point in expand(sweep.args, sweep.world) if point not in points]
+    return points
+
+
+def _strategy_key(row: Dict[str, str]) -> Tuple[int, ...]:
+    """A strategy's degrees, read alike from ND's ranking and a measured CSV."""
+    return tuple(int(row.get(name) or 1) for name in STRATEGY_DIMS)
+
+
+def _tag_of(key: Tuple[int, ...]) -> str:
+    """The directory name of the strategy a key stands for."""
+    degree = dict(zip(STRATEGY_DIMS, key))
+    tag = (f"ep{degree['EP']}_cp{degree['CP']}_op{degree['OP']}"
+           f"_tp{degree['MP']}_pp{degree['PP']}")
+    return f"{tag}_mbs{degree['MBS']}" if degree["MBS"] > 1 else tag
+
+
+def _ranks(values: Sequence[float]) -> List[float]:
+    """1-based ranks of *values*, a tie sharing the mean of its ranks."""
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        for position in range(start, end + 1):
+            ranks[order[position]] = (start + end) / 2 + 1
+        start = end + 1
+    return ranks
+
+
+def spearman(first: Sequence[float], second: Sequence[float]) -> Optional[float]:
+    """Rank correlation of two series, None when it is undefined."""
+    if len(first) < 3:
+        return None
+    ranks_a, ranks_b = _ranks(first), _ranks(second)
+    mean = (len(first) + 1) / 2
+    covariance = sum((a - mean) * (b - mean) for a, b in zip(ranks_a, ranks_b))
+    spread = (sum((a - mean) ** 2 for a in ranks_a) * sum((b - mean) ** 2 for b in ranks_b)) ** 0.5
+    return covariance / spread if spread else None
+
+
+def _ranking_table(sweep: Sweep, ranking: Sequence[Dict[str, str]],
+                   measured: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    """One row per measured strategy with ND's rank, score and memory, in ND's order."""
+    nd_of: Dict[Tuple[int, ...], Dict[str, str]] = {}
+    for row in ranking:
+        nd_of.setdefault(_strategy_key(row), row)
+    peaks = {_strategy_key(row): row for row in _read_rows(sweep.out / "memory.csv")}
+    times = [float(row["time"]) for row in measured]
+    table = []
+    for row, step, place in zip(measured, times, _ranks(times)):
+        key = _strategy_key(row)
+        nd_row = nd_of.get(key, {})
+        table.append({
+            "strategy": _tag_of(key), "nd_rank": nd_row.get("rank", ""),
+            "nd_score": nd_row.get("score", ""),
+            "nd_memory_gib": (f"{float(nd_row['memory_mb']) / 1024:.1f}" if nd_row else ""),
+            "measured_ms": f"{step:.1f}", "measured_rank": f"{place:g}",
+            "peak_allocated_gib": peaks.get(key, {}).get("max_allocated_gb", ""),
+        })
+    table.sort(key=lambda entry: int(entry["nd_rank"] or 10 ** 9))
+    return table
+
+
+def _print_verdict(table: Sequence[Dict[str, str]]) -> None:
+    """Say what following ND would cost, and how well its order holds."""
+    ranked = [entry for entry in table if entry["nd_rank"]]
+    if not ranked:
+        return
+    pick, fastest = ranked[0], min(table, key=lambda entry: float(entry["measured_ms"]))
+    cost = float(pick["measured_ms"]) / float(fastest["measured_ms"]) - 1
+    print(f"Of these, ND ranks {pick['strategy']} best (its #{pick['nd_rank']}): it "
+          f"measures {pick['measured_ms']} ms, {pick['measured_rank']} of {len(table)}. "
+          f"The fastest is {fastest['strategy']} at {fastest['measured_ms']} ms, so "
+          f"following ND costs {cost:.1%}.", flush=True)
+    correlation = spearman([float(entry["nd_score"]) for entry in ranked],
+                           [float(entry["measured_ms"]) for entry in ranked])
+    if correlation is not None:
+        print(f"Rank correlation of ND's score with the measured step over the "
+              f"{len(ranked)} it ranks: {correlation:+.2f} (1 is ND's order exactly).",
+              flush=True)
+
+
+def report_ranking(sweep: Sweep, ranking: Sequence[Dict[str, str]]) -> None:
+    """Set ND's rank of every measured strategy beside the measured order.
+
+    This is the comparison a top-k sweep exists for: whether the strategy ND
+    ranks first is the one that runs fastest, and how much following ND costs
+    when it is not. A strategy outside ND's ranking, one its search does not
+    generate or one it believes does not fit, has no rank; ``compare`` above
+    still prints its estimate.
+    """
+    measured = _read_rows(sweep.merged_csv)
+    if not measured:
+        return
+    table = _ranking_table(sweep, ranking, measured)
+    path = sweep.out / "nd_vs_measured.csv"
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(table[0]))
+        writer.writeheader()
+        writer.writerows(table)
+    print(f"\nND against the measurement, in ND's order of its {len(ranking)} "
+          "configurations; '-' is a strategy its search does not generate or "
+          "believes does not fit:", flush=True)
+    print(f"  {'strategy':28s} {'ND rank':>7s} {'ND score':>10s} {'ND GiB':>7s} "
+          f"{'step ms':>9s} {'measured':>8s} {'peak GiB':>8s}", flush=True)
+    for entry in table:
+        score = f"{float(entry['nd_score']):.3e}" if entry["nd_score"] else "-"
+        print(f"  {entry['strategy']:28s} {entry['nd_rank'] or '-':>7s} {score:>10s} "
+              f"{entry['nd_memory_gib'] or '-':>7s} {entry['measured_ms']:>9s} "
+              f"{entry['measured_rank']:>8s} {entry['peak_allocated_gib'] or '-':>8s}",
+              flush=True)
+    _print_verdict(table)
+    print(f"written to {path}", flush=True)
+
+
 def stage_compare(sweep: Sweep) -> None:
-    """Print ND's estimate beside every measured strategy.
+    """Print ND's estimate beside every measured strategy, and ND's rank of each.
 
     ``--framework`` must select the AutoModels-aware parser: run_nd defaults to
     ``mindformers``, which reads a different schema, and the deprecated
@@ -632,24 +941,33 @@ def stage_compare(sweep: Sweep) -> None:
     nd_yaml = sweep.out / "nd_model.yaml"
     write_nd_config(sweep, nd_yaml)
     _run([
-        sweep.python, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+        sweep.python, "-m", RUN_ND,
         "-y", str(nd_yaml), "-f", sweep.args.framework,
         "-d", str(sweep.world), "-A", sweep.args.arch,
         "--real_csv", str(sweep.merged_csv), "-o", str(sweep.out / "nd"),
     ], check=False)
+    ranking, why = load_ranking(sweep)
+    if ranking:
+        report_ranking(sweep, ranking)
+    elif sweep.args.nd_top:
+        print(why, flush=True)
 
 
 def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
     """Add the swept parallel degrees and the batch shape."""
-    parser.add_argument("--ep", default="1",
+    parser.add_argument("--nd-top", type=int, default=0,
+                        help="run the N strategies ND ranks best at this shape, of "
+                             "those this model and trainer can run; a named axis "
+                             "adds its grid beside them")
+    parser.add_argument("--ep", default=None,
                         help="expert-parallel degrees; every axis defaults to 1, "
                              "so a sweep varies only what it names")
-    parser.add_argument("--cp", default="1", help="context-parallel degrees")
+    parser.add_argument("--cp", default=None, help="context-parallel degrees")
     parser.add_argument("--op", default="",
                         help="FSDP shard widths (fsdp_config.dp_shard_size, ND's "
                              "OP); default is dp*cp, the whole shardable width")
-    parser.add_argument("--tp", default="1", help="tensor-parallel degrees")
-    parser.add_argument("--pp", default="1", help="pipeline-parallel degrees")
+    parser.add_argument("--tp", default=None, help="tensor-parallel degrees")
+    parser.add_argument("--pp", default=None, help="pipeline-parallel degrees")
     parser.add_argument("--global-batch-size", type=int, default=0,
                         help="default is the world size, which holds the work "
                              "per step fixed so strategies stay comparable")
@@ -688,7 +1006,7 @@ def _strategy_label(row: Dict[str, str], varying: Sequence[str]) -> str:
 
 def _varying_dims(rows: Sequence[Dict[str, str]]) -> List[str]:
     """Return the dimension columns that take more than one value."""
-    names = [n for n in ("EP", "CP", "OP", "DP", "MB", "MP", "PP") if n in rows[0]]
+    names = [n for n in ("EP", "CP", "OP", "DP", "MB", "MBS", "MP", "PP") if n in rows[0]]
     varying = [n for n in names if len({row[n] for row in rows}) > 1]
     return varying or names[:1]
 
@@ -793,14 +1111,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     """Sweep the requested strategies and score ND against the result."""
     args = parse_args(argv)
     sweep = Sweep(args=args, env=read_cluster_env(args.cluster_env))
-    sweep.points = expand(args, sweep.world)
     sweep.out.mkdir(parents=True, exist_ok=True)
+    stages = set(args.only or STAGES)
+    # A grid sweep ranks only when the stage is named: the search needs the
+    # analysis interpreter, which a sweep that only runs and fetches does not.
+    if "rank" in stages and (args.nd_top or args.only):
+        stage_rank(sweep)
+    sweep.points = choose_points(sweep)
     print(f"world={sweep.world} nodes={len(sweep.env['nodes'])}"
           f"x{sweep.env['nproc']}  {len(sweep.points)} strategy(ies)", flush=True)
     for point in sweep.points:
         print(f"  {point.tag}  dims={point.dims}", flush=True)
 
-    stages = set(args.only or STAGES)
     for name, run_stage in (
             ("mirror", mirror_code),
             ("data", stage_data),
