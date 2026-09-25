@@ -30,6 +30,7 @@ from unittest.mock import patch
 
 from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
 from hyper_parallel.auto_parallel._op_profiles import load_op_profile
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook, hook_runner
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
@@ -1558,6 +1559,38 @@ class TestSappNDRunND(unittest.TestCase):
                 ccfg = CostModelConfig(toml, framework="hyperparallel", source_code=source_path)
                 got = (ccfg.n_exp, ccfg.n_chosen_exp, ccfg.n_shared_exp, ccfg.fdm)
                 self.assertEqual(got, want, args)
+
+    def test_a_hook_class_prices_time_as_it_prices_memory(self) -> None:
+        """
+        Feature: estimate_performance, on a config priced through a hook class.
+        Description: A hook class whose hook applies the DeepSeek yaml's family
+            and then doubles its sequence, priced through the hook and through
+            the family alone.
+        Expectation: The time estimate applies the config's own hook, as the
+            memory estimate does, so the two differ.
+        """
+        old_registry = MemEvalHook.hook_registry.copy()
+        try:
+            MemEvalHook.hook_registry = {}
+
+            class _LongerSequence(MemEvalHook):
+                """The family, then twice the sequence."""
+
+                @staticmethod
+                @hook_runner("deepseek_longer")
+                def run_hooks(e: Any) -> None:
+                    """Apply the family, then double the sequence."""
+                    ArchHooks.check_and_apply_custom_hook(e)
+                    e.set_ccfg(lambda c: setattr(c, "s", 2 * c.s))
+
+            ccfg = CostModelConfig(config_path, hook_cls=_LongerSequence())
+        finally:
+            MemEvalHook.hook_registry = old_registry
+        hooked = PerfEstimate.estimate_performance(ccfg, device_type=Hard.Device_A2)
+        family = PerfEstimate.estimate_performance(
+            ccfg, device_type=Hard.Device_A2, extra_custom_func=ArchHooks.check_and_apply_custom_hook
+        )
+        self.assertGreater(hooked, family)
 
     def test_comm_overlap_fields_in_parsers(self) -> None:
         """
