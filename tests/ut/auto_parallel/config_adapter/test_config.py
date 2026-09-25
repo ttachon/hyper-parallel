@@ -699,7 +699,10 @@ class TestHpYamlReader(unittest.TestCase):
 
         run = read_hp_yaml_config(path).run
 
-        self.assertEqual(run["model"], {"torch_dtype": "bfloat16"})
+        self.assertEqual(run["model"], {
+            "_target_": "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained",
+            "torch_dtype": "bfloat16",
+        })
         self.assertEqual(run["model_init_dtype"], "bfloat16")
         self.assertEqual(run["training"]["max_grad_norm"], 1.0)
         self.assertFalse(run["fsdp_config"]["reshard_after_forward"])

@@ -93,9 +93,9 @@ def _get_dict(raw: Dict[str, Any], key: str) -> Dict[str, Any]:
     return val if isinstance(val, dict) else {}
 
 
-# The model section's keys that state how the run loads and computes the
-# weights, not the model; the cost model reads them there.
-_MODEL_RUN_KEYS = ("torch_dtype", "param_init_type", "compute_dtype", "softmax_compute_type")
+# The model section's keys that state how the run builds, loads and computes
+# the model, not the model; the cost model reads them there.
+_MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype", "softmax_compute_type")
 
 # The root keys of an AutoModels train.yaml that state the run.
 _RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer")
