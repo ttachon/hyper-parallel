@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Tests for the layer census, the records it states, and their pricing."""
+import functools
 import os
 import tempfile
 import unittest
@@ -26,11 +27,13 @@ from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
     KindActivations,
     _measure,
+    _RecomputedMatmuls,
     _selective_contexts,
     activations_from_dict,
     census_activations,
     census_layer,
     census_output_activations,
+    census_recomputed,
     tp_config,
 )
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
@@ -66,6 +69,21 @@ def _qwen3():
 
 
 _STACK = [{"kind": "linear_attention", "count": 1}, {"kind": "full_attention", "count": 1}]
+
+
+class _Layer(torch.nn.Module):
+    """A layer of an attention projection and a feed-forward of two, 64 wide within 256."""
+
+    def __init__(self):
+        """Its three projections."""
+        super().__init__()
+        self.self_attn = torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16)
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(64, 256, bias=False, dtype=torch.bfloat16), torch.nn.ReLU(),
+                                       torch.nn.Linear(256, 64, bias=False, dtype=torch.bfloat16))
+
+    def forward(self, hidden):
+        """The attention's projection, then the feed-forward."""
+        return self.mlp(self.self_attn(hidden))
 
 
 def _qwen35(text):
@@ -161,6 +179,23 @@ class TestLayerCensus(unittest.TestCase):
                 lambda out: out.backward(torch.ones_like(out)), checkpointed=True)
         self.assertEqual(kept, 2 * size)
 
+    def test_the_policy_runs_every_other_matmul_again(self):
+        """
+        Feature: the census's ledger of HyperParallel's selective policy.
+        Description: A layer of an attention projection and a feed-forward
+            of two, of 64 tokens, run under selective checkpointing.
+        Expectation: The policy saves the first and the third projections'
+            outputs and runs the second again: none of the attention's
+            FLOPs, and half the feed-forward's.
+        """
+        with FakeTensorMode():
+            layer = _Layer()
+            hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
+            ledger = _RecomputedMatmuls(layer)
+            activation_memory.checkpoint(layer, hidden, swap_inputs=False,
+                                         context_fn=functools.partial(_selective_contexts, ledger))
+        self.assertEqual((ledger.share(attention=True), ledger.share(attention=False)), (0.0, 0.5))
+
     def test_a_selective_layer_keeps_what_the_policy_saves(self):
         """
         Feature: census_layer under HyperParallel's selective checkpointing.
@@ -202,8 +237,12 @@ class TestLayerCensus(unittest.TestCase):
             self.assertAlmostEqual((record.saved + record.saved_tp) * 64, saved)
             self.assertAlmostEqual((record.working + record.working_tp) * 64, working)
             self.assertAlmostEqual((record.selective + record.selective_tp) * 64, kept)
+            self.assertEqual((record.selective_attention_mm, record.selective_ffn_mm),
+                             census_recomputed(_qwen35_text(), index, 64))
             self.assertGreater(record.saved_tp, 0)
             self.assertGreater(record.selective_tp, 0)
+            for share in (record.selective_attention_mm, record.selective_ffn_mm):
+                self.assertTrue(0 < share < 1, share)
 
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """
@@ -233,7 +272,8 @@ class TestKindActivations(unittest.TestCase):
         record = KindActivations(saved=2036.25, saved_tp=3812.5, working=2162.375, working_tp=3812.5,
                                  seq_length=64)
         selective = KindActivations(saved=2036.25, saved_tp=3812.5, working=2162.375, working_tp=3812.5,
-                                    seq_length=64, selective=512.0, selective_tp=1024.5)
+                                    seq_length=64, selective=512.0, selective_tp=1024.5,
+                                    selective_attention_mm=0.25, selective_ffn_mm=0.625)
         dumped = yaml.safe_dump({"linear_attention": selective.to_dict(), "full_attention": record.to_dict()})
         self.assertNotIn("selective", record.to_dict())
         self.assertEqual(activations_from_dict(yaml.safe_load(dumped)),
@@ -253,6 +293,8 @@ class TestKindActivations(unittest.TestCase):
             KindActivations.from_dict({"saved": 1.0})
         with self.assertRaisesRegex(ValueError, "without the other"):
             KindActivations.from_dict(dict(record, selective=1.0))
+        with self.assertRaisesRegex(ValueError, "exceed 1"):
+            KindActivations.from_dict(dict(record, selective_attention_mm=0.5, selective_ffn_mm=1.5))
         with self.assertRaisesRegex(ValueError, "output_activations must map"):
             KindActivations.from_dict([1.0], "output_activations")
         with self.assertRaisesRegex(ValueError, "layer kinds"):
