@@ -240,7 +240,9 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     recompute = config.estimator.get("recompute_strategy", "none")
 
     cluster = config.cluster_spec
-    context: Dict[str, Any] = {}
+    # The train.yaml's pricing options, beneath the search's own device count
+    # and memory budget.
+    context: Dict[str, Any] = dict(run.pop("context", None) or {})
     # ND prunes the space against ccfg.device_capacity, which the parser reads
     # from this field, so the user's memory_limit_gb has to reach it here.
     budget_gb = _memory_budget_gb(config)

@@ -322,9 +322,13 @@ def _census(text_config: Any, layers: Any, seq_length: int) -> Dict[str, Any]:
     return copy.deepcopy(_CENSUSES[key])
 
 
-def _no_census(census_seq_len: int) -> None:
-    """Warn that a census asked for cannot run: it builds layers from the checkpoint's config."""
-    if census_seq_len:
+def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
+    """Warn that a census asked for cannot run, unless the overrides state its records.
+
+    A census builds its layers from the checkpoint's config; a search hands
+    ND a spec whose overrides state the records its reader measured.
+    """
+    if census_seq_len and not explicit.get("activations"):
         logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
 
 
@@ -372,7 +376,7 @@ def resolve_hf_model_spec(
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len)
+            _no_census(census_seq_len, explicit)
             return _validated(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path "
@@ -388,7 +392,7 @@ def resolve_hf_model_spec(
                 "falling back to model.config_overrides", exc,
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len)
+            _no_census(census_seq_len, explicit)
             return _validated(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
