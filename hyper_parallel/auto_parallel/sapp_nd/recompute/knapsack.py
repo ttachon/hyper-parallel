@@ -16,12 +16,13 @@
 
 Every layer runs one option of its kind's front. At a stage that keeps k
 micro-batches of a layer in flight, an option keeps k times its memory per
-micro-batch plus its memory held once, and costs its forward and backward
-time. Choosing one option per layer so that a stage's layers are as fast as
-possible within the memory left to them is a multiple-choice knapsack.
-:func:`choose` solves it exactly over memory counted in buckets, each
-option's memory rounded up to a whole bucket, so a choice never keeps more
-than the budget.
+micro-batch plus its memory held once, less what those charge beyond the
+layer at k (:meth:`~.front.LayerOption.memory`), and costs its forward and
+backward time. Choosing one option per layer so that a stage's layers are as
+fast as possible within the memory left to them is a multiple-choice
+knapsack. :func:`choose` solves it exactly over memory counted in buckets,
+each option's memory rounded up to a whole bucket, so a choice never keeps
+more than the budget.
 
 Without pipeline parallelism the model is one stage, and :func:`choose` is
 the whole answer. With it, :func:`pp_lite` solves every stage of a split and
@@ -113,7 +114,7 @@ class PipelineChoice:
 
 def _kept(option: LayerOption, in_flight: int) -> float:
     """The bytes a layer running *option* keeps with *in_flight* micro-batches in flight."""
-    return in_flight * option.memory_per_micro_batch + option.memory_once
+    return option.memory(in_flight)
 
 
 def _time(option: LayerOption) -> float:

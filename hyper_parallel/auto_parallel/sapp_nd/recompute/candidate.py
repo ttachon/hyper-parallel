@@ -119,7 +119,7 @@ class _Layer:
 
 def _kept(option: LayerOption, in_flight: int) -> float:
     """The bytes a layer running *option* keeps with *in_flight* micro-batches in flight."""
-    return in_flight * option.memory_per_micro_batch + option.memory_once
+    return option.memory(in_flight)
 
 
 def _time(option: LayerOption) -> float:
@@ -450,7 +450,8 @@ def choose_recompute(
         return None
     counts = micro_batches_in_flight(evaluator)
     profiles = layer_profiles(evaluator, device_type, ccfg, most_in_flight=max(max(row) for row in counts),
-                              each_switch=modes is None or "selective" in modes)
+                              each_switch=modes is None or "selective" in modes,
+                              in_flight=[count for row in counts for count in row])
     fronts, by_mode = _offered(profiles, configured_switches(evaluator), modes)
     found = _body_layers(evaluator, fronts, counts)
     if found is None:

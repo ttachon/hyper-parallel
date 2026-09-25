@@ -18,6 +18,7 @@ their memory and their times.
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/memory_estimation/test_ppb.py -v
 """
+import itertools
 import json
 import os
 import tempfile
@@ -28,6 +29,7 @@ from typing import Any, Optional, Tuple
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _MEMORY_KEY, _OPTIONS, _PPB, _TIME_KEY
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.recompute.front import price_option
 from hyper_parallel.auto_parallel.sapp_ppb.utils import recompute as Recompute
 from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import generate_layers_list
 
@@ -103,6 +105,25 @@ def _options(desc: dict) -> dict:
     """``{option: (memory, backward time)}`` of the options *desc* offers."""
     return {name: (desc[_MEMORY_KEY[name]], desc.get(_TIME_KEY[name]))
             for name in _OPTIONS if _MEMORY_KEY[name] in desc}
+
+
+def _measure(dp: int, counts: Tuple[int, ...]) -> Tuple[Any, _Memory, SimpleNamespace]:
+    """The profile ``lay_ppb`` measures for a body when its stages keep *counts* micro-batches in flight.
+
+    Returns:
+        ``(profile, memory, config)``: the memory answers for the config's
+        switches and the layer its context is on.
+    """
+    ctx = Context()
+    ctx.head_node, ctx.tail_node = "head", "tail"
+    ctx.current_node = LayerType.NOT_REC_LAYER
+    ccfg = SimpleNamespace(model_name="unit", rec_op=SimpleNamespace(**_KEEP_ALL))
+    memory = _Memory(ctx, ccfg, dp)
+    ppb = _PPB(SimpleNamespace(ppb_combined=[]), memory)
+    ppb.layer_times, ppb.profiles = _Pricer(), {}
+    ppb.profile_in_flight, ppb.profile_counts = max(counts), counts
+    ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+    return ppb.profiles["unit", None], memory, ccfg
 
 
 def _withdraw(descriptions: list) -> list:
@@ -196,6 +217,48 @@ class TestMemorySplit(unittest.TestCase):
         desc, _ = _describe(LayerType.NOT_REC_LAYER, dict(_KEEP_ALL, softmax=0), _Pricer(), dp=5)
         self.assertEqual(desc["memory_parameter"], 4 + 5)
         self.assertEqual((desc["memory_activation"], desc["memory_select_comm"]), (8, 8))
+
+
+class TestProfileAtEveryCount(unittest.TestCase):
+    """An option's memory is exact at every count of micro-batches in flight a stage keeps."""
+
+    def test_the_split_states_what_it_charges_beyond_the_buffers_in_between(self):
+        """
+        Feature: _PPB profiles.
+        Description: Stages keep 1 to 4 micro-batches in flight, and a 5 MB
+            parameter buffer hides the gathered buffers of the first two.
+        Expectation: At 2 and 3, the split charges the plain layer 1 MB beyond
+            its buffers; recomputing the gathers, or the whole layer, leaves
+            buffers that do not grow, which the split charges exactly.
+        """
+        profile, _, _ = _measure(5, (1, 2, 3, 4))
+        self.assertEqual(profile.counts, (2, 3))
+        self.assertEqual(profile.plain.excess, (MEGABYTE, MEGABYTE))
+        self.assertEqual(profile.alone["softmax"].excess, (MEGABYTE, MEGABYTE))
+        self.assertEqual(profile.alone["gather"].excess, (0, 0))
+        self.assertEqual(profile.full.excess, (0, 0))
+
+    def test_every_option_keeps_what_the_memory_model_keeps_at_every_count(self):
+        """
+        Feature: _PPB profiles, price_option and LayerOption.memory.
+        Description: The 128 settings of the switches and full recompute,
+            with stages keeping 1 to 4 micro-batches in flight and a 5 MB
+            parameter buffer hiding the gathered buffers of the first two.
+        Expectation: At every count, each option keeps what the memory model
+            keeps for a layer running it.
+        """
+        profile, memory, ccfg = _measure(5, (1, 2, 3, 4))
+        settings = [frozenset(names) for size in range(len(_OPS) + 1) for names in itertools.combinations(_OPS, size)]
+        for recompute in settings + [None]:
+            option = price_option(profile, recompute)
+            if recompute is None:
+                memory.ctx.current_node = LayerType.FULL_REC_LAYER
+            else:
+                memory.ctx.current_node = LayerType.SEL_REC_LAYER if recompute else LayerType.NOT_REC_LAYER
+            ccfg.rec_op = SimpleNamespace(**{op: int(op not in (recompute or ())) for op in _OPS})
+            for count in (1, 2, 3, 4):
+                with self.subTest(recompute=recompute, count=count):
+                    self.assertEqual(option.memory(count), sum(memory(default_micro_factor=count)))
 
 
 class TestWithdrawal(unittest.TestCase):

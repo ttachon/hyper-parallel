@@ -69,6 +69,9 @@ class _PPB:
         # The most micro-batches any stage keeps in flight, where profiles
         # split the buffers when set.
         self.profile_in_flight: Optional[int] = None
+        # The counts of micro-batches in flight the stages keep, at which
+        # profiles state what the split charges beyond the buffers.
+        self.profile_counts: Tuple[int, ...] = ()
         # Whether profiles measure each switch alone, or only the plain and
         # the fully recomputed layer.
         self.profile_each_switch = True
@@ -169,10 +172,10 @@ class _PPB:
         ctx.current_node = LayerType.FULL_REC_LAYER
         dyn["FULL"] = self._dynamic_mem(many)
         desc["type"] = "BODY"
-        desc["memory_parameter"] = self.mb(res_stat) + self.mb(max(once for _, _, once in dyn.values()))
+        desc["memory_parameter"] = self.mb(res_stat) + self.mb(max(once for _, _, once, _ in dyn.values()))
         for name in _OPTIONS:
             if name in dyn:
-                activation, per_micro_batch, _ = dyn[name]
+                activation, per_micro_batch, _, _ = dyn[name]
                 desc[_MEMORY_KEY[name]] = self.mb(activation) + self.mb(per_micro_batch)
         desc["time"] = 1
 
@@ -187,20 +190,26 @@ class _PPB:
         if key in self.profiles:
             return
         many = max(2, self.profile_in_flight) if self.profile_in_flight else self._many(ccfg)
+        # The split is exact at one micro-batch in flight and at *many*.
+        counts = tuple(count for count in self.profile_counts if 1 < count < many)
         keep = dict.fromkeys(SWITCHES, 1)
         ctx.current_node = LayerType.NOT_REC_LAYER
-        plain = self._dynamic_mem(many)
-        alone = {
-            name: self._selective_dynamic_mem(ccfg, ctx, dict(keep, **{name: 0}), many)
-            for name in (SWITCHES if self.profile_each_switch else ())
-        }
+        plain = self._dynamic_mem(many, counts)
+        alone = {}
+        for name in SWITCHES if self.profile_each_switch else ():
+            # Only gather acts on the buffers, so any other op recomputed
+            # alone leaves the split charging what it charges the plain layer.
+            measured = self._selective_dynamic_mem(
+                ccfg, ctx, dict(keep, **{name: 0}), many, counts if name == "gather" else ()
+            )
+            alone[name] = measured if name == "gather" else measured[:3] + plain[3:]
         ctx.current_node = LayerType.FULL_REC_LAYER
-        full = self._dynamic_mem(many)
+        full = self._dynamic_mem(many, counts)
 
-        def _cost(memory: Tuple[float, float, float], backward: float) -> Cost:
+        def _cost(memory: Tuple[float, float, float, Tuple[float, ...]], backward: float) -> Cost:
             """A measurement as a cost: activations and growing buffers per micro-batch, the rest once."""
-            activation, per_micro_batch, once = memory
-            return Cost(activation + per_micro_batch, once, backward)
+            activation, per_micro_batch, once, excess = memory
+            return Cost(activation + per_micro_batch, once, backward, excess)
 
         forward, backward = self.layer_times(ccfg, kind, LayerType.NOT_REC_LAYER)
         self.profiles[key] = SwitchProfile(
@@ -211,22 +220,29 @@ class _PPB:
                 for name, memory in alone.items()
             },
             full=_cost(full, self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]),
+            counts=counts,
         )
 
-    def _dynamic_mem(self, many: int) -> Tuple[float, float, float]:
-        """``(activation, buffers per micro-batch, buffers once)`` of the current layer.
+    def _dynamic_mem(
+        self, many: int, counts: Tuple[int, ...] = ()
+    ) -> Tuple[float, float, float, Tuple[float, ...]]:
+        """``(activation, buffers per micro-batch, buffers once, excess)`` of the current layer.
 
         The buffers are split by how they grow from one micro-batch in
-        flight to *many*.
+        flight to *many*. At each of *counts*, the excess is what the split
+        charges beyond the buffers kept with that many micro-batches in
+        flight.
         """
+        at = [self._inner_dynamic_mem(default_micro_factor=count)[1] for count in counts]
         _, more = self._inner_dynamic_mem(default_micro_factor=many)
         activation, one = self._inner_dynamic_mem(ppb=True)
         per_micro_batch = (more - one) / (many - 1)
-        return activation, per_micro_batch, one - per_micro_batch
+        excess = tuple(one + (count - 1) * per_micro_batch - kept for count, kept in zip(counts, at))
+        return activation, per_micro_batch, one - per_micro_batch, excess
 
     def _selective_dynamic_mem(
-        self, ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], many: int
-    ) -> Tuple[float, float, float]:
+        self, ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], many: int, counts: Tuple[int, ...] = ()
+    ) -> Tuple[float, float, float, Tuple[float, ...]]:
         """:meth:`_dynamic_mem` of a selective layer with *switches*; the config's own are restored."""
         rec_op = ccfg.rec_op
         before = dict(vars(rec_op))
@@ -234,7 +250,7 @@ class _PPB:
         try:
             for name, value in switches.items():
                 setattr(rec_op, name, value)
-            return self._dynamic_mem(many)
+            return self._dynamic_mem(many, counts)
         finally:
             for name in switches:
                 if name in before:

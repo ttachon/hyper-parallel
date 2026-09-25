@@ -40,19 +40,31 @@ class Cost:
         memory_once: Bytes of communication buffers kept once, however many
             micro-batches are in flight.
         backward_time: The backward time, recompute included.
+        excess: At each of its profile's :attr:`~SwitchProfile.counts`, the
+            bytes the two memories charge beyond what the layer keeps with
+            that many micro-batches in flight. The split is exact at one
+            micro-batch and at the most any stage keeps, and a buffer that
+            does not grow can hide one that does in between.
     """
 
     memory_per_micro_batch: float
     memory_once: float
     backward_time: float
+    excess: Tuple[float, ...] = ()
 
     def __add__(self, other: "Cost") -> "Cost":
         """The sum, cost by cost."""
-        return Cost(*(mine + theirs for mine, theirs in zip(self.values(), other.values())))
+        return Cost(
+            *(mine + theirs for mine, theirs in zip(self.values(), other.values())),
+            excess=tuple(mine + theirs for mine, theirs in zip(self.excess, other.excess)),
+        )
 
     def __sub__(self, other: "Cost") -> "Cost":
         """The difference, cost by cost."""
-        return Cost(*(mine - theirs for mine, theirs in zip(self.values(), other.values())))
+        return Cost(
+            *(mine - theirs for mine, theirs in zip(self.values(), other.values())),
+            excess=tuple(mine - theirs for mine, theirs in zip(self.excess, other.excess)),
+        )
 
     def values(self) -> Tuple[float, float, float]:
         """``(memory per micro-batch, memory once, backward time)``."""
@@ -68,12 +80,15 @@ class SwitchProfile:
         plain: The layer keeping every op.
         alone: Per switch, the layer recomputing that op alone.
         full: The layer fully recomputed.
+        counts: The counts of micro-batches in flight, between one and the
+            most any stage keeps, at which each cost states its excess.
     """
 
     forward_time: float
     plain: Cost
     alone: Mapping[str, Cost]
     full: Cost
+    counts: Tuple[int, ...] = ()
 
     def selective(self, recompute: Iterable[str]) -> Cost:
         """The cost of recomputing the ops *recompute* names: the plain layer's, plus what each costs alone."""

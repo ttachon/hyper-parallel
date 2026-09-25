@@ -31,7 +31,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._hook_manager import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Dict, Optional, Union
+    from typing import Any, Callable, Dict, Optional, Sequence, Union
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 
@@ -138,6 +138,7 @@ class EvaluatorV2(_Utils, _HookManager):
         stages: list = None,
         most_in_flight: Optional[int] = None,
         each_switch: bool = True,
+        in_flight: Sequence[int] = (),
     ) -> Dict:
         """What each recompute switch saves and costs, per model and layer kind.
 
@@ -159,6 +160,10 @@ class EvaluatorV2(_Utils, _HookManager):
                 profile prices only the plain and the fully recomputed
                 layer, which is all one mode for every layer needs unless it
                 is selective.
+            in_flight: The counts of micro-batches in flight the stages
+                keep. At each between one and the most, a profile also
+                states what the split charges beyond the buffers kept, so
+                that an option's memory is exact at every count.
 
         Returns:
             ``{(model name, layer kind): SwitchProfile}``, in model order.
@@ -167,6 +172,7 @@ class EvaluatorV2(_Utils, _HookManager):
         self._ppb_obj.profiles = {}
         self._ppb_obj.profile_in_flight = most_in_flight
         self._ppb_obj.profile_each_switch = each_switch
+        self._ppb_obj.profile_counts = tuple(sorted(set(in_flight)))
         try:
             self._estimate_on_copy(stages, False, True, -1, False)
             return self._ppb_obj.profiles
@@ -175,6 +181,7 @@ class EvaluatorV2(_Utils, _HookManager):
             self._ppb_obj.profiles = None
             self._ppb_obj.profile_in_flight = None
             self._ppb_obj.profile_each_switch = True
+            self._ppb_obj.profile_counts = ()
 
     # Specific estimation
 

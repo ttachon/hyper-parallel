@@ -17,8 +17,9 @@
 An option runs a layer one way: plain, recomputing some of the seven ops the
 recompute switches name, or fully recomputed. Of the 128 settings of the
 switches and full recompute, the front keeps those that no other option beats
-on memory per micro-batch, memory held once and backward time together. The
-plain layer and full recompute are always on it.
+on memory per micro-batch, memory held once, memory at each count of
+micro-batches in flight a stage keeps, and backward time together. The plain
+layer and full recompute are always on it.
 
 :func:`layer_fronts` is the interim form of the search's entry point for
 layer options (shared decision S3): it measures each layer kind on the memory
@@ -27,7 +28,7 @@ search re-implements it on the model IR.
 """
 import itertools
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
@@ -51,6 +52,9 @@ class LayerOption:
             an option.
         names: The names the pipeline balancer and the parsers know the
             option by: NONE, SLCT, COMM, BOTH or FULL.
+        excess: ``(count, bytes)`` for each count of micro-batches in flight
+            at which the two memories charge more than the layer keeps, by
+            that many bytes; see :attr:`Cost.excess`.
     """
 
     recompute: Optional[FrozenSet[str]]
@@ -60,6 +64,12 @@ class LayerOption:
     backward_time: float
     link_bandwidth: float = 0.0
     names: Tuple[str, ...] = ()
+    excess: Tuple[Tuple[int, float], ...] = ()
+
+    def memory(self, in_flight: int) -> float:
+        """The bytes a layer running the option keeps with *in_flight* micro-batches in flight."""
+        kept = in_flight * self.memory_per_micro_batch + self.memory_once
+        return kept - next((excess for count, excess in self.excess if count == in_flight), 0.0)
 
     @property
     def switches(self) -> Optional[Dict[str, int]]:
@@ -132,7 +142,17 @@ def price_option(
         forward_time=profile.forward_time,
         backward_time=cost.backward_time,
         names=_names(recompute, configured or {}),
+        excess=tuple((count, excess) for count, excess in zip(profile.counts, cost.excess) if excess),
     )
+
+
+def _compared(cost: Cost, counts: Sequence[int]) -> Tuple[float, ...]:
+    """What an option is compared on: its two memories and backward time, and its memory at each of *counts*."""
+    at = (
+        count * cost.memory_per_micro_batch + cost.memory_once - excess
+        for count, excess in zip(counts, cost.excess)
+    )
+    return cost.values() + tuple(at)
 
 
 def build_front(
@@ -141,7 +161,8 @@ def build_front(
     """The options of a layer kind that no other option beats.
 
     An option beats another when it needs no more memory per micro-batch, no
-    more memory once and no more backward time. Of options that cost the
+    more memory once and no more backward time, and no more memory at any of
+    the profile's counts of micro-batches in flight. Of options that cost the
     same, the one that recomputes fewer ops stays. The plain layer and full
     recompute are always kept.
 
@@ -154,13 +175,14 @@ def build_front(
         The options, fastest first.
     """
     candidates: List[Tuple[Optional[FrozenSet[str]], Cost]] = list(_candidates(profile))
+    compared = [_compared(cost, profile.counts) for _, cost in candidates]
     kept = []
-    for index, (recompute, cost) in enumerate(candidates):
-        mine = cost.values()
+    for index, (recompute, _) in enumerate(candidates):
+        mine = compared[index]
         beaten = any(
-            all(theirs <= own for theirs, own in zip(other.values(), mine))
-            and (other.values() != mine or other_index < index)
-            for other_index, (_, other) in enumerate(candidates)
+            all(theirs <= own for theirs, own in zip(other, mine))
+            and (other != mine or other_index < index)
+            for other_index, other in enumerate(compared)
             if other_index != index
         )
         if not beaten or recompute is None or not recompute:
@@ -180,6 +202,7 @@ def layer_profiles(
     ccfg: Optional[CustomConfig] = None,
     most_in_flight: Optional[int] = None,
     each_switch: bool = True,
+    in_flight: Sequence[int] = (),
 ) -> Dict[Tuple[str, Optional[LayerKind]], SwitchProfile]:
     """What each switch of every layer kind saves and costs, at the evaluator's current strategy.
 
@@ -192,12 +215,14 @@ def layer_profiles(
             :meth:`EvaluatorV2.estimate_switch_profiles`.
         each_switch: Whether to measure each switch alone; without, a profile
             prices only the plain and the fully recomputed layer.
+        in_flight: The counts of micro-batches in flight the stages keep, at
+            each of which an option's memory is exact too.
 
     Returns:
         ``{(model name, layer kind): SwitchProfile}``, in model order.
     """
     return evaluator.estimate_switch_profiles(
-        LayerTimes(device_type, ccfg), most_in_flight=most_in_flight, each_switch=each_switch
+        LayerTimes(device_type, ccfg), most_in_flight=most_in_flight, each_switch=each_switch, in_flight=in_flight
     )
 
 

@@ -92,17 +92,23 @@ _VL_TRAINING = {
 }
 
 
-def _small_deepseek(folder: str, interleave: int) -> str:
-    """A seven-layer DeepSeek at DP 4, TP 2, PP 2, fully recomputed, with *interleave* chunks per stage."""
+def _small_deepseek(folder: str, interleave: int, **parallel: int) -> str:
+    """A seven-layer DeepSeek, fully recomputed, with *interleave* chunks per stage.
+
+    At DP 4, TP 2, PP 2, EP 2 and 4 micro-batches, but for what *parallel*
+    states in MindFormers' ``parallel_config``.
+    """
     with open(DEEPSEEK_YAML, encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     model = config["model"]["model_config"]
     model.update(num_layers=7, offset=0, pp_interleave_num=interleave)
     config["parallel_config"].update(data_parallel=4, model_parallel=2, pipeline_stage=2, expert_parallel=2,
                                      micro_batch_num=4)
+    config["parallel_config"].update(parallel)
     config["moe_config"]["expert_num"] = 16
     config["recompute_config"]["recompute"] = True
-    path = os.path.join(folder, f"deepseek_{interleave}.yaml")
+    name = "_".join([f"deepseek_{interleave}"] + [f"{key}{value}" for key, value in sorted(parallel.items())])
+    path = os.path.join(folder, f"{name}.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle)
     return path
@@ -316,6 +322,30 @@ class TestStageMemory(unittest.TestCase):
                 for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
                     self.assertLessEqual(abs(mine - model), 1.0, (interleave, share, describe(choice)))
         self.assertGreater(selective_ends, 0)
+
+    def test_a_stage_between_the_first_and_the_last_keeps_what_the_config_priced_whole_keeps(self):
+        """
+        Feature: choose_recompute.
+        Description: The small DeepSeek at DP 2, TP 4, PP 4 with 8
+            micro-batches, whose stages keep 4, 3, 2 and 1 in flight, and
+            devices between all plain and all fully recomputed. On the second
+            stage a DP buffer hides the dense layer's gathers of the first
+            micro-batches. Each choice that holds one selective setting at
+            most is stated as recompute ranges and the whole config priced
+            with them.
+        Expectation: Each stage keeps what the choice says it keeps, to its
+            MB.
+        """
+        path = _small_deepseek(self.folder.name, 1, data_parallel=2, model_parallel=4, pipeline_stage=4,
+                               micro_batch_num=8)
+        evaluator = EvaluatorV2(path, framework="mindformers", log_level=0)
+        self.assertEqual(micro_batches_in_flight(evaluator), [[4], [3], [2], [1]])
+        plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
+        for share in (0.1, 0.5, 0.9):
+            choice = choose_recompute(_with_capacity(evaluator, full + 16 + share * (plain - full)), Hard.Device_A2)
+            self.assertLessEqual(len({item.option.recompute for item in choice.ranges if item.option.recompute}), 1)
+            for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
+                self.assertLessEqual(abs(mine - model), 1.0, (share, describe(choice)))
 
 
 class TestOneMode(unittest.TestCase):

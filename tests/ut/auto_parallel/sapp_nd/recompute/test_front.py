@@ -19,6 +19,7 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/recompute/test_front.py -v
 """
 import copy
+import dataclasses
 import itertools
 import os
 import unittest
@@ -181,6 +182,27 @@ class TestBuildFront(_FrontChecks):
             frozenset({"ffAct", "gather"}): ("BOTH",),
             None: ("FULL",),
         })
+
+    def test_an_option_lighter_at_a_count_in_between_stays(self):
+        """
+        Feature: build_front.
+        Description: Two options that keep as much per micro-batch and once,
+            the faster one charged 20 beyond what it keeps at a count of
+            micro-batches in flight between one and the most, which a stage
+            keeps.
+        Expectation: Both stay, each keeping what it keeps at that count;
+            without the count, only the faster one stays.
+        """
+        plain = Cost(100.0, 10.0, 50.0, (0.0,))
+        alone = dict(dict.fromkeys(SWITCHES, plain), ffAct=Cost(70.0, 10.0, 50.01, (0.0,)),
+                     normOp=Cost(70.0, 10.0, 50.05, (20.0,)))
+        profile = SwitchProfile(25.0, plain, alone, Cost(2.0, 20.0, 80.0, (0.0,)), counts=(2,))
+        options = {option.recompute: option for option in build_front(profile)}
+        self.assertEqual((options[frozenset({"ffAct"})].memory(2), options[frozenset({"normOp"})].memory(2)),
+                         (150.0, 130.0))
+        without = {option.recompute for option in build_front(dataclasses.replace(profile, counts=()))}
+        self.assertIn(frozenset({"ffAct"}), without)
+        self.assertNotIn(frozenset({"normOp"}), without)
 
     def test_an_option_stands_for_a_switch_setting(self):
         """
