@@ -1221,8 +1221,17 @@ class TestSappNDRunND(unittest.TestCase):
                             run_name="__main__",
                         )
                 self.assertEqual(exc_info.exception.code, 0)
+                self.assertEqual(cluster_spec["device_type"], "A2")
+                with patch.object(sys, "argv", argv + ["-A", "A3"]):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
             self.assertEqual(cluster_spec["num_nodes"], 8)
-            mock_search.assert_called_once()
+            self.assertEqual(cluster_spec["device_type"], "A3")
+            self.assertEqual(mock_search.call_count, 2)
 
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
