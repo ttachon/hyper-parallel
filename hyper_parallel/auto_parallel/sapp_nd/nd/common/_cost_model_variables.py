@@ -201,6 +201,10 @@ class _CostModVar:
     # gathers them again when it runs next; MindSpore's optimizer
     # parallelism keeps its gathered weights.
     reshards: bool = False
+    # Whether FSDP holds each layer's reduce-scatter output until the
+    # backward ends, adding it to the accumulated gradient only then, as
+    # HyperParallel's does; PyTorch's FSDP2 adds it as soon as it is reduced.
+    defers_grads: bool = False
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:

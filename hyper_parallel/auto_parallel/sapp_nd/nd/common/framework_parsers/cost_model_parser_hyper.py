@@ -674,6 +674,9 @@ class CostModelParserHyperV2(_CostModelParser):
                                                              False))
         self.ccfg.grads_as_params = True
         self.ccfg.reshards = self._reshards_params()
+        # It adds each layer's reduce-scatter output to the accumulated
+        # gradient only in the root's backward hook.
+        self.ccfg.defers_grads = True
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
             else self.ccfg.d
