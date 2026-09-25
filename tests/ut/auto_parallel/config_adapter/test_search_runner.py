@@ -496,6 +496,64 @@ class TestModelSectionIsTheSpec(unittest.TestCase):
         self.assertEqual(hp_yaml["context"]["max_device_memory"], "60.0GB")
 
 
+# The run a train.yaml states beyond the strategy: the model's dtype, FSDP's
+# precision and resharding, an fp32 optimizer, clipping and Ulysses CP; and
+# the strategy it states too, which the search replaces.
+_STATED_RUN = {
+    "model": {"torch_dtype": "bfloat16"},
+    "model_init_dtype": "bfloat16",
+    "accelerator": {"tp_degree": 8, "tp_size": 8, "context_parallel_algo": "ulysses_cp"},
+    "fsdp_config": {
+        "dp_shard_size": 8,
+        "reshard_after_forward": False,
+        "mix_precision": {"param_dtype": "bfloat16"},
+    },
+    "training": {"global_batch_size": 64, "micro_batch_size": 1, "max_grad_norm": 1.0},
+    "optimizer": {"_target_": "hyper_parallel.optim.AdamW", "fp32_main_params": True},
+}
+
+
+def _search_yaml(config: NormalizedConfig) -> dict:
+    """The yaml the search hands ND for *config*."""
+    return sr._build_hp_yaml_dict(config)  # pylint: disable=protected-access
+
+
+class TestTheStatedRun(unittest.TestCase):
+    """The run the train.yaml states reaches ND beneath the searched strategy."""
+
+    def test_the_run_stays_as_the_train_yaml_states_it(self):
+        """What the search does not decide reaches ND as the train.yaml states it."""
+        config = _make_full_config(run=_STATED_RUN)
+        data = _search_yaml(config)
+        self.assertEqual(data["model"]["torch_dtype"], "bfloat16")
+        self.assertEqual(data["model"]["config_overrides"]["hidden_size"], 4096)
+        self.assertEqual(data["model_init_dtype"], "bfloat16")
+        self.assertEqual(data["optimizer"], _STATED_RUN["optimizer"])
+        self.assertFalse(data["fsdp_config"]["reshard_after_forward"])
+        self.assertEqual(data["fsdp_config"]["mix_precision"], {"param_dtype": "bfloat16"})
+        self.assertEqual(data["training"]["max_grad_norm"], 1.0)
+        self.assertEqual(data["accelerator"]["context_parallel_algo"], "ulysses_cp")
+
+    def test_the_searched_strategy_replaces_the_stated_one(self):
+        """The train.yaml's degrees and batch give way, under either spelling."""
+        config = _make_full_config(run=_STATED_RUN)
+        data = _search_yaml(config)
+        self.assertEqual(data["accelerator"]["tp_size"], 1)
+        self.assertNotIn("tp_degree", data["accelerator"])
+        self.assertEqual(data["fsdp_config"]["dp_shard_size"], 1)
+        self.assertEqual(data["training"]["global_batch_size"], 128)
+        self.assertEqual(_STATED_RUN["fsdp_config"]["dp_shard_size"], 8)
+
+    def test_no_stated_run_changes_nothing(self):
+        """A config read from no train.yaml builds the sections it always did."""
+        data = _search_yaml(_make_full_config())
+        self.assertEqual(
+            set(data), {"model", "training", "accelerator", "fsdp_config", "activation_checkpoint", "dataset",
+                        "context"},
+        )
+        self.assertNotIn("torch_dtype", data["model"])
+
+
 class TestSearchStrategies(unittest.TestCase):
     """End-to-end tests for search_strategies with mocked ND."""
 
@@ -720,3 +778,43 @@ class TestCostModelParserCpAlgoReal(unittest.TestCase):
             self.assertEqual(ccfg.cp_algo, "colossalai_cp")
         finally:
             os.unlink(path)
+
+
+class TestTheParserReadsTheStatedRun(unittest.TestCase):
+    """The real parser prices the run the train.yaml states, on the search's yaml."""
+
+    @staticmethod
+    def _parse(config):
+        """Parse the search's yaml for *config* with the real parser and return the ccfg."""
+        fd, path = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            yaml.dump(_search_yaml(config), fh)
+        try:
+            ccfg = _MinimalCcfg(Config(path))
+            CostModelParserHyperV2(ccfg).parse()
+        finally:
+            os.unlink(path)
+        return ccfg
+
+    def test_the_stated_run_is_priced(self):
+        """A bf16 model under an fp32 optimizer, gathered layers, clipping and Ulysses CP.
+
+        Without the stated run the search priced fp32 parameters, no fp32
+        copy, resharding, no clipping and ring CP.
+        """
+        ccfg = self._parse(_make_full_config(run=_STATED_RUN))
+        self.assertEqual(ccfg.bytes_p, 2)
+        self.assertEqual(ccfg.optimizer_state_bytes, 4)
+        self.assertEqual(ccfg.main_param_bytes, 4)
+        self.assertFalse(ccfg.reshard_params)
+        self.assertTrue(ccfg.has_clip)
+        self.assertEqual(ccfg.cp_algo, "ulysses_cp")
+        self.assertEqual(ccfg.optimizer, "hyper_parallel.optim.AdamW")
+
+    def test_no_stated_run_takes_the_defaults(self):
+        """A config read from no train.yaml keeps the parser's defaults."""
+        ccfg = self._parse(_make_full_config())
+        self.assertEqual(ccfg.bytes_p, 4)
+        self.assertEqual(ccfg.optimizer_state_bytes, 4)
+        self.assertEqual(ccfg.main_param_bytes, 0)
+        self.assertEqual(ccfg.cp_algo, "colossalai_cp")
