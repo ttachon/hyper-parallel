@@ -1505,6 +1505,16 @@ class TestFsdpResharding(unittest.TestCase):
             got.append(ccfg.reshards)
         self.assertEqual(got, [True, False, False])
 
+    def test_the_run_accumulates_without_a_pipeline(self):
+        """
+        Feature: accumulates_grads.
+        Description: A HyperParallel run at PP 1.
+        Expectation: Its FSDP holds each gradient between micro-batches, so
+            it accumulates them without a pipeline, and a search gives PP 1
+            several micro-batches.
+        """
+        self.assertTrue(_make_ccfg(_dense_overrides()).accumulates_grads)
+
 
 class TestHybridLayerStack(unittest.TestCase):
     """A hybrid stack prices each layer with its own attention flavour."""

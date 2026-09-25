@@ -741,6 +741,14 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(global_config.dim_val(Dim.DP, parallel_config), 2)
         self.assertEqual(global_config.global_batch_size(parallel_config), 16)
+        no_pipeline = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(no_pipeline), 8)
+        self.assertFalse(no_pipeline.is_valid())
+        fake_ccfg.accumulates_grads = True
+        accumulating = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(accumulating), 16)
+        self.assertTrue(accumulating.is_valid())
+        fake_ccfg.accumulates_grads = False
         self.assertEqual(global_config.layer_num_for_offset(), 4)
         self.assertEqual(global_config.total_layer_num(), 5)
         self.assertEqual(global_config.adapt_config(2, 1), ([0, 0], [0, 0]))
@@ -1660,6 +1668,7 @@ class TestSappNDRunND(unittest.TestCase):
         fp32 = _make_arch_cfg(p=1, bytes_p=4, grads_as_params=True)
         ArchHooks.custom_llama2(fp32)
         self.assertEqual(fp32.bytes_grad, 4)
+        self.assertTrue(fp32.accumulates_grads)
 
     def test_performance_formula_helpers(self) -> None:
         """

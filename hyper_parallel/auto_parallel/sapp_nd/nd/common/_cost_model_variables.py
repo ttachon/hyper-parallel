@@ -185,6 +185,10 @@ class _CostModVar:
     # Whether each gradient is held as its parameter is: in its width and
     # sharding, at any pipeline degree, as FSDP holds it.
     grads_as_params: bool = False
+    # Whether the run accumulates gradients over micro-batches without
+    # pipeline parallelism, holding them between micro-batches: a search
+    # then gives PP 1 several micro-batches.
+    accumulates_grads: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the run's optimizer keeps, None taking the family's: a state's
