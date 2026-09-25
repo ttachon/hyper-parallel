@@ -66,6 +66,21 @@ class TestDerive(unittest.TestCase):
             derive_embedding_sharding(ccfg)
             self.assertEqual(ccfg.shard_embed, expected, f"{fields}: shard_embed={ccfg.shard_embed}")
 
+    def test_fsdp_shards_the_embedding_over_its_group(self):
+        """
+        Feature: derive_embedding_sharding, under FSDP.
+        Description: A table over d=8 and t=2 whose FSDP group is 2 ranks,
+            as under HSDP, with and without FSDP.
+        Expectation: FSDP shards the table over its group and TP, and
+            gathers it over the group; otherwise it is split over d.
+        """
+        got = []
+        for fsdp in (True, False):
+            ccfg = _config(d=8, os_max_shard=2, grad_shard_as_params=fsdp)
+            derive_embedding_sharding(ccfg)
+            got.append((ccfg.shard_embed, ccfg.gather_embed))
+        self.assertEqual(got, [(4, 2), (16, 1)])
+
     def test_mindformers_recompute_switches(self):
         """
         Feature: derive_recompute_switches.

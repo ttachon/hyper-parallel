@@ -188,13 +188,16 @@ def derive_embedding_sharding(ccfg: Any) -> None:
     The table is split over tensor parallelism unless the vocabulary
     embedding runs data parallel without pipelining, and over data
     parallelism unless the config says it is not.  FSDP, which shards the
-    gradients as the parameters (``grad_shard_as_params``), gathers the
-    table over data parallelism to compute with it, as every parameter.
+    gradients as the parameters (``grad_shard_as_params``), shards the
+    table as every parameter, over :func:`optimizer_ranks`, its FSDP group
+    and not the whole of data parallelism under HSDP, and gathers it over
+    them to compute with it.
     """
     tp = 1 if (ccfg.vocab_emb_dp and ccfg.p == 1) else ccfg.t
-    ccfg.shard_embed = (ccfg.d if ccfg.emb_dp_sharded else 1) * tp
     fsdp = getattr(ccfg, "grad_shard_as_params", False)
-    ccfg.gather_embed = ccfg.d if fsdp and ccfg.emb_dp_sharded else 1
+    ranks = (optimizer_ranks(ccfg) if ccfg.has_op else 1) if fsdp else ccfg.d
+    ccfg.shard_embed = (ranks if ccfg.emb_dp_sharded else 1) * tp
+    ccfg.gather_embed = ranks if fsdp and ccfg.emb_dp_sharded else 1
 
 
 def hyper_rec_op(selective: Union[bool, list]) -> dict[str, int]:
