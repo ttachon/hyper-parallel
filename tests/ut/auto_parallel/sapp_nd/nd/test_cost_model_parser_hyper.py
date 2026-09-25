@@ -401,7 +401,8 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: _parse_parallelism — optimizer shard.
         Description: enable_parallel_optimizer and optimizer_weight_shard_size.
-        Expectation: has_op and os_max_shard match inputs.
+        Expectation: has_op and os_max_shard match inputs; with no size
+            stated, the optimizer shard counts every data-parallel rank.
         """
         cfg = _dense_overrides(train={
             "accelerator": {
@@ -421,7 +422,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         })
         ccfg2 = _make_ccfg(cfg2)
         self.assertFalse(ccfg2.has_op)
-        self.assertEqual(ccfg2.os_max_shard, ccfg2.d * ccfg2.t)
+        self.assertEqual(ccfg2.os_max_shard, ccfg2.d)
 
     def test_parallelism_grad_accum_shard(self):
         """
@@ -538,6 +539,19 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertFalse(ccfg.tie_emb_out)
         self.assertFalse(ccfg.freeze)
         self.assertEqual(ccfg.cp_algo, "colossalai_cp")
+
+    def test_feature_flags_tied_embeddings(self):
+        """
+        Feature: _parse_feature_flags, tied embeddings.
+        Description: A model whose config ties its output head to its
+            embedding, and the same model untied.
+        Expectation: tie_emb_out follows the model's tie_word_embeddings.
+        """
+        cfg = _dense_overrides()
+        cfg["model"]["config_overrides"]["tie_word_embeddings"] = True
+        self.assertTrue(_make_ccfg(cfg).tie_emb_out)
+        cfg["model"]["config_overrides"]["tie_word_embeddings"] = False
+        self.assertFalse(_make_ccfg(cfg).tie_emb_out)
 
     def test_feature_flags_clip(self):
         """

@@ -131,9 +131,9 @@ class TestGradientSharding(unittest.TestCase):
     def test_gradient_sharding(self):
         """
         Feature: derive_optimizer_sharding.
-        Description: At d=4, t=2 and an optimizer shard of 4: gradients
-            sharded as the parameters are, as FSDP holds them; over the whole
-            optimizer shard; and neither.
+        Description: At d=4, t=2 and an optimizer shard of 2 data-parallel
+            ranks: gradients sharded as the parameters are, as FSDP holds
+            them; over the whole optimizer shard; and neither.
         Expectation: The non-expert, expert and partial expert gradient
             factors: the parameters' (4, 8, 1), the optimizer's (8, 8, 1),
             and TP alone.
@@ -144,10 +144,29 @@ class TestGradientSharding(unittest.TestCase):
             ({}, (2, 2, 2)),
         ]
         for facts, want in cases:
-            ccfg = _config(os_max_shard=4, **facts)
+            ccfg = _config(os_max_shard=2, **facts)
             derive(ccfg)
             got = (ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial)
             self.assertEqual(got, want, f"{facts}: shard_grad_non_exp, shard_grad_exp, shard_grad_exp_partial={got}")
+
+
+class TestOptimizerSharding(unittest.TestCase):
+    """Optimizer sharding splits a parameter over data-parallel ranks, on top of TP."""
+
+    def test_parameters_are_sharded_over_tp_and_the_optimizer_ranks(self):
+        """
+        Feature: derive_optimizer_sharding.
+        Description: TP 4 and DP 8, with optimizer sharding over 2, 8, 3 and
+            16 data-parallel ranks, and without optimizer sharding.
+        Expectation: A parameter is sharded over TP times the ranks, never
+            fewer than TP; a count that does not divide DP shards over all of
+            it; without optimizer sharding, over TP alone.
+        """
+        cases = [(2, True, 8), (8, True, 32), (3, True, 32), (16, True, 32), (2, False, 4)]
+        for ranks, has_op, want in cases:
+            ccfg = _config(d=8, t=4, os_max_shard=ranks, has_op=has_op)
+            derive(ccfg)
+            self.assertEqual(ccfg.shard_p_os_non_exp_partial, want, f"{ranks} ranks, has_op={has_op}")
 
 
 class TestDeriveFamily(unittest.TestCase):

@@ -99,6 +99,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.mm_order = None
         self._vision_spec = None
         self._model_seq_len = 0
+        self._tie_word_embeddings = False
 
         # The model, through AutoModels' Transformers pipeline.
         self._resolve_model_config_pipeline()
@@ -125,6 +126,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override()
         )
         self._vision_spec = spec.pop("vision", None)
+        self._tie_word_embeddings = bool(spec.get("tie_word_embeddings"))
         self._apply_spec(self.ccfg, spec)
         ops = None if spec.get("ops") is None else ops_from_dict(spec["ops"])
         self.config_op_counts(self.ccfg, spec["arch"], ops)
@@ -287,8 +289,8 @@ class CostModelParserHyperV2(_CostModelParser):
         # Its own facts set its derived fields, not those of the language
         # model it was cloned from.
         apply_exec(cc, ExecSpec(
-            vocab_emb_dp=False, mtp_in_offset=False, grouped_gemm=False, capacity_factor=1,
-            offset=self._front_loaded_offset(cc.n_lay),
+            vocab_emb_dp=False, tie_embeddings=False, mtp_in_offset=False, grouped_gemm=False,
+            capacity_factor=1, offset=self._front_loaded_offset(cc.n_lay),
         ), strict=False)
         return cc
 
@@ -418,7 +420,7 @@ class CostModelParserHyperV2(_CostModelParser):
 
         stated, dp_shard = self._parse_parallel_dimensions(accel, fsdp)
         stated.update(self._parse_sequence_parallelism(accel))
-        stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"], stated["tp"]))
+        stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"]))
         return stated
 
     def _parse_parallel_dimensions(self, accel, fsdp) -> Tuple[Dict[str, Any], int]:
@@ -505,7 +507,7 @@ class CostModelParserHyperV2(_CostModelParser):
             "pp_schedule": str(self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")),
         }
 
-    def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int, tp: int) -> Dict[str, Any]:
+    def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int) -> Dict[str, Any]:
         """Optimizer and gradient sharding.
 
         HyperParallel's FSDP holds every gradient sharded as its parameter,
@@ -522,10 +524,10 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (dp_shard if is_auto_models else dp * tp))
+        ) or (dp_shard if is_auto_models else dp))
         return {
             "optimizer_parallel": optimizer_parallel,
-            "optimizer_shard": weight_shard if weight_shard >= 1 else dp * tp,
+            "optimizer_shard": weight_shard,
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
             "grad_shard_as_params": True,
             "grad_accumulation": True,
@@ -587,7 +589,7 @@ class CostModelParserHyperV2(_CostModelParser):
         return {
             "flash_attention": True,
             "vocab_emb_dp": True,
-            "tie_embeddings": False,
+            "tie_embeddings": self._tie_word_embeddings,
             "frozen": False,
             "grad_clip": max_grad_norm > 0,
             "cp_algo": cp_algo,

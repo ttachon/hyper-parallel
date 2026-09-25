@@ -278,7 +278,7 @@ and the memory module.
 | Op profile | `arch`, `op_counts`, `inherited_arch` | Architecture family whose op profile prices the model, and its op counts per layer kind; a vision tower's arch is `vision`, and `inherited_arch` names its language model's family, whose activation sharding it takes |
 | Layer stack | `layer_stack`, `layer_binding`, `layer_fields` | The kind of every layer, as data; the fields each kind assigns, bound when the family is applied; the fields a family gives every layer on top of its kind's |
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order`, `hooks_dict` | Used when one config is split into multiple model components, each priced by its own `arch` unless a hook class names its hook in `hooks_dict` |
-| Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
+| Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings; `os_max_shard` counts the data-parallel ranks optimizer sharding splits a parameter over, on top of TP |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |
 | Recompute | `full_rec`, `sel_rec`, `sel_comm_rec`, `sel_rec_rule`, `recompute_slice_activation`, `recompute_ranges`, `rec_op` | Full and selective recomputation controls; `recompute_ranges`, when an ExecSpec states them, give each layer its option in model order and replace `full_rec` and `sel_rec`; `rec_op` holds the switches of the one selective setting a config prices |
 | Model shape | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh`, `v_head_dim`, `dc_kv`, `dc_q`, `dhr` | Layer count, hidden sizes, sequence sizes, attention heads, and MLA-related dimensions |
@@ -287,7 +287,7 @@ and the memory module.
 | Optimizer shard | `shard_p_os_non_exp_partial`, `shard_p_os_non_exp`, `shard_grad_non_exp` | Non-expert parameter, optimizer-state, and gradient sharding factors |
 | Expert shard | `shard_p_os_exp_partial`, `shard_p_os_exp`, `shard_grad_exp` | Expert parameter, optimizer-state, and gradient sharding factors |
 | Communication | `comm_d_non_exp`, `comm_d_exp`, `comm_t`, `comm_ep`, `comm_cp` | Formula switches for DP, TP, EP, and CP communication memory |
-| Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `emb_dp_sharded`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches |
+| Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `emb_dp_sharded`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches; a tied embedding (`tie_emb_out`) shares the output layer's table only without pipeline parallelism, where both run on one stage |
 | MTP flags | `n_mtp`, `is_mtp_in_offset`, `is_shard_mtp_param` | Multi-token prediction layer placement and sharding controls |
 | Batch | `b`, `m`, `gbs` | Micro batch size, number of micro batches, and global batch size |
 | Activation shard | `shard_activations`, `shard_embed`, `shard_output_activ`, `shard_recompute_input` | Whether TP shards the activations between layers, and the embedding, output activation, and recompute input sharding factors |

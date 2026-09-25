@@ -199,7 +199,7 @@ class CostModelParserMindformers(_CostModelParser):
         if self.ccfg.op_weight_shard:
             self.ccfg.os_max_shard = self.ccfg.op_weight_shard
         elif self.ccfg.has_op:
-            self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+            self.ccfg.os_max_shard = self.ccfg.d
         else:
             self.ccfg.os_max_shard = 1
 

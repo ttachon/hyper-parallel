@@ -293,6 +293,8 @@ class ModelSpec:
         layer_types: The attention flavour of each layer, as a hybrid config
             such as Qwen3.5 lists them; a producer states ``layers`` from
             them and drops them.
+        tie_word_embeddings: Whether the output head shares the embedding's
+            table, as a Transformers config states it.
     """
 
     name: str
@@ -324,6 +326,7 @@ class ModelSpec:
     v_head_dim: Optional[int] = None
     # Qwen3.5 fuses an output gate into the query projection, doubling its width.
     attn_output_gate: Optional[bool] = None
+    tie_word_embeddings: Optional[bool] = None
 
     # Gated DeltaNet linear attention (Qwen3.5), for the layers a linear kind prices.
     linear_num_key_heads: Optional[int] = None
@@ -513,9 +516,9 @@ class ModelSpec:
             return layers_from_list(value)
         if key == "ffn_dim_multiplier":
             return float(value)
-        if key == "attn_output_gate":
+        if key in ("attn_output_gate", "tie_word_embeddings"):
             if not isinstance(value, bool):
-                raise ModelSpecError(f"attn_output_gate must be true or false, got {value!r}")
+                raise ModelSpecError(f"{key} must be true or false, got {value!r}")
             return value
         if key == "layer_types":
             if not isinstance(value, (list, tuple)) or not all(isinstance(kind, str) for kind in value):

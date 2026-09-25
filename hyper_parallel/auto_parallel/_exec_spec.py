@@ -170,7 +170,10 @@ class ExecSpec:
             input, and the output layer's.
         micro_batch_size, micro_batch_num, global_batch_size: The batch.
         optimizer_parallel: Whether optimizer states are sharded.
-        optimizer_shard: How many ways optimizer states are sharded.
+        optimizer_shard: How many data-parallel ranks optimizer sharding
+            splits each parameter over, on top of TP's split, as MindSpore's
+            ``optimizer_weight_shard_size`` and HyperParallel's ``dp_shard``
+            count them.
         grad_shard: Whether gradients are sharded too.
         grad_shard_as_params: Whether each gradient is sharded as its
             parameter is, as FSDP holds it; ``grad_shard`` does not apply.
