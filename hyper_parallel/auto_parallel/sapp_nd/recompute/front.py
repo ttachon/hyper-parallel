@@ -18,8 +18,8 @@ An option runs a layer one way: plain, recomputing some of the seven ops the
 recompute switches name, or fully recomputed. Of the 128 settings of the
 switches and full recompute, the front keeps those that no other option beats
 on memory per micro-batch, memory held once, memory at each count of
-micro-batches in flight a stage keeps, and backward time together. The plain
-layer and full recompute are always on it.
+micro-batches in flight a stage keeps, the working set of its backward, and
+backward time together. The plain layer and full recompute are always on it.
 
 :func:`layer_fronts` is the interim form of the search's entry point for
 layer options (shared decision S3): it measures each layer kind on the memory
@@ -56,6 +56,9 @@ class LayerOption:
         excess: ``(count, bytes)`` for each count of micro-batches in flight
             at which the two memories charge more than the layer keeps, by
             that many bytes; see :attr:`Cost.excess`.
+        working_extra: What the working set of the option's backward holds
+            beyond what it keeps at one micro-batch; see
+            :attr:`SwitchProfile.working`.
     """
 
     recompute: Optional[FrozenSet[str]]
@@ -66,6 +69,7 @@ class LayerOption:
     link_bandwidth: float = 0.0
     names: Tuple[str, ...] = ()
     excess: Tuple[Tuple[int, float], ...] = ()
+    working_extra: float = 0.0
 
     def memory(self, in_flight: int) -> float:
         """The bytes a layer running the option keeps with *in_flight* micro-batches in flight."""
@@ -144,16 +148,26 @@ def price_option(
         backward_time=cost.backward_time,
         names=_names(recompute, configured or {}),
         excess=tuple((count, excess) for count, excess in zip(profile.counts, cost.excess) if excess),
+        working_extra=profile.working[int(recompute is None or "gather" in recompute)],
     )
 
 
-def _compared(cost: Cost, counts: Sequence[int]) -> Tuple[float, ...]:
-    """What an option is compared on: its two memories and backward time, and its memory at each of *counts*."""
+def _working(recompute: Optional[FrozenSet[str]], cost: Cost, profile: SwitchProfile) -> float:
+    """The working set of the backward of a layer recomputing *recompute*: the plain layer's for full recompute."""
+    if recompute is None:
+        return _working(frozenset(), profile.plain, profile)
+    return cost.memory_per_micro_batch + cost.memory_once + profile.working[int("gather" in recompute)]
+
+
+def _compared(
+    recompute: Optional[FrozenSet[str]], cost: Cost, profile: SwitchProfile
+) -> Tuple[float, ...]:
+    """What an option is compared on: its two memories, backward time, memory at each count and working set."""
     at = (
         count * cost.memory_per_micro_batch + cost.memory_once - excess
-        for count, excess in zip(counts, cost.excess)
+        for count, excess in zip(profile.counts, cost.excess)
     )
-    return cost.values() + tuple(at)
+    return cost.values() + tuple(at) + (_working(recompute, cost, profile),)
 
 
 def build_front(
@@ -162,10 +176,10 @@ def build_front(
     """The options of a layer kind that no other option beats.
 
     An option beats another when it needs no more memory per micro-batch, no
-    more memory once and no more backward time, and no more memory at any of
-    the profile's counts of micro-batches in flight. Of options that cost the
-    same, the one that recomputes fewer ops stays. The plain layer and full
-    recompute are always kept.
+    more memory once and no more backward time, no more memory at any of the
+    profile's counts of micro-batches in flight, and no larger a working set
+    in its backward. Of options that cost the same, the one that recomputes
+    fewer ops stays. The plain layer and full recompute are always kept.
 
     Args:
         profile: The kind's costs, each switch measured alone.
@@ -176,7 +190,7 @@ def build_front(
         The options, fastest first.
     """
     candidates: List[Tuple[Optional[FrozenSet[str]], Cost]] = list(_candidates(profile))
-    compared = [_compared(cost, profile.counts) for _, cost in candidates]
+    compared = [_compared(recompute, cost, profile) for recompute, cost in candidates]
     kept = []
     for index, (recompute, _) in enumerate(candidates):
         mine = compared[index]

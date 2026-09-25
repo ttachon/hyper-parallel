@@ -25,8 +25,10 @@ stage by stage.
 
 At the end of warm-up, the memory model also charges each stage one layer's
 working set at one micro-batch: the plain layer's if the stage's last layer is
-fully recomputed, the layer's own otherwise. So that layer's options each keep
-the working set they end warm-up on too, and the knapsack weighs it with them.
+fully recomputed, the layer's own otherwise, what it keeps then and, under FSDP
+that reshards, the gathered parameters its backward holds besides. So that
+layer's options each keep the working set they end warm-up on too, and the
+knapsack weighs it with them.
 
 A runtime that runs every layer one way, such as HyperParallel's trainer with
 its ``activation_checkpoint.mode``, gets the fastest of its modes that fits
@@ -297,10 +299,12 @@ def _plain(options: Sequence[LayerOption]) -> LayerOption:
 def _working(option: LayerOption, options: Sequence[LayerOption]) -> float:
     """The working set a layer running *option* ends warm-up on.
 
-    Its own at one micro-batch, and for a fully recomputed layer the plain
-    layer's, *options* being its kind's.
+    What it keeps at one micro-batch and what its backward holds beyond, and
+    for a fully recomputed layer the plain layer's, *options* being its
+    kind's.
     """
-    return _kept(option if option.recompute is not None else _plain(options), 1)
+    run = option if option.recompute is not None else _plain(options)
+    return _kept(run, 1) + run.working_extra
 
 
 def _charge_working_sets(
@@ -360,9 +364,7 @@ def _first_working(
     """
     options = fronts[_kind_key(layer.key)]
     option = own.get(option, option)
-    if option.link_bandwidth:
-        return _kept(_plain(options), 1)
-    return _working(option, options)
+    return _working(_plain(options) if option.link_bandwidth else option, options)
 
 
 def _backward_kept(

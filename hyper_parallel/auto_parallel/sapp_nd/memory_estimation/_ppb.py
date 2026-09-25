@@ -15,7 +15,7 @@
 """PPB input module"""
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -205,6 +205,8 @@ class _PPB:
             alone[name] = measured if name == "gather" else measured[:3] + plain[3:]
         ctx.current_node = LayerType.FULL_REC_LAYER
         full = self._dynamic_mem(many, counts)
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        working = (self._working_extra(ctx), self._selective(ccfg, ctx, dict(keep, gather=0), self._working_extra))
 
         def _cost(memory: Tuple[float, float, float, Tuple[float, ...]], backward: float) -> Cost:
             """A measurement as a cost: activations and growing buffers per micro-batch, the rest once."""
@@ -221,7 +223,17 @@ class _PPB:
             },
             full=_cost(full, self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]),
             counts=counts,
+            working=working,
         )
+
+    def _working_extra(self, ctx: Context) -> float:
+        """What the working set of the current layer's backward holds beyond what it keeps at one micro-batch."""
+        kept = sum(self._inner_dynamic_mem(ppb=True))
+        ctx.working_set = True
+        try:
+            return sum(self._inner_dynamic_mem(default_micro_factor=1)) - kept
+        finally:
+            ctx.working_set = False
 
     def _dynamic_mem(
         self, many: int, counts: Tuple[int, ...] = ()
@@ -244,13 +256,18 @@ class _PPB:
         self, ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], many: int, counts: Tuple[int, ...] = ()
     ) -> Tuple[float, float, float, Tuple[float, ...]]:
         """:meth:`_dynamic_mem` of a selective layer with *switches*; the config's own are restored."""
+        return self._selective(ccfg, ctx, switches, lambda _: self._dynamic_mem(many, counts))
+
+    @staticmethod
+    def _selective(ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], measure: Callable) -> Any:
+        """*measure* of *ctx*, the current layer selective with *switches*; the config's own are restored."""
         rec_op = ccfg.rec_op
         before = dict(vars(rec_op))
         ctx.current_node = LayerType.SEL_REC_LAYER
         try:
             for name, value in switches.items():
                 setattr(rec_op, name, value)
-            return self._dynamic_mem(many, counts)
+            return measure(ctx)
         finally:
             for name in switches:
                 if name in before:

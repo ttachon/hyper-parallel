@@ -82,6 +82,12 @@ class SwitchProfile:
         full: The layer fully recomputed.
         counts: The counts of micro-batches in flight, between one and the
             most any stage keeps, at which each cost states its excess.
+        working: What the working set of the layer's backward, which the
+            memory model charges the layer that ends warm-up, holds beyond
+            what the layer keeps at one micro-batch: ``(gathers kept,
+            gathers recomputed)``. Only ``gather`` acts on it: FSDP that
+            reshards holds two layers' gathered parameters in a backward and
+            none between the layer's passes, in the buffers the gathers take.
     """
 
     forward_time: float
@@ -89,6 +95,7 @@ class SwitchProfile:
     alone: Mapping[str, Cost]
     full: Cost
     counts: Tuple[int, ...] = ()
+    working: Tuple[float, float] = (0.0, 0.0)
 
     def selective(self, recompute: Iterable[str]) -> Cost:
         """The cost of recomputing the ops *recompute* names: the plain layer's, plus what each costs alone."""

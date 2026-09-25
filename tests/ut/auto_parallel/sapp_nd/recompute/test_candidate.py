@@ -54,7 +54,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     option_label,
     to_records,
 )
-from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption, build_front, layer_profiles
 from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import MEGABYTE, Stage
 
 DEEPSEEK_YAML = os.path.join(
@@ -432,6 +432,60 @@ class TestTwoPeaks(unittest.TestCase):
                 for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
                     self.assertLessEqual(abs(mine - model), 1.0, (share, modes, describe(choice)))
         self.assertGreater(checked, 5)
+
+
+# The dense model at DP shard 2: HyperParallel's FSDP reshards, so a layer's
+# backward holds its own and the next layer's gathered parameters, in the
+# buffers its tensor-parallel gathers take.
+_RESHARDING = copy.deepcopy(_DENSE)
+_RESHARDING["train"]["accelerator"]["dp_shard"] = 2
+
+
+class TestWorkingSet(unittest.TestCase):
+    """The working set of the backward of the layer that ends a stage's warm-up."""
+
+    def test_each_option_of_the_layer_that_ends_warm_up_keeps_what_the_config_priced_whole_keeps(self):
+        """
+        Feature: the working set of the layer that ends warm-up.
+        Description: The dense model at DP shard 2, TP 4 and PP 2 under
+            HyperParallel's FSDP, which reshards: every layer plain but the
+            first stage's last, which runs each option of its kind's front
+            in turn, stated as recompute ranges and the whole config priced
+            with them.
+        Expectation: The first stage keeps what the search says it keeps, to
+            its MB, whether the option keeps its gathers or recomputes them,
+            though recomputing them leaves its backward's working set as it
+            was.
+        """
+        # pylint: disable=protected-access
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_RESHARDING, handle)
+            evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        counts = micro_batches_in_flight(evaluator)
+        profiles = layer_profiles(evaluator, Hard.Device_A2, most_in_flight=max(max(row) for row in counts),
+                                  in_flight=[count for row in counts for count in row])
+        fronts = {key: build_front(profile) for key, profile in profiles.items()}
+        layers, ends = Candidate._body_layers(evaluator, fronts, counts)
+        layers, fronts, _, own = Candidate._charge_working_sets(layers, ends, fronts, None)
+        _, peaks = Candidate._stages(evaluator, layers, fronts, own)
+        ending = next(layer for layer in layers[0] if layer.index == ends[0][0].index)
+        plain = {layer.index: Candidate._plain(fronts[layer.key]) for stage in layers for layer in stage}
+        total = sum(len(stage) for stage in layers)
+        kept_plain = own.get(plain[ending.index], plain[ending.index])
+        recomputing_gathers = 0
+        for option in fronts[ending.key]:
+            original = own.get(option, option)
+            recomputing_gathers += original.recompute is None or "gather" in original.recompute
+            mine = Candidate._stage_memory(layers[0], peaks[0], {**plain, ending.index: option}, fronts, own)
+            whole = _stage_peaks_of(evaluator, SimpleNamespace(ranges=(
+                LayerRange(0, ending.index, None, kept_plain),
+                LayerRange(ending.index, 1, None, original),
+                LayerRange(ending.index + 1, total - ending.index - 1, None, kept_plain),
+            )))
+            self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(original))
+        self.assertGreater(recomputing_gathers, 1)
 
 
 def _kind(per_micro_batch: int, once: int, forward: float) -> Tuple[LayerOption, ...]:
