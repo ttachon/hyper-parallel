@@ -66,6 +66,30 @@ Both are run the same way:
 python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd     -y train.yaml -s search.yaml -f hyper_v2     -d 64 -b 128 -A A3 -M 58GB -o out
 ```
 
+### The model spec and the run spec
+
+Whatever the input format, ND prices a model from two typed specs:
+
+- The model spec (`auto_parallel/_model_spec.py`, `ModelSpec`) states the
+  model under any strategy: its dimensions, its experts, its layer stack
+  (`layers`), its family (`arch`) and, where they differ from the family's,
+  its op counts per layer kind (`ops`). A Transformers config resolves into
+  one, and `model.config_overrides` states its fields offline.
+- The run spec (`auto_parallel/_exec_spec.py`, `ExecSpec`) states how the
+  model is trained: the parallel degrees, the pipeline layout, the batch,
+  the optimizer and gradient sharding, the recompute, the precisions, the
+  kernels, the sequence length and the device memory. A HyperParallel
+  configuration states it in the train.yaml; `offset`, `full_rec`,
+  `sel_rec`, `capacity_factor`, `use_gmm` and `seq_length` in
+  `config_overrides` belong to it.
+
+Every other field is derived from the two. What neither states comes from
+the model's family, in its op profile (`auto_parallel/op_profiles/<arch>.yaml`):
+its op counts per layer kind, and defaults such as its byte widths. A run
+spec states recompute as ranges of layers in model order, the body layers
+first and the MTP layers last, so a search can give each layer its own
+option; `{option: full}` alone recomputes every layer.
+
 ## Workflow
 
 1. Construct the model.
