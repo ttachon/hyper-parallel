@@ -303,9 +303,12 @@ The `plot` stage adds the view across the sweep that no single configuration
 shows: the measured step split into ND's parts, and peak device memory, with
 the x axis labelled by whichever dimensions actually vary.
 
-The ND input yaml is generated rather than reused: ND reads the training
-sequence length from `data.max_seq_len`, while the demo feeds an Indexed
-Dataset whose length lives in `dataset.data_config.seq_length`. Without
-carrying it across, the model would be costed at its 262144 context limit.
+The ND input yaml, `nd_model.yaml`, is generated rather than reused. The launch
+overrides the config's layer count, sequence length, recompute mode and batch
+on the command line, so the config file alone describes another run, 128
+tokens without recompute against a default sweep of 8192 with full recompute.
+The generated yaml is the config with the values the launch uses, and it
+states the world size so that ND derives the data-parallel width the trainer
+does.
 `--framework` defaults to `hyper_v2`, the parser that reads this schema;
 run_nd's own default reads a different one.

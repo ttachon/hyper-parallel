@@ -235,6 +235,11 @@ class Sweep:
         return self.out / "real_all.csv"
 
     @property
+    def gbs(self) -> int:
+        """Global batch size of every strategy, the world size unless given."""
+        return self.args.global_batch_size or self.world
+
+    @property
     def python(self) -> str:
         """Interpreter for the analysis steps, which must import hyper_parallel."""
         return self.args.python or sys.executable
@@ -587,26 +592,31 @@ def stage_classify(sweep: Sweep) -> None:
     print(f"\n{count} configuration(s) in {sweep.merged_csv}", flush=True)
 
 
-def write_nd_config(config: Path, nd_yaml: Path) -> None:
-    """Write the ND input yaml for the model the demo config builds.
+def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
+    """Write ND's input: the demo config with the shape the sweep runs it at.
 
-    The sequence length is carried across explicitly: an Indexed Dataset states
-    it as ``dataset.data_config.seq_length``, and without it ND falls back to
-    the model's context limit, 262144 here against a real 128. The attention
-    term is quadratic, so that alone makes compute swamp every other part.
+    The launch overrides the config's layer count, sequence length, recompute
+    mode and batch on the command line, so the config file alone describes a
+    different run: 128 tokens without recompute, against a default sweep of
+    8192 with full recompute. Those are set here from the same arguments the
+    launch uses. The degrees are left as the config states them, since ND
+    takes them from the measured CSV or searches them, and the world size is
+    stated so that ND derives the data-parallel width the trainer does.
     """
     import yaml  # pylint: disable=import-outside-toplevel
 
-    raw = yaml.safe_load(config.read_text(encoding="utf-8"))
-    model = dict(raw["model"])
-    model.pop("validate_placement", None)
-    seq_len = raw["dataset"]["data_config"]["seq_length"]
-    nd_yaml.write_text(
-        yaml.safe_dump(
-            {"model": model, "dataset": {"data_config": {"seq_length": seq_len}}},
-            sort_keys=False),
-        encoding="utf-8",
-    )
+    raw = yaml.safe_load(sweep.args.config.read_text(encoding="utf-8"))
+    raw["model"] = dict(raw["model"], num_hidden_layers=sweep.args.layers)
+    raw["model"].pop("validate_placement", None)
+    dataset = raw.setdefault("dataset", {})
+    dataset["data_config"] = dict(dataset.get("data_config") or {},
+                                  seq_length=sweep.args.seq_len)
+    raw["activation_checkpoint"] = dict(raw.get("activation_checkpoint") or {},
+                                        mode=sweep.args.activation_checkpoint)
+    raw["training"] = dict(raw.get("training") or {}, global_batch_size=sweep.gbs,
+                           micro_batch_size=sweep.args.micro_batch_size)
+    raw["context"] = dict(raw.get("context") or {}, device_num=sweep.world)
+    nd_yaml.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
 def stage_compare(sweep: Sweep) -> None:
@@ -620,7 +630,7 @@ def stage_compare(sweep: Sweep) -> None:
     if not sweep.merged_csv.is_file():
         raise SystemExit(f"nothing to compare: {sweep.merged_csv} does not exist")
     nd_yaml = sweep.out / "nd_model.yaml"
-    write_nd_config(sweep.args.config, nd_yaml)
+    write_nd_config(sweep, nd_yaml)
     _run([
         sweep.python, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
         "-y", str(nd_yaml), "-f", sweep.args.framework,
