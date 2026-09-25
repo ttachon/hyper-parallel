@@ -226,7 +226,7 @@ and the memory module.
 | Input | `config`, `config_format`, `parser` | Original config object, normalized source format, and active parser instance |
 | Model | `model_name`, `device_capacity` | Model identifier and per-device memory capacity |
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order` | Used when one config is split into multiple model components |
-| Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
+| Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings; `os_max_shard` counts the data-parallel ranks optimizer sharding splits a parameter over, on top of TP |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |
 | Recompute | `full_rec`, `sel_rec`, `rec_op` | Full and selective recomputation controls |
 | Model shape | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh`, `dc_kv`, `dc_q`, `dhr` | Layer count, hidden sizes, sequence sizes, attention heads, and MLA-related dimensions |

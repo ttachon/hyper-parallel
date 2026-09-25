@@ -165,13 +165,11 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.ep = max(1, self.config.parallelism.expert_parallel_degree)
         self.ccfg.sp = self.ccfg.t
         self.ccfg.vp = 1
-        self.ccfg.op_weight_shard = (
-            self.config.parallelism.data_parallel_shard_degree * self.ccfg.t
-        )
+        self.ccfg.op_weight_shard = self.config.parallelism.data_parallel_shard_degree
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
-            else self.ccfg.d * self.ccfg.t
-        )  # need correction
+            else self.ccfg.d
+        )
         self.ccfg.offset = 0  # important
         self.ccfg.full_rec = self.config.activation_checkpoint.mode == "full"
         self.ccfg.sel_rec = self.config.activation_checkpoint.mode == "selective"

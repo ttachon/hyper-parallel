@@ -71,21 +71,30 @@ class _CostModelParser(ABC):
             return dict(HYPER_SELECTIVE_REC_OP)
         return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
 
+    @staticmethod
+    def optimizer_ranks(ccfg):
+        """How many data-parallel ranks the optimizer shards a parameter over.
+
+        ``os_max_shard`` counts them, as MindSpore's ``optimizer_weight_shard_size``
+        and HyperParallel's ``dp_shard`` do, on top of TP's sharding.  A count
+        that does not divide DP shards over all of it, as MindSpore does.
+        """
+        ranks = int(ccfg.os_max_shard or 0)
+        return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
+
     def config_optimizer_shard(self, ccfg):
         """OP related variables"""
+        # With optimizer sharding, a parameter is sharded over TP and then
+        # over the optimizer's data-parallel ranks.
+        ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
         # Non expert params
-        ccfg.shard_p_os_non_exp_partial = (
-            ccfg.os_max_shard if ccfg.has_op else ccfg.t
-        ) * ccfg.cp
+        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * ccfg.cp
         ccfg.shard_p_os_non_exp = (
             (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
         )
 
         # Expert params
-        ccfg.shard_p_os_exp_partial = math.gcd(
-            ccfg.n_exp,
-            (ccfg.os_max_shard if ccfg.has_op else 1) * ccfg.t_exp,
-        )
+        ccfg.shard_p_os_exp_partial = math.gcd(ccfg.n_exp, ranks * ccfg.t_exp)
         ccfg.shard_p_os_exp = (
             (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
         )
