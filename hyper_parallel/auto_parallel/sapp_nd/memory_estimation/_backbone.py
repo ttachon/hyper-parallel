@@ -232,9 +232,13 @@ class _Backbone:
             # has run: a layer keeps none between its passes, and its
             # backward holds its own and the next layer's, prefetched, as
             # its working set counts them.  The root's, the embedding and
-            # output tables, stay gathered.
-            if "dp" in comm_mem and self._ccfg.reshards and self.is_regular_layer(self._ctx.current_node):
-                comm_mem["dp"] *= self._ctx.working_set
+            # output tables, stay gathered from the forward on: their
+            # nodes keep them, and a working set holds no second copy.
+            if "dp" in comm_mem and self._ccfg.reshards:
+                if self.is_regular_layer(self._ctx.current_node):
+                    comm_mem["dp"] *= self._ctx.working_set
+                elif self._ctx.working_set:
+                    comm_mem["dp"] = 0
             res = EvalUtils.eval_expr_insight(
                 expr=self._ctx.comm_expr,
                 ctx=self._ctx,
