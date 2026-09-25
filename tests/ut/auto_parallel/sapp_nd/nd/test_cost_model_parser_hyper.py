@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import yaml
 
+from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -188,6 +189,13 @@ def _mla_overrides(**kw: Any) -> Dict[str, Any]:
     return base
 
 
+def _image_text_config(**kw: Any) -> Dict[str, Any]:
+    """An AutoModels configuration whose model class builds a vision tower too."""
+    config = _auto_models_config(**kw)
+    config["model"]["_target_"] = "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained"
+    return config
+
+
 def _auto_models_config(**kw: Any) -> Dict[str, Any]:
     """Return a minimal current AutoModels Trainer configuration."""
     base = {
@@ -296,6 +304,18 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         # When num_key_value_heads=0, fallback sets n_kv = a = 64
         self.assertEqual(ccfg.n_kv, 64)
         self.assertEqual(ccfg.dh, 5120 / 64)
+
+    def test_an_offset_places_every_layer(self):
+        """
+        Feature: _balanced_offset.
+        Description: Seven layers at PP 4, and eight.
+        Expectation: With seven, the first three stages run one more layer
+            each, so every layer has a stage; with eight, none does.
+        """
+        seven = _make_ccfg(_dense_overrides(model={"config_overrides": {"num_hidden_layers": 7}}))
+        eight = _make_ccfg(_dense_overrides(model={"config_overrides": {"num_hidden_layers": 8}}))
+        self.assertEqual(list(seven.offset), [1, 1, 1, 0])
+        self.assertEqual(list(eight.offset), [0, 0, 0, 0])
 
     def test_overrides_mtp_depth(self):
         """
@@ -936,12 +956,13 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: MTP depth resolution.
         Description: Transformers spells MTP depth num_nextn_predict_layers.
-        Expectation: n_mtp picks up the alias and enters offset balancing.
+        Expectation: The model spec picks up the alias: the checkpoint has
+            the layer, which the AutoModels trainer does not build.
         """
         mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
-        ccfg = _make_ccfg(_auto_models_config())
-        self.assertEqual(ccfg.n_mtp, 1)
-        self.assertTrue(ccfg.is_mtp_in_offset)
+        spec = resolve_hf_model_spec(_auto_models_config()["model"])
+        self.assertEqual(spec["mtp_depth"], 1)
+        self.assertEqual(_make_ccfg(_auto_models_config()).n_mtp, 0)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_mtp_depth_prefers_internal_name(self, mock_hf):
@@ -951,8 +972,57 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Expectation: The internal mtp_depth wins.
         """
         mock_hf.return_value = self._hf_config(mtp_depth=3, num_nextn_predict_layers=1)
+        spec = resolve_hf_model_spec(_auto_models_config()["model"])
+        self.assertEqual(spec["mtp_depth"], 3)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_a_causal_lm_builds_no_vision_tower(self, mock_hf):
+        """
+        Feature: _builds_vision_tower.
+        Description: A vision-language checkpoint trained as a causal LM,
+            with no model class named, and as image-text-to-text.
+        Expectation: The causal LM prices the language model alone; the
+            image-text class and a yaml that names none price the tower.
+        """
+        mock_hf.return_value = SimpleNamespace(
+            model_type="qwen3_vl_moe",
+            text_config=self._hf_config(),
+            vision_config=SimpleNamespace(
+                hidden_size=1152, depth=6, num_heads=16, intermediate_size=4304, out_hidden_size=4096,
+                patch_size=16, spatial_merge_size=2, num_position_embeddings=2304,
+            ),
+        )
+        got = []
+        for target in ("hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained", None,
+                       "hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained"):
+            config = _auto_models_config()
+            if target:
+                config["model"]["_target_"] = target
+            else:
+                config["model"].pop("_target_", None)
+            got.append(bool(_make_ccfg(config).multimodal))
+        self.assertEqual(got, [False, True, True])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_the_trainer_builds_no_mtp_layer(self, mock_hf):
+        """
+        Feature: _without_mtp.
+        Description: A checkpoint with an MTP layer, under the AutoModels
+            trainer and under the legacy schema.
+        Expectation: The AutoModels trainer builds the Transformers model,
+            which has none: no MTP layer is priced, none enters offset
+            balancing and the stack holds the body alone.  The legacy
+            schema keeps its MTP layer.
+        """
+        mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
         ccfg = _make_ccfg(_auto_models_config())
-        self.assertEqual(ccfg.n_mtp, 3)
+        self.assertEqual(ccfg.n_mtp, 0)
+        self.assertFalse(ccfg.is_mtp_in_offset)
+        self.assertEqual(sum(count for _, count in layer_groups(ccfg)), ccfg.n_lay)
+        legacy = _make_ccfg(_dense_overrides(
+            model={"config_overrides": {"num_hidden_layers": 8, "mtp_depth": 1}},
+        ))
+        self.assertEqual(legacy.n_mtp, 1)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_missing_field_falls_back_to_overrides(self, mock_hf):
@@ -1024,7 +1094,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             submodule alongside it instead of raising AttributeError.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
 
         self.assertTrue(ccfg.multimodal)
         self.assertEqual(ccfg.mm_order, ["vision", "text"])
@@ -1060,7 +1130,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             caches unchanged.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         text = ccfg.mm_ccfgs["text"]
         vision = ccfg.mm_ccfgs["vision"]
 
@@ -1081,7 +1151,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Expectation: The vision submodule adopts the override.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config(context={"visual_seq_len": 2304}))
+        ccfg = _make_ccfg(_image_text_config(context={"visual_seq_len": 2304}))
         self.assertEqual(ccfg.mm_ccfgs["vision"].s, 2304)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
@@ -1094,7 +1164,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             placed entirely on the first stage.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
         self.assertEqual(vision.p, text.p)
         self.assertEqual(vision.vp, text.vp)
@@ -1114,7 +1184,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             through one submodule reaches neither the sibling nor the parent.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
 
         self.assertIsNot(text.overwrite_eval_functions,
@@ -1138,7 +1208,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             MLP, with no gated triple to cast.
         """
         mock_hf.return_value = self._vl_config()
-        vision = _make_ccfg(_auto_models_config()).mm_ccfgs["vision"]
+        vision = _make_ccfg(_image_text_config()).mm_ccfgs["vision"]
         check_and_apply_custom_hook(CWrap(vision))
         self.assertEqual((vision.shard_output_activ, vision.shard_recompute_input), (vision.t, vision.t))
         self.assertEqual((vision.n_ffMM, vision.n_normOp), (2, 2))
@@ -1217,7 +1287,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             vision tower still lands on the first stage of the first chunk.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config(
+        ccfg = _make_ccfg(_image_text_config(
             accelerator={"pp_size": 4, "pp_interleave_num": 2},
         ))
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
@@ -1510,6 +1580,23 @@ class TestFsdpResharding(unittest.TestCase):
             ccfg = _make_ccfg(_dense_overrides(fsdp_config=fsdp))
             got.append((ccfg.reshard_params, ccfg.reshards))
         self.assertEqual(got, [(True, True), (False, False), (False, False)])
+
+    def test_the_run_states_how_fsdp_shards_its_experts(self):
+        """
+        Feature: _parse_expert_sharding.
+        Description: A MoE run at EP 4 in the legacy schema, and in the
+            AutoModels one without and with edp_shard_size 2.
+        Expectation: The legacy schema states nothing; HyperParallel's keeps
+            each expert whole by default, and shards it over the ranks the
+            run states.
+        """
+        got = []
+        for extra in ({}, {"fsdp_config": {}}, {"fsdp_config": {"edp_shard_size": 2}}):
+            ccfg = _make_ccfg(_moe_overrides(**extra))
+            got.append((ccfg.expert_shard, ccfg.shard_p_os_exp))
+        self.assertEqual([shard for shard, _ in got], [None, 1, 2])
+        self.assertEqual(got[1][1], 1)
+        self.assertEqual(got[2][1], 2)
 
 
 class TestHybridLayerStack(unittest.TestCase):

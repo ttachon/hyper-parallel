@@ -167,9 +167,10 @@ ALL_DIMS = [DP, EP, TP, CP, PP, VPP, MBN, MBS, SP, OP]
 
 
 class Dimensions:
-    """All output dimensions"""
+    """All output dimensions, of a run that *accumulates* gradients over micro-batches or not"""
 
-    def __init__(self, config, all_dims=None):
+    def __init__(self, config, all_dims=None, accumulates=False):
+        self.accumulates = accumulates
         if isinstance(config, list):
             self.all_dims = [d for d, _ in config]
             self.dims_val = dict(config)
@@ -218,12 +219,17 @@ class Dimensions:
         return d in self.dims_val
 
     @staticmethod
-    def _check_mbn_pp(dims_val, all_dims):
-        """Return True if MBN/PP combination is valid."""
+    def _check_mbn_pp(dims_val, all_dims, accumulates=False):
+        """Return True if MBN/PP combination is valid.
+
+        A pipeline needs a micro-batch per stage at least.  Without one,
+        micro-batches are gradient accumulation steps, which only a run
+        that *accumulates* its gradients over them takes.
+        """
         if MBN not in dims_val or PP not in all_dims:
             return True
         valid = dims_val[MBN] >= dims_val[PP]
-        valid = valid and not (dims_val[PP] == 1 and dims_val[MBN] > 1)
+        valid = valid and (dims_val[PP] > 1 or dims_val[MBN] == 1 or accumulates)
         if not valid:
             logger.warning("PP and MBN were deemed not suitable")
         return valid
@@ -238,7 +244,7 @@ class Dimensions:
 
     def is_valid(self):
         """Check if all dimensions values are valid"""
-        if not self._check_mbn_pp(self.dims_val, self.all_dims):
+        if not self._check_mbn_pp(self.dims_val, self.all_dims, getattr(self, "accumulates", False)):
             return False
         if TP in self.all_dims and not self._check_power_of_two(TP, self.dims_val[TP]):
             return False

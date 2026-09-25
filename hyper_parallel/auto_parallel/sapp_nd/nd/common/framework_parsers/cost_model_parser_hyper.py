@@ -121,11 +121,18 @@ class CostModelParserHyperV2(_CostModelParser):
         ``model.config_overrides`` for standalone cost-model search files.
         A vision-language config additionally yields a ``vision`` sub-spec,
         held here until :meth:`_resolve_multimodal` can build its submodule.
+        The AutoModels trainer trains the model Transformers builds, which
+        has no MTP layer (:meth:`_without_mtp`), and a vision tower only
+        where its model class builds one (:meth:`_builds_vision_tower`).
         """
         spec = resolve_hf_model_spec(
             self._model_section(), self._visual_seq_len_override()
         )
+        if is_auto_models_schema(self.config):
+            spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
+        if self._vision_spec and not self._builds_vision_tower():
+            self._vision_spec = None
         self._tie_word_embeddings = bool(spec.get("tie_word_embeddings"))
         self._apply_spec(self.ccfg, spec)
         ops = None if spec.get("ops") is None else ops_from_dict(spec["ops"])
@@ -135,6 +142,41 @@ class CostModelParserHyperV2(_CostModelParser):
             LinearAttentionDims.from_fields(spec),
         ))
         self._model_seq_len = self._spec_int(spec, "max_position_embeddings")
+
+    # The AutoModels classes that build a vision-language checkpoint's
+    # vision tower; every other named class builds the language model alone.
+    _VISION_TARGETS = ("ImageTextToText", "Vision2Seq", "ConditionalGeneration")
+
+    def _builds_vision_tower(self) -> bool:
+        """Whether the run's model class builds the vision tower its checkpoint has.
+
+        HyperParallel's AutoModels trainer builds ``model._target_``:
+        ``HyperAutoModelForImageTextToText`` builds the tower, while
+        ``HyperAutoModelForCausalLM`` and the recipes' builders build the
+        language model alone and load the tower's weights as unexpected.
+        A yaml that names no class (the trainer requires one) and the
+        legacy schema price what the checkpoint has.
+        """
+        if not is_auto_models_schema(self.config):
+            return True
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        target = self._get_cfg_attr(model_raw, "_target_", None)
+        return not target or any(name in str(target) for name in self._VISION_TARGETS)
+
+    @staticmethod
+    def _without_mtp(spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Return *spec* without its MTP layers, as the AutoModels trainer builds the model.
+
+        It builds the Transformers causal LM, which has no MTP layer whatever
+        the checkpoint declares: Transformers loads their weights as
+        unexpected and never trains them (Qwen3.5's ``mtp.*``, DeepSeek-V3's
+        last layer).  The legacy schema's trainer is not this one.
+        """
+        layers = spec.get("layers")
+        if isinstance(layers, list):
+            spec["layers"] = [group for group in layers if not (isinstance(group, dict) and group.get("mtp"))]
+        spec["mtp_depth"] = 0
+        return spec
 
     def _model_section(self) -> Dict[str, Any]:
         """Return the ``model`` section as a plain mapping."""
@@ -356,7 +398,7 @@ class CostModelParserHyperV2(_CostModelParser):
         stated.update(self._init_bytes())
         stated.update(self._init_moe_run(stated["etp"]))
         stated.update(self._init_shard())
-        stated["offset"] = self._init_offset(stated["pp"])
+        stated["offset"] = self._init_offset(stated["pp"], stated["vpp"])
         stated["seq_split"] = 1
         # Match the MF parser: MTP layers the model declares take part in
         # pipeline offset balancing, and without any the offset leaves them
@@ -423,7 +465,20 @@ class CostModelParserHyperV2(_CostModelParser):
         stated, dp_shard = self._parse_parallel_dimensions(accel, fsdp)
         stated.update(self._parse_sequence_parallelism(accel))
         stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"]))
+        stated.update(self._parse_expert_sharding(fsdp))
         return stated
+
+    def _parse_expert_sharding(self, fsdp) -> Dict[str, Any]:
+        """How HyperParallel's FSDP shards a routed expert under expert parallelism.
+
+        Over ``edp_shard_size`` ranks of its expert data-parallel group, 1 by
+        default: a run that states none keeps each of its experts whole on
+        every rank holding it.  The legacy schema states nothing, and the
+        family's rule applies.
+        """
+        if not is_auto_models_schema(self.config):
+            return {}
+        return {"expert_shard": max(1, int(self._get_cfg_attr(fsdp, "edp_shard_size", 1) or 1))}
 
     def _parse_parallel_dimensions(self, accel, fsdp) -> Tuple[Dict[str, Any], int]:
         """Return the mesh's degrees, and the data shard degree."""
@@ -730,7 +785,7 @@ class CostModelParserHyperV2(_CostModelParser):
             run["etp"] = 1
         return run
 
-    def _init_offset(self, pp: int) -> Any:
+    def _init_offset(self, pp: int, vpp: int = 1) -> Any:
         """The pipeline offset.
 
         The MF parser reads ``model.model_config.offset`` directly from the
@@ -742,8 +797,8 @@ class CostModelParserHyperV2(_CostModelParser):
 
         To match the MF parser's *list*-based filtering behaviour (used by
         DeepSeek-V3 and other models that declare an explicit offset), this
-        parser states a list offset of length ``pp`` (all zeros = even
-        balancing) by default.  An explicit offset supplied via
+        parser states a list offset of length ``pp`` by default, one that
+        places every layer (:meth:`_balanced_offset`).  An explicit offset supplied via
         ``config_overrides.offset`` overrides this: a list is used as-is,
         and a non-zero int is broadcast to ``[int] * pp``.
         """
@@ -755,7 +810,19 @@ class CostModelParserHyperV2(_CostModelParser):
             return list(explicit)
         if isinstance(explicit, int):
             return 0 if explicit == 0 else [explicit] * pp
-        return [0] * pp
+        return self._balanced_offset(pp, vpp)
+
+    def _balanced_offset(self, pp: int, vpp: int = 1) -> list:
+        """An offset of length *pp* that places every layer the pipeline balances.
+
+        Each stage runs the layers per stage, and the first ones one more
+        each until the remainder has a stage, as the search's balancing
+        places them; all zeros where the pipeline divides the layers, or
+        interleaves, which the search balances itself.
+        """
+        layers = self.ccfg.n_lay + (self.ccfg.n_mtp or 0)
+        extra = layers % max(1, pp) if vpp <= 1 else 0
+        return [1 if stage < extra else 0 for stage in range(pp)]
 
     def _init_shard(self) -> Dict[str, Any]:
         """How the embedding and the recompute input are sharded.

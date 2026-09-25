@@ -292,6 +292,25 @@ class TestBuildMachine(unittest.TestCase):
         runner._build_machine(config)
         mock_hard.Machine.assert_called_with(32, "A2")
 
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_machine_mod"
+    )
+    def test_device_names_map_to_their_devices(self, mock_get_hw):
+        """Ascend's chip names map to their Atlas series, a code to itself."""
+        mock_hard = MagicMock()
+        mock_get_hw.return_value = mock_hard
+        runner = self._get_runner()
+        got = {}
+        for name in ("ascend", "ascend910b", "Ascend910_93", "ascend910c", "A3", "a3", "V100"):
+            config = _make_full_config()
+            config.cluster_spec["device_type"] = name
+            runner._build_machine(config)  # pylint: disable=protected-access
+            got[name] = mock_hard.Machine.call_args[0][1]
+        self.assertEqual(got, {
+            "ascend": "A2", "ascend910b": "A2", "Ascend910_93": "A3", "ascend910c": "A3",
+            "A3": "A3", "a3": "A3", "V100": "V100",
+        })
+
 
 class TestFormatResult(unittest.TestCase):
     """Tests for _format_result."""

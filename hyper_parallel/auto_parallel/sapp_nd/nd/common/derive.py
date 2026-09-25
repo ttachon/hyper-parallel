@@ -110,11 +110,31 @@ def optimizer_ranks(ccfg: Any) -> int:
     return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
 
 
+def routed_expert_shard(ccfg: Any, ranks: int) -> int:
+    """How many ranks a routed expert's parameters and optimizer states are sharded over.
+
+    A run that states its expert shard, as HyperParallel's ``edp_shard_size``,
+    shards an expert under expert parallelism over as many ranks of its expert
+    data-parallel group: the stage's ranks over EP, whatever their DP, CP or
+    TP, the group of ranks that hold the same experts.  Without expert
+    parallelism its FSDP shards the experts with the other parameters, over
+    the optimizer's *ranks*.  Stated by no one, the optimizer shards them over
+    the whole group.
+    """
+    stated = getattr(ccfg, "expert_shard", None)
+    if stated is None:
+        return (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
+    if ccfg.ep > 1:
+        return math.gcd(int(stated), max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep))
+    return ranks * ccfg.cp * ccfg.t_exp
+
+
 def derive_optimizer_sharding(ccfg: Any) -> None:
     """Set how parameters, optimizer states and gradients are sharded.
 
     With optimizer sharding, a parameter is sharded over TP and then over
-    :func:`optimizer_ranks` data-parallel ranks.  Gradients are sharded as
+    :func:`optimizer_ranks` data-parallel ranks, and a routed expert as
+    :func:`routed_expert_shard` says.  Gradients are sharded as
     the parameters are when the run says so (``grad_shard_as_params``), as
     FSDP shards them; else over the whole optimizer shard when the run
     shards them (``has_grad_shard``), and over TP alone otherwise.
@@ -128,9 +148,7 @@ def derive_optimizer_sharding(ccfg: Any) -> None:
 
     # Expert params
     ccfg.shard_p_os_exp_partial = math.gcd(ccfg.n_exp, ranks * ccfg.t_exp)
-    ccfg.shard_p_os_exp = (
-        (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
-    )
+    ccfg.shard_p_os_exp = routed_expert_shard(ccfg, ranks)
 
     # Gradients
     if getattr(ccfg, "grad_shard_as_params", False):
@@ -305,12 +323,15 @@ def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
     """Set the byte widths the estimators read from those the run states, else its family's.
 
     Gradients take memory only under pipeline parallelism, unless the run
-    accumulates them without it too (``grad_accumulation``).  The optimizer
+    accumulates them without it too (``grad_accumulation``, which it gives as
+    ``accumulates_grads``: the search then gives PP 1 several micro-batches,
+    its accumulation steps).  The optimizer
     keeps, per parameter, its states and any copy of the parameters: a
     layer's parameter as many states as its optimizer has, the embedding
     and output tables' AdamW's two.
     """
-    accumulates = ccfg.p > 1 or _stated(ccfg, "grad_accumulation", run)
+    ccfg.accumulates_grads = bool(_stated(ccfg, "grad_accumulation", run))
+    accumulates = ccfg.p > 1 or ccfg.accumulates_grads
     ccfg.bytes_grad = _stated(ccfg, "grad_bytes", run) if accumulates else 0
     ccfg.bytes_os = _stated(ccfg, "optimizer_state_bytes", run)
     main_copy = _stated(ccfg, "main_param_bytes", run)

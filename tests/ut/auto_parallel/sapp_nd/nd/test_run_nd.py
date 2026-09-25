@@ -730,6 +730,14 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(global_config.dim_val(Dim.DP, parallel_config), 2)
         self.assertEqual(global_config.global_batch_size(parallel_config), 16)
+        no_pipeline = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(no_pipeline), 8)
+        self.assertFalse(no_pipeline.is_valid())
+        fake_ccfg.accumulates_grads = True
+        accumulating = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(accumulating), 16)
+        self.assertTrue(accumulating.is_valid())
+        fake_ccfg.accumulates_grads = False
         self.assertEqual(global_config.layer_num_for_offset(), 4)
         self.assertEqual(global_config.total_layer_num(), 5)
         self.assertEqual(global_config.adapt_config(2, 1), ([0, 0], [0, 0]))
@@ -808,6 +816,13 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
 
+        # C4: DP 2 x TP 2 over EP 4 leaves one rank per expert group, which
+        # an expert shard of 2 cannot divide; a shard of 1 always does.
+        gc_ok.ccfg.expert_shard = 2
+        self.assertFalse(gc_ok.ep_constraints_valid(pc_ok))
+        gc_ok.ccfg.expert_shard = 1
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+
         # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
         gc_c1 = _make_gc(n_exp=8, ep=3, hff_exp=14336, etp=0, tp=2)
         pc_c1 = gc_c1.make_parallel_config(
@@ -876,7 +891,7 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(_FakeParallelize.instances, [])
         run_nd = runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="run_nd")
         search_cfg = SimpleNamespace(constraint={}, cluster_spec={}, estimator={"recompute_strategy": "full"})
-        cli = SimpleNamespace(global_batch_size=None, max_mem=None, devices=None, auto_recompute=True)
+        cli = SimpleNamespace(global_batch_size=None, max_mem=None, devices=None, device_type=None, auto_recompute=True)
         run_nd["_apply_cli_overrides"](search_cfg, cli)
         self.assertEqual(search_cfg.estimator["recompute_strategy"], "auto")
 
@@ -1286,8 +1301,17 @@ class TestSappNDRunND(unittest.TestCase):
                             run_name="__main__",
                         )
                 self.assertEqual(exc_info.exception.code, 0)
+                self.assertEqual(cluster_spec["device_type"], "A2")
+                with patch.object(sys, "argv", argv + ["-A", "A3"]):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
             self.assertEqual(cluster_spec["num_nodes"], 8)
-            mock_search.assert_called_once()
+            self.assertEqual(cluster_spec["device_type"], "A3")
+            self.assertEqual(mock_search.call_count, 2)
 
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """

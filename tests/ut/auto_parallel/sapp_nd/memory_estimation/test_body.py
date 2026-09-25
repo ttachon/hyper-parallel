@@ -641,6 +641,7 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ccfg.has_op = has_op
         ccfg.has_grad_shard = has_grad_shard
         ccfg.os_max_shard = os_max_shard
+        ccfg.expert_shard = None
         return ccfg
 
     def test_has_op_true_uses_d_exp(self):

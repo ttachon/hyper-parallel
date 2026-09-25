@@ -76,6 +76,10 @@ class _CostModVar:
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
+    # How many ranks of its expert data-parallel group FSDP shards a routed
+    # expert over under expert parallelism, as the run states it; None for
+    # the optimizer's whole group.
+    expert_shard: int = None
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
@@ -226,6 +230,10 @@ class _CostModVar:
     norm_bytes: float = None
     dropout_bytes: float = None
     grad_accumulation: bool = None
+    # Whether the run accumulates gradients over micro-batches without
+    # pipeline parallelism, as derive gives it from grad_accumulation: a
+    # search then gives PP 1 several micro-batches.
+    accumulates_grads: bool = False
     # Whether FSDP frees a layer's gathered parameters once it has run, as
     # the run states it, None taking its family's; and as derive gives it.
     reshard_params: bool = None

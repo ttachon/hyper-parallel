@@ -229,6 +229,43 @@ class TestDeriveFamily(unittest.TestCase):
             got.append(ccfg.reshards)
         self.assertEqual(got, [False, True, False])
 
+    def test_routed_expert_shard(self):
+        """
+        Feature: routed_expert_shard.
+        Description: A MoE model at DP 8 and optimizer shard 2, without expert
+            parallelism and at EP 4, whose run states no expert shard, 1, 2
+            or 4.
+        Expectation: Stated by no one, the experts shard over the whole
+            expert data-parallel group; stated, over as many of its ranks at
+            EP 4 (2 of them), and with the other parameters over the
+            optimizer's 2 ranks without EP.
+        """
+        got = {}
+        for ep in (1, 4):
+            for shard in (None, 1, 2, 4):
+                ccfg = _config(d=8, t=1, ep=ep, n_exp=16, os_max_shard=2, expert_shard=shard)
+                derive(ccfg)
+                got[ep, shard] = ccfg.shard_p_os_exp
+        self.assertEqual(got, {
+            (1, None): 8, (1, 1): 2, (1, 2): 2, (1, 4): 2,
+            (4, None): 2, (4, 1): 1, (4, 2): 2, (4, 4): 2,
+        })
+
+    def test_accumulates_grads(self):
+        """
+        Feature: derive_byte_widths, gradient accumulation without a pipeline.
+        Description: A run that states nothing, and one that states it holds
+            its gradients without pipeline parallelism.
+        Expectation: The family accumulates only in a pipeline; what a run
+            states wins, and at PP 1 its gradients then take memory.
+        """
+        got = []
+        for facts in ({}, {"grad_accumulation": True}):
+            ccfg = _config(p=1, **facts)
+            derive(ccfg)
+            got.append((ccfg.accumulates_grads, ccfg.bytes_grad > 0))
+        self.assertEqual(got, [(False, False), (True, True)])
+
     def test_deferred_grad_accumulation(self):
         """
         Feature: derive_resharding, the gradients FSDP holds back.
