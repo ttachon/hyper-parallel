@@ -1531,6 +1531,26 @@ class TestSappNDRunND(unittest.TestCase):
             CommTime.EvalLayerComm.dp_comm_layer(ccfg, ctx), CommTime.EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
         )
 
+    def test_comm_walk_leaves_the_model_as_it_found_it(self) -> None:
+        """
+        Feature: comm_time.estimate_from_mem_comm.
+        Description: Walk the DeepSeek yaml's stages, dense and MoE layers,
+            twice on one config, as an estimate does for its communication and
+            again for its recompute's.
+        Expectation: The config leaves the walk as it entered it, and both
+            walks price every stage alike, its embedding and output layers
+            included.
+        """
+        ccfg = CostModelConfig(config_path)
+        ArchHooks.check_and_apply_custom_hook(ccfg)
+        stages = ccfg.generate_partitions_vpp()
+        before = {k: v for k, v in vars(ccfg).items() if isinstance(v, (bool, int, float, str))}
+        first = CommTime.estimate_from_mem_comm(ccfg, CustomConfig(), stages, Hard.Device_A2)
+        after = {k: v for k, v in vars(ccfg).items() if isinstance(v, (bool, int, float, str))}
+        second = CommTime.estimate_from_mem_comm(ccfg, CustomConfig(), stages, Hard.Device_A2)
+        self.assertEqual(after, before)
+        self.assertEqual(first, second)
+
     def test_comm_overlap_fields_in_parsers(self) -> None:
         """
         Feature: TestSappNDRunND.
