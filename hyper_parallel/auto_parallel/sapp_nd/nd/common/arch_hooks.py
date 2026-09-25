@@ -106,7 +106,7 @@ def apply_op_counts(ccfg: Any, counts: OpCounts) -> None:
 # differ in attention writes all of them, so applying kinds in place, one
 # layer after another and in any order, leaves each layer the same config.
 _ATTENTION_FIELDS = (
-    "attn_kind", "a", "dh", "n_kv", "attn_output_gate", "attn_extra_p",
+    "attn_kind", "a", "dh", "n_kv", "attn_output_gate", "attn_extra_p", "n_qknorm",
     "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
 )
 
@@ -137,6 +137,8 @@ def _linear_attention(snapshot: Any, linear: LinearAttentionDims) -> Dict[str, A
         "n_kv": n_k * d_k / d_v,
         "attn_output_gate": True,
         "attn_extra_p": linear.conv_kernel_dim * qkv_width + 2 * snapshot.h * n_v,
+        # The kernel normalizes its queries and keys itself, with no weights.
+        "n_qknorm": 0,
         "lin_n_k": n_k,
         "lin_d_k": d_k,
         "lin_n_v": n_v,

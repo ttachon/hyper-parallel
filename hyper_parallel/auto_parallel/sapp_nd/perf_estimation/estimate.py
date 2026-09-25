@@ -25,7 +25,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, RealParts, estimation_in_real_parts
 
@@ -92,6 +92,10 @@ def op_table(cfg, attn=None):
     table["n_ffAct"] = 21 * cfg.b * cfg.s * cfg.hff
 
     table["n_normOp"] = 30 * cfg.b * cfg.s * cfg.h * cfg.t / cfg.sp
+    # A QK-norm runs over every head's queries and keys, which TP splits.
+    # The entry exists only for a model that has one.
+    if getattr(cfg, "n_qknorm", 0):
+        table["n_qknorm"] = 30 * cfg.b * cfg.s * (att.a + att.n_kv) * d_h
     table["n_dropout"] = (
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )
@@ -700,6 +704,14 @@ def _save_recompute(stage_perfs, savings, debugger):
     return [perf - saved for perf, saved in zip(stage_perfs, savings)]
 
 
+def _user_hook(cfg: Any) -> Optional[Callable]:
+    """The hook a unimodal config's hook class gives it, as the memory estimate applies it."""
+    hooks = getattr(cfg, "hooks_dict", None)
+    if not hooks or getattr(cfg, "multimodal", False):
+        return None
+    return next(iter(hooks.values()))
+
+
 def _finalize_perf(perf, cache_file, debugger, memory):
     """Apply cached regression coefficients and record debug info.
 
@@ -740,9 +752,13 @@ def estimate_performance(*args, **kwargs):
         memory,
     ) = _resolve_estimate_args(args, kwargs)
 
-    # Process custom model config
+    # Process custom model config: the config's own hook when its hook class
+    # gives it one, as the memory estimate applies it, else its family.
+    user_hook = _user_hook(cfg)
     if extra_custom_func:
         extra_custom_func(cfg)
+    elif user_hook is not None:
+        user_hook(CWrap(cfg))
     else:
         logger.info("auto applying custom model config")
         check_and_apply_custom_hook(cfg)

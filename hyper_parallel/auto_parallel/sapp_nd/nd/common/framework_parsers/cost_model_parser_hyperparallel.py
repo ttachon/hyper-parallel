@@ -19,6 +19,7 @@ import importlib.util
 import time
 import sys
 import os
+from hyper_parallel.auto_parallel._op_profiles import infer_qk_norm
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -209,8 +210,9 @@ class CostModelParserHyperparallel(_CostModelParser):
 
     def __parse_hyperparam(self):
         """hyperparameter vars"""
-        self.ccfg.multiple_of = max(1, self.ccfg.specs.multiple_of)
-        self.ccfg.fdm = max(1, self.ccfg.specs.ffn_dim_multiplier)
+        # A flavor may state either as None, TorchTitan's default: no multiplier.
+        self.ccfg.multiple_of = max(1, self.ccfg.specs.multiple_of or 1)
+        self.ccfg.fdm = max(1, self.ccfg.specs.ffn_dim_multiplier or 1)
         self.ccfg.h = self.ccfg.specs.dim
         self.ccfg.hff = self.ccfg.specs.inter_dim
         if not self.ccfg.hff:
@@ -231,6 +233,12 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.dc_kv = self.ccfg.specs.kv_lora_rank
         self.ccfg.dc_q = self.ccfg.specs.q_lora_rank
         self.ccfg.dhr = self.ccfg.specs.qk_rope_head_dim
+        # TorchTitan's Qwen3 flavors normalize each head's queries and keys
+        # unless they state otherwise; its other families have no QK-norm.
+        stated = vars(self.ccfg.specs)
+        self.ccfg.qk_norm = (
+            bool(stated["qk_norm"]) if "qk_norm" in stated else infer_qk_norm(self.ccfg.model_name)
+        )
         self.ccfg.k_1st_dense = self.ccfg.specs.n_dense_layers
         self.ccfg.is_mtp_in_offset = True
 
@@ -240,16 +248,17 @@ class CostModelParserHyperparallel(_CostModelParser):
             self.ccfg.specs.moe_inter_dim if self.ccfg.specs.moe_inter_dim
             else self.ccfg.hff
         )
-        if (
-            not hasattr(self.ccfg.specs, "moe_enabled")
-            or self.ccfg.specs.moe_enabled
-        ):
-            if self.ccfg.specs.moe_args:
-                self.ccfg.n_exp = self.ccfg.specs.moe_args.num_experts
-                self.ccfg.n_chosen_exp = self.ccfg.specs.moe_args.top_k
-                self.ccfg.n_shared_exp = (
-                    self.ccfg.specs.moe_args.num_shared_experts
-                )
+        # A flavor that states its experts runs them unless it says it does
+        # not: TorchTitan's DeepSeek-V3 states moe_args and no moe_enabled.
+        # The specs answer a missing field with 0, so read what they state.
+        stated = vars(self.ccfg.specs)
+        moe_enabled = stated["moe_enabled"] if "moe_enabled" in stated else True
+        if moe_enabled and self.ccfg.specs.moe_args:
+            self.ccfg.n_exp = self.ccfg.specs.moe_args.num_experts
+            self.ccfg.n_chosen_exp = self.ccfg.specs.moe_args.top_k
+            self.ccfg.n_shared_exp = (
+                self.ccfg.specs.moe_args.num_shared_experts
+            )
         else:
             self.ccfg.n_exp = 1
             self.ccfg.n_chosen_exp = 1

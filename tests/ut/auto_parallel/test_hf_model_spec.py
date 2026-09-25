@@ -227,5 +227,37 @@ class TestOverridesOfTheRun(unittest.TestCase):
             resolve_hf_model_spec(model_raw)
 
 
+
+class TestQkNorm(unittest.TestCase):
+    """Whether a model's attention normalizes its queries and keys is settled with its spec."""
+
+    _MODEL = {"hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000}
+
+    def _qk_norm(self, model_type: str, **stated: Any) -> Any:
+        """The QK-norm the spec of a *model_type* config stating *stated* settles on."""
+        with _stub_registry(_Recorder(SimpleNamespace(model_type=model_type, **self._MODEL, **stated))):
+            return resolve_hf_model_spec({"pretrained_model_name_or_path": "local/model"})["qk_norm"]
+
+    def test_the_qwen3_generation_normalizes_queries_and_keys(self) -> None:
+        """
+        Feature: the QK-norm of a Transformers config, which Qwen3's does not state.
+        Description: Qwen3, Qwen3-MoE, Qwen3.5-MoE, Qwen3-VL-MoE, Llama and Qwen2 configs.
+        Expectation: The Qwen3 generation has one, Llama and Qwen2 none.
+        """
+        types_ = ("qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl_moe", "llama", "qwen2")
+        self.assertEqual([self._qk_norm(model_type) for model_type in types_],
+                         [True, True, True, True, False, False])
+
+    def test_a_stated_qk_norm_wins(self) -> None:
+        """
+        Feature: the QK-norm of a Transformers config that states it.
+        Description: A Qwen3 config stating use_qk_norm False, and a GLM-4.5
+            one stating it True.
+        Expectation: Each is taken at its word.
+        """
+        self.assertEqual([self._qk_norm("qwen3", use_qk_norm=False), self._qk_norm("glm4_moe", use_qk_norm=True)],
+                         [False, True])
+
+
 if __name__ == "__main__":
     unittest.main()

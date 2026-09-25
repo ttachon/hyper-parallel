@@ -30,7 +30,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
-from hyper_parallel.auto_parallel._op_profiles import infer_arch, resolve_ops
+from hyper_parallel.auto_parallel._op_profiles import infer_arch, infer_qk_norm, resolve_ops
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,8 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "qk_rope_head_dim": ("qk_rope_head_dim",),
     "attn_output_gate": ("attn_output_gate",),
     "tie_word_embeddings": ("tie_word_embeddings",),
+    # Stated by a few families; Qwen3's config does not state its own.
+    "qk_norm": ("qk_norm", "use_qk_norm", "qk_layernorm"),
     # A hybrid stack states its layers; without this every layer is costed
     # as full attention, which is quadratic in the sequence length.
     "layer_types": ("layer_types",),
@@ -277,12 +279,17 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
     and the layer stack are settled here too, so the serialised spec states
     what it will be priced with and which kind each layer is, even when the
     family was only inferred from the model name and the stack from
-    ``layer_types`` or ``first_k_dense_replace``.  ``layer_types`` is
+    ``layer_types`` or ``first_k_dense_replace``; and so is whether its
+    attention normalizes queries and keys, which a Transformers config does
+    not state.  ``layer_types`` is
     consumed: ``layers`` says the same, checked against the profile.  A
     vision tower states its stack likewise.
     """
     typed = ModelSpec.from_dict(spec)
-    typed = dataclasses.replace(typed, arch=typed.arch or infer_arch(typed.name))
+    typed = dataclasses.replace(
+        typed, arch=typed.arch or infer_arch(typed.name),
+        qk_norm=typed.qk_norm if typed.qk_norm is not None else infer_qk_norm(typed.name),
+    )
     resolve_ops(typed.arch, typed.ops)
     layers = spec_layer_stack(typed).to_layers()
     vision = typed.vision

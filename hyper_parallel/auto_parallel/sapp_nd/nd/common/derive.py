@@ -329,6 +329,14 @@ def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:
     ccfg.shard_output_activ = ccfg.t if sharded else 1
 
 
+def derive_qk_norm(ccfg: Any) -> None:
+    """Count the QK-norm each layer runs, ``n_qknorm``: one where the model has one.
+
+    A layer kind whose attention has none, a linear one, states 0 instead.
+    """
+    ccfg.n_qknorm = 1 if getattr(ccfg, "qk_norm", False) else 0
+
+
 def derive_head_dim(ccfg: Any) -> None:
     """Price an MLA family's heads at the value heads' width, ``dh``.
 
@@ -398,4 +406,5 @@ def derive(ccfg: Any, strict: bool = True) -> None:
     derive_recompute_ranges(ccfg)
     derive_recompute_switches(ccfg)
     derive_flash_attention_factor(ccfg)
+    derive_qk_norm(ccfg)
     derive_family(ccfg)

@@ -268,6 +268,23 @@ def infer_arch(name: Any) -> str:
     return DEFAULT_ARCH
 
 
+# What a lower-cased model name contains when its attention normalizes each
+# head's queries and keys: the Qwen3 generation, Qwen3.5 and the Qwen3
+# vision-language models included.
+_QK_NORM_NAMES = ("qwen3",)
+
+
+def infer_qk_norm(name: Any) -> bool:
+    """Return whether a model named *name* normalizes each head's queries and keys.
+
+    For a producer whose config does not state it, as a Transformers config
+    does not: the Qwen3 generation does, and no other family the cost model
+    prices does.
+    """
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _QK_NORM_NAMES)
+
+
 def resolve_ops(arch: str, ops: Optional[Mapping[str, OpCounts]] = None) -> Dict[str, OpCounts]:
     """Return the op counts a model is priced with, per layer kind.
 
