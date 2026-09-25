@@ -276,7 +276,9 @@ python examples/training_demo/sweep_qwen3_5_moe.py --only classify --only compar
 
 A strategy that dies is not waited out. One dead rank ends the job, but it
 does not end the other ranks: they wait in the collective it never joins until
-`HCCL_EXEC_TIMEOUT`, half an hour on this cluster. So the sweep watches for a
+`HCCL_EXEC_TIMEOUT`, which `cluster_qwen3_5_moe.env` sets to 180 s against a
+default of half an hour. Even three minutes per failed strategy adds up over a
+sweep broken the same way at every point, so the sweep watches for a
 node the kit reports as `DEAD` rather than for every node to stop running,
 kills what is left of that run, which is also what frees the devices for the
 next strategy, and moves on. It prints the exception it found in the failed

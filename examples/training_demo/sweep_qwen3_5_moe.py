@@ -515,12 +515,13 @@ def wait_for(sweep: Sweep, run_id: Optional[str]) -> str:
     read as RUNNING again through pid reuse.
 
     One dead rank ends the job, but it does not end the other ranks: they wait
-    in the collective it never joins until HCCL_EXEC_TIMEOUT, half an hour on
-    this cluster. Blocking until every node stops RUNNING therefore costs that
-    timeout for each failed strategy, and a sweep broken the same way at every
-    point pays it at every point. So a DEAD node ends the wait at the next
-    poll instead, and the survivors are killed rather than left to time out,
-    which is also what frees the devices for the next strategy.
+    in the collective it never joins until HCCL_EXEC_TIMEOUT, 180 s in the kit
+    config here and half an hour by default. Blocking until every node stops
+    RUNNING therefore costs that timeout for each failed strategy, and a sweep
+    broken the same way at every point pays it at every point. So a DEAD node
+    ends the wait at the next poll instead, and the survivors are killed rather
+    than left to time out, which is also what frees the devices for the next
+    strategy.
     """
     command = sweep.kit("status", *([run_id] if run_id else []))
     deadline = time.monotonic() + sweep.args.timeout
