@@ -256,11 +256,13 @@ def set_twin_handles(ax1, data_frame, dbg_cols):
     )
 
     handle2, label2 = ax2.get_legend_handles_labels()  # type: ignore
-    for handle in handle2:
-        if handle not in handle1:
-            handle1.append(handle)
-    for lbl in label2:
+    # Patches compare by identity, so testing the handle admitted every one of
+    # them while the labels deduplicated by name: the legend then drew more
+    # swatches than it had names and mislabelled every entry past the first
+    # shared one. Deduplicate on the label and keep its handle in step.
+    for handle, lbl in zip(handle2, label2):
         if lbl not in label1:
+            handle1.append(handle)
             label1.append(lbl)
     handles = handle1
     labels = label1
