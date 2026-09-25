@@ -356,7 +356,7 @@ class CostModelParserHyperV2(_CostModelParser):
         stated.update(self._init_bytes())
         stated.update(self._init_moe_run(stated["etp"]))
         stated.update(self._init_shard())
-        stated["offset"] = self._init_offset(stated["pp"])
+        stated["offset"] = self._init_offset(stated["pp"], stated["vpp"])
         stated["seq_split"] = 1
         # Match the MF parser: MTP layers the model declares take part in
         # pipeline offset balancing, and without any the offset leaves them
@@ -743,7 +743,7 @@ class CostModelParserHyperV2(_CostModelParser):
             run["etp"] = 1
         return run
 
-    def _init_offset(self, pp: int) -> Any:
+    def _init_offset(self, pp: int, vpp: int = 1) -> Any:
         """The pipeline offset.
 
         The MF parser reads ``model.model_config.offset`` directly from the
@@ -755,8 +755,8 @@ class CostModelParserHyperV2(_CostModelParser):
 
         To match the MF parser's *list*-based filtering behaviour (used by
         DeepSeek-V3 and other models that declare an explicit offset), this
-        parser states a list offset of length ``pp`` (all zeros = even
-        balancing) by default.  An explicit offset supplied via
+        parser states a list offset of length ``pp`` by default, one that
+        places every layer (:meth:`_balanced_offset`).  An explicit offset supplied via
         ``config_overrides.offset`` overrides this: a list is used as-is,
         and a non-zero int is broadcast to ``[int] * pp``.
         """
@@ -768,7 +768,19 @@ class CostModelParserHyperV2(_CostModelParser):
             return list(explicit)
         if isinstance(explicit, int):
             return 0 if explicit == 0 else [explicit] * pp
-        return [0] * pp
+        return self._balanced_offset(pp, vpp)
+
+    def _balanced_offset(self, pp: int, vpp: int = 1) -> list:
+        """An offset of length *pp* that places every layer the pipeline balances.
+
+        Each stage runs the layers per stage, and the first ones one more
+        each until the remainder has a stage, as the search's balancing
+        places them; all zeros where the pipeline divides the layers, or
+        interleaves, which the search balances itself.
+        """
+        layers = self.ccfg.n_lay + (self.ccfg.n_mtp or 0)
+        extra = layers % max(1, pp) if vpp <= 1 else 0
+        return [1 if stage < extra else 0 for stage in range(pp)]
 
     def _init_shard(self) -> Dict[str, Any]:
         """How the embedding and the recompute input are sharded.

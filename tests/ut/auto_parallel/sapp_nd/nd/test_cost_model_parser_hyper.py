@@ -297,6 +297,18 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.n_kv, 64)
         self.assertEqual(ccfg.dh, 5120 / 64)
 
+    def test_an_offset_places_every_layer(self):
+        """
+        Feature: _balanced_offset.
+        Description: Seven layers at PP 4, and eight.
+        Expectation: With seven, the first three stages run one more layer
+            each, so every layer has a stage; with eight, none does.
+        """
+        seven = _make_ccfg(_dense_overrides(model={"config_overrides": {"num_hidden_layers": 7}}))
+        eight = _make_ccfg(_dense_overrides(model={"config_overrides": {"num_hidden_layers": 8}}))
+        self.assertEqual(list(seven.offset), [1, 1, 1, 0])
+        self.assertEqual(list(eight.offset), [0, 0, 0, 0])
+
     def test_overrides_mtp_depth(self):
         """
         Feature: CostModelParserHyperV2 MTP.
