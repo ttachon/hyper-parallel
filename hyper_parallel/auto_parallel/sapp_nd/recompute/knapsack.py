@@ -196,6 +196,55 @@ def choose(
     return _stage_choice(assignments)
 
 
+def suffix_times(
+    layers: Sequence[Layers],
+    fronts: Mapping[Hashable, Sequence[LayerOption]],
+    budgets: Sequence[float],
+    bucket: float = MEGABYTE,
+) -> List[float]:
+    """For every start, the least time of the layers from it on that keep at most its budget.
+
+    One pass over the layers from the last to the first, as :func:`choose`
+    solves one stage, gives every suffix's fastest choice at once.
+
+    Args:
+        layers: The layers in order, one :class:`Layers` of count 1 each.
+        fronts: Each kind's options.
+        budgets: One budget in bytes per start, ``len(layers) + 1`` of them;
+            the last is the empty suffix's.
+        bucket: The memory granularity, as for :func:`choose`.
+
+    Returns:
+        ``len(layers) + 1`` times, ``inf`` where a suffix cannot fit its
+        budget.
+    """
+    if len(budgets) != len(layers) + 1:
+        raise ValueError(f"{len(budgets)} budgets for {len(layers)} layers; expected one more")
+    size = int(max(0.0, *budgets) // bucket)
+    fastest = np.full(size + 1, np.inf)
+    fastest[0] = 0.0
+
+    def _least(start: int) -> float:
+        """The least time of the suffix now in *fastest* within its budget."""
+        if budgets[start] < 0:
+            return math.inf
+        return float(np.min(fastest[:int(budgets[start] // bucket) + 1]))
+
+    times = [math.inf] * (len(layers) + 1)
+    times[-1] = _least(len(layers))
+    for start in range(len(layers) - 1, -1, -1):
+        layer = layers[start]
+        after = np.full(size + 1, np.inf)
+        for option in _useful(fronts[layer.kind], layer.in_flight):
+            weight = math.ceil(_kept(option, layer.in_flight) / bucket)
+            if weight > size:
+                continue
+            np.minimum(after[weight:], fastest[:size + 1 - weight] + _time(option), out=after[weight:])
+        fastest = after
+        times[start] = _least(start)
+    return times
+
+
 def _stage_choice(assignments: Sequence[Assignment]) -> StageChoice:
     """A stage's assignments, with the memory they keep and the time they take."""
     return StageChoice(

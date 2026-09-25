@@ -48,8 +48,9 @@ class LayerOption:
         memory_once: Bytes kept once, however many micro-batches are in flight.
         forward_time: The forward time.
         backward_time: The backward time, recompute included.
-        link_bandwidth: Bytes moved to the host and back; 0 until offload is
-            an option.
+        link_bandwidth: For an option that offloads, the bytes each
+            micro-batch moves to the host after its forward and back before
+            its backward; 0 for one that keeps them on the device.
         names: The names the pipeline balancer and the parsers know the
             option by: NONE, SLCT, COMM, BOTH or FULL.
         excess: ``(count, bytes)`` for each count of micro-batches in flight

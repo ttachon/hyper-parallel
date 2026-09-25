@@ -31,6 +31,17 @@ the working set they end warm-up on too, and the knapsack weighs it with them.
 A runtime that runs every layer one way, such as HyperParallel's trainer with
 its ``activation_checkpoint.mode``, gets the fastest of its modes that fits
 instead, from the same budgets: see :data:`MODES`.
+
+With a host link, a choice per layer may also offload: a stage's first layers
+run plain and move what they keep per micro-batch to the host after their
+forward, and back before their backward, so that they keep only what they
+hold once. A micro-batch's copies to the host keep pace with its own forward:
+each offloaded layer's, with those of the offloaded layers after it, fit in
+the forward left after it, so that a stage's last layers cannot offload when
+their window is too short. The copies back run in the longer backward, one
+layer ahead, on the same stream, which then has room for them; the stage
+keeps one offloaded layer's worth in transit. Offload is priced at one chunk
+per stage.
 """
 import math
 from dataclasses import dataclass, replace
@@ -39,6 +50,7 @@ from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequ
 
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import HostLink
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
@@ -49,7 +61,15 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.front import (
     layer_profiles,
     price_option,
 )
-from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import MEGABYTE, Layers, PipelineChoice, Stage, pp_lite
+from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import (
+    MEGABYTE,
+    Layers,
+    PipelineChoice,
+    Stage,
+    choose,
+    pp_lite,
+    suffix_times,
+)
 from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES
 
 # The pipeline schedules whose micro-batches in flight and end-of-warm-up
@@ -409,6 +429,102 @@ def _offered(
     return {key: tuple(options.values()) for key, options in by_mode.items()}, by_mode
 
 
+@dataclass(frozen=True)
+class _Link:
+    """A host link in the performance estimate's time units.
+
+    Attributes:
+        per_byte: The time one byte takes over the link, one way.
+        overlap: The share of the compute time the copies may take.
+    """
+
+    per_byte: float
+    overlap: float
+
+
+def _link(link: HostLink, evaluator: EvaluatorV2) -> _Link:
+    """*link* in the estimate's units: FLOPs of forward and backward, times the precision's bytes, per device."""
+    units_per_second = link.flops_per_second() * evaluator.ccfg.bytes_p
+    return _Link(link.seconds_per_byte() * units_per_second, link.overlap)
+
+
+def _offloaded(option: LayerOption) -> LayerOption:
+    """*option* with what it keeps per micro-batch moved to the host, so that it keeps only what it holds once."""
+    return replace(
+        option, memory_per_micro_batch=0.0, excess=(), link_bandwidth=option.memory_per_micro_batch, names=()
+    )
+
+
+def _offload_limit(stage_layers: Sequence[_Layer], plain: Sequence[LayerOption], link: _Link) -> int:
+    """How many of a stage's first layers can offload running plain, the copies keeping pace with the forward.
+
+    Each offloaded layer's copy to the host, with those of the offloaded
+    layers after it, fits in the forward time left after it, of the link's
+    share of it. The layer that ends warm-up, and every layer after it, keep
+    their activations.
+    """
+    ending = next((position for position, layer in enumerate(stage_layers) if _ENDS_WARM_UP in layer.key),
+                  len(stage_layers))
+    count, slack, left = 0, math.inf, sum(option.forward_time for option in plain)
+    for position in range(ending):
+        copy = plain[position].memory_per_micro_batch * link.per_byte
+        left -= plain[position].forward_time
+        # Every earlier offloaded layer's copies now queue this one too.
+        slack = min(slack, link.overlap * left) - copy
+        if slack < 0:
+            break
+        count = position + 1
+    return count
+
+
+def _offload_stage(
+    stage_layers: Sequence[_Layer],
+    budget: float,
+    fronts: Mapping[Hashable, Tuple[LayerOption, ...]],
+    link: _Link,
+    bucket: float,
+) -> Optional[Tuple[Dict[int, LayerOption], float]]:
+    """The fastest choice of a stage's layers when its first layers may offload.
+
+    Every count of first layers the link allows is weighed, the rest of the
+    layers choosing their options in what the offloaded ones leave.
+
+    Returns:
+        ``(chosen, transit)``: each layer's option by index, and the memory
+        the offloaded layers keep in transit; ``None`` when the stage cannot
+        fit.
+    """
+    plain = [_plain(fronts[layer.key]) for layer in stage_layers]
+    most = _offload_limit(stage_layers, plain, link)
+    budgets, held, largest = [budget], 0.0, 0.0
+    for position, layer in enumerate(stage_layers):
+        held += _kept(_offloaded(plain[position]), layer.in_flight)
+        largest = max(largest, plain[position].memory_per_micro_batch)
+        budgets.append(budget - held - largest)
+    rest = suffix_times([Layers(layer.key, 1, layer.in_flight) for layer in stage_layers], fronts, budgets, bucket)
+    offloaded = [0.0]
+    for option in plain:
+        offloaded.append(offloaded[-1] + _time(option))
+    count = min(range(most + 1), key=lambda first: (offloaded[first] + rest[first], first))
+    if not math.isfinite(offloaded[count] + rest[count]):
+        return None
+    groups: Dict[Tuple[Hashable, int], int] = {}
+    for layer in stage_layers[count:]:
+        groups[layer.key, layer.in_flight] = groups.get((layer.key, layer.in_flight), 0) + 1
+    choice = choose(tuple(Layers(key, number, flight) for (key, flight), number in groups.items()), fronts,
+                    budgets[count], bucket)
+    if choice is None:
+        return None
+    chosen = {layer.index: _offloaded(plain[position]) for position, layer in enumerate(stage_layers[:count])}
+    waiting: Dict[Tuple[Hashable, int], List[int]] = {}
+    for layer in stage_layers[count:]:
+        waiting.setdefault((layer.key, layer.in_flight), []).append(layer.index)
+    for assignment in choice.assignments:
+        for _ in range(assignment.count):
+            chosen[waiting[assignment.layers.kind, assignment.layers.in_flight].pop(0)] = assignment.option
+    return chosen, (max(option.memory_per_micro_batch for option in plain[:count]) if count else 0.0)
+
+
 def _stages(evaluator: EvaluatorV2, layers: Sequence[Sequence[_Layer]]) -> Tuple[List[Stage], List[float]]:
     """Every stage for the knapsack, and the bytes each keeps outside the choice."""
     capacity = evaluator.ccfg.device_capacity.to_mb().size
@@ -426,6 +542,7 @@ def choose_recompute(
     ccfg: Optional[CustomConfig] = None,
     bucket: float = MEGABYTE,
     modes: Optional[Sequence[str]] = None,
+    link: Optional[HostLink] = None,
 ) -> Optional[RecomputeChoice]:
     """The fastest recompute option of every layer that fits, at the evaluator's current strategy.
 
@@ -438,6 +555,9 @@ def choose_recompute(
             runs, of :data:`MODES`: the fastest that fits is chosen for every
             layer. Without them, each layer gets its own option from its
             kind's front.
+        link: For a choice per layer at one chunk per stage, the host link
+            each stage's first layers may offload over; ``None`` keeps every
+            layer's activations on the device.
 
     Returns:
         The choice, or ``None`` when there is none to make: a multimodal
@@ -461,19 +581,44 @@ def choose_recompute(
     if by_mode is not None:
         one = _one_mode(layers, stages, by_mode, modes)
         return None if one is None else _result(layers, fixed, one[1], one[0], own)
+    if link is not None and config.vp == 1:
+        return _offload_result(layers, stages, fixed, fronts, own, _link(link, evaluator), bucket)
     choice = pp_lite(stages, fronts, bucket)
     if choice is None:
         return None
     return _result(layers, fixed, _assign([layer for stage in layers for layer in stage], choice), None, own)
 
 
+def _offload_result(
+    layers: Sequence[Sequence[_Layer]],
+    stages: Sequence[Stage],
+    fixed: Sequence[float],
+    fronts: Mapping[Hashable, Tuple[LayerOption, ...]],
+    own: Mapping[LayerOption, LayerOption],
+    link: _Link,
+    bucket: float,
+) -> Optional[RecomputeChoice]:
+    """The choice per layer, each stage's first layers offloading where that is faster."""
+    chosen: Dict[int, LayerOption] = {}
+    kept = []
+    for stage_layers, stage, stage_fixed in zip(layers, stages, fixed):
+        found = _offload_stage(stage_layers, stage.budget, fronts, link, bucket)
+        if found is None:
+            return None
+        chosen.update(found[0])
+        kept.append(stage_fixed + found[1])
+    return _result(layers, kept, chosen, None, own)
+
+
 def option_label(option: LayerOption) -> str:
     """How an option reads in the search's output."""
     if option.recompute is None:
-        return "full recompute"
-    if not option.recompute:
-        return "no recompute"
-    return "recompute " + "+".join(name for name in SWITCHES if name in option.recompute)
+        label = "full recompute"
+    elif not option.recompute:
+        label = "no recompute"
+    else:
+        label = "recompute " + "+".join(name for name in SWITCHES if name in option.recompute)
+    return label + ", offloaded to the host" if option.link_bandwidth else label
 
 
 def option_record(option: LayerOption) -> Any:
@@ -490,17 +635,21 @@ def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
 
     Returns:
         One ``{"first", "count", "kind", "recompute"}`` per range, in model
-        order; ``kind`` is the kind's name, or ``None``.
+        order, with ``"offload": True`` for a range that offloads; ``kind``
+        is the kind's name, or ``None``.
     """
-    return [
-        {
+    records = []
+    for item in choice.ranges:
+        record = {
             "first": item.first,
             "count": item.count,
             "kind": item.kind.name if item.kind is not None else None,
             "recompute": option_record(item.option),
         }
-        for item in choice.ranges
-    ]
+        if item.option.link_bandwidth:
+            record["offload"] = True
+        records.append(record)
+    return records
 
 
 def describe(choice: RecomputeChoice) -> str:

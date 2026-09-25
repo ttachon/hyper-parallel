@@ -16,8 +16,50 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional
+
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
+
+
+@dataclass(frozen=True)
+class HostLink:
+    """How fast a device moves activations to its host's memory and back, as offload prices it.
+
+    The figures each device states below are assumptions, not measurements:
+    measure the link on the target with hyper_offload's
+    ``profile_transfer_bandwidth``, which reports GiB/s, and the throughput
+    from a profiled training step, or take the vendor's, and state them
+    here or with ``run_nd --host_link_gibps`` and ``--sustained_tflops``.
+
+    Attributes:
+        gib_per_s: The sustained copy bandwidth between the device and
+            pinned host memory, in GiB/s, with one copy stream carrying both
+            directions, as hyper_offload and the trainer's input swap run it.
+        sustained_tflops: The device's sustained dense throughput at the
+            training precision, in TFLOP/s, which turns a copy's seconds into
+            the performance estimate's units.
+        overlap: The share of the compute time the copy stream may take
+            without slowing the compute.
+    """
+
+    gib_per_s: float
+    sustained_tflops: float
+    overlap: float = 0.8
+
+    def __post_init__(self) -> None:
+        """Refuse a figure that cannot price a copy."""
+        if self.gib_per_s <= 0 or self.sustained_tflops <= 0 or not 0 < self.overlap <= 1:
+            raise ValueError(f"a host link needs positive figures and an overlap in (0, 1], not {self}")
+
+    def seconds_per_byte(self) -> float:
+        """The seconds one byte takes over the link, one way."""
+        return 1.0 / (self.gib_per_s * 2 ** 30)
+
+    def flops_per_second(self) -> float:
+        """The device's sustained FLOP/s."""
+        return self.sustained_tflops * 10 ** 12
 
 
 class Type:
@@ -27,14 +69,16 @@ class Type:
     levels: int  # levels in hierarchy
     level_bound_number: list[int]  # devices per level
     level_bandwidth: list[int]  # bandwidth (GB/s) per level
+    host_link: Optional[HostLink]  # the copy path to the host, for offload
 
-    def __init__(self, name, bounds, bandwidths):
+    def __init__(self, name, bounds, bandwidths, host_link=None):
         self.name = name
         self.level_bound_number = bounds
         self.level_bandwidth = bandwidths
         if len(bounds) != len(bandwidths):
             raise ValueError("bounds and bandwidths must have the same length")
         self.levels = len(bounds)
+        self.host_link = host_link
 
     def __str__(self):
         return self.name
@@ -91,15 +135,25 @@ class Type:
         return assignment
 
 
+# The host links are placeholders until measured (HostLink): 16 GiB/s is
+# hyper_offload's own default before it profiles the link, and the
+# throughputs are about half of each device's dense BF16 or FP16 peak.
 # Device_A2 = Machine(devices_per_node=8, inter_node_bw=10, intra_node_bw=50)
-Device_A2 = Type(name="A2", bounds=[8, None], bandwidths=[50, 10])
+Device_A2 = Type(
+    name="A2", bounds=[8, None], bandwidths=[50, 10], host_link=HostLink(gib_per_s=16.0, sustained_tflops=140.0)
+)
 Device_A3 = Type(
-    name="A3", bounds=[16, 24, None], bandwidths=[200, 25, 10]
+    name="A3",
+    bounds=[16, 24, None],
+    bandwidths=[200, 25, 10],
+    host_link=HostLink(gib_per_s=16.0, sustained_tflops=160.0),
 )
 device_map = {
     "A2": Device_A2,
     "A3": Device_A3,
-    "V100": Type(name="V100", bounds=[8, None], bandwidths=[50, 10]),
+    "V100": Type(
+        name="V100", bounds=[8, None], bandwidths=[50, 10], host_link=HostLink(gib_per_s=12.0, sustained_tflops=60.0)
+    ),
 }
 
 

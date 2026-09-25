@@ -22,7 +22,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 from unittest.mock import patch
 
 import yaml
@@ -40,6 +40,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
+from hyper_parallel.auto_parallel.sapp_nd.recompute import candidate as Candidate
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     MODES,
     LayerRange,
@@ -348,6 +349,163 @@ class TestStageMemory(unittest.TestCase):
                 self.assertLessEqual(abs(mine - model), 1.0, (share, describe(choice)))
 
 
+# A link so fast that a copy takes no time, and one too slow for any layer's.
+_FAST_LINK = Hard.HostLink(gib_per_s=10.0 ** 6, sustained_tflops=140.0)
+_SLOW_LINK = Hard.HostLink(gib_per_s=10.0 ** -3, sustained_tflops=140.0)
+
+
+def _offloaded_indices(choice: RecomputeChoice) -> List[int]:
+    """The layers the choice offloads, in model order."""
+    return [index for item in choice.ranges if item.option.link_bandwidth
+            for index in range(item.first, item.first + item.count)]
+
+
+class TestOffloadWindow(unittest.TestCase):
+    """A stage's first layers offload while their copies keep pace with the forward."""
+
+    @staticmethod
+    def _limit(copies: Sequence[float], ending: Optional[int] = None) -> int:
+        """How many of four layers, each with a forward of 1, may offload with *copies* to the host."""
+        stage_layers = []
+        for position in range(len(copies)):
+            key = ("unit", None) + (("ends warm-up",) if position == ending else ())
+            stage_layers.append(Candidate._Layer(position, key, 1, _option(frozenset())))  # pylint: disable=protected-access
+        plain = [LayerOption(recompute=frozenset(), memory_per_micro_batch=copy, memory_once=0.0, forward_time=1.0,
+                             backward_time=2.0) for copy in copies]
+        link = Candidate._Link(per_byte=1.0, overlap=1.0)  # pylint: disable=protected-access
+        return Candidate._offload_limit(stage_layers, plain, link)  # pylint: disable=protected-access
+
+    def test_a_layer_cannot_offload_more_than_the_forward_left_after_it(self):
+        """
+        Feature: the offload window.
+        Description: Four layers with a forward of 1 each, whose copies take
+            half a forward, one forward, one and a half forwards, or four.
+        Expectation: Each offloaded layer's copy, with those after it, fits
+            in the forward left after it: three layers at half and at one
+            forward, two at one and a half, none at four; the last layer,
+            with no forward left after it, never.
+        """
+        self.assertEqual(self._limit([0.5] * 4), 3)
+        self.assertEqual(self._limit([1.0] * 4), 3)
+        self.assertEqual(self._limit([1.5] * 4), 2)
+        self.assertEqual(self._limit([4.0] * 4), 0)
+
+    def test_the_layer_that_ends_warm_up_keeps_its_activations(self):
+        """
+        Feature: the offload window.
+        Description: Copies that take no time, the third layer ending warm-up.
+        Expectation: Only the two layers before it may offload.
+        """
+        self.assertEqual(self._limit([0.0] * 4, ending=2), 2)
+
+
+class TestOffload(unittest.TestCase):
+    """With a host link, a choice per layer may offload each stage's first layers."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """The small DeepSeek at PP 1 and at PP 2, and at two chunks per stage."""
+        cls.folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        cls.paths = {
+            "pp1": _small_deepseek(cls.folder.name, 1, pipeline_stage=1, data_parallel=8),
+            "pp2": _small_deepseek(cls.folder.name, 1),
+            "vpp": _small_deepseek(cls.folder.name, 2),
+        }
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Remove the configs."""
+        cls.folder.cleanup()
+
+    def _evaluator(self, name: str, share: float) -> EvaluatorV2:
+        """The small DeepSeek *name*, its device *share* of the way from all fully recomputed to all plain."""
+        evaluator = EvaluatorV2(self.paths[name], framework="mindformers", log_level=0)
+        plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
+        return _with_capacity(evaluator, full + 16 + share * (plain - full))
+
+    def test_early_layers_offload_and_the_last_cannot(self):
+        """
+        Feature: choose_recompute with a host link.
+        Description: PP 1, a device a fifth of the way from all fully
+            recomputed to all plain, A2's placeholder link and one whose
+            copies take no time.
+        Expectation: Each offloads a run of first layers, which run plain,
+            the faster link more of them, and never the last layer.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        last = len(layer_kinds(evaluator.ccfg)) - 1
+        offloaded = {}
+        for name, link in (("A2", Hard.Device_A2.host_link), ("fast", _FAST_LINK)):
+            choice = choose_recompute(evaluator, Hard.Device_A2, link=link)
+            offloaded[name] = _offloaded_indices(choice)
+            self.assertEqual(offloaded[name], list(range(len(offloaded[name]))), name)
+            self.assertNotIn(last, offloaded[name], name)
+            self.assertTrue(all(item.option.recompute == frozenset() for item in choice.ranges
+                                if item.option.link_bandwidth), name)
+        self.assertGreater(len(offloaded["A2"]), 0)
+        self.assertGreater(len(offloaded["fast"]), len(offloaded["A2"]))
+
+    def test_an_offloading_choice_fits_and_is_no_slower(self):
+        """
+        Feature: choose_recompute with a host link.
+        Description: PP 1 and PP 2, devices a fifth and three fifths of the
+            way from all fully recomputed to all plain, with a link whose
+            copies take no time.
+        Expectation: Every stage fits the device, and the layers save at
+            least as much time as they do without the link, more in some.
+        """
+        gained = 0
+        for name in ("pp1", "pp2"):
+            for share in (0.2, 0.6):
+                evaluator = self._evaluator(name, share)
+                capacity = evaluator.ccfg.device_capacity.to_mb().size
+                without = choose_recompute(evaluator, Hard.Device_A2)
+                choice = choose_recompute(evaluator, Hard.Device_A2, link=_FAST_LINK)
+                self.assertLessEqual(choice.memory, capacity, (name, share))
+                self.assertGreaterEqual(sum(choice.stage_savings), sum(without.stage_savings), (name, share))
+                gained += sum(choice.stage_savings) > sum(without.stage_savings)
+        self.assertGreater(gained, 0)
+
+    def test_a_link_too_slow_for_any_layer_changes_nothing(self):
+        """
+        Feature: choose_recompute with a host link.
+        Description: PP 1, a link too slow for any layer's copy.
+        Expectation: The choice made without a link.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, link=_SLOW_LINK),
+                         choose_recompute(evaluator, Hard.Device_A2))
+
+    def test_one_mode_and_two_chunks_per_stage_do_not_offload(self):
+        """
+        Feature: choose_recompute with a host link.
+        Description: One mode for every layer, and two chunks per stage.
+        Expectation: Each the choice made without a link: a runtime with one
+            mode runs no offload, and offload is priced at one chunk per
+            stage.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, modes=MODES, link=_FAST_LINK),
+                         choose_recompute(evaluator, Hard.Device_A2, modes=MODES))
+        evaluator = self._evaluator("vpp", 0.2)
+        self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, link=_FAST_LINK),
+                         choose_recompute(evaluator, Hard.Device_A2))
+
+    def test_an_offloading_choice_reads_so(self):
+        """
+        Feature: describe and to_records.
+        Description: A choice that offloads its first layers.
+        Expectation: Their line says so, and their record states offload.
+        """
+        choice = choose_recompute(self._evaluator("pp1", 0.2), Hard.Device_A2, link=_FAST_LINK)
+        first = choice.ranges[0]
+        self.assertTrue(first.option.link_bandwidth)
+        self.assertTrue(describe(choice).splitlines()[0].endswith("no recompute, offloaded to the host"))
+        self.assertEqual(to_records(choice)[0]["offload"], True)
+        self.assertTrue(all("offload" not in record for record, item in zip(to_records(choice), choice.ranges)
+                            if not item.option.link_bandwidth))
+
+
 class TestOneMode(unittest.TestCase):
     """One mode for every layer, the way a runtime with one activation checkpoint mode runs them."""
 
@@ -534,6 +692,24 @@ class TestAutoRecomputeSearch(unittest.TestCase):
             self.assertLessEqual(score, own[str(config)])
             self.assertTrue(runner.mem_eval.mem_fit(memory))
         self.assertLess(auto[0][2], full[0][2])
+
+    def test_offload_needs_a_choice_per_layer_and_takes_the_device_link(self):
+        """
+        Feature: ParallelizeLayer auto_offload.
+        Description: Ask for offload without auto recompute, then with it,
+            then with a link of one's own.
+        Expectation: Refused without it; with it, the device's link, or the
+            one given.
+        """
+        with self.assertRaises(ValueError):
+            Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
+                            auto_offload=True)
+        runner = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
+                                 auto_recompute=True, auto_offload=True).instance
+        self.assertEqual(runner.offload_link, Hard.Device_A2.host_link)
+        runner = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
+                                 auto_recompute=True, auto_offload=True, host_link=_FAST_LINK).instance
+        self.assertEqual(runner.offload_link, _FAST_LINK)
 
     def test_the_recompute_cannot_also_come_from_the_config(self):
         """

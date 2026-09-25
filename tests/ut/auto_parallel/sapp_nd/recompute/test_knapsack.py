@@ -36,6 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import (
     Stage,
     choose,
     pp_lite,
+    suffix_times,
 )
 
 DEEPSEEK_YAML = os.path.join(
@@ -182,6 +183,45 @@ class TestChoose(unittest.TestCase):
         times = [item.option.backward_time for item in choice.assignments]
         self.assertEqual(times, [30.0, 23.0, 20.5])
         self.assertEqual(times, sorted(times, reverse=True))
+
+
+class TestSuffixTimes(unittest.TestCase):
+    """Every suffix of a stage's layers, each within a budget of its own, in one pass."""
+
+    def test_each_suffix_is_as_fast_as_choosing_it_alone(self):
+        """
+        Feature: suffix_times.
+        Description: Random stages of two kinds kept at one to three
+            micro-batches in flight, and a random budget for every start.
+        Expectation: Each suffix takes what choose gives it alone within its
+            budget, and inf where choose finds nothing that fits.
+        """
+        rng = random.Random(3)
+        fronts = {"a": _FRONT, "b": (_option(60, 5, 12), _option(30, 15, 14), _option(2, 15, 19))}
+        for _ in range(30):
+            layers = [Layers(rng.choice("ab"), 1, rng.randint(1, 3)) for _ in range(rng.randint(1, 6))]
+            budgets = [rng.uniform(-50, 900) * MEGABYTE for _ in range(len(layers) + 1)]
+            times = suffix_times(layers, fronts, budgets)
+            for start, time in enumerate(times):
+                counts = {}
+                for layer in layers[start:]:
+                    counts[layer.kind, layer.in_flight] = counts.get((layer.kind, layer.in_flight), 0) + 1
+                alone = choose(tuple(Layers(kind, count, flight) for (kind, flight), count in counts.items()),
+                               fronts, budgets[start])
+                with self.subTest(layers=layers, start=start):
+                    if alone is None:
+                        self.assertEqual(time, math.inf)
+                    else:
+                        self.assertAlmostEqual(time, alone.time, places=6)
+
+    def test_one_budget_per_start(self):
+        """
+        Feature: suffix_times.
+        Description: As many budgets as layers.
+        Expectation: Refused, since the empty suffix needs one too.
+        """
+        with self.assertRaises(ValueError):
+            suffix_times([Layers("a", 1, 1)], {"a": _FRONT}, [MEGABYTE])
 
 
 class TestPpLite(unittest.TestCase):

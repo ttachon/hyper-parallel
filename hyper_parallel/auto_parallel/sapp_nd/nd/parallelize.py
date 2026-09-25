@@ -78,6 +78,17 @@ class ParallelizeLayer:
         unknown = sorted(set(self.recompute_modes or ()) - set(MODES))
         if unknown:
             raise ValueError(f"unknown recompute modes {unknown}; expected some of {', '.join(MODES)}")
+        # With auto_offload, a choice per layer may offload each stage's first
+        # layers over the host link: host_link, else the device's own.
+        auto_offload = extra_config.pop("auto_offload", False)
+        host_link = extra_config.pop("host_link", None)
+        self.offload_link = None
+        if auto_offload:
+            if not auto_recompute:
+                raise ValueError("auto_offload offloads in the choice per layer that auto_recompute makes")
+            self.offload_link = host_link or machine.device.host_link
+            if self.offload_link is None:
+                raise ValueError(f"device {machine.device} states no host link to offload over; give host_link")
 
         self.mem_eval = evaluator
         # Choose every layer's recompute option for each candidate, rather
@@ -505,7 +516,8 @@ class ParallelizeLayer:
         if not self.auto_recompute:
             return None
         self.mem_eval.set_config(self.config.ccfg)
-        choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes)
+        choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
+                                  link=self.offload_link)
         if choice is not None:
             self.recompute_choices[parallel_config] = choice
         return choice
@@ -525,7 +537,7 @@ class ParallelizeLayer:
         """
         self.config.set_parallel_config(parallel_config)
         self.mem_eval.set_config(self.config.ccfg)
-        choice = choose_recompute(self.mem_eval, self.machine.device)
+        choice = choose_recompute(self.mem_eval, self.machine.device, link=self.offload_link)
         if choice is None:
             return None, None
         score = estimate_performance(

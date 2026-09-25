@@ -147,6 +147,10 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-v VERBOSITY]
     [-A DEVICE_TYPE]
     [-mppb | --manual_pipeline_balance]
+    [-ar | --auto_recompute]
+    [-ao | --auto_offload]
+    [--host_link_gibps GIB_PER_S]
+    [--sustained_tflops TFLOPS]
     [-t TOP_CONFIG_NUMBER]
     [-mem MEM_FOR_PPB]
 ```
@@ -159,6 +163,15 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-v`, `--verbosity`: verbosity in range `[0, 6]`.
 - `-A`, `--device_type`: device type, such as `A2` or `A3`.
 - `-mppb`, `--manual_pipeline_balance`: read offset and recompute from yaml.
+- `-ar`, `--auto_recompute`: give every layer of each configuration the
+  fastest recompute option that fits, instead of scoring it fully recomputed.
+- `-ao`, `--auto_offload`: with `-ar`, let each pipeline stage's first layers
+  offload their activations to the host instead of recomputing them, over the
+  device's host link (see Hardware). Priced at one chunk per stage; not with a
+  search config, whose trainer runs no offload.
+- `--host_link_gibps`, `--sustained_tflops`: the host link's copy bandwidth
+  and the device's sustained throughput `-ao` prices with, replacing the
+  device's placeholders.
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
 
@@ -212,6 +225,17 @@ sapp_nd/
 - Ascend A2.
 - Ascend A3.
 - Other Ascend variants and GPU support are future work.
+
+Offload (`-ao`) prices each copy to the host with two figures per device,
+`HostLink` in `nd/common/hardware.py`: the copy bandwidth to pinned host
+memory, in GiB/s, and the sustained dense throughput, in TFLOP/s, which turns
+a copy's seconds into the estimate's units. The figures there are
+placeholders, not measurements: 16 GiB/s is hyper_offload's own default
+before it profiles the link, and the throughputs are about half of each
+device's dense peak. Measure the link on the target with hyper_offload's
+`profile_transfer_bandwidth`, and the throughput from a profiled training
+step, or take the vendor's figures; then state them in `hardware.py` or pass
+`--host_link_gibps` and `--sustained_tflops`.
 
 ### Parallel Dimensions
 

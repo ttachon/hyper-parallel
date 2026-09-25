@@ -26,6 +26,31 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 
 
+def _host_link(cli_parser, cli_args, device):
+    """The host link -ao offloads over: the device's, with what the CLI states replacing its placeholders.
+
+    Args:
+        cli_parser: The parser, to report a device with no link to offload over.
+        cli_args: The parsed CLI namespace.
+        device: The device type the search prices.
+
+    Returns:
+        The link, or ``None`` without -ao.
+    """
+    if not cli_args.auto_offload:
+        return None
+    link = device.host_link
+    if link is None and (cli_args.host_link_gibps is None or cli_args.sustained_tflops is None):
+        cli_parser.error(
+            f"device {device} states no host link; give both --host_link_gibps and --sustained_tflops for -ao"
+        )
+    return Hard.HostLink(
+        gib_per_s=cli_args.host_link_gibps if cli_args.host_link_gibps is not None else link.gib_per_s,
+        sustained_tflops=cli_args.sustained_tflops if cli_args.sustained_tflops is not None else link.sustained_tflops,
+        overlap=link.overlap if link is not None else Hard.HostLink.overlap,
+    )
+
+
 def _apply_cli_overrides(search_cfg, cli_args):
     """Override the search config's batch, memory budget and devices from the CLI.
 
@@ -270,6 +295,30 @@ if __name__ == "__main__":
         "option that fits, instead of scoring it fully recomputed",
     )
     parser.add_argument(
+        "-ao",
+        "--auto_offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With -ar, let each pipeline stage's first layers offload their "
+        "activations to the host instead of recomputing them, over the "
+        "device's host link",
+    )
+    parser.add_argument(
+        "--host_link_gibps",
+        type=float,
+        default=None,
+        help="The host link's sustained copy bandwidth in GiB/s, for -ao, as "
+        "hyper_offload's profile_transfer_bandwidth measures it; the device's "
+        "placeholder when omitted",
+    )
+    parser.add_argument(
+        "--sustained_tflops",
+        type=float,
+        default=None,
+        help="The device's sustained TFLOP/s at the training precision, for "
+        "-ao; the device's placeholder when omitted",
+    )
+    parser.add_argument(
         "-t",
         "--top_config_number",
         type=int,
@@ -350,6 +399,13 @@ if __name__ == "__main__":
 
     if args.auto_recompute and args.mppb:
         parser.error("-ar/--auto_recompute chooses the recompute, so it cannot take it from the yaml (-mppb)")
+    if args.auto_offload and not args.auto_recompute:
+        parser.error("-ao/--auto_offload offloads in the choice per layer -ar/--auto_recompute makes")
+    if args.auto_offload and args.search_config:
+        parser.error("-ao/--auto_offload prices a choice per layer; a search config (-s) chooses one mode for the "
+                     "trainer, which runs no offload")
+    if not args.auto_offload and (args.host_link_gibps is not None or args.sustained_tflops is not None):
+        parser.error("--host_link_gibps and --sustained_tflops price offload, which needs -ao/--auto_offload")
 
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)
@@ -371,6 +427,7 @@ if __name__ == "__main__":
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
     machine = Hard.Machine(args.devices, args.device_type)
+    host_link = _host_link(parser, args, machine.device)
 
     if args.framework == "hyperparallel2":
         if args.yaml_config is None or args.train_yaml is None or args.accelerate_yaml is None:
@@ -400,6 +457,8 @@ if __name__ == "__main__":
         swap_os=args.swap_opt_state,
         mppb=args.mppb,
         auto_recompute=args.auto_recompute,
+        auto_offload=args.auto_offload,
+        host_link=host_link,
         model=args.model,
         # model="Telecom",  # args.model ====ONLY FOR XINYU BRANCH====
         max_mem=max_mem,

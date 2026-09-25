@@ -880,6 +880,37 @@ class TestSappNDRunND(unittest.TestCase):
         run_nd["_apply_cli_overrides"](search_cfg, cli)
         self.assertEqual(search_cfg.estimator["recompute_strategy"], "auto")
 
+    def test_run_nd_cli_asks_for_auto_offload(self) -> None:
+        """
+        Feature: run_nd -ao/--auto_offload.
+        Description: Ask for offload with auto recompute, then with the
+            link's figures stated, then without auto recompute, then the
+            figures without offload, then with a search config.
+        Expectation: The search gets the device's link, then one with the
+            stated figures; the last three command lines are refused before
+            any search is built.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-A", "A3"]
+            with patch.object(sys, "argv", argv + ["-ar", "-ao"]):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            kwargs = _FakeParallelize.instances[-1].kwargs
+            self.assertTrue(kwargs["auto_offload"])
+            self.assertEqual(kwargs["host_link"], Hard.Device_A3.host_link)
+            with patch.object(sys, "argv", argv + ["-ar", "-ao", "--host_link_gibps", "32",
+                                                   "--sustained_tflops", "200"]):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].kwargs["host_link"],
+                             Hard.HostLink(gib_per_s=32.0, sustained_tflops=200.0))
+            _FakeParallelize.instances = []
+            for extra in (["-ao"], ["-ar", "--host_link_gibps", "32"], ["-ar", "-ao", "-s", config_path]):
+                with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances, [])
+
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """
         Feature: TestSappNDRunND.
