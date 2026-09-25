@@ -58,7 +58,7 @@ PEAK_PATTERN = re.compile(
     r"memory/device_max_reserved_gb=([0-9.]+)"
 )
 REMOTE_PROFILES = "output/sweep_ep_profiles"
-STAGES = ("mirror", "run", "fetch", "classify", "compare")
+STAGES = ("mirror", "run", "fetch", "classify", "compare", "plot")
 
 
 def _run(command: Sequence[str], *, capture: bool = False, check: bool = True) -> str:
@@ -539,6 +539,90 @@ def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
                         help="routed experts, used to reject an ep that cannot divide them")
 
 
+def _read_rows(path: Path) -> List[Dict[str, str]]:
+    """Read a CSV into dicts, empty when the file is absent."""
+    if not path.is_file():
+        return []
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _strategy_label(row: Dict[str, str], varying: Sequence[str]) -> str:
+    """Name a row by the dimensions that actually change across the sweep."""
+    return " ".join(f"{name}{row[name]}" for name in varying) or "single"
+
+
+def _varying_dims(rows: Sequence[Dict[str, str]]) -> List[str]:
+    """Return the dimension columns that take more than one value."""
+    names = [n for n in ("EP", "CP", "OP", "DP", "MB", "MP", "PP") if n in rows[0]]
+    varying = [n for n in names if len({row[n] for row in rows}) > 1]
+    return varying or names[:1]
+
+
+def stage_plot(sweep: Sweep) -> None:
+    """Draw the sweep: where each step goes, and what it costs in memory.
+
+    ND already plots its estimate against each configuration; this is the view
+    across the sweep, which no single configuration shows.
+    """
+    try:
+        import matplotlib  # pylint: disable=import-outside-toplevel
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        print("matplotlib not available to this interpreter; skipping the plot. "
+              "Run with --python pointing at the training environment.", flush=True)
+        return
+
+    timing = _read_rows(sweep.merged_csv)
+    memory = _read_rows(sweep.out / "memory.csv")
+    if not timing and not memory:
+        print("nothing to plot: no classified CSV and no memory.csv", flush=True)
+        return
+
+    panels = [name for name, rows in (("time", timing), ("memory", memory)) if rows]
+    figure, axes = plt.subplots(len(panels), 1, figsize=(2 + 1.4 * max(
+        len(timing), len(memory)), 4 * len(panels)), squeeze=False)
+
+    if timing:
+        axis = axes[panels.index("time")][0]
+        varying = _varying_dims(timing)
+        labels = [_strategy_label(row, varying) for row in timing]
+        parts = [c for c in timing[0] if c == "comp" or c.endswith("_wait")]
+        parts = [c for c in parts if any(float(row[c]) for row in timing)]
+        bottom = [0.0] * len(timing)
+        for part in parts:
+            values = [float(row[part]) for row in timing]
+            axis.bar(labels, values, bottom=bottom, label=part)
+            bottom = [b + v for b, v in zip(bottom, values)]
+        idle = [float(row["time"]) - b for row, b in zip(timing, bottom)]
+        axis.bar(labels, idle, bottom=bottom, label="idle")
+        axis.set_ylabel("step (ms)")
+        axis.set_title("Measured step, split into ND's parts")
+        axis.legend(fontsize="small", ncol=2)
+        axis.tick_params(axis="x", rotation=45)
+
+    if memory:
+        axis = axes[panels.index("memory")][0]
+        varying = _varying_dims(memory)
+        labels = [_strategy_label(row, varying) for row in memory]
+        for column, style in (("max_allocated_gb", "o-"), ("max_reserved_gb", "s--")):
+            axis.plot(labels, [float(row[column]) for row in memory], style,
+                      label=column)
+        axis.set_ylabel("peak per device (GiB)")
+        axis.set_title("Peak device memory")
+        axis.grid(True, alpha=0.3)
+        axis.legend(fontsize="small")
+        axis.tick_params(axis="x", rotation=45)
+
+    figure.tight_layout()
+    out = sweep.out / "sweep.pdf"
+    figure.savefig(out, bbox_inches="tight")
+    figure.savefig(out.with_suffix(".png"), dpi=150, bbox_inches="tight")
+    plt.close(figure)
+    print(f"sweep plot: {out} (and .png)", flush=True)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the sweep arguments."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -589,6 +673,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ("fetch", stage_fetch),
             ("classify", stage_classify),
             ("compare", stage_compare),
+            ("plot", stage_plot),
     ):
         if name in stages:
             run_stage(sweep)

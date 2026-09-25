@@ -241,6 +241,7 @@ python examples/training_demo/sweep_qwen3_5_moe_ep.py --only classify --only com
 | `fetch` | copies the profiles from the node holding `profiling.rank` |
 | `classify` | `nd.trace_classify` per run, merged into one CSV |
 | `compare` | `run_nd --real_csv`, printing measured against estimated shares |
+| `plot` | `sweep.pdf`/`.png`: the step split and the peak memory across the sweep |
 
 Memory is measured in its own pass. Recording the allocator history brackets
 the profiled window and moves both step time and idle, so `--profile-memory`
@@ -254,6 +255,12 @@ the sweep harvests `memory/device_max_allocated_gb` and
 no cost to the numbers being timed. The memory pass is for the detail that the
 peak alone does not give: `operator_memory.csv`, `memory_record.csv` and the
 allocator snapshot `.pkl`, which opens at pytorch.org/memory_viz.
+
+Two plots come out. `run_nd` writes its own per-configuration comparison to
+`nd/real_all.pdf`, measured against estimated shares with the idle remainder.
+The `plot` stage adds the view across the sweep that no single configuration
+shows: the measured step split into ND's parts, and peak device memory, with
+the x axis labelled by whichever dimensions actually vary.
 
 The ND input yaml is generated rather than reused: ND reads the training
 sequence length from `data.max_seq_len`, while the demo feeds an Indexed
