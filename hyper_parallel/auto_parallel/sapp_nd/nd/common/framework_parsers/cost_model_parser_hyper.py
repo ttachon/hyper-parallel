@@ -762,7 +762,7 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         # Always a string: GlobalConfig.max_op only bounds OP by the data
         # parallel degree when this reads as a non-muon optimizer name, and
-        # the generated cost-model yaml carries no optimizer section.
+        # a train.yaml need not state its optimizer.
         self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
         self._init_optimizer_states(optimizer, str(opt_type or ""))
 

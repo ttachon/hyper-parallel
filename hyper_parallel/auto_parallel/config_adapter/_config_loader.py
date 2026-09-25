@@ -18,6 +18,7 @@ Reads Search Config (``search.yaml``) and HyperParallel training config
 (``train.yaml``) files, producing :class:`NormalizedConfig` instances.
 """
 
+import copy
 import logging
 import os
 from typing import Any, Dict, List, Tuple, Optional
@@ -90,6 +91,49 @@ def _get_dict(raw: Dict[str, Any], key: str) -> Dict[str, Any]:
     """Return the value of a key if it is a dict, otherwise an empty dict."""
     val = raw.get(key, {})
     return val if isinstance(val, dict) else {}
+
+
+# The model section's keys that state how the run loads and computes the
+# weights, not the model; the cost model reads them there.
+_MODEL_RUN_KEYS = ("torch_dtype", "param_init_type", "compute_dtype", "softmax_compute_type")
+
+# The root keys of an AutoModels train.yaml that state the run.
+_RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer")
+
+# The keys of a legacy train.yaml's ``train`` section that are not its
+# training settings: recompute, the search's, and precision, which the cost
+# model reads from the model section.
+_LEGACY_TRAIN_SECTIONS = ("accelerator", "optimizer", "gradient_checkpointing", "mixed_precision")
+
+
+def _model_run(model_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the dtypes a model section states for the run."""
+    return {key: model_raw[key] for key in _MODEL_RUN_KEYS if model_raw.get(key) is not None}
+
+
+def _stated_run(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the run a train.yaml states, in the AutoModels sections' names.
+
+    The model's dtypes, FSDP's precision and resharding, the optimizer,
+    gradient clipping and the accelerator's settings are the run's, and the
+    model spec carries none of them.  The strategy the same sections state
+    stays in: the search runner writes the one it searches over it.  A legacy
+    train.yaml states them under ``train``.
+    """
+    run: Dict[str, Any] = {"model": _model_run(_get_dict(raw, "model"))}
+    if is_auto_models_schema(raw):
+        for key in _RUN_SECTIONS:
+            if raw.get(key) is not None:
+                run[key] = copy.deepcopy(raw[key])
+        return run
+    train_raw = _get_dict(raw, "train")
+    run["training"] = {
+        key: copy.deepcopy(value) for key, value in train_raw.items() if key not in _LEGACY_TRAIN_SECTIONS
+    }
+    for key in ("accelerator", "optimizer"):
+        if isinstance(train_raw.get(key), dict):
+            run[key] = copy.deepcopy(train_raw[key])
+    return run
 
 
 def _load_auto_models_model_spec(
@@ -241,15 +285,19 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         base_config = _build_config_from_hp_yaml(base_raw)
 
     model_spec: Dict[str, Any]
+    run: Dict[str, Any]
     if base_config:
         model_spec = dict(base_config.model_spec)
+        run = copy.deepcopy(base_config.run)
     else:
         model_spec = {}
+        run = {}
 
     # Override or supply model section from search.yaml
     search_model = _get_dict(raw, "model")
     if search_model:
         model_spec.update(search_model)
+        run.setdefault("model", {}).update(_model_run(search_model))
 
     model_spec.setdefault("max_position_embeddings", 4096)
     model_spec.setdefault("local_batch_size", 1)
@@ -314,6 +362,7 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         parallelism_summary=summary,
         estimator=estimator,
         pp_config=pp_config,
+        run=run,
     )
 
 
@@ -458,6 +507,7 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
             "stage_partition_mode": "uniform",
             "micro_batch_num": max(1, micro_batch_num),
         },
+        run=_stated_run(raw),
     )
 
 
@@ -542,6 +592,7 @@ def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         constraint=constraint,
         estimator=estimator,
         pp_config=pp_config,
+        run=_stated_run(raw),
     )
 
 
