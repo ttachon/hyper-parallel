@@ -94,7 +94,8 @@ class EvalMTP:
             return 0
         micro_factor = ctx.micro_factor
         res = micro_factor * ccfg.n_mtp * ccfg.bytes_compute
-        res *= ccfg.s * ccfg.b * 3 * ccfg.h
+        # A CP rank runs the layer on its own chunk of the sequence.
+        res *= ccfg.s * ccfg.b * 3 * ccfg.h / max(1, ccfg.cp)
         # Shared Head
         ctx.current_node = LayerType.EMBEDDING_LAYER
         res += ccfg.n_mtp * ctx.eval.dyn.activation(ccfg, ctx)
@@ -171,7 +172,9 @@ class EvalTailSingle:
         last_norm = ccfg.s * ccfg.b * ccfg.bytes_norm * ccfg.h
         lm_head = ccfg.s * ccfg.b * ccfg.bytes_compute * ccfg.v
         activ_size = last_norm + lm_head
-        activ_size /= ccfg.shard_output_activ
+        # A CP rank computes the logits of its own chunk of the sequence: the
+        # output layer gathers none across CP.
+        activ_size /= ccfg.shard_output_activ * max(1, ccfg.cp)
         return micro_factor * activ_size
 
     @staticmethod
