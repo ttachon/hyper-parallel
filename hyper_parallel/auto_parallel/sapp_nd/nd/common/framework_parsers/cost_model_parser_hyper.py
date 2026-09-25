@@ -423,7 +423,20 @@ class CostModelParserHyperV2(_CostModelParser):
         stated, dp_shard = self._parse_parallel_dimensions(accel, fsdp)
         stated.update(self._parse_sequence_parallelism(accel))
         stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"]))
+        stated.update(self._parse_expert_sharding(fsdp))
         return stated
+
+    def _parse_expert_sharding(self, fsdp) -> Dict[str, Any]:
+        """How HyperParallel's FSDP shards a routed expert under expert parallelism.
+
+        Over ``edp_shard_size`` ranks of its expert data-parallel group, 1 by
+        default: a run that states none keeps each of its experts whole on
+        every rank holding it.  The legacy schema states nothing, and the
+        family's rule applies.
+        """
+        if not is_auto_models_schema(self.config):
+            return {}
+        return {"expert_shard": max(1, int(self._get_cfg_attr(fsdp, "edp_shard_size", 1) or 1))}
 
     def _parse_parallel_dimensions(self, accel, fsdp) -> Tuple[Dict[str, Any], int]:
         """Return the mesh's degrees, and the data shard degree."""

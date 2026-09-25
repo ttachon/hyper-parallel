@@ -174,6 +174,11 @@ class ExecSpec:
             splits each parameter over, on top of TP's split, as MindSpore's
             ``optimizer_weight_shard_size`` and HyperParallel's ``dp_shard``
             count them.
+        expert_shard: How many ranks of its expert data-parallel group FSDP
+            shards a routed expert over under expert parallelism, as
+            HyperParallel's ``edp_shard_size`` counts them; without expert
+            parallelism the experts shard with the other parameters.  Stated
+            by no one, the optimizer shards them over the whole group.
         grad_shard: Whether gradients are sharded too.
         grad_shard_as_params: Whether each gradient is sharded as its
             parameter is, as FSDP holds it; ``grad_shard`` does not apply.
@@ -247,6 +252,7 @@ class ExecSpec:
 
     optimizer_parallel: Optional[bool] = None
     optimizer_shard: Optional[int] = None
+    expert_shard: Optional[int] = None
     grad_shard: Optional[bool] = None
     grad_shard_as_params: Optional[bool] = None
     grad_accumulation: Optional[bool] = None
@@ -353,7 +359,8 @@ class ExecSpec:
 # none of them is kept as it is.
 _KINDS: Dict[str, tuple] = {
     "count": ("dp", "tp", "pp", "vpp", "cp", "ep", "micro_batch_size", "micro_batch_num",
-              "global_batch_size", "optimizer_shard", "seq_split", "seq_length", "optimizer_states"),
+              "global_batch_size", "optimizer_shard", "expert_shard", "seq_split", "seq_length",
+              "optimizer_states"),
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
              "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
     "flag": ("sequence_parallel", "shard_activations", "optimizer_parallel", "grad_shard",
