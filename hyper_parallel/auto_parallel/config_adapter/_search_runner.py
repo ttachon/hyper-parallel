@@ -19,8 +19,9 @@ Hands a :class:`NormalizedConfig` to the ND search as the mapping
 memory budget, and returns the optimal strategy.
 """
 
+import copy
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from hyper_parallel.auto_parallel._hf_model_spec import EXEC_OVERRIDE_KEYS
 from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
@@ -119,6 +120,39 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": spec.name, "config_overrides": overrides}
 
 
+# The strategy, under every name the cost model reads it by, in the sections
+# a train.yaml states its run in: the search sets it, from its candidates or
+# its own config, so the train.yaml's values give way.  The rest of each
+# section is the run's.
+_STRATEGY_KEYS: Dict[str, FrozenSet[str]] = {
+    "accelerator": frozenset({
+        "dp_replicate", "dp_shard", "tp_size", "tp_degree", "pp_size", "pipeline_parallel_degree",
+        "cp_size", "context_parallel_degree", "ep_size", "expert_parallel_degree",
+        "expert_tensor_parallel_degree", "micro_batch_num", "optimizer_weight_shard_size",
+        "pipeline_scheduler", "pp_interleave_num",
+    }),
+    "fsdp_config": frozenset({"dp_shard_size"}),
+    "training": frozenset({"global_batch_size", "micro_batch_size", "micro_batch_num"}),
+}
+
+
+def _stated_run(config: NormalizedConfig) -> Dict[str, Any]:
+    """Return the run the train.yaml states, less the strategy the search sets.
+
+    Args:
+        config: The normalized config whose ``run`` the train.yaml filled.
+
+    Returns:
+        A copy of ``config.run``, its sections without the strategy's keys.
+    """
+    run = copy.deepcopy(config.run)
+    for section, strategy in _STRATEGY_KEYS.items():
+        stated = run.get(section)
+        if isinstance(stated, dict):
+            run[section] = {key: value for key, value in stated.items() if key not in strategy}
+    return run
+
+
 def _memory_budget_gb(config: NormalizedConfig) -> float:
     """Return the per-device memory budget in GB, or ``0.0`` if unconstrained.
 
@@ -164,13 +198,15 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     Fixed dimensions (``constraint.fixed_*_degree``) are written directly
     into the strategy sections. Dimensions with search-space candidates
     use the first candidate as a placeholder -- the actual search is driven
-    by the ``dimensions`` parameter passed to :class:`Parallelize`.
+    by the ``dimensions`` parameter passed to :class:`Parallelize`.  The
+    strategy goes over the run the train.yaml states, which stays as stated.
     """
     model = config.model_spec
     constraint = config.constraint
+    run = _stated_run(config)
 
-    accel: Dict[str, Any] = {}
-    fsdp: Dict[str, Any] = {}
+    accel: Dict[str, Any] = dict(run.pop("accelerator", None) or {})
+    fsdp: Dict[str, Any] = dict(run.pop("fsdp_config", None) or {})
 
     # Fixed dimensions -- write actual value.
     fixed_map = {
@@ -233,8 +269,10 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     model_dict = _build_model_dict(model)
 
     hp_yaml: dict = {
-        "model": model_dict,
+        **run,
+        "model": {**run.get("model", {}), **model_dict},
         "training": {
+            **run.get("training", {}),
             "global_batch_size": constraint.get("global_batch_size", 0),
             "micro_batch_size": model.get("local_batch_size", 1),
             "micro_batch_num": accel.pop("micro_batch_num", 1),

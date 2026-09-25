@@ -146,7 +146,6 @@ class _CostModVar:
     tokens_per_expert: list = None
 
     # CP modeling
-    kv_lora_rank: float = 0
     attention_type: str = None
     device_per_node: float = 8
     bw_intra: float = 400.0
@@ -222,11 +221,26 @@ class _CostModVar:
     # estimators bytes_grad, bytes_os, bytes_norm and bytes_dropout from them.
     grad_bytes: float = None
     optimizer_state_bytes: float = None
+    optimizer_states: float = None
+    main_param_bytes: float = None
     norm_bytes: float = None
     dropout_bytes: float = None
     grad_accumulation: bool = None
+    # Whether FSDP frees a layer's gathered parameters once it has run, as
+    # the run states it, None taking its family's; and as derive gives it.
+    reshard_params: bool = None
+    reshards: bool = False
+    # Whether FSDP holds each layer's reduce-scatter output until the
+    # backward ends, as stated, None taking its family's; and as derive
+    # gives it.
+    deferred_grad_accumulation: bool = None
+    defers_grads: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
+    # What the optimizer keeps per parameter: a layer's, and the embedding
+    # and output tables', which keep AdamW's two states (derive).
+    bytes_optim: float = 0
+    bytes_optim_table: float = 0
     bytes_norm: float = 0
     bytes_dropout: float = 0
 

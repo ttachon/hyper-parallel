@@ -137,11 +137,11 @@ class EvalBody:
             return 0
         non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
         # Routed experts
-        routed_mem = routed_p / ccfg.ep * 2 * ccfg.bytes_os / ccfg.shard_p_os_exp
+        routed_mem = routed_p / ccfg.ep * ccfg.bytes_optim / ccfg.shard_p_os_exp
         # Shared experts
-        shared_mem = shared_p * 2 * ccfg.bytes_os / ccfg.shard_p_os_exp_partial
+        shared_mem = shared_p * ccfg.bytes_optim / ccfg.shard_p_os_exp_partial
         # Non expert
-        non_exp_mem = non_exp_p * 2 * ccfg.bytes_os / ccfg.shard_p_os_non_exp_partial
+        non_exp_mem = non_exp_p * ccfg.bytes_optim / ccfg.shard_p_os_non_exp_partial
         return non_exp_mem + routed_mem + shared_mem
 
     @staticmethod

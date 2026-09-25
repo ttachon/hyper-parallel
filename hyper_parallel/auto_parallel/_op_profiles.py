@@ -69,10 +69,14 @@ FFN_FLAVOURS = ("dense", "moe")
 DEFAULT_RUN = MappingProxyType({
     "grad_bytes": 4,
     "optimizer_state_bytes": 4,
+    "optimizer_states": 2,
+    "main_param_bytes": 0,
     "norm_bytes": 4,
     "dropout_bytes": 0,
     "grad_accumulation": False,
     "shard_activations": False,
+    "reshard_params": False,
+    "deferred_grad_accumulation": False,
 })
 
 # The model facts a profile's ``model`` may give a model that states none.

@@ -56,7 +56,7 @@ class EvalHead:
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim_table
         b_os /= ccfg.cp
         return param_size * b_os
 
@@ -82,10 +82,13 @@ class EvalHead:
 
     @staticmethod
     def tp_comm_embed(ccfg: CostModelConfig, _) -> float:
-        """TP Communication size"""
+        """TP Communication size.
+
+        The embedding is never recomputed, so it keeps its buffer whatever
+        the gather switch says: a switch acts only in a selective layer.
+        """
         return (
-            ccfg.rec_op.gather
-            * ccfg.comm_t
+            ccfg.comm_t
             * ccfg.s
             * ccfg.h
             * ccfg.b

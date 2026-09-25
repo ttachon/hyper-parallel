@@ -37,7 +37,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import exec_of
 from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -576,8 +576,9 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Feature: _init_bytes.
         Description: Bytes from dtype fields in model section.
         Expectation: bytes_p=4 (float32), bytes_compute=2 (bfloat16),
-            bytes_softmax=4 (float32); the family's bytes_grad=4, bytes_os=4
-            and bytes_norm=4, which the parser leaves to derive.
+            bytes_softmax=4 (float32); the family's bytes_grad=4 and
+            bytes_norm=4, which the parser leaves to derive; bytes_os=4, the
+            stored parameters' width, which the optimizer's states take.
         """
         cfg = _dense_overrides(model={
             "param_init_type": "float32",
@@ -591,6 +592,24 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.bytes_grad, 4)
         self.assertEqual(ccfg.bytes_os, 4)
         self.assertEqual(ccfg.bytes_norm, 4)
+
+    def test_optimizer_states_follow_the_stored_parameters(self):
+        """
+        Feature: _optimizer_states.
+        Description: A bf16 model trained with AdamW, with Muon, and with
+            fp32 main parameters.
+        Expectation: AdamW's two moments and Muon's one momentum take the
+            stored parameters' bf16: 4 and 2 bytes per layer parameter, the
+            tables' AdamW 4; fp32 main parameters keep fp32 states and an
+            fp32 copy, 12 bytes per parameter.
+        """
+        got = []
+        for optimizer in ({"max_grad_norm": 1.0},
+                          {"_target_": "hyper_parallel.components.optim.Muon"},
+                          {"fp32_main_params": True}):
+            ccfg = _make_ccfg(_dense_overrides(model={"torch_dtype": "bfloat16"}, train={"optimizer": optimizer}))
+            got.append((ccfg.bytes_os, ccfg.bytes_optim, ccfg.bytes_optim_table))
+        self.assertEqual(got, [(2, 4, 4), (2, 2, 4), (4, 12, 12)])
 
     def test_top_level_model_init_dtype_sizes_the_parameters(self):
         """
@@ -1390,6 +1409,107 @@ class TestGradientsAsFsdpHoldsThem(unittest.TestCase):
                 with self.subTest(pp=pp):
                     self.assertGreater(stage["ModelParameters"], 0)
                     self.assertEqual(stage["AccumulGradients"], stage["ModelParameters"])
+
+
+class TestFsdpResharding(unittest.TestCase):
+    """HyperParallel's FSDP frees a layer's gathered parameters once it has run."""
+
+    @staticmethod
+    def _stage(fsdp: Dict[str, Any]) -> Dict[str, Any]:
+        """Stage 0 of a dense model at DP shard 4 and PP 2, fully recomputed, under *fsdp*."""
+        config = _auto_models_config(accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 2}, fsdp_config=fsdp)
+        with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+            mock_hf.return_value = SimpleNamespace(
+                model_type="llama", hidden_size=1024, num_hidden_layers=4, num_attention_heads=8,
+                num_key_value_heads=8, intermediate_size=2816, vocab_size=32000, max_position_embeddings=4096,
+            )
+            with tempfile.TemporaryDirectory() as folder:
+                path = os.path.join(folder, "train.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(config, handle)
+                evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        return evaluator.estimate_peak_insight()[0]["Node Log"]
+
+    def test_a_layer_keeps_no_gathered_parameters(self):
+        """
+        Feature: FSDP resharding on the memory path.
+        Description: A dense model at DP shard 4, with HyperParallel's
+            default FSDP, and with reshard_after_forward off.
+        Expectation: Kept gathered, each layer keeps its gathered
+            parameters, and so does the working set that ends warm-up.
+            Resharded, no layer keeps any, and that working set holds two
+            layers', its own and the next one's, prefetched.
+        """
+        def gathered(log):
+            """Each layer's gathered parameters, then the working set's."""
+            layers = [value.get("ag_comm", 0) for key, value in log.items() if isinstance(key[2], int)]
+            working = [value["ag_comm"] for key, value in log.items() if str(key[2]).startswith("rec_")]
+            return layers, working
+
+        kept = gathered(self._stage({"dp_shard_size": 4, "reshard_after_forward": False}))
+        layer = kept[1][0]
+        self.assertGreater(layer, 0)
+        self.assertEqual(kept, ([layer, layer], [layer]))
+        freed = gathered(self._stage({"dp_shard_size": 4}))
+        self.assertEqual(freed[0], [0, 0])
+        # The log keeps whole MB, of two layers as of one.
+        self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
+
+    @staticmethod
+    def _dynamic(micro_batches: int, **run: Any) -> float:
+        """Stage 0's dynamic memory, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
+        config = _auto_models_config(
+            accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1}, fsdp_config={"dp_shard_size": 4},
+            training={"global_batch_size": 4 * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+        )
+        with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+            mock_hf.return_value = SimpleNamespace(
+                model_type="llama", hidden_size=4096, num_hidden_layers=8, num_attention_heads=32,
+                num_key_value_heads=8, intermediate_size=14336, vocab_size=32000, max_position_embeddings=4096,
+            )
+            with tempfile.TemporaryDirectory() as folder:
+                path = os.path.join(folder, "train.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(config, handle)
+                evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        for name, value in run.items():
+            setattr(evaluator.ccfg, name, value)
+        derive(evaluator.ccfg)
+        stage = evaluator.estimate_peak_insight()[0]
+        grads = sum(value.get("accu_grad", 0) for key, value in stage["Node Log"].items() if isinstance(key[2], int))
+        return stage["Dynamic"], grads
+
+    def test_reduce_scatter_outputs_wait_for_the_backward_end(self):
+        """
+        Feature: the end of a later micro-batch's backward.
+        Description: The same stage with one micro-batch per step, with two,
+            and with two under an FSDP that adds each reduce-scatter output
+            as soon as it is reduced.
+        Expectation: With two, HyperParallel's FSDP holds every layer's
+            output until the backward ends, beside the gradients it
+            accumulated: the peak rises to at least the layers' gradients
+            again. Without accumulation, or without the deferral, it does not.
+        """
+        self.assertTrue(_make_ccfg(_dense_overrides()).defers_grads)
+        one, grads = self._dynamic(1)
+        two, _ = self._dynamic(2)
+        self.assertGreater(two, one)
+        self.assertGreaterEqual(two, grads + 1024)
+        self.assertEqual(self._dynamic(2, deferred_grad_accumulation=False)[0], one)
+
+    def test_the_run_states_whether_it_reshards(self):
+        """
+        Feature: _reshards_params.
+        Description: HyperParallel's default FSDP, and FSDP that keeps a
+            layer's gathered parameters after its forward, or after its
+            backward.
+        Expectation: The default frees them; keeping them either way keeps them.
+        """
+        got = []
+        for fsdp in ({}, {"reshard_after_forward": False}, {"reshard_after_backward": False}):
+            ccfg = _make_ccfg(_dense_overrides(fsdp_config=fsdp))
+            got.append((ccfg.reshard_params, ccfg.reshards))
+        self.assertEqual(got, [(True, True), (False, False), (False, False)])
 
 
 class TestHybridLayerStack(unittest.TestCase):

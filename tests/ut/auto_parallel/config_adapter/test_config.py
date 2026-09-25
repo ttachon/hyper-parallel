@@ -506,6 +506,36 @@ data:
         self.assertEqual(config.constraint["global_batch_size"], 64)
 
 
+    def test_train_yaml_run_reaches_the_search(self) -> None:
+        """The train.yaml's run rides along, and the search config's model dtype wins."""
+        train_yaml = {
+            "model": {
+                "name": "llama",
+                "torch_dtype": "bfloat16",
+                "config_overrides": {
+                    "hidden_size": 2048, "num_hidden_layers": 16, "num_attention_heads": 16, "vocab_size": 50000,
+                },
+            },
+            "training": {"global_batch_size": 64, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            "fsdp_config": {"dp_shard_size": 8, "reshard_after_backward": False},
+        }
+        train_path = os.path.join(self.tmpdir, "train.yaml")
+        _write_yaml(train_path, train_yaml)
+        search_path = os.path.join(self.tmpdir, "search.yaml")
+        _write_yaml(search_path, {
+            "train_yaml": train_path,
+            "model": {"torch_dtype": "float32"},
+            "cluster": {"num_nodes": 2, "cards_per_node": 8},
+            "parallelism": {"tp": [1, 2, 4]},
+        })
+
+        run = read_search_config(search_path).run
+
+        self.assertEqual(run["model"], {"torch_dtype": "float32"})
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertFalse(run["fsdp_config"]["reshard_after_backward"])
+
+
 class TestHpYamlReader(unittest.TestCase):
     """Unit tests for the HyperParallel train.yaml reader (read_hp_yaml_config)."""
 
@@ -680,6 +710,49 @@ class TestHpYamlReader(unittest.TestCase):
         config = read_hp_yaml_config(path)
 
         self.assertEqual(config.model_spec["device_num"], 32)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_yaml_states_its_run(self, mock_get_hf_config) -> None:
+        """The run's dtypes, FSDP, optimizer and clipping ride in ``run``, as stated."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="llama", num_hidden_layers=32, hidden_size=4096, intermediate_size=11008,
+            num_attention_heads=32, num_key_value_heads=8, vocab_size=128256, max_position_embeddings=8192,
+        )
+        raw = yaml.safe_load(_auto_models_hp_yaml_content())
+        raw["model_init_dtype"] = "bfloat16"
+        raw["training"]["max_grad_norm"] = 1.0
+        raw["fsdp_config"]["reshard_after_forward"] = False
+        raw["accelerator"]["context_parallel_algo"] = "ulysses_cp"
+        raw["optimizer"] = {"_target_": "hyper_parallel.optim.AdamW", "fp32_main_params": True}
+        path = os.path.join(self.tmpdir, "auto_models.yaml")
+        _write_yaml(path, raw)
+
+        run = read_hp_yaml_config(path).run
+
+        self.assertEqual(run["model"], {"torch_dtype": "bfloat16"})
+        self.assertEqual(run["model_init_dtype"], "bfloat16")
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertFalse(run["fsdp_config"]["reshard_after_forward"])
+        self.assertEqual(run["accelerator"]["context_parallel_algo"], "ulysses_cp")
+        self.assertTrue(run["optimizer"]["fp32_main_params"])
+        self.assertNotIn("activation_checkpoint", run)
+
+    def test_legacy_yaml_states_its_run_under_train(self) -> None:
+        """A legacy train.yaml's run comes from its model section and ``train``."""
+        raw = yaml.safe_load(_dense_hp_yaml_content())
+        raw["model"].update(param_init_type="float32", compute_dtype="bfloat16")
+        raw["train"]["max_grad_norm"] = 1.0
+        raw["train"]["optimizer"] = {"type": "AdamW"}
+        path = os.path.join(self.tmpdir, "train.yaml")
+        _write_yaml(path, raw)
+
+        run = read_hp_yaml_config(path).run
+
+        self.assertEqual(run["model"], {"param_init_type": "float32", "compute_dtype": "bfloat16"})
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertEqual(run["optimizer"], {"type": "AdamW"})
+        self.assertEqual(run["accelerator"]["tp_degree"], 4)
+        self.assertNotIn("gradient_checkpointing", run["training"])
 
     def test_hp_yaml_empty_accelerator_defaults(self) -> None:
         """Empty accelerator section produces default search_space (single-element lists)."""

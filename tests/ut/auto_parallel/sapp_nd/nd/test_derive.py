@@ -195,6 +195,55 @@ class TestDeriveFamily(unittest.TestCase):
             got = (ccfg.bytes_grad, ccfg.bytes_os, ccfg.bytes_norm, ccfg.bytes_dropout)
             self.assertEqual(got, want, f"{facts}: bytes_grad, bytes_os, bytes_norm, bytes_dropout={got}")
 
+    def test_optimizer_bytes(self):
+        """
+        Feature: derive_byte_widths, the optimizer's bytes per parameter.
+        Description: The default fp32 AdamW; bf16 states; Muon's one bf16
+            momentum; fp32 states with an fp32 copy of the parameters.
+        Expectation: A layer's parameter keeps its optimizer's states and
+            any copy; the embedding and output tables AdamW's two states.
+        """
+        cases = [
+            ({}, (8, 8)),
+            ({"optimizer_state_bytes": 2}, (4, 4)),
+            ({"optimizer_state_bytes": 2, "optimizer_states": 1}, (2, 4)),
+            ({"optimizer_state_bytes": 4, "main_param_bytes": 4}, (12, 12)),
+        ]
+        for facts, want in cases:
+            ccfg = _config(p=2, **facts)
+            derive(ccfg)
+            self.assertEqual((ccfg.bytes_optim, ccfg.bytes_optim_table), want, f"{facts}")
+
+    def test_resharding(self):
+        """
+        Feature: derive_resharding.
+        Description: A run that states nothing, and runs that state their
+            FSDP frees a layer's gathered parameters, or keeps them.
+        Expectation: The family keeps them, as MindSpore's optimizer
+            parallelism does; what a run states wins.
+        """
+        got = []
+        for facts in ({}, {"reshard_params": True}, {"reshard_params": False}):
+            ccfg = _config(**facts)
+            derive(ccfg)
+            got.append(ccfg.reshards)
+        self.assertEqual(got, [False, True, False])
+
+    def test_deferred_grad_accumulation(self):
+        """
+        Feature: derive_resharding, the gradients FSDP holds back.
+        Description: A run that states nothing, and one that states its FSDP
+            holds each layer's reduce-scatter output until the backward ends.
+        Expectation: The family adds each output as soon as it is reduced;
+            what a run states wins.
+        """
+        got = []
+        for facts in ({}, {"deferred_grad_accumulation": True}):
+            ccfg = _config(**facts)
+            derive(ccfg)
+            got.append(ccfg.defers_grads)
+        self.assertEqual(got, [False, True])
+
     def test_activation_sharding(self):
         """
         Feature: derive_activation_sharding.

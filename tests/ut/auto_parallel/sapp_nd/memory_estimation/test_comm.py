@@ -741,7 +741,7 @@ class TestCpCommBuffer(unittest.TestCase):
     """Test cp_comm_buffer (CP communication buffer memory estimation)."""
 
     def _make_ccfg_buffer(self, cp=2, s=1024, b=4, t=1, a=32,
-                          n_kv=32, dh=128, kv_lora_rank=0, h=4096,
+                          n_kv=32, dh=128, dc_kv=0, dhr=0, h=4096,
                           device_per_node=8, cp_algo="colossalai_cp"):
         """Create a mock CostModelConfig for CP comm buffer tests."""
         ccfg = MagicMock()
@@ -752,7 +752,8 @@ class TestCpCommBuffer(unittest.TestCase):
         ccfg.a = a
         ccfg.n_kv = n_kv
         ccfg.dh = dh
-        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.dc_kv = dc_kv
+        ccfg.dhr = dhr
         ccfg.h = h
         ccfg.device_per_node = device_per_node
         ccfg.cp_algo = cp_algo
@@ -820,18 +821,22 @@ class TestCpCommBuffer(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=0)
 
     def test_mla_kv_dim(self):
-        """CM-CB06: MLA uses kv_lora_rank for kv_dim (not h/t)."""
-        ccfg_ring = self._make_ccfg_buffer(
+        """CM-CB06: MLA exchanges its heads' K and V, not its latent.
+
+        Each head's key is 128 wide plus the 64-wide rotary part and its
+        value 128 wide: 32 * (2 * 128 + 64) / 2 each, where MHA's is h / t.
+        """
+        ccfg_mla = self._make_ccfg_buffer(
             cp=2, device_per_node=8, cp_algo="colossalai_cp",
-            kv_lora_rank=512, n_kv=32, dh=128)
+            dc_kv=512, n_kv=32, dh=128, dhr=64)
         ccfg_mha = self._make_ccfg_buffer(
             cp=2, device_per_node=8, cp_algo="colossalai_cp",
-            kv_lora_rank=0, n_kv=32, dh=128)
+            dc_kv=0, n_kv=32, dh=128)
         ctx = MagicMock()
-        r_mla = EvalLayerComm.cp_comm_buffer(ccfg_ring, ctx)
+        r_mla = EvalLayerComm.cp_comm_buffer(ccfg_mla, ctx)
         r_mha = EvalLayerComm.cp_comm_buffer(ccfg_mha, ctx)
-        # MLA kv_dim=512, MHA kv_dim=4096 → different buffer sizes
-        self.assertNotAlmostEqual(r_mla, r_mha, places=0)
+        # One extra chunk of s / cp tokens at two 2-byte tensors each.
+        self.assertEqual((r_mla, r_mha), ((1024 / 2) * 4 * 32 * (2 * 128 + 64) / 2 * 4, (1024 / 2) * 4 * 4096 * 4))
 
 
 class TestNodeCommEvalRepr(unittest.TestCase):

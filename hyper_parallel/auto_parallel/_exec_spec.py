@@ -179,6 +179,14 @@ class ExecSpec:
             parameter is, as FSDP holds it; ``grad_shard`` does not apply.
         grad_accumulation: Whether gradients take memory without pipeline
             parallelism too; under it they always do.
+        deferred_grad_accumulation: Whether FSDP holds each layer's
+            reduce-scatter output until the micro-batch's backward ends, and
+            only then adds it to the accumulated gradient, as HyperParallel's
+            does; PyTorch's FSDP2 adds it as soon as it is reduced.
+        reshard_params: Whether FSDP frees a layer's gathered parameters
+            once the layer has run, forward or backward, and gathers them
+            again when it runs next, as HyperParallel's does by default;
+            the root's, the embedding and output tables, stay gathered.
         pp_schedule: The pipeline schedule, such as ``1f1b``.
         offset: How many layers each pipeline stage holds beyond an even
             split, per stage or per chunk and stage.
@@ -203,6 +211,12 @@ class ExecSpec:
             optimizer_state_bytes, norm_bytes, dropout_bytes: Bytes per
             element of the parameters, activations, softmax outputs,
             gradients, optimizer states, norm activations and dropout masks.
+        optimizer_states: How many states the optimizer keeps per parameter
+            of a layer: AdamW's two moments, or Muon's one momentum.  The
+            embedding and output tables keep AdamW's two.
+        main_param_bytes: Bytes per element of the copy of the parameters
+            the optimizer keeps, 0 when it keeps none, as HyperParallel's
+            fp32 main parameters keep one.
         flash_attention, grad_clip, grouped_gemm, tie_embeddings: Kernels
             and features the run uses.
         vocab_emb_dp: Whether the vocabulary embedding runs data parallel.
@@ -236,6 +250,8 @@ class ExecSpec:
     grad_shard: Optional[bool] = None
     grad_shard_as_params: Optional[bool] = None
     grad_accumulation: Optional[bool] = None
+    deferred_grad_accumulation: Optional[bool] = None
+    reshard_params: Optional[bool] = None
 
     pp_schedule: Optional[str] = None
     offset: Optional[Union[int, list]] = None
@@ -256,6 +272,8 @@ class ExecSpec:
     softmax_bytes: Optional[int] = None
     grad_bytes: Optional[int] = None
     optimizer_state_bytes: Optional[int] = None
+    optimizer_states: Optional[int] = None
+    main_param_bytes: Optional[int] = None
     norm_bytes: Optional[int] = None
     dropout_bytes: Optional[int] = None
 
@@ -335,11 +353,13 @@ class ExecSpec:
 # none of them is kept as it is.
 _KINDS: Dict[str, tuple] = {
     "count": ("dp", "tp", "pp", "vpp", "cp", "ep", "micro_batch_size", "micro_batch_num",
-              "global_batch_size", "optimizer_shard", "seq_split", "seq_length"),
+              "global_batch_size", "optimizer_shard", "seq_split", "seq_length", "optimizer_states"),
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
-             "optimizer_state_bytes", "norm_bytes", "dropout_bytes"),
+             "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
     "flag": ("sequence_parallel", "shard_activations", "optimizer_parallel", "grad_shard",
-             "grad_shard_as_params", "grad_accumulation", "mtp_in_offset", "emb_out_in_offset",
+             "grad_shard_as_params", "grad_accumulation", "deferred_grad_accumulation", "reshard_params",
+             "mtp_in_offset",
+             "emb_out_in_offset",
              "recompute_slice_activation", "flash_attention", "grad_clip", "grouped_gemm",
              "vocab_emb_dp", "emb_dp_sharded", "tie_embeddings", "shard_mtp_param", "frozen"),
     "name": ("pp_schedule", "selective_rule", "cp_algo", "optimizer", "device_memory"),

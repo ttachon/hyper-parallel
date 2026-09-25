@@ -305,13 +305,27 @@ def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
     """Set the byte widths the estimators read from those the run states, else its family's.
 
     Gradients take memory only under pipeline parallelism, unless the run
-    accumulates them without it too (``grad_accumulation``).
+    accumulates them without it too (``grad_accumulation``).  The optimizer
+    keeps, per parameter, its states and any copy of the parameters: a
+    layer's parameter as many states as its optimizer has, the embedding
+    and output tables' AdamW's two.
     """
     accumulates = ccfg.p > 1 or _stated(ccfg, "grad_accumulation", run)
     ccfg.bytes_grad = _stated(ccfg, "grad_bytes", run) if accumulates else 0
     ccfg.bytes_os = _stated(ccfg, "optimizer_state_bytes", run)
+    main_copy = _stated(ccfg, "main_param_bytes", run)
+    ccfg.bytes_optim = _stated(ccfg, "optimizer_states", run) * ccfg.bytes_os + main_copy
+    ccfg.bytes_optim_table = 2 * ccfg.bytes_os + main_copy
     ccfg.bytes_norm = _stated(ccfg, "norm_bytes", run)
     ccfg.bytes_dropout = _stated(ccfg, "dropout_bytes", run)
+
+
+def derive_resharding(ccfg: Any, run: Mapping[str, Any]) -> None:
+    """Set whether FSDP frees a layer's gathered parameters once it has run, ``reshards``,
+    and whether it holds each layer's reduce-scatter output until the backward ends,
+    ``defers_grads``."""
+    ccfg.reshards = bool(_stated(ccfg, "reshard_params", run))
+    ccfg.defers_grads = bool(_stated(ccfg, "deferred_grad_accumulation", run))
 
 
 def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:
@@ -376,12 +390,13 @@ def derive_layer_fields(ccfg: Any) -> None:
 def derive_family(ccfg: Any) -> None:
     """Set what the config's family decides where its producer states nothing.
 
-    The byte widths and the activation sharding, from the run facts the
-    config states and else its family's (:func:`family_run`); an MLA
+    The byte widths, the resharding and the activation sharding, from the
+    run facts the config states and else its family's (:func:`family_run`); an MLA
     family's head width; and the fields cm gives every layer.
     """
     run = family_run(ccfg)
     derive_byte_widths(ccfg, run)
+    derive_resharding(ccfg, run)
     derive_activation_sharding(ccfg, run)
     derive_head_dim(ccfg)
     derive_layer_fields(ccfg)

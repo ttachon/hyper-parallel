@@ -25,6 +25,7 @@ Test cases:
 How to run:
     pytest tests/ut/auto_parallel/sapp_nd/test_cp_modeling.py -v
 """
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -65,6 +66,8 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Cont
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.parallelize import ParallelizeLayer
 
+DEEPSEEK_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nd", "deepseek.yaml")
+
 
 def _make_ccfg(**overrides):
     """Build a real CostModelConfig backed by _CostModVar.
@@ -76,7 +79,6 @@ def _make_ccfg(**overrides):
     defaults = {
         "s": 131072, "b": 1, "h": 8192, "a": 64, "dh": 128, "n_kv": 8,
         "cp": 4, "t": 1, "p": 1, "d": 1, "ep": 1, "device_per_node": 8,
-        "kv_lora_rank": 0,
         "bw_intra": 400.0, "bw_inter": 25.0, "cp_algo": "colossalai_cp",
         "comm_cp": 1, "comm_t": 1, "comm_ep": 1,
         "n_softmax": 4, "n_attBMM": 4, "n_attMM": 4, "n_attParamCast": 0,
@@ -464,12 +466,28 @@ class TestAttentionTypeDetection(unittest.TestCase):
     def test_mla_detection(self):
         """
         Feature: Attention type detection
-        Description: Detect MLA attention type from kv_lora_rank > 0
+        Description: Detect MLA attention type from its latent, dc_kv > 0
         Expectation: Returns AttentionType.MLA
         """
-        ccfg = _make_ccfg(kv_lora_rank=512)
+        ccfg = _make_ccfg(dc_kv=512)
         attn_type = detect_attention_type(ccfg)
         self.assertEqual(attn_type, AttentionType.MLA)
+
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="unessential",
+    )
+    def test_a_parsed_deepseek_is_mla(self):
+        """
+        Feature: Attention type detection on a parsed config
+        Description: The MindFormers DeepSeek-V3 yaml, which states its latent
+            as kv_lora_rank 512, with 128 heads at TP 4
+        Expectation: MLA, and CP exchanges its heads' K and V: 128 heads of a
+            128 + 64 wide key and a 128 wide value, a quarter per TP rank
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        self.assertEqual((detect_attention_type(ccfg), compute_kv_dim(ccfg)),
+                         (AttentionType.MLA, 128 * (2 * 128 + 64) / 2 / 4))
 
     @arg_mark(
         plat_marks=["cpu_linux"], level_mark="level0",
@@ -513,7 +531,7 @@ class TestMLAModelMemoryEstimation(unittest.TestCase):
         Description: Test memory estimation for Multi-Latent Attention (MLA) models
         Expectation: MLA has different KV cache size, should estimate correctly
         """
-        ccfg = _make_ccfg(cp=4, kv_lora_rank=512)
+        ccfg = _make_ccfg(cp=4, dc_kv=512)
         ctx = Context()
 
         cp_memory = EvalBody.act_cp_layer(ccfg, ctx)
@@ -530,11 +548,14 @@ class TestMLAModelMemoryEstimation(unittest.TestCase):
     def test_mla_vs_mha_comparison(self):
         """
         Feature: MLA vs MHA Memory Comparison
-        Description: Compare memory usage between MLA and MHA
-        Expectation: MLA should have smaller KV cache than MHA
+        Description: An MLA layer and an MHA layer of the same 64 heads and
+            hidden size, the MLA heads' keys 128 wide plus a 64-wide rotary
+            part and their values 128 wide.
+        Expectation: CP keeps the MLA layer's heads' K and V, not its latent:
+            64 * (2 * 128 + 64) / 2 wide each, wider than the MHA layer's h.
         """
-        ccfg_mla = _make_ccfg(cp=4, kv_lora_rank=512)
-        ccfg_mha = _make_ccfg(cp=4, kv_lora_rank=0, n_kv=64, a=64)
+        ccfg_mla = _make_ccfg(cp=4, dc_kv=512, n_kv=64, a=64, dhr=64)
+        ccfg_mha = _make_ccfg(cp=4, n_kv=64, a=64)
         ctx = Context()
 
         cp_memory_mla = EvalBody.act_cp_layer(ccfg_mla, ctx)
@@ -542,14 +563,9 @@ class TestMLAModelMemoryEstimation(unittest.TestCase):
 
         self.assertIsInstance(cp_memory_mla, CPMemoryBreakdown)
         self.assertIsInstance(cp_memory_mha, CPMemoryBreakdown)
-
-        self.assertGreater(cp_memory_mla.total_memory, 0)
-        self.assertGreater(cp_memory_mha.total_memory, 0)
-
-        self.assertLess(
-            cp_memory_mla.kv_cache_memory, cp_memory_mha.kv_cache_memory,
-            f"MLA kv_cache ({cp_memory_mla.kv_cache_memory}) should be smaller "
-            f"than MHA kv_cache ({cp_memory_mha.kv_cache_memory})"
+        self.assertEqual(
+            cp_memory_mla.kv_cache_memory / cp_memory_mha.kv_cache_memory,
+            64 * (2 * 128 + 64) / 2 / 8192,
         )
 
 
@@ -799,7 +815,7 @@ class TestRealCostModelConfigIntegration(unittest.TestCase):
         Description: Verify MLA path works with _CostModVar field names
         Expectation: detect_attention_type returns MLA, no crash
         """
-        ccfg = _make_ccfg(cp=4, kv_lora_rank=512)
+        ccfg = _make_ccfg(cp=4, dc_kv=512)
         ctx = Context()
         cp_memory = EvalBody.act_cp_layer(ccfg, ctx)
         cp_comm = cp_comm_layer_detailed(ccfg, ctx)
@@ -1099,19 +1115,20 @@ class TestCPWithTPLayout(unittest.TestCase):
         plat_marks=["cpu_linux"], level_mark="level0",
         card_mark="onecard", essential_mark="unessential",
     )
-    def test_mla_kv_dim_unchanged_by_tp(self):
+    def test_mla_kv_dim_split_by_tp(self):
         """
-        Feature: MLA KV Dim Not Split by TP
-        Description: MLA compressed latent is not split by TP
-        Expectation: kv_dim is the same regardless of TP degree
+        Feature: MLA KV Dim Split by TP
+        Description: CP exchanges an MLA layer's heads' K and V, whose heads
+            TP splits, not its latent
+        Expectation: kv_dim at TP 4 is a quarter of kv_dim at TP 1
         """
-        ccfg_t1 = _make_ccfg(cp=4, t=1, kv_lora_rank=512)
-        ccfg_t4 = _make_ccfg(cp=4, t=4, kv_lora_rank=512)
+        ccfg_t1 = _make_ccfg(cp=4, t=1, dc_kv=512)
+        ccfg_t4 = _make_ccfg(cp=4, t=4, dc_kv=512)
 
         kv_dim_t1 = compute_kv_dim(ccfg_t1)
         kv_dim_t4 = compute_kv_dim(ccfg_t4)
 
-        self.assertEqual(kv_dim_t1, kv_dim_t4, "MLA kv_dim should not change with TP")
+        self.assertEqual(kv_dim_t4, kv_dim_t1 / 4, "MLA kv_dim should split over TP")
 
 
 class TestUlyssesVsRing(unittest.TestCase):
