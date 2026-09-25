@@ -20,11 +20,13 @@ How to run this:
 import copy
 import dataclasses
 import os
+import tempfile
 import unittest
 from typing import Any, Dict
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook, hook_runner
 from hyper_parallel.auto_parallel._exec_spec import ExecSpec, RecomputeRange
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import (
     apply_exec,
@@ -51,6 +53,97 @@ _SOURCES = (
 )
 
 
+# A TorchTitan-style model for the TOML parser: two dense layers, then four
+# MoE layers.
+_TOML_SOURCE = """def get_train_spec():
+    return TrainSpec(model_args=model_args)
+model_args = {
+    'tiny': ModelArgs(dim=256, inter_dim=1024, hidden_dim=0, vocab_size=4096,
+                      n_heads=4, n_layers=6, n_kv_heads=0, kv_lora_rank=0,
+                      q_lora_rank=0, qk_rope_head_dim=0, n_dense_layers=2,
+                      moe_inter_dim=128, moe_enabled=True,
+                      moe_args=MoEArgs(num_experts=8, top_k=2, num_shared_experts=1),
+                      enable_weight_tying=False, multiple_of=1, ffn_dim_multiplier=1)
+}
+"""
+
+
+def _toml(folder: str) -> CostModelConfig:
+    """A TOML config of the model in :data:`_TOML_SOURCE`, on two stages."""
+    source = os.path.join(folder, "__init__.py")
+    with open(source, "w", encoding="utf-8") as handle:
+        handle.write(_TOML_SOURCE)
+    return CostModelConfig(Config({
+        "model": {"name": "deepseek_v3", "flavor": "tiny"},
+        "parallelism": {
+            "data_parallel_replicate_degree": 1, "data_parallel_shard_degree": 2,
+            "tensor_parallel_degree": 2, "pipeline_parallel_degree": 2, "context_parallel_degree": 1,
+            "expert_parallel_degree": 2, "expert_tensor_parallel_degree": 0,
+            "pipeline_parallel_schedule": "1F1B",
+        },
+        "activation_checkpoint": {"mode": "full"},
+        "training": {"seq_len": 512, "local_batch_size": 1},
+    }), framework="hyperparallel", source_code=source)
+
+
+def _mindspeed_module(model_id: str, layers: int, **extra: Any) -> Dict[str, Any]:
+    """One MindSpeed submodule."""
+    module = {
+        "model_id": model_id, "freeze": False, "moe_grouped_gemm": False,
+        "tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1,
+        "expert_model_parallel_size": 1, "sequence_parallel": False,
+        "num_layers": layers, "hidden_size": 256, "ffn_hidden_size": 1024, "vocab_size": 4096,
+        "num_attention_heads": 4, "num_query_groups": 0, "kv_channels": 0, "k_lora_rank": 0,
+        "q_lora_rank": 0, "qk_rope_head_dim": 0, "num_moe_experts": 1, "moe_router_topk": 1,
+        "n_shared_exp": 0, "moe_intermediate_size": 0, "first_k_dense_replace": 0,
+        "recompute_num_layers": 1, "params_dtype": "bfloat16", "attention_softmax_in_fp32": True,
+        "mtp_num_layers": 0,
+    }
+    module.update(extra)
+    return module
+
+
+def _mindspeed() -> CostModelConfig:
+    """A MindSpeed vision tower and DeepSeek text model, with hooks that change nothing."""
+    old_registry = MemEvalHook.hook_registry.copy()
+    try:
+        MemEvalHook.hook_registry = {}
+
+        class _Hooks(MemEvalHook):
+            """One hook per submodule."""
+
+            @staticmethod
+            @hook_runner("vit")
+            def run_hooks(e: Any) -> None:
+                """No change."""
+                del e
+
+        class _TextHooks(MemEvalHook):
+            """The text model's hook."""
+
+            @staticmethod
+            @hook_runner("deepseek_v3")
+            def run_hooks(e: Any) -> None:
+                """No change."""
+                del e
+
+        class _BothHooks(_Hooks, _TextHooks):
+            """Both submodules."""
+
+        # The config reads its hooks from the registry when it is built.
+        return CostModelConfig(Config({
+            "model_id": "multi",
+            "tmp": {"pp": 2, "mbs": 1, "dp": 2, "tp": 1, "cp": 1, "vpp": 1, "ep": 2, "seqlen": 512, "etp": 0},
+            "image_encoder": _mindspeed_module("vit", 2, pipeline_num_layers=[2, 0]),
+            "text_decoder": _mindspeed_module(
+                "deepseek_v3", 4, pipeline_num_layers=[1, 3], num_moe_experts=8, moe_router_topk=2,
+                n_shared_exp=1, moe_intermediate_size=128, first_k_dense_replace=1,
+            ),
+        }), hook_cls=_BothHooks(), framework="mindspeed")
+    finally:
+        MemEvalHook.hook_registry = old_registry
+
+
 def _state(ccfg: Any) -> Dict[str, Any]:
     """The config's fields, declared or set, with the ones held in objects read as values."""
     state = {}
@@ -68,6 +161,15 @@ def _state(ccfg: Any) -> Dict[str, Any]:
 class TestApplyExec(unittest.TestCase):
     """apply_exec writes what an ExecSpec states, and derives the rest."""
 
+    def _round_trip(self, ccfg: Any, name: str) -> None:
+        """Apply *ccfg* its own ExecSpec: only the recompute's form may change."""
+        before, layers = _state(ccfg), ccfg.generate_partitions_vpp()
+        apply_exec(ccfg, exec_of(ccfg))
+        after = _state(ccfg)
+        changed = sorted(key for key, value in before.items() if value != after[key])
+        self.assertEqual(changed, ["recompute_ranges"], f"{name}: fields changed {changed}")
+        self.assertEqual(ccfg.generate_partitions_vpp(), layers, name)
+
     def test_its_own_spec_leaves_a_config_as_it_is(self):
         """
         Feature: exec_of and apply_exec.
@@ -77,13 +179,20 @@ class TestApplyExec(unittest.TestCase):
             stated as ranges, and every layer recomputes as before.
         """
         for path, framework in _SOURCES:
-            ccfg = CostModelConfig(path, framework=framework)
-            before, layers = _state(ccfg), ccfg.generate_partitions_vpp()
-            apply_exec(ccfg, exec_of(ccfg))
-            after = _state(ccfg)
-            changed = sorted(key for key, value in before.items() if value != after[key])
-            self.assertEqual(changed, ["recompute_ranges"], f"{os.path.basename(path)}: fields changed {changed}")
-            self.assertEqual(ccfg.generate_partitions_vpp(), layers, os.path.basename(path))
+            self._round_trip(CostModelConfig(path, framework=framework), os.path.basename(path))
+
+    def test_every_parser_reads_its_config_back(self):
+        """
+        Feature: exec_of and apply_exec, for the parsers the yamls do not reach.
+        Description: The same round trip on a TOML config of a DeepSeek-shaped
+            model, and on each submodule of a MindSpeed vision-language model.
+        Expectation: No field changes but the recompute's form, and every
+            layer recomputes as before.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            self._round_trip(_toml(folder), "toml")
+        for name, submodule in _mindspeed().mm_ccfgs.items():
+            self._round_trip(submodule, f"mindspeed {name}")
 
     def test_a_partial_spec_changes_what_it_states(self):
         """

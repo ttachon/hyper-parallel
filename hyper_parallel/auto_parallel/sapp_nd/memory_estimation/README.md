@@ -188,6 +188,33 @@ parser states nothing: the run's byte widths, whether its gradients take memory
 without pipeline parallelism and whether TP shards its activations (`run`),
 and an MLA family's value-head width (`model`). `derive()` reads them.
 
+A parser may state the run as one `ExecSpec` (`auto_parallel/_exec_spec.py`)
+and apply it with `apply_exec(ccfg, spec)` (`nd/common/apply_exec.py`), which
+writes what the spec states and derives the rest; the HyperParallel yaml
+parser (`hyper_v2`) does. `exec_of(ccfg)` reads any config's spec back, its
+recompute as ranges.
+`set_strategy()` goes through the same two: `strategy_exec` turns its
+keywords into an ExecSpec. A config a search owns takes a new degree (`d`,
+`t`, `ep`, `p`, `vp`, `cp`, `os_max_shard`) only through these and refuses a
+direct write; a copy of it, such as an estimator's, starts free.
+
+```python
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec, exec_of
+
+spec = ExecSpec.from_dict({"tp": 4, "recompute": [
+    {"first": 0, "count": 3, "option": "full"},
+    {"first": 3, "option": "selective", "ops": {"ffAct": "recompute", "normOp": "recompute"}},
+]})
+apply_exec(ccfg, spec)   # three layers recomputed in full, the rest selectively
+exec_of(ccfg).recompute  # the same ranges, read back
+```
+
+Recompute ranges run in model order over the body layers and then the MTP
+layers; a layer no range covers is not recomputed. A selective range names
+the ops it recomputes, or none to take the run's rule (`selective_rule`), and
+a config prices one selective setting.
+
 The parser is responsible for validating user input before it reaches memory
 formulas. At minimum, it should normalize model metadata, model hyperparameters,
 parallel strategy, recomputation settings, precision bytes, and device capacity.
