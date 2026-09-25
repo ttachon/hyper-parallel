@@ -37,7 +37,7 @@ CONFIG_OVERRIDE_FIELDS = [
     "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
     "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
     "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
-    "head_dim", "vision", "attn_output_gate",
+    "head_dim", "vision", "attn_output_gate", "qk_norm",
     "layer_types", "linear_num_key_heads", "linear_key_head_dim",
     "linear_num_value_heads", "linear_value_head_dim",
     "linear_conv_kernel_dim",

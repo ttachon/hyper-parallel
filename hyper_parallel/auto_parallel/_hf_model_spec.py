@@ -64,6 +64,8 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "qk_rope_head_dim": ("qk_rope_head_dim",),
     "attn_output_gate": ("attn_output_gate",),
     "tie_word_embeddings": ("tie_word_embeddings",),
+    # Stated by a few families; Qwen3's config does not state its own.
+    "qk_norm": ("qk_norm", "use_qk_norm", "qk_layernorm"),
     # A hybrid stack states its layers; without this every layer is costed
     # as full attention, which is quadratic in the sequence length.
     "layer_types": ("layer_types",),
@@ -88,6 +90,30 @@ _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 
 # Fallback when a vision tower declares no positional-embedding grid.
 _DEFAULT_VISUAL_SEQ_LEN = 1024
+
+
+# What a lower-cased model name contains when its attention normalizes each
+# head's queries and keys: the Qwen3 generation, Qwen3.5 and the Qwen3
+# vision-language models included.
+_QK_NORM_NAMES = ("qwen3",)
+
+
+def infer_qk_norm(name: Any) -> bool:
+    """Return whether a model named *name* normalizes each head's queries and keys.
+
+    For a producer whose config does not state it, as a Transformers config
+    does not: the Qwen3 generation does, and no other family the cost model
+    prices does.
+    """
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _QK_NORM_NAMES)
+
+
+def _settle_qk_norm(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Settle whether the language model normalizes queries and keys, from its name if nothing states it."""
+    if spec.get("qk_norm") is None:
+        spec["qk_norm"] = infer_qk_norm(spec.get("name"))
+    return spec
 
 
 def _declares_pretrained_path(mapping: Any) -> bool:
@@ -254,7 +280,9 @@ def resolve_hf_model_spec(
     ``model.config_overrides`` stays supported for standalone cost-model
     search files, and doubles as the fallback when the Transformers config
     cannot be reached (offline node, unreachable repository).  Explicit
-    overrides always win over resolved values.
+    overrides always win over resolved values.  Whether the language model
+    normalizes its queries and keys, which a Transformers config does not
+    state, is settled from its name when nothing states it.
 
     Args:
         model_raw: The ``model`` section, as a plain mapping.
@@ -273,7 +301,7 @@ def resolve_hf_model_spec(
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            return explicit
+            return _settle_qk_norm(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path "
             "or model.config_overrides for Auto Parallel search"
@@ -288,7 +316,7 @@ def resolve_hf_model_spec(
                 "falling back to model.config_overrides", exc,
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            return explicit
+            return _settle_qk_norm(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "
@@ -308,4 +336,4 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    return spec
+    return _settle_qk_norm(spec)

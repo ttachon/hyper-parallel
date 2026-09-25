@@ -1390,7 +1390,8 @@ class TestHybridLayerStack(unittest.TestCase):
             one layer after the next.  Record the attention fields each
             layer of [linear, linear, full, linear, full] is priced with.
         Expectation: A full layer gets the full-attention fields back rather
-            than keeping those of the linear layers before it.
+            than keeping those of the linear layers before it, its QK-norm
+            included, which a linear layer's kernel does without.
         """
         linear_kind, full_kind = "linear_attention", "full_attention"
         mock_hf.return_value = SimpleNamespace(
@@ -1412,7 +1413,7 @@ class TestHybridLayerStack(unittest.TestCase):
             if isinstance(ctx.current_lay_id, int):
                 seen.setdefault(ctx.current_lay_id, (
                     ccfg.attn_kind, ccfg.a, ccfg.dh, ccfg.n_kv,
-                    ccfg.n_softmax, ccfg.n_linrec, ccfg.attn_extra_p,
+                    ccfg.n_softmax, ccfg.n_linrec, ccfg.attn_extra_p, ccfg.n_qknorm,
                 ))
             return EvalAttn.attn_score_activations(ccfg, ctx)
 
@@ -1424,9 +1425,9 @@ class TestHybridLayerStack(unittest.TestCase):
         evaluator.set_attn_eval_fun(score=spy)
         evaluator.estimate_peak()
 
-        full = ("full", 8, 128, 2, 1, 0, 0)
+        full = ("full", 8, 128, 2, 1, 0, 0, 1)
         # Conv over q, k and v, plus two gates per value head.
-        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16)
+        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16, 0)
         self.assertEqual([seen[lay_id] for lay_id in sorted(seen)],
                          [linear, linear, full, linear, full])
 

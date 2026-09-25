@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 # place, one layer after another, rather than on a copy per group.
 _LINEAR_ATTN_FIELDS = (
     "a", "dh", "n_kv", "attn_output_gate", "n_attBMM", "n_softmax",
-    "n_headCast", "n_linrec", "attn_extra_p",
+    "n_headCast", "n_linrec", "attn_extra_p", "n_qknorm",
     "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
 )
 
@@ -264,6 +264,8 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
         # Qwen3.5 fuses the output gate into q_proj, doubling its width.
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
+        # Qwen3 normalizes each head's queries and keys.
+        self.state_qk_norm(ccfg, spec.get("qk_norm", False))
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""
@@ -376,6 +378,8 @@ class CostModelParserHyperV2(_CostModelParser):
             lccfg.n_softmax = 0
             lccfg.n_headCast = 0
             lccfg.n_linrec = 1
+            # The kernel normalizes its queries and keys itself, with no weights.
+            lccfg.n_qknorm = 0
             # Short convolution over the projected stream, plus the two
             # per-head gates the delta rule needs.
             qkv_width = 2 * linear["n_k"] * linear["d_k"] + linear["n_v"] * linear["d_v"]

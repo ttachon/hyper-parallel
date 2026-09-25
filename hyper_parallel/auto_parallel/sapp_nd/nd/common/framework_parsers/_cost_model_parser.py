@@ -72,6 +72,15 @@ class _CostModelParser(ABC):
         return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
 
     @staticmethod
+    def state_qk_norm(ccfg, qk_norm):
+        """State whether the model normalizes each head's queries and keys, and the QK-norm each layer runs.
+
+        A layer group whose attention has none, a linear one, states 0 instead.
+        """
+        ccfg.qk_norm = bool(qk_norm)
+        ccfg.n_qknorm = 1 if ccfg.qk_norm else 0
+
+    @staticmethod
     def optimizer_ranks(ccfg):
         """How many data-parallel ranks the optimizer shards a parameter over.
 

@@ -19,6 +19,7 @@ import importlib.util
 import time
 import sys
 import os
+from hyper_parallel.auto_parallel._hf_model_spec import infer_qk_norm
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -234,6 +235,12 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.dc_kv = self.ccfg.specs.kv_lora_rank
         self.ccfg.dc_q = self.ccfg.specs.q_lora_rank
         self.ccfg.dhr = self.ccfg.specs.qk_rope_head_dim
+        # TorchTitan's Qwen3 flavors normalize each head's queries and keys
+        # unless they state otherwise; its other families have no QK-norm.
+        stated = vars(self.ccfg.specs)
+        self.state_qk_norm(
+            self.ccfg, stated["qk_norm"] if "qk_norm" in stated else infer_qk_norm(self.ccfg.model_name)
+        )
         self.ccfg.k_1st_dense = self.ccfg.specs.n_dense_layers
         self.ccfg.is_mtp_in_offset = True
 
