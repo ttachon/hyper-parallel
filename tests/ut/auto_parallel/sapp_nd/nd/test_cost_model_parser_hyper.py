@@ -29,6 +29,7 @@ import yaml
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import _optimizer_bytes
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
@@ -587,6 +588,27 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.bytes_grad, 4)
         self.assertEqual(ccfg.bytes_os, 4)
         self.assertEqual(ccfg.bytes_norm, 4)
+
+    def test_optimizer_states_follow_the_stored_parameters(self):
+        """
+        Feature: _init_optimizer_states, and the family hook that prices it.
+        Description: A bf16 model trained with AdamW, with Muon, and with
+            fp32 main parameters.
+        Expectation: AdamW's two moments and Muon's one momentum take the
+            stored parameters' bf16: 4 and 2 bytes per layer parameter, the
+            tables' AdamW 4; fp32 main parameters keep fp32 states and an
+            fp32 copy, 12 bytes per parameter.
+        """
+        got = []
+        for optimizer in ({"max_grad_norm": 1.0},
+                          {"_target_": "hyper_parallel.components.optim.Muon"},
+                          {"fp32_main_params": True}):
+            ccfg = _make_ccfg(_dense_overrides(model={"torch_dtype": "bfloat16"}, train={"optimizer": optimizer}))
+            facts = SimpleNamespace(optimizer_state_bytes=ccfg.optimizer_state_bytes,
+                                    optimizer_states=ccfg.optimizer_states, main_param_bytes=ccfg.main_param_bytes)
+            _optimizer_bytes(facts, 4)
+            got.append((facts.bytes_os, facts.bytes_optim, facts.bytes_optim_table))
+        self.assertEqual(got, [(2, 4, 4), (2, 2, 4), (4, 12, 12)])
 
     def test_top_level_model_init_dtype_sizes_the_parameters(self):
         """

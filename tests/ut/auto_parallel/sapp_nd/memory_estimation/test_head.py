@@ -26,8 +26,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 
 def _embedding(tied: bool, p: int) -> SimpleNamespace:
     """An embedding of 1000 x 64 parameters, sharded over 4 ranks."""
-    return SimpleNamespace(h=64, v=1000, shard_embed=4, cp=1, bytes_p=2, bytes_os=4, bytes_grad=2,
-                           tie_emb_out=tied, p=p)
+    return SimpleNamespace(h=64, v=1000, shard_embed=4, cp=1, bytes_p=2, bytes_os=4, bytes_optim_table=8,
+                           bytes_grad=2, tie_emb_out=tied, p=p)
 
 
 _CTX = SimpleNamespace(eval=SimpleNamespace(num_p=EvalHead.num_params_embed), swap_os=False)

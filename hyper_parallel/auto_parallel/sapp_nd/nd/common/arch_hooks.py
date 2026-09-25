@@ -32,6 +32,20 @@ def _grad_bytes(ccfg, width, without_pp=False):
     return width if (without_pp or ccfg.p > 1) else 0
 
 
+def _optimizer_bytes(ccfg, width):
+    """Set what the optimizer keeps: a state's width, and its bytes per parameter.
+
+    A state takes the width the run states, else the family's *width*.  A
+    layer's parameter keeps as many states as the run's optimizer has, two
+    unless it says, and any copy of the parameters the optimizer keeps; the
+    embedding and output tables keep AdamW's two states.
+    """
+    ccfg.bytes_os = getattr(ccfg, "optimizer_state_bytes", None) or width
+    main_copy = getattr(ccfg, "main_param_bytes", None) or 0
+    ccfg.bytes_optim = (getattr(ccfg, "optimizer_states", None) or 2) * ccfg.bytes_os + main_copy
+    ccfg.bytes_optim_table = 2 * ccfg.bytes_os + main_copy
+
+
 class CWrap:
     """Temporary evaluator-like instance"""
 
@@ -81,7 +95,7 @@ def custom_default_transformer(ccfg):
     ccfg.n_normOp = 2  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
     ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 0  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
 
@@ -112,7 +126,7 @@ def custom_mixtral(ccfg):
     ccfg.n_normOp = 5  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
     ccfg.bytes_grad = _grad_bytes(ccfg, 2)  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 0  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
     ccfg.hff = ccfg.hff_exp
@@ -138,7 +152,7 @@ def custom_t5(ccfg):
         c.n_normOp = 2  # num normalization
         c.n_gather = 4  # num gather (TP)
         c.bytes_grad = _grad_bytes(c, 4)  # gradients
-        c.bytes_os = 4  # optimizer states
+        _optimizer_bytes(c, 4)
         c.bytes_dropout = 1  # dropout mask
         c.bytes_norm = 4  # normalization input
 
@@ -158,7 +172,7 @@ def custom_t5(ccfg):
         c.n_normOp = 3  # num normalization
         c.n_gather = 6  # num gather (TP)
         c.bytes_grad = _grad_bytes(c, 4)  # gradients
-        c.bytes_os = 4  # optimizer states
+        _optimizer_bytes(c, 4)
         c.bytes_dropout = 1  # dropout mask
         c.bytes_norm = 4  # normalization input
 
@@ -175,7 +189,7 @@ def custom_t5(ccfg):
     # The model takes the byte widths every layer takes: the embedding and
     # the output layer are priced on it, before and after any layer.
     ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 1  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
     ccfg.layer_custom_config = [
@@ -201,7 +215,7 @@ def custom_pangualpha(ccfg):
     ccfg.n_normOp = 4  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
     ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 1  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
 
