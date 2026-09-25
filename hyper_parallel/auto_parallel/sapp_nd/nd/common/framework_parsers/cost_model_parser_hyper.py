@@ -585,6 +585,7 @@ class CostModelParserHyperV2(_CostModelParser):
         dp_shard = self._parse_parallel_dimensions(accel, fsdp)
         self._parse_sequence_parallelism(accel)
         self._parse_optimizer_parallelism(accel, dp_shard)
+        self._parse_expert_sharding(fsdp)
 
     def _parse_parallel_dimensions(self, accel, fsdp) -> int:
         """Populate mesh dimensions and return the data shard degree."""
@@ -667,6 +668,17 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
         )
+
+    def _parse_expert_sharding(self, fsdp) -> None:
+        """How HyperParallel's FSDP shards a routed expert under expert parallelism.
+
+        Over ``edp_shard_size`` ranks of its expert data-parallel group, 1 by
+        default: a run that states none keeps each of its experts whole on
+        every rank holding it.  The legacy schema states nothing, and the
+        family's rule applies.
+        """
+        if is_auto_models_schema(self.config):
+            self.ccfg.expert_shard = max(1, int(self._get_cfg_attr(fsdp, "edp_shard_size", 1) or 1))
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
         """Populate optimizer and gradient sharding settings.

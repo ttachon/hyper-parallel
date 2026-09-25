@@ -166,6 +166,14 @@ class GlobalConfig:
         if not r2:
             logger.warning("EP constraint C2 failed: %s", r2.message)
             return False
+        # C4: an expert shard the run states divides its expert data-parallel
+        # group, the stage's ranks over EP, as HyperParallel requires.
+        shard = getattr(self.ccfg, "expert_shard", None) or 1
+        if ep > 1 and shard > 1:
+            group = self.dim_val(Dim.DP, parallel_config) * self.dim_val(Dim.CP, parallel_config) * tp // ep
+            if group % shard:
+                logger.warning("EP constraint C4 failed: an expert shard of %d in a group of %d", shard, group)
+                return False
         return True
 
     def make_parallel_config_args(self, **kwargs):
