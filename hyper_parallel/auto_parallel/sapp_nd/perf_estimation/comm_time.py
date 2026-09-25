@@ -161,6 +161,32 @@ def _ring_cp_volumes(ccfg, rec_factor, kv_dim):
     return _CPVolumes(kv_vol_step, total_kv, comm_vol, int(cp - 1), 2)
 
 
+def cp_traffic(ccfg: CostModelConfig, cp_algo: CPAlgo) -> float:
+    """The bytes a rank moves a micro-batch for one layer's context parallelism.
+
+    Attention exchanges its keys and values, the MLP nothing.  colossalai
+    and hybrid CP all-gather K and V over the sequence in the forward and
+    reduce-scatter their gradients in the backward, as HyperParallel runs
+    them (a ring passes the same chunks), each moving (cp - 1) / cp of the
+    sequence a rank.  Ulysses all-to-alls the local query, key, value and
+    output between sequence and heads, forward and backward.  A
+    linear-attention layer passes its recurrent state to the next rank,
+    and its gradient back, unless it all-to-alls as Ulysses does.
+    """
+    cp, t = ccfg.cp, max(1, ccfg.t)
+    ring = (cp - 1) / cp
+    head = ccfg.dh or ccfg.h / max(1, ccfg.a)
+    kv_width = compute_kv_dim(ccfg)
+    if cp_algo == CPAlgo.ULYSSES_CP:
+        rope = ccfg.dhr if detect_attention_type(ccfg) == AttentionType.MLA else 0
+        widths = ccfg.a * (head + rope) / t + 2 * kv_width + ccfg.a * head / t
+        return 2 * ring * ccfg.s / cp * ccfg.b * widths * ccfg.bytes_compute
+    if ccfg.n_linrec:
+        state_bytes = 4
+        return 2 * ccfg.a / t * head * head * state_bytes
+    return 2 * ring * ccfg.s * ccfg.b * 2 * kv_width * ccfg.bytes_compute
+
+
 def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPCommunicationCost:
     """Estimate CP communication cost with detailed breakdown.
 
@@ -193,6 +219,7 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
         volumes = _ulysses_cp_volumes(ccfg, rec_factor)
     else:
         volumes = _ring_cp_volumes(ccfg, rec_factor, kv_dim)
+    volumes = volumes._replace(comm_volume=cp_traffic(ccfg, cp_algo))
     return _cp_comm_cost_common(
         ccfg, volumes, attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
@@ -542,9 +569,10 @@ def _accumulate_stage_comm(param, stage, stage_id):
             comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
                 cfg, param["ctx"], 1
             )  # * param["cfg"].ep
-            comm[Dim.CP] += cp_comm_layer_detailed(
-                cfg, param["ctx"]
-            ).comm_volume
+            if is_body:
+                comm[Dim.CP] += cp_comm_layer_detailed(
+                    cfg, param["ctx"]
+                ).comm_volume
             # min(device_type.level_bound_number[0], param["cfg"].ep)
             # comm_cp += EvalLayerComm.cp_comm_layer
             # (param["cfg"], param["ctx"])

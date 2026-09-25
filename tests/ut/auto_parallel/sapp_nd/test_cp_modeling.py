@@ -2366,23 +2366,24 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         plat_marks=["cpu_linux"], level_mark="level0",
         card_mark="onecard", essential_mark="unessential",
     )
-    def test_comm_volume_equals_old_cp_comm_layer(self):
+    def test_comm_volume_is_the_keys_and_values_exchanged(self):
         """
-        Feature: CP comm_volume backward compatibility
-        Description: comm_volume should exactly equal the legacy
-                     EvalLayerComm.cp_comm_layer output, since it replaced
-                     that value in the comm[Dim.CP] accumulation.
-        Expectation: comm_volume == old cp_comm_layer (Ring cp=4)
+        Feature: CP comm_volume, the traffic the time model prices.
+        Description: GQA at cp=4 (8 KV heads of 128, bf16, 131072 tokens):
+                     colossalai CP, Ulysses, and a linear-attention layer.
+        Expectation: colossalai gathers K and V forward and reduce-scatters
+                     their gradients backward, 3/4 of the sequence a rank
+                     each; Ulysses all-to-alls its local query, key, value
+                     and output both ways, 3/4 of each; the linear layer
+                     passes its fp32 recurrent state and its gradient.
         """
-        ccfg = _make_ccfg(cp=4, p=1)
-        ctx = Context()
-        ctx.current_node = LayerType.NOT_REC_LAYER
-
-        new_result = cp_comm_layer_detailed(ccfg, ctx)
-        old_result = EvalLayerComm.cp_comm_layer(ccfg, ctx)
-        self.assertAlmostEqual(new_result.comm_volume, old_result, places=6,
-                               msg=f"comm_volume ({new_result.comm_volume}) should equal "
-                                   f"old cp_comm_layer ({old_result})")
+        ring = cp_comm_layer_detailed(_make_ccfg(cp=4, p=1), Context())
+        self.assertAlmostEqual(ring.comm_volume, 2 * 0.75 * 131072 * 2 * 1024 * 2)
+        self.assertAlmostEqual(ring.comm_volume, ring.total_kv_volume)
+        ulysses = cp_comm_layer_detailed(_make_ccfg(cp=4, p=1, cp_algo="ulysses_cp"), Context())
+        self.assertAlmostEqual(ulysses.comm_volume, 2 * 0.75 * 131072 / 4 * (8192 + 2 * 1024 + 8192) * 2)
+        linear = cp_comm_layer_detailed(_make_ccfg(cp=4, p=1, n_linrec=1), Context())
+        self.assertAlmostEqual(linear.comm_volume, 2 * 64 * 128 * 128 * 4)
 
 
 class TestCPCommBufferInPeak(unittest.TestCase):
