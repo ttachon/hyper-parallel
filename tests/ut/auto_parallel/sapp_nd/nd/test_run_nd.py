@@ -330,7 +330,7 @@ def _make_arch_cfg(**kwargs: Any) -> SimpleNamespace:
     return SimpleNamespace(**defaults)
 
 
-def _torchtitan_flavor(name: str, args: str) -> CostModelConfig:
+def _torchtitan_flavor(name: str, args: str, **parallelism: Any) -> CostModelConfig:
     """Parse a TorchTitan flavor of model *name* stating *args*, as the TOML parser reads one."""
     toml = Config({
         "model": {"name": name, "flavor": "tiny"},
@@ -338,7 +338,7 @@ def _torchtitan_flavor(name: str, args: str) -> CostModelConfig:
             "data_parallel_replicate_degree": 1, "data_parallel_shard_degree": 2,
             "tensor_parallel_degree": 1, "pipeline_parallel_degree": 1, "context_parallel_degree": 1,
             "expert_parallel_degree": 1, "expert_tensor_parallel_degree": 0,
-            "pipeline_parallel_schedule": "1F1B",
+            "pipeline_parallel_schedule": "1F1B", **parallelism,
         },
         "activation_checkpoint": {"mode": "full"},
         "training": {"seq_len": 128, "local_batch_size": 1},
@@ -1613,6 +1613,21 @@ class TestSappNDRunND(unittest.TestCase):
             ccfg = _torchtitan_flavor(name, args)
             got.append((ccfg.qk_norm, ccfg.n_qknorm))
         self.assertEqual(got, [(True, 1), (False, 0), (True, 1), (False, 0), (False, 0)])
+
+    def test_torchtitan_reshards_as_its_policy_says(self) -> None:
+        """
+        Feature: the TOML parser's FSDP resharding.
+        Description: TorchTitan's default policy without pipelining and at
+            PP 2, and its always and never policies at PP 2.
+        Expectation: The default reshards only without pipelining; always
+            and never do as they say.
+        """
+        flavor = "dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=4, n_kv_heads=4"
+        cases = ({}, {"pipeline_parallel_degree": 2},
+                 {"pipeline_parallel_degree": 2, "fsdp_reshard_after_forward": "always"},
+                 {"fsdp_reshard_after_forward": "never"})
+        got = [_torchtitan_flavor("llama3", flavor, **case).reshards for case in cases]
+        self.assertEqual(got, [True, False, True, False])
 
     def test_a_hook_class_prices_time_as_it_prices_memory(self) -> None:
         """

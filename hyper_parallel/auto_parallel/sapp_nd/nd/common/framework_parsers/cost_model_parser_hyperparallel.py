@@ -164,6 +164,11 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.p = max(1, self.config.parallelism.pipeline_parallel_degree)
         self.ccfg.cp = max(1, self.config.parallelism.context_parallel_degree)
         self.ccfg.ep = max(1, self.config.parallelism.expert_parallel_degree)
+        # TorchTitan's FSDP2 frees a block's gathered parameters after its
+        # forward under the "always" policy, and under the default one when
+        # nothing is pipelined.
+        policy = self.config.parallelism.fsdp_reshard_after_forward or "default"
+        self.ccfg.reshards = policy == "always" or (policy == "default" and self.ccfg.p == 1)
         self.ccfg.sp = self.ccfg.t
         self.ccfg.vp = 1
         self.ccfg.op_weight_shard = self.config.parallelism.data_parallel_shard_degree

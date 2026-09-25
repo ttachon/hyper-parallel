@@ -673,6 +673,7 @@ class CostModelParserHyperV2(_CostModelParser):
                                                              "gradient_accumulation_shard",
                                                              False))
         self.ccfg.grads_as_params = True
+        self.ccfg.reshards = self._reshards_params()
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
             else self.ccfg.d
@@ -745,6 +746,18 @@ class CostModelParserHyperV2(_CostModelParser):
         # the generated cost-model yaml carries no optimizer section.
         self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
         self._init_optimizer_states(optimizer, str(opt_type or ""))
+
+    def _reshards_params(self):
+        """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
+
+        It does after the layer's forward and after its backward, unless the
+        run keeps them gathered through either.
+        """
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
+        return bool(
+            self._get_cfg_attr(fsdp, "reshard_after_forward", True)
+            and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
+        )
 
     def _init_optimizer_states(self, optimizer, target):
         """State what HyperParallel's optimizer keeps per parameter.

@@ -197,6 +197,10 @@ class _CostModVar:
     main_param_bytes: float = None
     bytes_optim: float = 0
     bytes_optim_table: float = 0
+    # Whether FSDP frees a layer's gathered parameters once it has run, and
+    # gathers them again when it runs next; MindSpore's optimizer
+    # parallelism keeps its gathered weights.
+    reshards: bool = False
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
