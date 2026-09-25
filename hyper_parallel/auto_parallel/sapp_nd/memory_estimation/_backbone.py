@@ -138,10 +138,12 @@ class _Backbone:
 
     def _inner_static_mem(self) -> float:
         """static memory evaluation for backbone estimation"""
+        self._ctx.node_grad = 0
         if self._ctx.current_node in self._ctx.node_eval:
             p = self._ctx.eval.stat.p(self._ccfg, self._ctx)
             ost = self._ctx.eval.stat.os(self._ccfg, self._ctx)
             grad = self._ctx.eval.stat.grad(self._ccfg, self._ctx)
+            self._ctx.node_grad = grad
             res = p + ost + grad
             self._ctx.save2log("_param", res)
             # Log routed/shared expert param breakdown for MoE layers
@@ -482,6 +484,22 @@ class _Backbone:
         self._ccfg = original_ccfg
         return res
 
+    @staticmethod
+    def _stage_buffers(stages: list, pipeline: int) -> Dict:
+        """What the layer loop fills, per stage, chunk and layer, and per stage."""
+        def per_layer(value):
+            """One *value* per layer of every chunk of every stage."""
+            return [[[value for _ in c] for c in s] for s in stages]
+
+        return {
+            "stat": per_layer(0),
+            "dyn": per_layer(0),
+            "comm": per_layer(0),
+            "micro": per_layer(1),
+            "grad_out": [0 for _ in stages],
+            "logs": [Config({}) for _ in range(pipeline)],
+        }
+
     def __estimate_stages_backbone(self, *args) -> Tuple[list, Dict]:
         """Evaluator's main function for stage estimation"""
         stages = args[0]
@@ -503,11 +521,7 @@ class _Backbone:
                 ),
             )
 
-        stage_misc = {
-            "stat": [[[0 for _ in c] for c in s] for s in stages],
-            "dyn": [[[0 for _ in c] for c in s] for s in stages],
-            "logs": [Config({}) for _ in range(self._ccfg.p)],
-        }
+        stage_misc = self._stage_buffers(stages, self._ccfg.p)
         # tmp_ppb_lay_desc = []  # PPB purpose
         ppb_lay_desc = []
         record_lay_types = {}
@@ -626,10 +640,14 @@ class _Backbone:
                     self._ctx.current_chunk_id = chunk_id
                     self._ctx.current_lay_id = lay_id
                     self._ctx.current_node = node
-                    sm["stat"][stage_id][chunk_id][lay_id] = self._inner_static_mem()
-                    sm["dyn"][stage_id][chunk_id][lay_id] = sum(
-                        self._inner_dynamic_mem()
-                    )
+                    static_mem = self._inner_static_mem()
+                    sm["stat"][stage_id][chunk_id][lay_id] = static_mem
+                    activation, comm = self._inner_dynamic_mem()
+                    sm["dyn"][stage_id][chunk_id][lay_id] = activation + comm
+                    sm["comm"][stage_id][chunk_id][lay_id] = comm
+                    sm["micro"][stage_id][chunk_id][lay_id] = self._ctx.micro_factor or 1
+                    if self.is_regular_layer(node):
+                        sm["grad_out"][stage_id] += self._ctx.node_grad
                     if verbose:
                         logger.info("pp micro factor for dynamic: %s",self._ctx.micro_factor)
                     # PPB Purpose
@@ -649,6 +667,34 @@ class _Backbone:
                         self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
                 self.__update_stage_logs(sm["logs"], stage_id)
 
+    def __backward_end(self, stages, stage_id, sm, record_lay_types) -> float:
+        """The stage's dynamic memory as a later micro-batch's backward ends, or 0.
+
+        FSDP that holds each layer's reduce-scatter output until the backward
+        ends, and accumulates gradients over several micro-batches, then
+        holds the outputs of all the stage's layers beside the gradients it
+        accumulated: its peak can come as the backward ends, when that
+        micro-batch keeps nothing but the other micro-batches in flight
+        still do.  The root's gathered tables stay, and the stage's first
+        layer runs its backward last.
+        """
+        if self._ccfg.freeze or not self._ccfg.defers_grads or self._ccfg.m <= 1 or not sm["grad_out"][stage_id]:
+            return 0
+        kept = 0
+        for chunk_id, chunk in enumerate(stages[stage_id]):
+            for lay_id, node in enumerate(chunk):
+                if self.is_regular_layer(node):
+                    micro = sm["micro"][stage_id][chunk_id][lay_id]
+                    kept += sm["dyn"][stage_id][chunk_id][lay_id] * (micro - 1) / micro
+                else:
+                    kept += sm["comm"][stage_id][chunk_id][lay_id]
+        ccfg, ctx = self._ccfg, self._ctx
+        try:
+            working = self._overhead_obj.first_layer_working_set(stages, stage_id, record_lay_types)
+        finally:
+            self._ccfg, self._ctx = ccfg, ctx
+        return kept + sm["grad_out"][stage_id] + working
+
     def __postprocess_stages(self, *args):
         """Build memory insights from raw stage evaluation buffers."""
         stages, record_lay_types = args[0], args[1]
@@ -663,6 +709,7 @@ class _Backbone:
             ins["Dynamic"] = sum(
                 sum(mem for mem in c) for c in sm["dyn"][stage_id]
             )
+            backward_end = self.__backward_end(stages, stage_id, sm, record_lay_types)
             self._ctx.init_tmp_buff()
             if not self._ccfg.freeze:
                 ins["Dynamic"] += self._overhead_obj.estimate(
@@ -672,6 +719,7 @@ class _Backbone:
             safety_buffer = 1024 * 1024 * 1024  # 1 GB
             if ins["Dynamic"] > 0:
                 ins["Dynamic"] += safety_buffer
+                ins["Dynamic"] = max(ins["Dynamic"], backward_end + safety_buffer)
             stage_accu = sm["logs"][stage_id].accu_mem_type
             ins["ModelParameters"] = self.mb(stage_accu[MemType.MODEL_PARAM])
             ins["OptimizerStates"] = self.mb(stage_accu[MemType.OPTIM_STATE])

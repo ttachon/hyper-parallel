@@ -59,6 +59,23 @@ class _BackwardOverhead:
         finally:
             self._ctx.working_set = False
 
+    def first_layer_working_set(self, stages: list, stage_id: int, record_lay_types: dict) -> float:
+        """The working set of the backward of the stage's first layer, the last it runs, unlogged."""
+        for lay_id, node in enumerate(stages[stage_id][0]):
+            if self.backbone.is_regular_layer(node):
+                break
+        else:
+            return 0
+        self._fetch_node_and_switch_env(stages, record_lay_types, stage_id, 0, lay_id)
+        ctx = self._ctx
+        saved = (ctx.current_node, ctx.current_lay_id, ctx.enable_node_log, dict(ctx.accu_mem_type))
+        ctx.current_node = LayerType.NOT_REC_LAYER if node == LayerType.FULL_REC_LAYER else node
+        ctx.enable_node_log = False
+        try:
+            return self._working_set()
+        finally:
+            ctx.current_node, ctx.current_lay_id, ctx.enable_node_log, ctx.accu_mem_type = saved
+
     def estimate(
         self, stages: list, stage_id: int, record_lay_types: dict
     ) -> float:
