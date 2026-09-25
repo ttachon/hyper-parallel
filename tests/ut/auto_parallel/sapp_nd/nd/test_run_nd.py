@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import matplotlib.pyplot as plt
 import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook, hook_runner
@@ -1397,6 +1398,22 @@ class TestSappNDRunND(unittest.TestCase):
                 debug_parts,
                 plot_idle=True,
             )
+
+    def test_the_degree_table_reads_a_boolean_dimension(self) -> None:
+        """
+        Feature: the degree table under ND's plot of a search.
+        Description: A search that varied SP, whose degrees print as True or False.
+        Expectation: The table is drawn instead of failing on the boolean cell.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.SP, True)], all_dims=[Dim.DP, Dim.SP])
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        plot.parse_data([(dims, 128, 10.0, [10.0])])
+        figure = plt.figure()
+        try:
+            plot.make_table()
+        finally:
+            plt.close(figure)
+        self.assertEqual(plot.cell_text, [["8"], ["True"], [128]])
 
     def test_arch_hook_variants(self) -> None:
         """

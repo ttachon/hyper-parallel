@@ -272,6 +272,17 @@ def set_twin_handles(ax1, data_frame, dbg_cols):
     leg.legend_handles[-1].set_facecolor(pp_color)  # type: ignore
 
 
+def _cell_number(text):
+    """Read one cell of the degree table as a number.
+
+    A boolean dimension such as SP prints as True or False, which float()
+    refuses, so every search that varied SP failed as its plot was drawn.
+    """
+    if text in ("True", "False"):
+        return float(text == "True")
+    return float(text)
+
+
 class Plot:
     """plot ND top configs"""
 
@@ -295,7 +306,7 @@ class Plot:
     def make_table(self):
         """Make table below plot with each parallelism degree"""
         self.cell_text = list(map(list, zip(*self.cell_text)))  # transpose
-        max_rows = list(map(max, map(partial(map, float), self.cell_text)))
+        max_rows = list(map(max, map(partial(map, _cell_number), self.cell_text)))
         the_table = plt.table(
             cellText=self.cell_text,
             rowLabels=self.row_title,
@@ -311,7 +322,7 @@ class Plot:
             cell.set_text_props(fontproperties=FontProperties(weight="bold"))
             for col in range(len(self.cell_text[0])):
                 cell = the_table[row + 1, col]
-                value = float(str(cell.get_text().get_text()))
+                value = _cell_number(str(cell.get_text().get_text()))
                 try:
                     ratio = 1 - (value / max_rows[row])
                 except ZeroDivisionError:
