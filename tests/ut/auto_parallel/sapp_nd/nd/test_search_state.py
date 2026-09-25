@@ -111,6 +111,18 @@ class TestSearchState(unittest.TestCase):
                                  max_mem=Memory.from_string("50GB"))
         self.assertEqual(runner.instance.mem_eval.ccfg.device_capacity.to_gb().size, 50)
 
+    def test_a_reserve_comes_out_of_the_cap(self):
+        """
+        Feature: the -M memory cap with the -mem reserve.
+        Description: Start a search with a 50 GB cap and an 8 GB reserve, as
+            ``run_nd -M 50GB -mem 8GB`` does.
+        Expectation: The capacity the search fits candidates against is 42 GB.
+        """
+        runner = Par.Parallelize("mindformers", self._small_deepseek(), Hard.Machine(16, "A2"),
+                                 global_batch_size=16, dimensions=[Dim.DP, Dim.TP, Dim.PP],
+                                 max_mem=Memory.from_string("50GB"), mem_for_ppb=Memory.from_string("8GB"))
+        self.assertEqual(runner.instance.mem_eval.ccfg.device_capacity.to_gb().size, 42)
+
     def test_building_a_candidate_leaves_the_bounds_alone(self):
         """
         Feature: search-space bounds.
