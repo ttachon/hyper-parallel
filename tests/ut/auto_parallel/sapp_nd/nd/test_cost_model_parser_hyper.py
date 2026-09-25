@@ -1499,6 +1499,23 @@ class TestFsdpResharding(unittest.TestCase):
             got.append(ccfg.reshards)
         self.assertEqual(got, [True, False, False])
 
+    def test_the_run_states_how_fsdp_shards_its_experts(self):
+        """
+        Feature: _parse_expert_sharding.
+        Description: A MoE run at EP 4 in the legacy schema, and in the
+            AutoModels one without and with edp_shard_size 2.
+        Expectation: The legacy schema states nothing; HyperParallel's keeps
+            each expert whole by default, and shards it over the ranks the
+            run states.
+        """
+        got = []
+        for extra in ({}, {"fsdp_config": {}}, {"fsdp_config": {"edp_shard_size": 2}}):
+            ccfg = _make_ccfg(_moe_overrides(**extra))
+            got.append((ccfg.expert_shard, ccfg.shard_p_os_exp))
+        self.assertEqual([shard or None for shard, _ in got], [None, 1, 2])
+        self.assertEqual(got[1][1], 1)
+        self.assertEqual(got[2][1], 2)
+
     def test_the_run_accumulates_without_a_pipeline(self):
         """
         Feature: accumulates_grads.

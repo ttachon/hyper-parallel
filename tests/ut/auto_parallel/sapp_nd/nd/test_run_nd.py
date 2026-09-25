@@ -817,6 +817,13 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
 
+        # C4: DP 2 x TP 2 over EP 4 leaves one rank per expert group, which
+        # an expert shard of 2 cannot divide; a shard of 1 always does.
+        gc_ok.ccfg.expert_shard = 2
+        self.assertFalse(gc_ok.ep_constraints_valid(pc_ok))
+        gc_ok.ccfg.expert_shard = 1
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+
         # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
         gc_c1 = _make_gc(n_exp=8, ep=3, hff_exp=14336, etp=0, tp=2)
         pc_c1 = gc_c1.make_parallel_config(

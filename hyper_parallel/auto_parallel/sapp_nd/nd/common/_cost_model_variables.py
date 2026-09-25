@@ -56,6 +56,10 @@ class _CostModVar:
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
+    # How many ranks of its expert data-parallel group FSDP shards a routed
+    # expert over under expert parallelism, as the run states it; None for
+    # the optimizer's whole group.
+    expert_shard: int = None
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
