@@ -35,6 +35,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import (
     Layers,
     Stage,
     choose,
+    least_times,
     pp_lite,
     suffix_times,
 )
@@ -222,6 +223,37 @@ class TestSuffixTimes(unittest.TestCase):
         """
         with self.assertRaises(ValueError):
             suffix_times([Layers("a", 1, 1)], {"a": _FRONT}, [MEGABYTE])
+
+
+class TestLeastTimes(unittest.TestCase):
+    """A stage's least time within every budget, from one pass."""
+
+    def test_every_budget_is_as_fast_as_choosing_within_it(self):
+        """
+        Feature: least_times.
+        Description: Random stages of two kinds kept at one to three
+            micro-batches in flight, none among them, and budgets from below
+            the lightest choice to past the heaviest.
+        Expectation: Each budget takes the time choose gives within it, and
+            inf where choose finds nothing that fits.
+        """
+        rng = random.Random(5)
+        fronts = {"a": _FRONT, "b": (_option(60, 5, 12), _option(30, 15, 14), _option(2, 15, 19))}
+        for _ in range(30):
+            counts = {}
+            for _ in range(rng.randint(0, 6)):
+                key = (rng.choice("ab"), rng.randint(1, 3))
+                counts[key] = counts.get(key, 0) + 1
+            groups = tuple(Layers(kind, count, flight) for (kind, flight), count in counts.items())
+            largest = rng.uniform(0, 1500) * MEGABYTE
+            within = least_times(groups, fronts, largest)
+            for budget in (min(rng.uniform(-50, 1500) * MEGABYTE, largest) for _ in range(8)):
+                alone = choose(groups, fronts, budget)
+                with self.subTest(groups=groups, budget=budget):
+                    if alone is None:
+                        self.assertEqual(within(budget), math.inf)
+                    else:
+                        self.assertAlmostEqual(within(budget), alone.time, places=6)
 
 
 class TestPpLite(unittest.TestCase):

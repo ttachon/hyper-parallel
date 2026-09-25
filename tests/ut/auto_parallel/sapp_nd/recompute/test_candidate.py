@@ -18,11 +18,13 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/recompute/test_candidate.py -v
 """
 import copy
+import itertools
 import os
+import random
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import patch
 
 import yaml
@@ -53,6 +55,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     to_records,
 )
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import MEGABYTE, Stage
 
 DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
@@ -347,6 +350,143 @@ class TestStageMemory(unittest.TestCase):
             self.assertLessEqual(len({item.option.recompute for item in choice.ranges if item.option.recompute}), 1)
             for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
                 self.assertLessEqual(abs(mine - model), 1.0, (share, describe(choice)))
+
+
+# The dense model at TP 1 on 1024 tokens, with a small vocabulary: under
+# HyperParallel's FSDP, which holds each layer's gradient output until the
+# backward ends, its first stage peaks as a later micro-batch's backward ends.
+_DEFERRING = copy.deepcopy(_DENSE)
+_DEFERRING["model"]["config_overrides"]["vocab_size"] = 4000
+_DEFERRING["train"]["accelerator"]["tp_degree"] = 1
+_DEFERRING["data"]["max_seq_len"] = 1024
+
+
+class TestTwoPeaks(unittest.TestCase):
+    """A stage whose peak can come as warm-up ends or as a later micro-batch's backward ends."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """The dense model at TP 1, PP 2 and 4 micro-batches, fully recomputed."""
+        cls.folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        cls.path = os.path.join(cls.folder.name, "train.yaml")
+        with open(cls.path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(_DEFERRING, handle)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Remove the config."""
+        cls.folder.cleanup()
+
+    def _evaluator(self) -> EvaluatorV2:
+        """A fresh evaluator of the dense model."""
+        return EvaluatorV2(self.path, framework="hyper_v2", log_level=0)
+
+    def test_the_memory_model_states_both_points(self):
+        """
+        Feature: EvaluatorV2.peak_points.
+        Description: The dense model's stages, fully recomputed.
+        Expectation: Each stage's dynamic memory is the higher of its two
+            points, and the first stage's comes as a backward ends.
+        """
+        evaluator = self._evaluator()
+        insights = evaluator.estimate_peak_insight()
+        self.assertEqual([insight["Dynamic"] for insight in insights],
+                         [max(points) for points in evaluator.peak_points])
+        warm_up, backward = evaluator.peak_points[0]
+        self.assertGreater(backward, warm_up)
+
+    def test_a_roomy_device_runs_every_layer_plain(self):
+        """
+        Feature: choose_recompute.
+        Description: A 1 TB device.
+        Expectation: Every layer runs plain, and each stage keeps what the
+            memory model says it keeps with every layer plain, to its MB,
+            though the first stage peaks as a backward ends.
+        """
+        evaluator = _with_capacity(self._evaluator(), 1024 * 1024)
+        choice = choose_recompute(evaluator, Hard.Device_A2)
+        self.assertTrue(all(_is_plain(item.option) for item in choice.ranges))
+        for mine, model in zip(choice.stage_memory, _stage_peaks(evaluator, full_rec=False)):
+            self.assertLessEqual(abs(mine - model), 1.0)
+
+    def test_a_mix_keeps_what_the_config_priced_whole_keeps(self):
+        """
+        Feature: choose_recompute.
+        Description: Devices between all plain and all fully recomputed. Each
+            choice that holds one selective setting at most is stated as
+            recompute ranges and the whole config priced with them.
+        Expectation: Every choice fits, and each stage keeps what the choice
+            says it keeps, to its MB, one mode for every layer too.
+        """
+        evaluator = self._evaluator()
+        plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
+        checked = 0
+        for share in (0.7, 0.5, 0.3, 0.1, 0.0):
+            capacity = full + 16 + share * (plain - full)
+            for modes in (None, ("off", "full")):
+                choice = choose_recompute(_with_capacity(evaluator, capacity), Hard.Device_A2, modes=modes)
+                self.assertLessEqual(choice.memory, capacity)
+                if len({item.option.recompute for item in choice.ranges if item.option.recompute}) > 1:
+                    continue
+                checked += 1
+                for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
+                    self.assertLessEqual(abs(mine - model), 1.0, (share, modes, describe(choice)))
+        self.assertGreater(checked, 5)
+
+
+def _kind(per_micro_batch: int, once: int, forward: float) -> Tuple[LayerOption, ...]:
+    """A kind's options, from its plain layer's MB per micro-batch and once and its forward time."""
+    options = []
+    for recompute, kept, slower in ((frozenset(), per_micro_batch, 0.0), (frozenset({"ffAct"}), per_micro_batch // 2,
+                                                                          0.2), (None, 2, 1.0)):
+        options.append(LayerOption(recompute=recompute, memory_per_micro_batch=kept * MEGABYTE,
+                                   memory_once=once * MEGABYTE, forward_time=forward,
+                                   backward_time=(2.0 + slower) * forward))
+    return tuple(options)
+
+
+class TestTwoPeaksChoice(unittest.TestCase):
+    """A stage's choice when its peak can also come as a later micro-batch's backward ends."""
+
+    def test_the_choice_is_the_fastest_that_fits_at_both_points(self):
+        """
+        Feature: the choice of a stage that peaks at two points.
+        Description: Random stages of one to four layers of two kinds, the
+            last ending warm-up, kept at one to three micro-batches in
+            flight, what the stage keeps outside its layers at each point,
+            and devices from too small for any choice to roomy.
+        Expectation: Every choice fits at both points and none that fits is
+            faster, trying every one; where none fits, there is no choice.
+        """
+        rng = random.Random(11)
+        # pylint: disable=protected-access
+        for _ in range(80):
+            fronts = {("unit", kind): _kind(rng.randint(20, 200), rng.randint(0, 50), rng.uniform(1.0, 5.0))
+                      for kind in "ab"}
+            in_flight = rng.randint(1, 3)
+            layers = []
+            for index in range(rng.randint(1, 4)):
+                key = ("unit", rng.choice("ab"))
+                layers.append(Candidate._Layer(index, key, in_flight, fronts[key][2]))
+            (stage_layers,), fronts, _, own = Candidate._charge_working_sets([layers], [[layers[-1]]], fronts, None)
+            peaks = Candidate._Peaks(rng.randint(0, 500) * MEGABYTE, rng.randint(0, 900) * MEGABYTE)
+            capacity = rng.randint(200, 2500) * MEGABYTE
+            stage = Stage(groups=Candidate._groups(stage_layers), budget=capacity - peaks.warm_up)
+            chosen = Candidate._choose_stage(stage_layers, stage, peaks, fronts, own, MEGABYTE, capacity)
+            best = None
+            for picks in itertools.product(*(fronts[layer.key] for layer in stage_layers)):
+                trial = {layer.index: option for layer, option in zip(stage_layers, picks)}
+                if Candidate._stage_memory(stage_layers, peaks, trial, fronts, own) <= capacity:
+                    time = sum(option.forward_time + option.backward_time for option in picks)
+                    best = time if best is None else min(best, time)
+            with self.subTest(layers=[layer.key for layer in stage_layers], in_flight=in_flight, peaks=peaks,
+                              capacity=capacity):
+                if best is None:
+                    self.assertIsNone(chosen)
+                    continue
+                self.assertLessEqual(Candidate._stage_memory(stage_layers, peaks, chosen, fronts, own), capacity)
+                self.assertAlmostEqual(sum(option.forward_time + option.backward_time for option in chosen.values()),
+                                       best, places=6)
 
 
 # A link so fast that a copy takes no time, and one too slow for any layer's.

@@ -32,7 +32,7 @@ before the pipeline balancer places their layers unevenly.
 import math
 from collections import Counter
 from dataclasses import dataclass
-from typing import Hashable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -194,6 +194,55 @@ def choose(
         for option, count in sorted(chosen, key=lambda pair: -_time(pair[0])):
             assignments.append(Assignment(group, option, count))
     return _stage_choice(assignments)
+
+
+def least_times(
+    groups: Sequence[Layers],
+    fronts: Mapping[Hashable, Sequence[LayerOption]],
+    budget: float,
+    bucket: float = MEGABYTE,
+) -> Callable[[float], float]:
+    """The least time of a stage's layers within every budget up to *budget*, as :func:`choose` finds it.
+
+    One pass over the layers, as :func:`choose` makes for one budget, answers
+    all of them.
+
+    Args:
+        groups: The stage's layers, by kind and micro-batches in flight.
+        fronts: Each kind's options.
+        budget: The largest budget asked, in bytes.
+        bucket: The memory granularity, as for :func:`choose`.
+
+    Returns:
+        For a budget in bytes, the time of the choice :func:`choose` makes
+        within it; ``inf`` where none fits.
+    """
+    useful = [_useful(fronts[group.kind], group.in_flight) for group in groups]
+    heaviest = sum(group.count * _kept(options[-1], group.in_flight) for group, options in zip(groups, useful))
+    fastest_time = sum(group.count * _time(options[-1]) for group, options in zip(groups, useful))
+    # Past the fastest options' memory every budget has them.
+    size = int(max(0.0, min(budget, heaviest)) // bucket)
+    fastest = np.full(size + 1, np.inf)
+    fastest[0] = 0.0
+    for group, options in zip(groups, useful):
+        weights = [math.ceil(_kept(option, group.in_flight) / bucket) for option in options]
+        for _ in range(group.count):
+            after = np.full(size + 1, np.inf)
+            for option, weight in zip(options, weights):
+                if weight <= size:
+                    np.minimum(after[weight:], fastest[:size + 1 - weight] + _time(option), out=after[weight:])
+            fastest = after
+    within = np.minimum.accumulate(fastest)
+
+    def _within(room: float) -> float:
+        """The least time within *room* bytes."""
+        if room < 0:
+            return math.inf
+        if heaviest <= room:
+            return fastest_time
+        return float(within[min(int(room // bucket), size)])
+
+    return _within
 
 
 def suffix_times(

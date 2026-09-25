@@ -42,7 +42,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, Tuple
+    from typing import Any, Dict, List, Tuple
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 EVAL_YML = os.path.join(current_dir, "configs_eval/default.yaml")
@@ -77,6 +77,11 @@ class _Backbone:
                 raise AttributeError("missing config")
         self.evaluator_instances = None
         self.ppb = None
+        # Each stage's dynamic memory, in MB, at the two points of the last
+        # stage estimate where its peak can come: as warm-up ends, and as a
+        # later micro-batch's backward ends (0 where that is no candidate).
+        # The stage's Dynamic insight is the larger.
+        self.peak_points: List[Tuple[int, int]] = []
         self._overhead_obj = _BackwardOverhead(
             self, self._ccfg, self._ctx, self._inner_dynamic_mem
         )
@@ -691,6 +696,7 @@ class _Backbone:
         sm = args[2]
         verbose, spec_stage_id = args[3], args[4]
         insights = args[5]
+        points = []
         for stage_id in range(self._ccfg.p):
             ins = {}  # Mem Insights purpose
             ins["Static"] = sum(
@@ -709,7 +715,10 @@ class _Backbone:
             safety_buffer = 1024 * 1024 * 1024  # 1 GB
             if ins["Dynamic"] > 0:
                 ins["Dynamic"] += safety_buffer
+                points.append((self.mb(ins["Dynamic"]), self.mb(backward_end + safety_buffer) if backward_end else 0))
                 ins["Dynamic"] = max(ins["Dynamic"], backward_end + safety_buffer)
+            else:
+                points.append((self.mb(ins["Dynamic"]), 0))
             stage_accu = sm["logs"][stage_id].accu_mem_type
             ins["ModelParameters"] = self.mb(stage_accu[MemType.MODEL_PARAM])
             ins["OptimizerStates"] = self.mb(stage_accu[MemType.OPTIM_STATE])
@@ -737,6 +746,7 @@ class _Backbone:
             ins["Static"] = self.mb(ins["Static"])
             ins["Dynamic"] = self.mb(ins["Dynamic"])
             insights += [ins]
+        self.peak_points = points
 
     def __verbose_insights(self, *args):
         """logging purpose"""
