@@ -1544,6 +1544,23 @@ class TestFsdpResharding(unittest.TestCase):
         grads = sum(value.get("accu_grad", 0) for key, value in stage["Node Log"].items() if isinstance(key[2], int))
         return stage["Dynamic"], grads
 
+    def test_the_output_layers_backward_gathers_no_table_again(self):
+        """
+        Feature: the root's gathered tables in a working set.
+        Description: The working set of the output layer's backward, which
+            ends warm-up on a single stage, under FSDP that reshards, and
+            with reshard_after_forward off.
+        Expectation: Resharding, FSDP's root keeps its tables gathered from
+            the forward on: the output layer keeps its table, and its
+            backward's working set gathers none again.  Kept gathered, as
+            before, the working set counts it.
+        """
+        log = self._insight(1)["Node Log"]
+        self.assertGreater(log[(0, 0, "", "O")]["ag_comm"], 0)
+        self.assertEqual(log[(0, 0, "G_", "O")].get("ag_comm", 0), 0)
+        kept = self._insight(1, reshards=False)["Node Log"]
+        self.assertEqual(kept[(0, 0, "G_", "O")]["ag_comm"], kept[(0, 0, "", "O")]["ag_comm"])
+
     def test_the_root_gathers_both_tables(self):
         """
         Feature: gather_embed, the embedding table FSDP gathers.
