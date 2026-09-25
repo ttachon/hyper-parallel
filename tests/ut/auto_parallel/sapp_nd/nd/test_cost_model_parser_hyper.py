@@ -1522,8 +1522,8 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
 
     @staticmethod
-    def _dynamic(micro_batches: int, **run: Any) -> float:
-        """Stage 0's dynamic memory, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
+    def _insight(micro_batches: int, **run: Any) -> Dict[str, Any]:
+        """Stage 0's insight, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
         config = _auto_models_config(
             accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1}, fsdp_config={"dp_shard_size": 4},
             training={"global_batch_size": 4 * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
@@ -1540,9 +1540,44 @@ class TestFsdpResharding(unittest.TestCase):
                 evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
         for name, value in run.items():
             setattr(evaluator.ccfg, name, value)
-        stage = evaluator.estimate_peak_insight()[0]
+        return evaluator.estimate_peak_insight()[0]
+
+    @classmethod
+    def _dynamic(cls, micro_batches: int, **run: Any) -> float:
+        """Stage 0's dynamic memory, in MB, and its layers' gradients, as :meth:`_insight`."""
+        stage = cls._insight(micro_batches, **run)
         grads = sum(value.get("accu_grad", 0) for key, value in stage["Node Log"].items() if isinstance(key[2], int))
         return stage["Dynamic"], grads
+
+    def test_the_root_gathers_both_tables(self):
+        """
+        Feature: gather_embed, the embedding table FSDP gathers.
+        Description: The root of a model whose embedding and output tables
+            are two, each sharded over the DP shard.
+        Expectation: FSDP gathers the embedding table whole to compute with
+            it, as the output table: their buffers weigh the same.
+        """
+        log = self._insight(1)["Node Log"]
+        self.assertEqual(log[(0, 0, "", "E")]["ag_comm"], log[(0, 0, "", "O")]["ag_comm"])
+
+    def test_the_backward_ends_holding_whole_gradients(self):
+        """
+        Feature: the end of the backward, under FSDP that overlaps each
+            layer's gradient reduction with the next layer's backward.
+        Description: The same stage, two micro-batches per step, with the
+            reductions overlapped, as HyperParallel's are, and without.
+        Expectation: Overlapped, the backward ends holding the first two
+            layers' gradients whole, the second's reduction in flight and
+            the first's not started, and the output table's until the root's
+            hook: four sharded gradients each over the DP shard of 4, less
+            the first layer's output, which is not there yet.
+        """
+        self.assertTrue(_make_ccfg(_dense_overrides()).overlaps_grad_reduce)
+        overlapped = self._insight(2)
+        plain = self._insight(2, overlaps_grad_reduce=False)
+        log = overlapped["Node Log"]
+        layer, output = log[(0, 0, 0, "F")]["accu_grad"], log[(0, 0, "", "O")]["accu_grad"]
+        self.assertAlmostEqual(overlapped["Dynamic"] - plain["Dynamic"], 4 * (2 * layer + output) - layer, delta=3)
 
     def test_reduce_scatter_outputs_wait_for_the_backward_end(self):
         """

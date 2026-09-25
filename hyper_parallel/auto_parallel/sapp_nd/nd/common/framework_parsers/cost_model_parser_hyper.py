@@ -748,6 +748,9 @@ class CostModelParserHyperV2(_CostModelParser):
         # It adds each layer's reduce-scatter output to the accumulated
         # gradient only in the root's backward hook.
         self.ccfg.defers_grads = True
+        # It reduce-scatters a layer's gradients while the next layer's
+        # backward runs, and the root's in its backward hook.
+        self.ccfg.overlaps_grad_reduce = True
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
             else self.ccfg.d
@@ -1020,6 +1023,8 @@ class CostModelParserHyperV2(_CostModelParser):
             if (ccfg.vocab_emb_dp and ccfg.p == 1)
             else (ccfg.t * ccfg.d)
         )
+        # FSDP gathers the table over data parallelism to compute with it.
+        ccfg.gather_embed = ccfg.d
 
     def config_shard_recompute(self, ccfg: Any) -> None:
         """Recompute ``shard_recompute_input`` after strategy changes, on *ccfg*.

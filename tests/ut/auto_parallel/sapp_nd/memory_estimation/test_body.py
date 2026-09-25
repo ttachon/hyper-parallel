@@ -301,6 +301,32 @@ class TestStatGradLayer(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=4)
 
 
+class TestReducedGradLayer(unittest.TestCase):
+    """Test EvalBody.reduced_grad_layer, the gradients FSDP reduce-scatters."""
+
+    def test_fsdp_reduces_what_it_shards(self):
+        """BD-G04: whole and sharded gradients of the parts a data-parallel rank shards.
+
+        Experts under EP 4 kept whole on each rank (no expert shard) are not
+        reduce-scattered; the other parts, sharded over 4, are.
+        """
+        ccfg = _make_ccfg(
+            n_exp=8,
+            n_shared_exp=1,
+            ep=4,
+            bytes_grad=2,
+            shard_grad_non_exp=4.0,
+            shard_grad_exp=1.0,
+            shard_grad_exp_partial=4.0,
+        )
+        ccfg.t, ccfg.t_exp = 1, 1
+        ctx = _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, routed_p=400.0, shared_p=200.0)
+        whole, sharded = EvalBody.reduced_grad_layer(ccfg, ctx)
+        # non_exp: 150 * 2 whole, / 4 sharded; shared: 200 * 2 whole, / 4 sharded
+        self.assertAlmostEqual(whole, (150.0 + 200.0) * 2, places=4)
+        self.assertAlmostEqual(sharded, (150.0 + 200.0) * 2 / 4, places=4)
+
+
 class TestNumParamsRoutedExpert(unittest.TestCase):
     """Test EvalFFn.num_params_routed_expert with ETP correction."""
 

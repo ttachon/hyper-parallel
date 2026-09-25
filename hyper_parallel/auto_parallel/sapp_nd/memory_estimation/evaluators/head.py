@@ -73,11 +73,11 @@ class EvalHead:
 
     @staticmethod
     def dp_comm_embed(ccfg: CostModelConfig, ctx: Context) -> float:
-        """DP Communication size"""
+        """DP Communication size: the table as the layer gathers it to compute."""
         return (
             ccfg.comm_d_non_exp
             * ctx.eval.num_p(ccfg, ctx)
-            / (ccfg.shard_embed * ccfg.cp)
+            / (ccfg.shard_embed / (ccfg.gather_embed or 1) * ccfg.cp)
         )
 
     @staticmethod
