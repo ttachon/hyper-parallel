@@ -60,6 +60,7 @@ def _vl_train_yaml() -> dict:
     """Return an AutoModels Trainer config for a vision-language model."""
     return {
         "model": {
+            "_target_": "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained",
             "pretrained_model_name_or_path": "local/vl",
             "torch_dtype": "bfloat16",
         },

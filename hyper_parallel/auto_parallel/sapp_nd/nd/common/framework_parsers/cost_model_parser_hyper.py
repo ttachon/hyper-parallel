@@ -122,7 +122,8 @@ class CostModelParserHyperV2(_CostModelParser):
         A vision-language config additionally yields a ``vision`` sub-spec,
         held here until :meth:`_resolve_multimodal` can build its submodule.
         The AutoModels trainer trains the model Transformers builds, which
-        has no MTP layer (:meth:`_without_mtp`).
+        has no MTP layer (:meth:`_without_mtp`), and a vision tower only
+        where its model class builds one (:meth:`_builds_vision_tower`).
         """
         spec = resolve_hf_model_spec(
             self._model_section(), self._visual_seq_len_override()
@@ -130,6 +131,8 @@ class CostModelParserHyperV2(_CostModelParser):
         if is_auto_models_schema(self.config):
             spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
+        if self._vision_spec and not self._builds_vision_tower():
+            self._vision_spec = None
         self._tie_word_embeddings = bool(spec.get("tie_word_embeddings"))
         self._apply_spec(self.ccfg, spec)
         ops = None if spec.get("ops") is None else ops_from_dict(spec["ops"])
@@ -139,6 +142,26 @@ class CostModelParserHyperV2(_CostModelParser):
             LinearAttentionDims.from_fields(spec),
         ))
         self._model_seq_len = self._spec_int(spec, "max_position_embeddings")
+
+    # The AutoModels classes that build a vision-language checkpoint's
+    # vision tower; every other named class builds the language model alone.
+    _VISION_TARGETS = ("ImageTextToText", "Vision2Seq", "ConditionalGeneration")
+
+    def _builds_vision_tower(self) -> bool:
+        """Whether the run's model class builds the vision tower its checkpoint has.
+
+        HyperParallel's AutoModels trainer builds ``model._target_``:
+        ``HyperAutoModelForImageTextToText`` builds the tower, while
+        ``HyperAutoModelForCausalLM`` and the recipes' builders build the
+        language model alone and load the tower's weights as unexpected.
+        A yaml that names no class (the trainer requires one) and the
+        legacy schema price what the checkpoint has.
+        """
+        if not is_auto_models_schema(self.config):
+            return True
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        target = self._get_cfg_attr(model_raw, "_target_", None)
+        return not target or any(name in str(target) for name in self._VISION_TARGETS)
 
     @staticmethod
     def _without_mtp(spec: Dict[str, Any]) -> Dict[str, Any]:

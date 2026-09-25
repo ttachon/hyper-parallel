@@ -189,6 +189,13 @@ def _mla_overrides(**kw: Any) -> Dict[str, Any]:
     return base
 
 
+def _image_text_config(**kw: Any) -> Dict[str, Any]:
+    """An AutoModels configuration whose model class builds a vision tower too."""
+    config = _auto_models_config(**kw)
+    config["model"]["_target_"] = "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained"
+    return config
+
+
 def _auto_models_config(**kw: Any) -> Dict[str, Any]:
     """Return a minimal current AutoModels Trainer configuration."""
     base = {
@@ -969,6 +976,34 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(spec["mtp_depth"], 3)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_a_causal_lm_builds_no_vision_tower(self, mock_hf):
+        """
+        Feature: _builds_vision_tower.
+        Description: A vision-language checkpoint trained as a causal LM,
+            with no model class named, and as image-text-to-text.
+        Expectation: The causal LM prices the language model alone; the
+            image-text class and a yaml that names none price the tower.
+        """
+        mock_hf.return_value = SimpleNamespace(
+            model_type="qwen3_vl_moe",
+            text_config=self._hf_config(),
+            vision_config=SimpleNamespace(
+                hidden_size=1152, depth=6, num_heads=16, intermediate_size=4304, out_hidden_size=4096,
+                patch_size=16, spatial_merge_size=2, num_position_embeddings=2304,
+            ),
+        )
+        got = []
+        for target in ("hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained", None,
+                       "hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained"):
+            config = _auto_models_config()
+            if target:
+                config["model"]["_target_"] = target
+            else:
+                config["model"].pop("_target_", None)
+            got.append(bool(_make_ccfg(config).multimodal))
+        self.assertEqual(got, [False, True, True])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_the_trainer_builds_no_mtp_layer(self, mock_hf):
         """
         Feature: _without_mtp.
@@ -1059,7 +1094,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             submodule alongside it instead of raising AttributeError.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
 
         self.assertTrue(ccfg.multimodal)
         self.assertEqual(ccfg.mm_order, ["vision", "text"])
@@ -1095,7 +1130,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             caches unchanged.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         text = ccfg.mm_ccfgs["text"]
         vision = ccfg.mm_ccfgs["vision"]
 
@@ -1116,7 +1151,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Expectation: The vision submodule adopts the override.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config(context={"visual_seq_len": 2304}))
+        ccfg = _make_ccfg(_image_text_config(context={"visual_seq_len": 2304}))
         self.assertEqual(ccfg.mm_ccfgs["vision"].s, 2304)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
@@ -1129,7 +1164,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             placed entirely on the first stage.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
         self.assertEqual(vision.p, text.p)
         self.assertEqual(vision.vp, text.vp)
@@ -1149,7 +1184,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             through one submodule reaches neither the sibling nor the parent.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
 
         self.assertIsNot(text.overwrite_eval_functions,
@@ -1173,7 +1208,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             MLP, with no gated triple to cast.
         """
         mock_hf.return_value = self._vl_config()
-        vision = _make_ccfg(_auto_models_config()).mm_ccfgs["vision"]
+        vision = _make_ccfg(_image_text_config()).mm_ccfgs["vision"]
         check_and_apply_custom_hook(CWrap(vision))
         self.assertEqual((vision.shard_output_activ, vision.shard_recompute_input), (vision.t, vision.t))
         self.assertEqual((vision.n_ffMM, vision.n_normOp), (2, 2))
@@ -1252,7 +1287,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             vision tower still lands on the first stage of the first chunk.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config(
+        ccfg = _make_ccfg(_image_text_config(
             accelerator={"pp_size": 4, "pp_interleave_num": 2},
         ))
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
