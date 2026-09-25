@@ -907,8 +907,8 @@ class CostModelParserHyperV2(_CostModelParser):
 
         To match the MF parser's *list*-based filtering behaviour (used by
         DeepSeek-V3 and other models that declare an explicit offset), this
-        parser emits a list offset of length ``pp`` (all zeros = even
-        balancing) by default.  An explicit offset supplied via
+        parser emits a list offset of length ``pp`` by default, one that
+        places every layer (:meth:`_balanced_offset`).  An explicit offset supplied via
         ``config_overrides.offset`` overrides this — a list is used as-is,
         and a non-zero int is broadcast to ``[int] * pp``.
         """
@@ -925,7 +925,20 @@ class CostModelParserHyperV2(_CostModelParser):
             else:
                 self.ccfg.offset = [explicit] * self.ccfg.p
         else:
-            self.ccfg.offset = [0] * self.ccfg.p
+            self.ccfg.offset = self._balanced_offset()
+
+    def _balanced_offset(self) -> list:
+        """An offset of length ``pp`` that places every layer the pipeline balances.
+
+        Each stage runs the layers per stage, and the first ones one more
+        each until the remainder has a stage, as the search's balancing
+        places them; all zeros where the pipeline divides the layers, or
+        interleaves, which the search balances itself.
+        """
+        pp = max(1, int(self.ccfg.p or 1))
+        layers = self.ccfg.n_lay + (self.ccfg.n_mtp if self.ccfg.is_mtp_in_offset else 0)
+        extra = layers % pp if int(self.ccfg.vp or 1) <= 1 else 0
+        return [1 if stage < extra else 0 for stage in range(pp)]
 
     def config_shard_emb(self, ccfg: Any) -> None:
         """Configure embedding sharding based on current parallelism, on *ccfg*.
