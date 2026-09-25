@@ -1006,10 +1006,11 @@ class CostModelParserHyperV2(_CostModelParser):
 
         Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
         ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
-        configuration changes.  When ``vocab_emb_dp`` is enabled and pipeline
-        parallelism is disabled (``p == 1``), the embedding is sharded only
-        along the data-parallel dimension (``d``); otherwise it is sharded
-        along ``t * d``.
+        configuration changes.  HyperParallel's FSDP shards the table as every
+        parameter, over its group, the optimizer's ranks, and not the whole of
+        data parallelism under HSDP.  When ``vocab_emb_dp`` is enabled and
+        pipeline parallelism is disabled (``p == 1``), the embedding is sharded
+        only over those ranks; otherwise over ``t`` times them.
 
         Without this method, ``CostModelConfig.set_strategy`` skips the
         ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
@@ -1018,13 +1019,14 @@ class CostModelParserHyperV2(_CostModelParser):
         multimodal submodule shares this parser, so the config to refresh is
         passed in.
         """
+        ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
         ccfg.shard_embed = (
-            ccfg.d
+            ranks
             if (ccfg.vocab_emb_dp and ccfg.p == 1)
-            else (ccfg.t * ccfg.d)
+            else (ccfg.t * ranks)
         )
-        # FSDP gathers the table over data parallelism to compute with it.
-        ccfg.gather_embed = ccfg.d
+        # FSDP gathers the table over its group to compute with it.
+        ccfg.gather_embed = ranks
 
     def config_shard_recompute(self, ccfg: Any) -> None:
         """Recompute ``shard_recompute_input`` after strategy changes, on *ccfg*.

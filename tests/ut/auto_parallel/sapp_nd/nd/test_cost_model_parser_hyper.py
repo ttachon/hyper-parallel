@@ -1522,11 +1522,12 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
 
     @staticmethod
-    def _insight(micro_batches: int, **run: Any) -> Dict[str, Any]:
-        """Stage 0's insight, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
+    def _insight(micro_batches: int, devices: int = 4, **run: Any) -> Dict[str, Any]:
+        """Stage 0's insight, in MB, of a dense model at DP shard 4 over *devices* and PP 1, fully recomputed."""
         config = _auto_models_config(
             accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1}, fsdp_config={"dp_shard_size": 4},
-            training={"global_batch_size": 4 * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            training={"global_batch_size": devices * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            context={"device_num": devices},
         )
         with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
             mock_hf.return_value = SimpleNamespace(
@@ -1559,6 +1560,19 @@ class TestFsdpResharding(unittest.TestCase):
         """
         log = self._insight(1)["Node Log"]
         self.assertEqual(log[(0, 0, "", "E")]["ag_comm"], log[(0, 0, "", "O")]["ag_comm"])
+
+    def test_hsdp_shards_both_tables_alike(self):
+        """
+        Feature: the embedding table under HSDP.
+        Description: DP 16 over 16 devices, its FSDP group 4 ranks, the
+            others replicas.
+        Expectation: The embedding table is sharded over the FSDP group, as
+            the output table: they weigh the same.
+        """
+        log = self._insight(1, devices=16)["Node Log"]
+        embedding, output = log[(0, 0, "", "E")], log[(0, 0, "", "O")]
+        self.assertEqual(embedding["model_param"], output["model_param"])
+        self.assertEqual(embedding["ag_comm"], output["ag_comm"])
 
     def test_the_backward_ends_holding_whole_gradients(self):
         """
