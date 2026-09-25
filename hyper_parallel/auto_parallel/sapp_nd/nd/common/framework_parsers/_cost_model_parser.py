@@ -14,7 +14,7 @@
 # ============================================================================
 """cost model parser module"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import math
 from abc import ABC
@@ -38,6 +38,12 @@ HYPER_SELECTIVE_REC_OP = {
     "gather": 0,
     "ffAct": 0,
 }
+
+
+def runs_hyper_selective(ccfg: Any) -> bool:
+    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches are its switches."""
+    switches = vars(ccfg.rec_op) if getattr(ccfg, "rec_op", None) is not None else {}
+    return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
 class _CostModelParser(ABC):

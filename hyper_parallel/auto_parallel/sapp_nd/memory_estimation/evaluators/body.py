@@ -29,6 +29,9 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
     detect_attention_type,
     compute_kv_dim,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
+    runs_hyper_selective,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 if TYPE_CHECKING:
@@ -175,7 +178,9 @@ class EvalBody:
     def layer_activ(ccfg: CostModelConfig, ctx: Context) -> float:
         """activations"""
         census = getattr(ccfg, "kind_activations", None)
-        if isinstance(census, KindActivations) and ctx.current_node != LayerType.SEL_REC_LAYER:
+        if isinstance(census, KindActivations) and (
+                ctx.current_node != LayerType.SEL_REC_LAYER
+                or census.selective is not None and runs_hyper_selective(ccfg)):
             return EvalBody.census_activ(ccfg, ctx, census)
         attn_size = sum(
             [
@@ -199,15 +204,21 @@ class EvalBody:
         set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
         of the sequence: TP splits one part, sequence parallelism the
         other, and CP that gathers keys and values leaves them whole
-        (:meth:`EvalAttn.kv_shards`).  A selective layer's switches drop
-        parts the census does not tell apart: its formulas price it.
+        (:meth:`EvalAttn.kv_shards`).  A selective layer keeps what the
+        census measured under HyperParallel's selective checkpointing, whose
+        switches it has (:func:`runs_hyper_selective`): other switches drop
+        parts the census does not tell apart, and its formulas price it.
         """
         tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
-        kept = census.saved / max(1, ccfg.sp) + census.saved_tp / max(1, ccfg.t)
         held = census.working / max(1, ccfg.sp) + census.working_tp / max(1, ccfg.t)
         # A census counts a rank's share of the keys and values; where CP
-        # gathers them the attention keeps the rest of the sequence's too.
+        # gathers them the attention keeps the rest of the sequence's too,
+        # but for a selective layer, which gathers them again to recompute.
         gathered = EvalAttn.gathered_kv_bytes(ccfg)
+        if ctx.current_node == LayerType.SEL_REC_LAYER:
+            kept = census.selective / max(1, ccfg.sp) + census.selective_tp / max(1, ccfg.t)
+            return EvalUtils.census_bytes(ctx, tokens, kept, held + gathered)
+        kept = census.saved / max(1, ccfg.sp) + census.saved_tp / max(1, ccfg.t)
         return EvalUtils.census_bytes(ctx, tokens, kept + gathered, held + gathered)
 
     # Full recompute
