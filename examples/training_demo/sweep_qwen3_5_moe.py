@@ -307,6 +307,7 @@ class Sweep:
     args: argparse.Namespace
     env: Dict[str, Any]
     points: List[Point] = field(default_factory=list)
+    started: float = field(default_factory=time.monotonic)
 
     @property
     def world(self) -> int:
@@ -576,14 +577,50 @@ def harvest_peaks(sweep: Sweep, run_id: Optional[str]) -> Dict[str, float]:
             "max_reserved_gb": max(float(r) for _, r in found)}
 
 
-def run_pass(sweep: Sweep, memory: bool) -> Dict[str, Any]:
+def _duration(seconds: float) -> str:
+    """Render a duration as 1h02m, 14m05s or 45s."""
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+@dataclass
+class Progress:
+    """How far a run stage has got, to head each launch with.
+
+    ``started`` is when the stage began, so the estimate of what is left
+    averages the launches made so far and leaves out the stages before them.
+    """
+
+    total: int
+    started: float = field(default_factory=time.monotonic)
+    done: int = 0
+
+    def header(self, sweep_started: float) -> str:
+        """Return ``run 3/12, 14m05s elapsed, about 28m00s left`` for the next launch."""
+        now = time.monotonic()
+        text = f"run {self.done + 1}/{self.total}, {_duration(now - sweep_started)} elapsed"
+        if self.done:
+            left = (now - self.started) / self.done * (self.total - self.done)
+            text += f", about {_duration(left)} left"
+        return text
+
+
+def run_pass(sweep: Sweep, memory: bool, progress: Progress) -> Dict[str, Any]:
     """Run every strategy once, returning each one's status and peaks."""
     results: Dict[str, Any] = {}
     label = "memory" if memory else "timing"
     for point in sweep.points:
-        print(f"\n===== {point.tag} ({label}) =====", flush=True)
+        print(f"\n===== {progress.header(sweep.started)}: {point.tag} ({label}) =====",
+              flush=True)
         run_id = launch(sweep, point, memory=memory)
         status = wait_for(sweep, run_id)
+        progress.done += 1
         print(status, flush=True)
         results[point.tag] = {
             "run_id": run_id, "status": status,
@@ -612,14 +649,18 @@ def write_peaks_csv(results: Dict[str, Any], path: Path) -> int:
 
 def stage_run(sweep: Sweep) -> None:
     """Run the timing pass, then the memory pass when one is asked for."""
-    results = run_pass(sweep, memory=sweep.args.profile_memory == "same")
+    passes = 2 if sweep.args.profile_memory == "separate" else 1
+    progress = Progress(total=passes * len(sweep.points))
+    results = run_pass(sweep, memory=sweep.args.profile_memory == "same", progress=progress)
     count = write_peaks_csv(results, sweep.out / "memory.csv")
     print(f"\npeak memory for {count} strategy(ies) in "
           f"{sweep.out / 'memory.csv'}", flush=True)
     if sweep.args.profile_memory == "separate":
-        results["memory_pass"] = run_pass(sweep, memory=True)
+        results["memory_pass"] = run_pass(sweep, memory=True, progress=progress)
     (sweep.out / "run_states.json").write_text(
         json.dumps(results, indent=2), encoding="utf-8")
+    print(f"\n{progress.done} run(s) in {_duration(time.monotonic() - progress.started)}",
+          flush=True)
 
 
 def stage_fetch(sweep: Sweep) -> None:
@@ -1193,6 +1234,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ):
         if name in stages:
             run_stage(sweep)
+    print(f"\nsweep done in {_duration(time.monotonic() - sweep.started)}", flush=True)
 
 
 if __name__ == "__main__":
