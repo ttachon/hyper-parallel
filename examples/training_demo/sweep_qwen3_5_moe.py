@@ -21,10 +21,12 @@ ND's estimate is printed beside the measurement for every configuration.
 
 Run it on the cluster's control node:
 
-    python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 1,2,4,8,16,32,64
+    python examples/training_demo/sweep_qwen3_5_moe.py --ep 1,2,4,8,16,32,64
 
-Every swept dimension takes a list and the sweep is their cartesian product,
-so this compares four strategies:
+No axis is swept by default: every degree defaults to 1, so a bare run
+profiles a single point and each sweep names the axis it varies. Every
+dimension takes a list and the sweep is their cartesian product, so this
+compares four strategies:
 
     ... --ep 2,16 --cp 1,2
 
@@ -57,7 +59,7 @@ PEAK_PATTERN = re.compile(
     r"memory/device_max_allocated_gb=([0-9.]+).*?"
     r"memory/device_max_reserved_gb=([0-9.]+)"
 )
-REMOTE_PROFILES = "output/sweep_ep_profiles"
+REMOTE_PROFILES = "output/sweep_profiles"
 STAGES = ("mirror", "data", "run", "fetch", "classify", "compare", "plot")
 
 
@@ -554,8 +556,9 @@ def stage_compare(sweep: Sweep) -> None:
 
 def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
     """Add the swept parallel degrees and the batch shape."""
-    parser.add_argument("--ep", default="1,2,4,8,16,32,64",
-                        help="expert-parallel degrees to sweep")
+    parser.add_argument("--ep", default="1",
+                        help="expert-parallel degrees; every axis defaults to 1, "
+                             "so a sweep varies only what it names")
     parser.add_argument("--cp", default="1", help="context-parallel degrees")
     parser.add_argument("--op", default="",
                         help="FSDP shard widths (fsdp_config.dp_shard_size, ND's "
@@ -566,9 +569,12 @@ def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
                         help="default is the world size, which holds the work "
                              "per step fixed so strategies stay comparable")
     parser.add_argument("--micro-batch-size", type=int, default=1)
-    parser.add_argument("--layers", type=int, default=32,
+    parser.add_argument("--layers", type=int, default=8,
                         help="decoder layers kept by the crop; a multiple of 4 "
-                             "preserves the 3 linear to 1 full attention ratio")
+                             "preserves the 3 linear to 1 full attention ratio. "
+                             "Communication volume and compute are both linear "
+                             "in this, so a crop rescales the step rather than "
+                             "changing what the comparison tests")
     parser.add_argument("--seq-len", type=int, default=8192,
                         help="training sequence length; the dataset is rebuilt "
                              "to match, since its documents are exactly this long")
@@ -671,7 +677,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cluster-env", type=Path, default=DEFAULT_ENV)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--out", type=Path, default=REPO_ROOT / "output" / "sweep_ep")
+    parser.add_argument("--out", type=Path, default=REPO_ROOT / "output" / "sweep")
     parser.add_argument("--cluster", default="cluster",
                         help="the kit entry point (path or name on PATH)")
     parser.add_argument("--arch", default="A3", help="hardware name passed to ND")

@@ -183,31 +183,39 @@ the relative path and the interpreter resolve correctly.
 Read the kit's node logs first when a multinode launch fails. A node whose
 environment setup fails exits before training starts and reports it only there.
 
-### Sweeping expert parallelism against ND
+### Sweeping parallel strategies against ND
 
-`sweep_qwen3_5_moe_ep.py` profiles one run per `ep_size`, classifies each into
-ND's parts and prints ND's estimate beside the measurement:
-
-```bash
-python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 1,2,4,8,16,32,64
-```
-
-Every swept dimension takes a list and the sweep is their cartesian product,
-so this runs four strategies, and `--op` holds the FSDP shard width fixed
-across all of them:
+`sweep_qwen3_5_moe.py` profiles one run per strategy, classifies each into
+ND's parts and prints ND's estimate beside the measurement. No axis is swept
+unless it is named, so a sweep varies only what it says it varies:
 
 ```bash
-python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 2,16 --cp 1,2 --op 16
+python examples/training_demo/sweep_qwen3_5_moe.py --ep 1,2,4,8,16,32,64
 ```
+
+Every dimension takes a list and the sweep is their cartesian product, so this
+runs four strategies, and `--op` holds the FSDP shard width fixed across all
+of them:
+
+```bash
+python examples/training_demo/sweep_qwen3_5_moe.py --ep 2,16 --cp 1,2 --op 16
+```
+
+One axis at a time is usually what a cost model needs. Sweeping EP alone does
+not isolate EP: expert weights are all-gathered by FSDP in blocks of
+`num_experts / ep`, so EP moves the data-parallel volume too, and a
+disagreement along that axis cannot be attributed to either term. Sweeping OP
+at fixed EP changes the shard width without changing that volume, which
+separates them.
 
 | flag | sets | default |
 |---|---|---|
-| `--ep` | `accelerator.ep_size` | `1,2,4,8,16,32,64` |
+| `--ep` | `accelerator.ep_size` | `1` |
 | `--cp` | `accelerator.cp_size` | `1` |
 | `--op` | `fsdp_config.dp_shard_size`, ND's `OP` | `dp * cp` |
 | `--tp`, `--pp` | refused above 1 on this model, see below | `1` |
 | `--global-batch-size` | `training.global_batch_size` | the world size |
-| `--layers` | `model.num_hidden_layers` | `32` |
+| `--layers` | `model.num_hidden_layers` | `8` |
 | `--seq-len` | `dataset.data_config.seq_length`, and rebuilds the dataset | `8192` |
 | `--activation-checkpoint` | `activation_checkpoint.mode` | `full` |
 
@@ -224,10 +232,14 @@ labelled in the classified CSV as it actually ran:
 - `edp_shard_size = world / ep`, since expert weights are sharded by EP over
   the whole device mesh.
 
-The sweep defaults to a shape worth calibrating against rather than the light
-one the single-node demo uses: 32 layers, sequence 8192 and full recompute.
-The yaml itself stays small so the smoke test stays quick. Two consequences
-worth knowing before the first run at that shape:
+The sweep defaults to sequence 8192 with full recompute, which the
+single-node demo's 128 is too small to stand in for, but keeps the crop at 8
+layers so a sweep finishes in a usable time. Layer count rescales the step
+rather than changing what the comparison tests, since both communication
+volume and compute are linear in it; sequence length is not substitutable that
+way, because attention is quadratic in it and the step is launch-bound until
+it is long. Pass `--layers 32` when the absolute numbers matter more than the
+turnaround. Two consequences worth knowing:
 
 - The dataset is rebuilt by the `data` stage because its documents are exactly
   `seq_length` long, so raising the sequence without rebuilding would leave the
@@ -247,7 +259,7 @@ Stages run in order and any can be run alone, so a sweep can be re-classified
 without re-profiling and a changed cost model re-scored without re-running:
 
 ```bash
-python examples/training_demo/sweep_qwen3_5_moe_ep.py --only classify --only compare
+python examples/training_demo/sweep_qwen3_5_moe.py --only classify --only compare
 ```
 
 | stage | what it does |
