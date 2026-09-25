@@ -227,13 +227,17 @@ class _PPB:
         )
 
     def _working_extra(self, ctx: Context) -> float:
-        """What the working set of the current layer's backward holds beyond what it keeps at one micro-batch."""
+        """What the working set of the current layer's backward holds beyond what it keeps at one micro-batch.
+
+        The working set that ends warm-up, which holds two layers' gathered
+        parameters under FSDP that reshards: the layer's own and the next's.
+        """
         kept = sum(self._inner_dynamic_mem(ppb=True))
-        ctx.working_set = True
+        ctx.working_set = 2
         try:
             return sum(self._inner_dynamic_mem(default_micro_factor=1)) - kept
         finally:
-            ctx.working_set = False
+            ctx.working_set = 0
 
     def _dynamic_mem(
         self, many: int, counts: Tuple[int, ...] = ()

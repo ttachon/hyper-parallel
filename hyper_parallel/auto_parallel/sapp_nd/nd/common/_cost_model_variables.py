@@ -212,6 +212,9 @@ class _CostModVar:
 
     # shard
     shard_embed: float = 0
+    # Over how many of the ranks that shard the embedding table its layer
+    # gathers it to compute with it.
+    gather_embed: float = 1
     shard_output_activ: float = 0
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
@@ -243,6 +246,11 @@ class _CostModVar:
     # gives it.
     deferred_grad_accumulation: bool = None
     defers_grads: bool = False
+    # Whether FSDP holds a layer's whole gradients while the next layer's
+    # backward runs, and the root's until the backward ends, as stated,
+    # None taking its family's; and as derive gives it.
+    overlapped_grad_reduce: bool = None
+    overlaps_grad_reduce: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the optimizer keeps per parameter: a layer's, and the embedding

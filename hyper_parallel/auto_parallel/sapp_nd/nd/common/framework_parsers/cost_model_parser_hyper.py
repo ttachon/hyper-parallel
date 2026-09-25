@@ -591,6 +591,9 @@ class CostModelParserHyperV2(_CostModelParser):
             # It adds each layer's reduce-scatter output to the accumulated
             # gradient only in the root's backward hook.
             "deferred_grad_accumulation": True,
+            # It reduce-scatters a layer's gradients while the next layer's
+            # backward runs, and the root's in its backward hook.
+            "overlapped_grad_reduce": True,
             "reshard_params": self._reshards_params(),
         }
 

@@ -16,8 +16,10 @@
 # whether gradients take memory without pipeline parallelism (false),
 # reshard_params, whether FSDP frees a layer's gathered parameters once it
 # has run (false), deferred_grad_accumulation, whether it holds each
-# layer's reduce-scatter output until the backward ends (false), and
-# shard_activations, whether tensor parallelism shards the activations
+# layer's reduce-scatter output until the backward ends (false),
+# overlapped_grad_reduce, whether it holds a layer's whole gradients while
+# the next layer's backward runs and the root's until the backward ends
+# (false), and shard_activations, whether tensor parallelism shards the activations
 # between layers and the output layer's (false).  Under model, an MLA
 # family states the v_head_dim a model that declares none has.
 kinds:

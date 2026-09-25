@@ -281,6 +281,20 @@ class TestDeriveFamily(unittest.TestCase):
             got.append(ccfg.defers_grads)
         self.assertEqual(got, [False, True])
 
+    def test_overlapped_grad_reduce(self):
+        """
+        Feature: derive_resharding, the gradients FSDP holds whole.
+        Description: A run that states nothing, and one that states its FSDP
+            reduces a layer's gradients while the next layer's backward runs.
+        Expectation: The family holds no whole gradient; what a run states wins.
+        """
+        got = []
+        for facts in ({}, {"overlapped_grad_reduce": True}):
+            ccfg = _config(**facts)
+            derive(ccfg)
+            got.append(ccfg.overlaps_grad_reduce)
+        self.assertEqual(got, [False, True])
+
     def test_activation_sharding(self):
         """
         Feature: derive_activation_sharding.
