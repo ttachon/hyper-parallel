@@ -43,6 +43,13 @@ class _CostModVar:
     mm_ccfgs: any = None
     mm_order: list = None
     layer_custom_config: list = None
+    # What a layer of each kind keeps and holds per token, as a census states
+    # it (an auto_parallel KindActivations per layer type), the record of the
+    # kind of the layer priced, which the Hyper parser binds, and the output
+    # layer's; with none, the formulas price them.
+    census: dict = None
+    kind_activations: any = None
+    output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
 

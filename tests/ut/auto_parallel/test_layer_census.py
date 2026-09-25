@@ -1,0 +1,289 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Tests for the layer census, the records it states, and their pricing."""
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import torch
+import yaml
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
+from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
+    KindActivations,
+    _measure,
+    activations_from_dict,
+    census_activations,
+    census_layer,
+    census_output_activations,
+    tp_config,
+)
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+
+_HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
+_CAUSAL_LM = "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained"
+_IMAGE_TEXT = "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained"
+
+
+def _qwen35_text():
+    """A two-layer Qwen3.5-MoE text config, one layer of each attention kind."""
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
+        Qwen3_5MoeTextConfig,
+    )
+    return Qwen3_5MoeTextConfig.from_dict({
+        "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "head_dim": 16, "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 32, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
+        "linear_num_value_heads": 4, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
+        "vocab_size": 128, "max_position_embeddings": 256, "layer_types": ["linear_attention", "full_attention"],
+    })
+
+
+def _qwen3():
+    """A two-layer dense Qwen3 config, whose layers are one kind."""
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config  # pylint: disable=C0415
+    return Qwen3Config.from_dict({
+        "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "head_dim": 16, "intermediate_size": 128, "vocab_size": 128, "max_position_embeddings": 256,
+    })
+
+
+_STACK = [{"kind": "linear_attention", "count": 1}, {"kind": "full_attention", "count": 1}]
+
+
+def _qwen35(text):
+    """The vision-language config around *text*, its vision tower Transformers' default."""
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
+        Qwen3_5MoeConfig,
+    )
+    return Qwen3_5MoeConfig.from_dict({"text_config": text.to_dict()})
+
+
+def _train_yaml(folder: str, target: str = _CAUSAL_LM, mode: str = "off", pp: int = 1, **context) -> str:
+    """A train yaml of the model on two ranks, at DP shard 2 over PP 1 or on two stages."""
+    config = {
+        "model": {"_target_": target, "pretrained_model_name_or_path": "local/model",
+                  "torch_dtype": "bfloat16"},
+        "training": {"global_batch_size": 4, "micro_batch_size": 1},
+        "accelerator": {"tp_size": 1, "pp_size": pp, "ep_size": 1, "cp_size": 1},
+        "fsdp_config": {"dp_shard_size": 2 // pp},
+        "activation_checkpoint": {"mode": mode},
+        "dataset": {"data_transform": {"max_seq_len": 4096}},
+        "context": dict(context, device_num=2),
+    }
+    path = os.path.join(folder, "train.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle)
+    return path
+
+
+def _evaluator(model_config, **train) -> EvaluatorV2:
+    """The evaluator of :func:`_train_yaml`'s run of *model_config*."""
+    with patch(_HF_CONFIG, return_value=model_config):
+        with tempfile.TemporaryDirectory() as folder:
+            return EvaluatorV2(_train_yaml(folder, **train), framework="hyper_v2", log_level=0)
+
+
+class TestLayerCensus(unittest.TestCase):
+    """The census counts what a fake layer keeps and holds."""
+
+    def test_a_tensor_parallel_rank_holds_a_share(self):
+        """
+        Feature: tp_config and census_layer.
+        Description: Each kind's layer, and the same layer as one of two
+            tensor-parallel ranks holds it.
+        Expectation: The rank's layer has half the heads and widths, the same
+            head width, and keeps and holds less, but more than half.
+        """
+        config = _qwen35_text()
+        rank = tp_config(config, 2)
+        self.assertEqual((rank.num_attention_heads, rank.num_key_value_heads, rank.head_dim), (2, 1, 16))
+        self.assertEqual((rank.moe_intermediate_size, rank.linear_num_value_heads), (16, 2))
+        for index in (0, 1):
+            whole, share = census_layer(config, index, 64), census_layer(rank, index, 64)
+            for full, half in zip(whole, share):
+                self.assertGreater(full, half)
+                self.assertGreater(2 * half, full)
+
+    def test_a_gradient_the_size_of_a_parameter_is_an_activations(self):
+        """
+        Feature: _measure, which tells gradients apart.
+        Description: A projection of a 64-wide input of 64 tokens, whose
+            input's gradient has as many elements as its weight.
+        Expectation: The forward keeps the input; when the backward peaks,
+            the input, the output's gradient and the input's are the
+            activations held, and the weight's gradient is not.
+        """
+        with FakeTensorMode():
+            weight = torch.nn.Parameter(torch.empty(64, 64, dtype=torch.bfloat16))
+            hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
+            size = hidden.untyped_storage().nbytes()
+            saved, working = _measure([weight], (hidden,), lambda: hidden @ weight.t(),
+                                      lambda out: out.backward(torch.ones_like(out)))
+        self.assertEqual((saved, working), (size, 3 * size))
+
+    def test_each_kind_gets_its_record(self):
+        """
+        Feature: census_activations.
+        Description: The census of a stack of one linear-attention layer and
+            one full-attention layer.
+        Expectation: A record per kind, at the census's length, splitting
+            each layer's bytes between what TP splits and what it does not.
+        """
+        got = census_activations(_qwen35_text(), _STACK, 64)
+        self.assertEqual(sorted(got), ["full_attention", "linear_attention"])
+        for kind, index in (("linear_attention", 0), ("full_attention", 1)):
+            record = got[kind]
+            saved, working = census_layer(_qwen35_text(), index, 64)
+            self.assertEqual(record.seq_length, 64)
+            self.assertAlmostEqual((record.saved + record.saved_tp) * 64, saved)
+            self.assertAlmostEqual((record.working + record.working_tp) * 64, working)
+            self.assertGreater(record.saved_tp, 0)
+
+    def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
+        """
+        Feature: census_output_activations.
+        Description: The output layer of the model with a vocabulary of
+            4096, which its logits outweigh.
+        Expectation: Per token and vocabulary entry, the layer keeps the
+            loss's fp32 log-probabilities and its backward holds three such
+            tensors: the part a vocabulary-parallel loss splits.
+        """
+        config = _qwen35_text()
+        config.vocab_size = 4096
+        record = census_output_activations(config, 48)
+        self.assertEqual((record.saved_tp, record.working_tp, record.seq_length), (4 * 4096, 12 * 4096, 48))
+        self.assertGreater(record.saved, 0)
+
+
+class TestKindActivations(unittest.TestCase):
+    """A spec states a census's records as plain mappings."""
+
+    def test_round_trip_through_yaml(self):
+        """
+        Feature: KindActivations.to_dict and activations_from_dict.
+        Description: Each kind's record, dumped to YAML and read back.
+        Expectation: The same records.
+        """
+        record = KindActivations(saved=2036.25, saved_tp=3812.5, working=2162.375, working_tp=3812.5,
+                                 seq_length=64)
+        dumped = yaml.safe_dump({"linear_attention": record.to_dict(), "full_attention": record.to_dict()})
+        self.assertEqual(activations_from_dict(yaml.safe_load(dumped)),
+                         {"linear_attention": record, "full_attention": record})
+
+    def test_a_record_is_checked(self):
+        """
+        Feature: KindActivations.from_dict and activations_from_dict.
+        Description: A negative size, a missing field, a record that is no
+            mapping, and activations that map no kinds.
+        Expectation: Each raises, naming what is wrong.
+        """
+        record = {"saved": 1.0, "saved_tp": 1.0, "working": 1.0, "working_tp": 1.0, "seq_length": 64}
+        with self.assertRaisesRegex(ValueError, "negative"):
+            KindActivations.from_dict(dict(record, saved=-1.0))
+        with self.assertRaisesRegex(ValueError, "lacks"):
+            KindActivations.from_dict({"saved": 1.0})
+        with self.assertRaisesRegex(ValueError, "output_activations must map"):
+            KindActivations.from_dict([1.0], "output_activations")
+        with self.assertRaisesRegex(ValueError, "layer kinds"):
+            activations_from_dict([record])
+
+
+class TestCensusPricing(unittest.TestCase):
+    """``context.census`` has the memory model price a layer with its kind's census."""
+
+    def test_the_resolver_states_each_kinds_census(self):
+        """
+        Feature: resolve_hf_model_spec's census_seq_len.
+        Description: The hybrid model resolved twice with a census at 48
+            tokens, and a spec of config_overrides alone.
+        Expectation: The spec states each kind's record and the output
+            layer's at that length, the census runs once; with no
+            checkpoint config there is none.
+        """
+        model = {"pretrained_model_name_or_path": "local/qwen3_5_moe"}
+        with patch(_HF_CONFIG, return_value=_qwen35_text()), patch(
+                "hyper_parallel.auto_parallel._hf_model_spec.census_activations", wraps=census_activations) as run:
+            spec = resolve_hf_model_spec(model, census_seq_len=48)
+            self.assertEqual(resolve_hf_model_spec(model, census_seq_len=48), spec)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(sorted(spec["activations"]), ["full_attention", "linear_attention"])
+        self.assertEqual(spec["activations"]["linear_attention"]["seq_length"], 48)
+        self.assertEqual(spec["output_activations"]["seq_length"], 48)
+        overrides = {"name": "llama", "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+                     "intermediate_size": 128, "vocab_size": 128}
+        with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING"):
+            plain = resolve_hf_model_spec({"config_overrides": overrides}, census_seq_len=48)
+        self.assertNotIn("activations", plain)
+        self.assertNotIn("output_activations", plain)
+
+    def test_each_kind_binds_its_record(self):
+        """
+        Feature: the Hyper parser's context.census.
+        Description: The hybrid model parsed with a census and without, a
+            dense model whose layers are one kind, and the hybrid model's
+            vision-language checkpoint trained with its tower.
+        Expectation: With it, the config holds each kind's record and the
+            output layer's at the dataset's length; a stack of one kind
+            binds its record, a hybrid one its groups'; the tower holds
+            none; without it, there is none.
+        """
+        ccfg = _evaluator(_qwen35_text(), census=True).ccfg
+        self.assertEqual({record.seq_length for record in ccfg.census.values()}, {4096})
+        self.assertEqual(ccfg.output_census.seq_length, 4096)
+        self.assertIsNone(ccfg.kind_activations)
+        dense = _evaluator(_qwen3(), census=True).ccfg
+        self.assertEqual(list(dense.census), ["full_attention"])
+        self.assertIs(dense.kind_activations, dense.census["full_attention"])
+        plain = _evaluator(_qwen35_text()).ccfg
+        self.assertIsNone(plain.census)
+        self.assertIsNone(plain.output_census)
+        towers = _evaluator(_qwen35(_qwen35_text()), target=_IMAGE_TEXT, census=True).ccfg.mm_ccfgs
+        self.assertEqual(towers["text"].census, ccfg.census)
+        self.assertEqual(towers["text"].output_census, ccfg.output_census)
+        for name in ("census", "kind_activations", "output_census"):
+            self.assertIsNone(getattr(towers["vision"], name))
+
+    def test_a_layer_is_priced_with_its_kinds_census(self):
+        """
+        Feature: the census on the memory path.
+        Description: The hybrid model without recompute on one stage, and
+            fully recomputed on two, each with a census.
+        Expectation: Each layer keeps its kind's census bytes for the
+            micro-batch's 4096 tokens, and the output layer its own; the
+            output layer's backward holds what its census states beyond
+            that; the first stage's last layer, which recomputes, holds its
+            kind's working set in its backward.
+        """
+        evaluator = _evaluator(_qwen35_text(), census=True)
+        census, output = evaluator.ccfg.census, evaluator.ccfg.output_census
+        log = evaluator.estimate_peak_insight()[0]["Node Log"]
+        for index, kind in enumerate(("linear_attention", "full_attention")):
+            kept = 4096 * (census[kind].saved + census[kind].saved_tp) / 2 ** 20
+            self.assertAlmostEqual(log[(0, 0, index, "N")]["_activ"], kept, delta=1)
+        kept = output.saved + output.saved_tp
+        self.assertAlmostEqual(log[(0, 0, "", "O")]["_activ"], 4096 * kept / 2 ** 20, delta=1)
+        held = output.working + output.working_tp - kept
+        self.assertAlmostEqual(log[(0, 0, "G_", "O")]["_activ"], 4096 * held / 2 ** 20, delta=1)
+        log = _evaluator(_qwen35_text(), mode="full", pp=2, census=True).estimate_peak_insight()[0]["Node Log"]
+        working = [value["_activ"] for key, value in log.items() if str(key[2]).startswith("rec_")]
+        linear = census["linear_attention"]
+        self.assertAlmostEqual(working[0], 4096 * (linear.working + linear.working_tp) / 2 ** 20, delta=1)
+
+
+if __name__ == "__main__":
+    unittest.main()
