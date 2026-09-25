@@ -189,6 +189,10 @@ class _CostModVar:
     # gathers it to compute with it.
     gather_embed: float = 1
     shard_output_activ: float = 0
+    # Whether the loss runs on logits sharded over the vocabulary, as the
+    # run states it, None taking its family's; and as the families read it.
+    loss_parallel: bool = None
+    shards_logits: bool = True
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
 
