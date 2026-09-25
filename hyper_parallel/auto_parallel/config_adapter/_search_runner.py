@@ -286,6 +286,16 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
 
 
 
+# The names a search config may give its devices, and the sapp_nd device
+# codes they mean: the Ascend 910B is the Atlas A2 series' chip, and the
+# 910C, CANN's ascend910_93, the A3's.  A generic "ascend" stays A2.
+_DEVICE_CODES: Dict[str, str] = {
+    "a2": "A2", "a3": "A3", "v100": "V100",
+    "ascend": "A2", "ascend910": "A2", "ascend910b": "A2",
+    "ascend910c": "A3", "ascend910_93": "A3",
+}
+
+
 def _build_machine(config: NormalizedConfig) -> Any:
     """Build a ``Hard.Machine`` from cluster_spec."""
     hw_mod = _get_machine_mod()
@@ -293,11 +303,8 @@ def _build_machine(config: NormalizedConfig) -> Any:
     nodes = max(1, cluster.get("num_nodes", 1))
     cards_per_node = max(1, cluster.get("cards_per_node", 8))
     total_devices = nodes * cards_per_node
-    device_type = cluster.get("device_type", "A2")
-    # Map generic names to sapp_nd device codes.
-    device_code_map = {"ascend": "A2", "ascend910": "A2", "ascend910b": "A3"}
-    device_type = device_code_map.get(str(device_type).lower(), device_type)
-    return hw_mod.Machine(total_devices, device_type)
+    device_type = str(cluster.get("device_type", "A2"))
+    return hw_mod.Machine(total_devices, _DEVICE_CODES.get(device_type.lower(), device_type))
 
 
 def _resolve_search_dimensions(config: NormalizedConfig) -> Tuple[List[Any], Set[Any]]:
