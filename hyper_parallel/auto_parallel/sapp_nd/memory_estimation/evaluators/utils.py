@@ -214,11 +214,16 @@ class EvalUtils:
 
     @staticmethod
     def pp_seq1f1b_micro_factor(ccfg: CostModelConfig, ctx: Context) -> int:
-        """Seq1F1B Warm-up microbatches count"""
+        """Seq1F1B Warm-up microbatches count, in sequence chunks.
+
+        Each chunk holds ``n_s_split``'th of a micro-batch's sequence: the
+        count goes to ``ctx.seq_chunks``, and the backbone evaluates the node
+        at that length.
+        """
         stage_id, chunk_id = ctx.current_stage_id, ctx.current_chunk_id
         # Warm_up micros num compute
         micro_factor = 1
-        ccfg.s /= ccfg.n_s_split  # Splitting seq length
+        ctx.seq_chunks = max(1, ccfg.n_s_split)
         base_micro = min(ccfg.p, ccfg.m)
         if ccfg.vp == 1:
             micro_factor = base_micro - stage_id + ccfg.n_s_split - 1
