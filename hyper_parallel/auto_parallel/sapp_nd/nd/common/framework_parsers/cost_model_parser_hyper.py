@@ -121,10 +121,14 @@ class CostModelParserHyperV2(_CostModelParser):
         ``model.config_overrides`` for standalone cost-model search files.
         A vision-language config additionally yields a ``vision`` sub-spec,
         held here until :meth:`_resolve_multimodal` can build its submodule.
+        The AutoModels trainer trains the model Transformers builds, which
+        has no MTP layer (:meth:`_without_mtp`).
         """
         spec = resolve_hf_model_spec(
             self._model_section(), self._visual_seq_len_override()
         )
+        if is_auto_models_schema(self.config):
+            spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
         self._tie_word_embeddings = bool(spec.get("tie_word_embeddings"))
         self._apply_spec(self.ccfg, spec)
@@ -135,6 +139,21 @@ class CostModelParserHyperV2(_CostModelParser):
             LinearAttentionDims.from_fields(spec),
         ))
         self._model_seq_len = self._spec_int(spec, "max_position_embeddings")
+
+    @staticmethod
+    def _without_mtp(spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Return *spec* without its MTP layers, as the AutoModels trainer builds the model.
+
+        It builds the Transformers causal LM, which has no MTP layer whatever
+        the checkpoint declares: Transformers loads their weights as
+        unexpected and never trains them (Qwen3.5's ``mtp.*``, DeepSeek-V3's
+        last layer).  The legacy schema's trainer is not this one.
+        """
+        layers = spec.get("layers")
+        if isinstance(layers, list):
+            spec["layers"] = [group for group in layers if not (isinstance(group, dict) and group.get("mtp"))]
+        spec["mtp_depth"] = 0
+        return spec
 
     def _model_section(self) -> Dict[str, Any]:
         """Return the ``model`` section as a plain mapping."""

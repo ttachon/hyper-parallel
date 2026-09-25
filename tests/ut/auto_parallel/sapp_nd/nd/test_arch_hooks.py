@@ -460,11 +460,12 @@ class TestStackAsData(unittest.TestCase):
     def test_a_one_kind_stack_needs_no_kind(self):
         """
         Feature: layer groups.
-        Description: A dense model with one MTP layer.
-        Expectation: One group covering all five layers, priced on the
+        Description: A dense model whose checkpoint declares one MTP layer,
+            which the AutoModels trainer does not build.
+        Expectation: One group covering its four layers, priced on the
             config as the family hook leaves it.
         """
-        self.assertEqual(layer_groups(_ccfg("qwen3_moe", mtp_depth=1)), [(None, 5)])
+        self.assertEqual(layer_groups(_ccfg("qwen3_moe", mtp_depth=1)), [(None, 4)])
 
     def test_a_linear_kind_without_dimensions_is_refused(self):
         """
@@ -521,15 +522,16 @@ class TestDenseThenMoE(unittest.TestCase):
     def test_the_stack_comes_from_first_k_dense_replace(self):
         """
         Feature: DeepSeek layer stack.
-        Description: One dense layer, three MoE layers and one MTP layer.
-        Expectation: Three groups, the MTP one repeating the MoE kind, each
-            priced by its kind.
+        Description: One dense layer and three MoE layers, and the
+            checkpoint's MTP layer, which the AutoModels trainer does not
+            build.
+        Expectation: Two groups, each priced by its kind.
         """
         ccfg = _deepseek()
         self.assertEqual([(group.kind.name, group.count, group.mtp) for group in ccfg.layer_stack.groups],
-                         [("dense", 1, False), ("moe", 3, False), ("moe", 1, True)])
+                         [("dense", 1, False), ("moe", 3, False)])
         self.assertEqual([(kind.name, count) for kind, count in layer_groups(ccfg)],
-                         [("dense", 1), ("moe", 3), ("moe", 1)])
+                         [("dense", 1), ("moe", 3)])
 
     def test_each_kind_assigns_the_whole_feed_forward(self):
         """
