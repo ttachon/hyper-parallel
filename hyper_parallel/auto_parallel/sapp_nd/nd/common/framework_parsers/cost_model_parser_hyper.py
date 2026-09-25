@@ -418,7 +418,7 @@ class CostModelParserHyperV2(_CostModelParser):
 
         stated, dp_shard = self._parse_parallel_dimensions(accel, fsdp)
         stated.update(self._parse_sequence_parallelism(accel))
-        stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"], stated["tp"]))
+        stated.update(self._parse_optimizer_parallelism(accel, dp_shard, stated["dp"]))
         return stated
 
     def _parse_parallel_dimensions(self, accel, fsdp) -> Tuple[Dict[str, Any], int]:
@@ -505,7 +505,7 @@ class CostModelParserHyperV2(_CostModelParser):
             "pp_schedule": str(self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")),
         }
 
-    def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int, tp: int) -> Dict[str, Any]:
+    def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int) -> Dict[str, Any]:
         """Optimizer and gradient sharding.
 
         HyperParallel's FSDP holds every gradient sharded as its parameter,
@@ -522,10 +522,10 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (dp_shard if is_auto_models else dp * tp))
+        ) or (dp_shard if is_auto_models else dp))
         return {
             "optimizer_parallel": optimizer_parallel,
-            "optimizer_shard": weight_shard if weight_shard >= 1 else dp * tp,
+            "optimizer_shard": weight_shard,
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
             "grad_shard_as_params": True,
             "grad_accumulation": True,

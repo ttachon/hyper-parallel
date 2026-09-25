@@ -401,7 +401,8 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: _parse_parallelism — optimizer shard.
         Description: enable_parallel_optimizer and optimizer_weight_shard_size.
-        Expectation: has_op and os_max_shard match inputs.
+        Expectation: has_op and os_max_shard match inputs; with no size
+            stated, the optimizer shard counts every data-parallel rank.
         """
         cfg = _dense_overrides(train={
             "accelerator": {
@@ -421,7 +422,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         })
         ccfg2 = _make_ccfg(cfg2)
         self.assertFalse(ccfg2.has_op)
-        self.assertEqual(ccfg2.os_max_shard, ccfg2.d * ccfg2.t)
+        self.assertEqual(ccfg2.os_max_shard, ccfg2.d)
 
     def test_parallelism_grad_accum_shard(self):
         """

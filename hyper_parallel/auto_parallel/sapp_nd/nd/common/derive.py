@@ -99,27 +99,35 @@ def derive_expert_degrees(ccfg: Any, strict: bool = True) -> None:
     ccfg.n_exp = max(1, ccfg.n_exp)
 
 
+def optimizer_ranks(ccfg: Any) -> int:
+    """How many data-parallel ranks the optimizer shards a parameter over.
+
+    ``os_max_shard`` counts them, as MindSpore's ``optimizer_weight_shard_size``
+    and HyperParallel's ``dp_shard`` do, on top of TP's sharding.  A count
+    that does not divide DP shards over all of it, as MindSpore does.
+    """
+    ranks = int(ccfg.os_max_shard or 0)
+    return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
+
+
 def derive_optimizer_sharding(ccfg: Any) -> None:
     """Set how parameters, optimizer states and gradients are sharded.
 
-    Gradients are sharded as the parameters are when the run says so
-    (``grad_shard_as_params``), as FSDP shards them; else over the whole
-    optimizer shard when the run shards them (``has_grad_shard``), and over
-    TP alone otherwise.
+    With optimizer sharding, a parameter is sharded over TP and then over
+    :func:`optimizer_ranks` data-parallel ranks.  Gradients are sharded as
+    the parameters are when the run says so (``grad_shard_as_params``), as
+    FSDP shards them; else over the whole optimizer shard when the run
+    shards them (``has_grad_shard``), and over TP alone otherwise.
     """
+    ranks = optimizer_ranks(ccfg) if ccfg.has_op else 1
     # Non expert params
-    ccfg.shard_p_os_non_exp_partial = (
-        ccfg.os_max_shard if ccfg.has_op else ccfg.t
-    ) * ccfg.cp
+    ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * ccfg.cp
     ccfg.shard_p_os_non_exp = (
         (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
     )
 
     # Expert params
-    ccfg.shard_p_os_exp_partial = math.gcd(
-        ccfg.n_exp,
-        (ccfg.os_max_shard if ccfg.has_op else 1) * ccfg.t_exp,
-    )
+    ccfg.shard_p_os_exp_partial = math.gcd(ccfg.n_exp, ranks * ccfg.t_exp)
     ccfg.shard_p_os_exp = (
         (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
     )
