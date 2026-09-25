@@ -760,6 +760,30 @@ class CostModelParserHyperV2(_CostModelParser):
         # parallel degree when this reads as a non-muon optimizer name, and
         # the generated cost-model yaml carries no optimizer section.
         self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
+        self._init_optimizer_states(optimizer, str(opt_type or ""))
+
+    def _init_optimizer_states(self, optimizer, target):
+        """State what HyperParallel's optimizer keeps per parameter.
+
+        Its AdamW keeps two moments and its Muon one momentum per matrix,
+        each ``zeros_like`` the gradient, which FSDP casts to the stored
+        parameter's dtype.  With ``fp32_main_params`` the optimizer keeps an
+        fp32 copy of each narrower parameter, and its states in fp32.
+        """
+        stored = self._stored_param_bytes()
+        fp32_main = bool(self._get_cfg_attr(optimizer, "fp32_main_params", False))
+        self.ccfg.optimizer_states = 1 if "muon" in target.lower() else 2
+        self.ccfg.optimizer_state_bytes = 4 if fp32_main else stored
+        self.ccfg.main_param_bytes = 4 if fp32_main and stored < 4 else 0
+
+    def _stored_param_bytes(self):
+        """The width FSDP stores the parameters in: the model's, whatever FSDP gathers them in."""
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        return self._bytes_from_dtype(
+            self._get_cfg_attr(self.config, "model_init_dtype", None)
+            or self._get_cfg_attr(model_raw, "torch_dtype", None)
+            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+        )
 
     def _parse_recompute(self):
         """Parse recompute mode.

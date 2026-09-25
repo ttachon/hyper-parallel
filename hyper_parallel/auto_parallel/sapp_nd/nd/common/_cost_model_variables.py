@@ -187,6 +187,16 @@ class _CostModVar:
     grads_as_params: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
+    # What the run's optimizer keeps, None taking the family's: a state's
+    # width, its states per layer parameter (2 for AdamW, 1 for Muon) and
+    # the width of its copy of the parameters; and, from them, its bytes
+    # per parameter of a layer and of the embedding and output tables,
+    # which the family hooks set.
+    optimizer_state_bytes: float = None
+    optimizer_states: float = None
+    main_param_bytes: float = None
+    bytes_optim: float = 0
+    bytes_optim_table: float = 0
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
