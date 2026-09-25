@@ -100,6 +100,11 @@ _MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype"
 # The root keys of an AutoModels train.yaml that state the run.
 _RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer")
 
+# The ``context`` keys of a train.yaml that state how the cost model prices
+# the run: a census of the layers, and a vision tower's token count.  The
+# device count and the memory budget are a search's own.
+_RUN_CONTEXT_KEYS = ("census", "visual_seq_len")
+
 # The keys of a legacy train.yaml's ``train`` section that are not its
 # training settings: recompute, the search's, and precision, which the cost
 # model reads from the model section.
@@ -118,9 +123,13 @@ def _stated_run(raw: Dict[str, Any]) -> Dict[str, Any]:
     gradient clipping and the accelerator's settings are the run's, and the
     model spec carries none of them.  The strategy the same sections state
     stays in: the search runner writes the one it searches over it.  A legacy
-    train.yaml states them under ``train``.
+    train.yaml states them under ``train``.  The context's pricing options,
+    :data:`_RUN_CONTEXT_KEYS`, ride along.
     """
     run: Dict[str, Any] = {"model": _model_run(_get_dict(raw, "model"))}
+    context = {key: value for key, value in _get_dict(raw, "context").items() if key in _RUN_CONTEXT_KEYS}
+    if context:
+        run["context"] = copy.deepcopy(context)
     if is_auto_models_schema(raw):
         for key in _RUN_SECTIONS:
             if raw.get(key) is not None:
@@ -139,13 +148,14 @@ def _stated_run(raw: Dict[str, Any]) -> Dict[str, Any]:
 def _load_auto_models_model_spec(
     model_raw: Dict[str, Any],
     visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
 ) -> Dict[str, Any]:
     """Resolve model dimensions through the shared AutoModels path.
 
     Delegates to :func:`resolve_hf_model_spec` so this reader and the
     SAPP-ND parser cannot disagree about field names or fallbacks.
     """
-    return _normalize_model_spec(resolve_hf_model_spec(model_raw, visual_seq_len))
+    return _normalize_model_spec(resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len))
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -439,12 +449,15 @@ def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any
     data_transform_raw = _get_dict(dataset_raw, "data_transform")
     context_raw = _get_dict(raw, "context")
 
-    model_spec = _load_auto_models_model_spec(
-        model_raw, context_raw.get("visual_seq_len"),
-    )
     # Both spellings the SAPP-ND parser accepts, so the two halves of the
     # cost model agree on where the training sequence length comes from.
     seq_len = data_transform_raw.get("max_seq_len") or _get_dict(raw, "data").get("max_seq_len")
+    # A census builds its layers from the checkpoint's config, which only
+    # this reader resolves: the search hands ND the spec, its records in it.
+    census_seq_len = int(seq_len or 4096) if context_raw.get("census") else 0
+    model_spec = _load_auto_models_model_spec(
+        model_raw, context_raw.get("visual_seq_len"), census_seq_len,
+    )
     if seq_len:
         model_spec["max_position_embeddings"] = seq_len
     else:

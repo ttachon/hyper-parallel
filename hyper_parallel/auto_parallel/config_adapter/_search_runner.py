@@ -41,7 +41,7 @@ CONFIG_OVERRIDE_FIELDS = [
     "head_dim", "vision", "attn_output_gate", "qk_norm", "tie_word_embeddings",
     "layer_types", "linear_num_key_heads", "linear_key_head_dim",
     "linear_num_value_heads", "linear_value_head_dim",
-    "linear_conv_kernel_dim",
+    "linear_conv_kernel_dim", "activations", "output_activations",
     "param_init_type", "compute_dtype", "softmax_compute_type",
 ]
 
@@ -271,7 +271,9 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     recompute = config.estimator.get("recompute_strategy", "none")
 
     cluster = config.cluster_spec
-    context: Dict[str, Any] = {}
+    # The train.yaml's pricing options, beneath the search's own device count
+    # and memory budget.
+    context: Dict[str, Any] = dict(run.pop("context", None) or {})
     # ND prunes the space against ccfg.device_capacity, which the parser reads
     # from this field, so the user's memory_limit_gb has to reach it here.
     budget_gb = _memory_budget_gb(config)
