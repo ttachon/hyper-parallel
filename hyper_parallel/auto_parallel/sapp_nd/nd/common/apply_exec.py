@@ -49,6 +49,7 @@ CONFIG_FIELDS = {
     "grad_shard_as_params": "grad_shard_as_params",
     "grad_accumulation": "grad_accumulation",
     "reshard_params": "reshard_params",
+    "deferred_grad_accumulation": "deferred_grad_accumulation",
     "pp_schedule": "pp_sched",
     "offset": "offset",
     "seq_split": "n_s_split",

@@ -321,8 +321,11 @@ def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
 
 
 def derive_resharding(ccfg: Any, run: Mapping[str, Any]) -> None:
-    """Set whether FSDP frees a layer's gathered parameters once it has run, ``reshards``."""
+    """Set whether FSDP frees a layer's gathered parameters once it has run, ``reshards``,
+    and whether it holds each layer's reduce-scatter output until the backward ends,
+    ``defers_grads``."""
     ccfg.reshards = bool(_stated(ccfg, "reshard_params", run))
+    ccfg.defers_grads = bool(_stated(ccfg, "deferred_grad_accumulation", run))
 
 
 def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:

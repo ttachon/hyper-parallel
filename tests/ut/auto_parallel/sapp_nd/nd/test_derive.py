@@ -229,6 +229,21 @@ class TestDeriveFamily(unittest.TestCase):
             got.append(ccfg.reshards)
         self.assertEqual(got, [False, True, False])
 
+    def test_deferred_grad_accumulation(self):
+        """
+        Feature: derive_resharding, the gradients FSDP holds back.
+        Description: A run that states nothing, and one that states its FSDP
+            holds each layer's reduce-scatter output until the backward ends.
+        Expectation: The family adds each output as soon as it is reduced;
+            what a run states wins.
+        """
+        got = []
+        for facts in ({}, {"deferred_grad_accumulation": True}):
+            ccfg = _config(**facts)
+            derive(ccfg)
+            got.append(ccfg.defers_grads)
+        self.assertEqual(got, [False, True])
+
     def test_activation_sharding(self):
         """
         Feature: derive_activation_sharding.

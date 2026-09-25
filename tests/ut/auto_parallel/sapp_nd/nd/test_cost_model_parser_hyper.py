@@ -37,7 +37,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import exec_of
 from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -1454,6 +1454,48 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertEqual(freed[0], [0, 0])
         # The log keeps whole MB, of two layers as of one.
         self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
+
+    @staticmethod
+    def _dynamic(micro_batches: int, **run: Any) -> float:
+        """Stage 0's dynamic memory, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
+        config = _auto_models_config(
+            accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1}, fsdp_config={"dp_shard_size": 4},
+            training={"global_batch_size": 4 * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+        )
+        with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+            mock_hf.return_value = SimpleNamespace(
+                model_type="llama", hidden_size=4096, num_hidden_layers=8, num_attention_heads=32,
+                num_key_value_heads=8, intermediate_size=14336, vocab_size=32000, max_position_embeddings=4096,
+            )
+            with tempfile.TemporaryDirectory() as folder:
+                path = os.path.join(folder, "train.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(config, handle)
+                evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        for name, value in run.items():
+            setattr(evaluator.ccfg, name, value)
+        derive(evaluator.ccfg)
+        stage = evaluator.estimate_peak_insight()[0]
+        grads = sum(value.get("accu_grad", 0) for key, value in stage["Node Log"].items() if isinstance(key[2], int))
+        return stage["Dynamic"], grads
+
+    def test_reduce_scatter_outputs_wait_for_the_backward_end(self):
+        """
+        Feature: the end of a later micro-batch's backward.
+        Description: The same stage with one micro-batch per step, with two,
+            and with two under an FSDP that adds each reduce-scatter output
+            as soon as it is reduced.
+        Expectation: With two, HyperParallel's FSDP holds every layer's
+            output until the backward ends, beside the gradients it
+            accumulated: the peak rises to at least the layers' gradients
+            again. Without accumulation, or without the deferral, it does not.
+        """
+        self.assertTrue(_make_ccfg(_dense_overrides()).defers_grads)
+        one, grads = self._dynamic(1)
+        two, _ = self._dynamic(2)
+        self.assertGreater(two, one)
+        self.assertGreaterEqual(two, grads + 1024)
+        self.assertEqual(self._dynamic(2, deferred_grad_accumulation=False)[0], one)
 
     def test_the_run_states_whether_it_reshards(self):
         """

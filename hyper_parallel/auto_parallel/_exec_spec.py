@@ -179,6 +179,10 @@ class ExecSpec:
             parameter is, as FSDP holds it; ``grad_shard`` does not apply.
         grad_accumulation: Whether gradients take memory without pipeline
             parallelism too; under it they always do.
+        deferred_grad_accumulation: Whether FSDP holds each layer's
+            reduce-scatter output until the micro-batch's backward ends, and
+            only then adds it to the accumulated gradient, as HyperParallel's
+            does; PyTorch's FSDP2 adds it as soon as it is reduced.
         reshard_params: Whether FSDP frees a layer's gathered parameters
             once the layer has run, forward or backward, and gathers them
             again when it runs next, as HyperParallel's does by default;
@@ -246,6 +250,7 @@ class ExecSpec:
     grad_shard: Optional[bool] = None
     grad_shard_as_params: Optional[bool] = None
     grad_accumulation: Optional[bool] = None
+    deferred_grad_accumulation: Optional[bool] = None
     reshard_params: Optional[bool] = None
 
     pp_schedule: Optional[str] = None
@@ -352,7 +357,8 @@ _KINDS: Dict[str, tuple] = {
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
              "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
     "flag": ("sequence_parallel", "shard_activations", "optimizer_parallel", "grad_shard",
-             "grad_shard_as_params", "grad_accumulation", "reshard_params", "mtp_in_offset",
+             "grad_shard_as_params", "grad_accumulation", "deferred_grad_accumulation", "reshard_params",
+             "mtp_in_offset",
              "emb_out_in_offset",
              "recompute_slice_activation", "flash_attention", "grad_clip", "grouped_gemm",
              "vocab_emb_dp", "emb_dp_sharded", "tie_embeddings", "shard_mtp_param", "frozen"),

@@ -533,6 +533,9 @@ class CostModelParserHyperV2(_CostModelParser):
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
             "grad_shard_as_params": True,
             "grad_accumulation": True,
+            # It adds each layer's reduce-scatter output to the accumulated
+            # gradient only in the root's backward hook.
+            "deferred_grad_accumulation": True,
             "reshard_params": self._reshards_params(),
         }
 

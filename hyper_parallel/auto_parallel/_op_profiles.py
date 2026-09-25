@@ -76,6 +76,7 @@ DEFAULT_RUN = MappingProxyType({
     "grad_accumulation": False,
     "shard_activations": False,
     "reshard_params": False,
+    "deferred_grad_accumulation": False,
 })
 
 # The model facts a profile's ``model`` may give a model that states none.

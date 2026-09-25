@@ -230,6 +230,11 @@ class _CostModVar:
     # the run states it, None taking its family's; and as derive gives it.
     reshard_params: bool = None
     reshards: bool = False
+    # Whether FSDP holds each layer's reduce-scatter output until the
+    # backward ends, as stated, None taking its family's; and as derive
+    # gives it.
+    deferred_grad_accumulation: bool = None
+    defers_grads: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the optimizer keeps per parameter: a layer's, and the embedding
