@@ -592,6 +592,30 @@ class TestOffloadWindow(unittest.TestCase):
         """
         self.assertEqual(self._limit([0.0] * 4, ending=2), 2)
 
+    def test_no_layer_offloads_to_save_only_rounding(self):
+        """
+        Feature: the choice of a stage whose first layers may offload.
+        Description: Three layers of 0.1, 0.2 and 0.3 that all fit plain,
+            and copies that take no time. Offloading the first sums the
+            same times in another order, 0.1 + (0.3 + 0.2) = 0.6 against
+            (0.1 + 0.2) + 0.3 = 0.6000000000000001.
+        Expectation: No layer offloads.
+        """
+        # pylint: disable=protected-access
+        fronts, layers = {}, []
+        for index, forward in enumerate((0.1, 0.2, 0.3)):
+            plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=MEGABYTE, memory_once=0.0,
+                                forward_time=forward, backward_time=0.0)
+            fronts["unit", index] = (plain,)
+            layers.append(Candidate._Layer(index, ("unit", index), 1, plain))
+        capacity = 64 * MEGABYTE
+        stage = Stage(groups=Candidate._groups(layers), budget=capacity)
+        link = Candidate._Link(per_byte=0.0, overlap=1.0)
+        chosen, transit = Candidate._offload_stage(layers, stage, Candidate._Peaks(0.0), fronts, {}, link, MEGABYTE,
+                                                   capacity)
+        self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
+        self.assertEqual(transit, 0.0)
+
 
 class TestOffload(unittest.TestCase):
     """With a host link, a choice per layer may offload each stage's first layers."""

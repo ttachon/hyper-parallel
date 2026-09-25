@@ -94,6 +94,9 @@ MODES = ("off", "selective", "full")
 _ENDS = (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER)
 # Marks the front of a layer that ends warm-up, whose options keep its working set.
 _ENDS_WARM_UP = "ends warm-up"
+# A time shorter than another by this share of it or less is the same time: the
+# same options' times summed in another order can differ in their last bits.
+_ROUNDING = 1e-9
 
 
 @dataclass(frozen=True)
@@ -746,7 +749,8 @@ def _offload_stage(
     budgets = _offload_budgets(stage_layers, stage, peaks, plain, fronts, own, capacity)
     rest = suffix_times([Layers(layer.key, 1, layer.in_flight) for layer in stage_layers], fronts, budgets, bucket)
     offloaded = list(itertools.accumulate((_time(option) for option in plain), initial=0.0))
-    count, fastest = 0, math.inf if stay is None else sum(_time(option) for option in stay.values())
+    # Offload only where it saves time, more than rounding.
+    count, fastest = 0, math.inf if stay is None else sum(_time(option) for option in stay.values()) * (1 - _ROUNDING)
     for first in range(1, most + 1):
         if offloaded[first] + rest[first] < fastest:
             count, fastest = first, offloaded[first] + rest[first]
