@@ -168,7 +168,8 @@ def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str,
 
     For every flavour some kind of the stack states, the fields it assigns,
     with the kind's values or the model's; then the fields the family gives
-    every layer.
+    every layer, and the kind's census record, None where the spec states
+    none.
     """
     kinds = stack.distinct_kinds()
     fields: Dict[str, Any] = {}
@@ -180,6 +181,7 @@ def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str,
     if any(other.ffn is not None for other in kinds):
         fields.update(_feed_forward(snapshot, kind.ffn))
     fields.update(getattr(snapshot, "layer_fields", None) or {})
+    fields["kind_activations"] = (getattr(snapshot, "census", None) or {}).get(kind.name)
     return fields
 
 

@@ -33,9 +33,11 @@ import unittest
 from unittest.mock import MagicMock, PropertyMock
 
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive_optimizer_sharding
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 
 def _make_ccfg(
@@ -417,6 +419,71 @@ class TestLayerActiv(unittest.TestCase):
         result = EvalBody.layer_activ(ccfg, ctx)
         expected = (10 + 20 + 30) + 200 + 5
         self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestCensusActiv(unittest.TestCase):
+    """Test EvalBody.layer_activ on a layer whose kind has a census record."""
+
+    RECORD = KindActivations(saved=100.0, saved_tp=300.0, working=150.0, working_tp=330.0, seq_length=4096)
+
+    @staticmethod
+    def _ccfg(record, sp=2, cp=1):
+        """A MoE layer at TP 2, micro-batch 2 of 4096 tokens, priced with *record*."""
+        ccfg = _make_ccfg(n_exp=8)
+        ccfg.kind_activations = record
+        ccfg.s, ccfg.b, ccfg.t, ccfg.sp, ccfg.cp = 4096, 2, 2, sp, cp
+        return ccfg
+
+    @staticmethod
+    def _ctx(node=LayerType.NOT_REC_LAYER, working_set=0, on_saved=False):
+        """A layer of *node* at micro factor 3, its formulas 235 bytes."""
+        ctx = MagicMock()
+        ctx.current_node, ctx.micro_factor = node, 3
+        ctx.working_set, ctx.working_on_saved = working_set, on_saved
+        ctx.attn_qkv_activ = ctx.attn_score_activ = ctx.attn_proj_activ = lambda c, x: 10.0
+        ctx.ffn_moe_activ = lambda c, x: 200.0
+        ctx.norm_activ = lambda c, x: 5.0
+        return ctx
+
+    def test_a_layer_keeps_what_its_census_states(self):
+        """
+        Feature: EvalBody.census_activ, between a layer's passes.
+        Description: The layer with sequence parallelism, without it, and
+            at CP 2.
+        Expectation: The census's bytes per token for the micro-batches in
+            flight: TP splits one part, sequence parallelism the other, and
+            CP the tokens.
+        """
+        tokens = 3 * 4096 * 2
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD), self._ctx()), tokens * (50 + 150))
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD, sp=1), self._ctx()), tokens * (100 + 150))
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD, cp=2), self._ctx()), tokens / 2 * (50 + 150))
+
+    def test_a_backward_holds_its_working_set(self):
+        """
+        Feature: EvalBody.census_activ, as a backward's working set.
+        Description: The working set of a layer that recomputed, of one that
+            did not, whose stage counts what it keeps already, and of one
+            whose backward holds less than it keeps.
+        Expectation: The most the backward holds; beyond what the layer
+            keeps where that is counted, and never below it.
+        """
+        tokens = 3 * 4096 * 2
+        ccfg = self._ccfg(self.RECORD)
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(working_set=2)), tokens * (75 + 165))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(working_set=2, on_saved=True)), tokens * 40)
+        small = self._ccfg(KindActivations(100.0, 300.0, 50.0, 100.0, 4096))
+        self.assertEqual(EvalBody.layer_activ(small, self._ctx(working_set=1, on_saved=True)), 0)
+
+    def test_the_formulas_price_a_layer_the_census_does_not(self):
+        """
+        Feature: EvalBody.layer_activ's census path.
+        Description: A selective layer of a kind with a record, and a layer
+            of a kind without one.
+        Expectation: Their formulas price both.
+        """
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD), self._ctx(LayerType.SEL_REC_LAYER)), 235)
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(None), self._ctx()), 235)
 
 
 class TestFullrecLayerActiv(unittest.TestCase):

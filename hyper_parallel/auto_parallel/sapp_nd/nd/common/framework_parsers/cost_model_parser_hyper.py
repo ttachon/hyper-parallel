@@ -58,6 +58,8 @@ search config).  Give them only to cost one fixed strategy::
     context:
       max_device_memory: "64GB"
       device_num: 64
+      census: true                   # price each layer kind's activations
+                                     # from a census of a fake layer of it
 
 ``model.config_overrides`` stays supported for standalone search configs,
 and wins over anything read from the checkpoint.
@@ -75,7 +77,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     resolve_hf_model_spec,
 )
 from hyper_parallel.auto_parallel._layer_stack import LinearAttentionDims, resolve_layers
-from hyper_parallel.auto_parallel._model_spec import layers_from_list, ops_from_dict
+from hyper_parallel.auto_parallel._model_spec import activations_from_dict, layers_from_list, ops_from_dict
 from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH
 
 logger = logging.getLogger(__name__)
@@ -124,9 +126,11 @@ class CostModelParserHyperV2(_CostModelParser):
         The AutoModels trainer trains the model Transformers builds, which
         has no MTP layer (:meth:`_without_mtp`), and a vision tower only
         where its model class builds one (:meth:`_builds_vision_tower`).
+        ``context.census`` has the resolver run a census of each layer kind
+        (:meth:`_config_census`).
         """
         spec = resolve_hf_model_spec(
-            self._model_section(), self._visual_seq_len_override()
+            self._model_section(), self._visual_seq_len_override(), self._census_seq_len()
         )
         if is_auto_models_schema(self.config):
             spec = self._without_mtp(spec)
@@ -141,7 +145,33 @@ class CostModelParserHyperV2(_CostModelParser):
             spec["arch"], layers_from_list(spec["layers"]), ops,
             LinearAttentionDims.from_fields(spec),
         ))
+        self._config_census(spec)
         self._model_seq_len = self._spec_int(spec, "max_position_embeddings")
+
+    def _config_census(self, spec: Dict[str, Any]) -> None:
+        """Hold the census the spec states, and the record of a stack of one kind.
+
+        The memory model prices a layer whose kind has a record with it,
+        rather than with its formulas.  A stack of several kinds binds each
+        kind's record as the layer priced becomes one of it (``arch_hooks``).
+        """
+        census = spec.get("activations")
+        self.ccfg.census = activations_from_dict(census) if census else None
+        kinds = self.ccfg.layer_stack.distinct_kinds()
+        single = len(kinds) == 1 and self.ccfg.census
+        self.ccfg.kind_activations = self.ccfg.census.get(kinds[0].name) if single else None
+
+    def _census_seq_len(self) -> int:
+        """The tokens to run a census of each layer kind at, 0 unless ``context.census`` asks for one.
+
+        A census gives bytes per token, which hardly depend on the length:
+        it runs at the dataset's, else at 4096 tokens, never at the model's
+        context limit.
+        """
+        ctx = self._get_cfg_attr(self.config, "context", Config({}))
+        if not self._get_cfg_attr(ctx, "census", False):
+            return 0
+        return self._dataset_seq_len() or 4096
 
     # The AutoModels classes that build a vision-language checkpoint's
     # vision tower; every other named class builds the language model alone.
@@ -325,6 +355,8 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.v = 0  # patch embedding, not a vocabulary table
         cc.n_mtp = 0
         cc.layer_binding = None
+        # The language model's census is not the tower's.
+        cc.census = cc.kind_activations = None
         self.config_layer_stack(cc, resolve_layers(
             VISION_ARCH, layers_from_list(vision_spec.get("layers"), "vision.layers"),
         ))
@@ -356,12 +388,8 @@ class CostModelParserHyperV2(_CostModelParser):
         stages[0] = head
         return stages
 
-    def _resolve_sequence_length(self) -> int:
-        """The training sequence length: the dataset's, else the model's limit.
-
-        A model section that states no limit falls back on
-        ``config_overrides.seq_length``, then on 4096.
-        """
+    def _dataset_seq_len(self) -> int:
+        """The sequence length the dataset states, the legacy ``data.max_seq_len`` too, else 0."""
         data_raw = self._get_cfg_attr(self.config, "data", Config({}))
         legacy_seq_len = self._get_cfg_attr(data_raw, "max_seq_len", 0)
 
@@ -370,10 +398,18 @@ class CostModelParserHyperV2(_CostModelParser):
             dataset_raw, "data_transform", Config({}),
         )
         trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
+        return int(trainer_seq_len or legacy_seq_len or 0)
+
+    def _resolve_sequence_length(self) -> int:
+        """The training sequence length: the dataset's, else the model's limit.
+
+        A model section that states no limit falls back on
+        ``config_overrides.seq_length``, then on 4096.
+        """
         model_seq_len = self._model_seq_len or int(
             self._get_cfg_attr(self._config_overrides(), "seq_length", 0) or 0
         )
-        return int(trainer_seq_len or legacy_seq_len or model_seq_len or 4096)
+        return int(self._dataset_seq_len() or model_seq_len or 4096)
 
     def _resolve_device_capacity(self) -> str:
         """The device's memory: ``context.max_device_memory``, else 64 GB."""

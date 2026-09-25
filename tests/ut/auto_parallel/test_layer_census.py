@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the layer census and the activations it states in the model spec."""
+"""Tests for the layer census, the activations it states in the model spec, and their pricing."""
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
+from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import census_activations, census_layer, tp_config
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import bind_layer_stack
+
+_HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
+_CAUSAL_LM = "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained"
+_IMAGE_TEXT = "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained"
 
 
 def _qwen35_text():
@@ -26,16 +36,49 @@ def _qwen35_text():
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
         Qwen3_5MoeTextConfig,
     )
-    return Qwen3_5MoeTextConfig(
-        hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-        num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32, shared_expert_intermediate_size=32,
-        linear_num_key_heads=2, linear_key_head_dim=16, linear_num_value_heads=4, linear_value_head_dim=16,
-        linear_conv_kernel_dim=4, vocab_size=128, max_position_embeddings=256,
-        layer_types=["linear_attention", "full_attention"],
-    )
+    return Qwen3_5MoeTextConfig.from_dict({
+        "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "head_dim": 16, "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 32, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
+        "linear_num_value_heads": 4, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
+        "vocab_size": 128, "max_position_embeddings": 256, "layer_types": ["linear_attention", "full_attention"],
+    })
 
 
 _STACK = [{"kind": "linear_attention", "count": 1}, {"kind": "full_attention", "count": 1}]
+
+
+def _qwen35(text):
+    """The vision-language config around *text*, its vision tower Transformers' default."""
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
+        Qwen3_5MoeConfig,
+    )
+    return Qwen3_5MoeConfig.from_dict({"text_config": text.to_dict()})
+
+
+def _train_yaml(folder: str, target: str = _CAUSAL_LM, mode: str = "off", pp: int = 1, **context) -> str:
+    """A train yaml of the hybrid model on two ranks, at DP shard 2 over PP 1 or on two stages."""
+    config = {
+        "model": {"_target_": target, "pretrained_model_name_or_path": "local/qwen3_5_moe",
+                  "torch_dtype": "bfloat16"},
+        "training": {"global_batch_size": 4, "micro_batch_size": 1},
+        "accelerator": {"tp_size": 1, "pp_size": pp, "ep_size": 1, "cp_size": 1},
+        "fsdp_config": {"dp_shard_size": 2 // pp},
+        "activation_checkpoint": {"mode": mode},
+        "dataset": {"data_transform": {"max_seq_len": 4096}},
+        "context": dict(context, device_num=2),
+    }
+    path = os.path.join(folder, "train.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle)
+    return path
+
+
+def _evaluator(model_config, **train) -> EvaluatorV2:
+    """The evaluator of :func:`_train_yaml`'s run of *model_config*."""
+    with patch(_HF_CONFIG, return_value=model_config):
+        with tempfile.TemporaryDirectory() as folder:
+            return EvaluatorV2(_train_yaml(folder, **train), framework="hyper_v2", log_level=0)
 
 
 def _spec(**activations) -> dict:
@@ -118,6 +161,73 @@ class TestKindActivations(unittest.TestCase):
             ModelSpec.from_dict(_spec(linear_attention={"saved": 1.0}))
         with self.assertRaisesRegex(ModelSpecError, "decoder"):
             ModelSpec.from_dict(_spec(decoder=record))
+
+
+class TestCensusPricing(unittest.TestCase):
+    """``context.census`` has the memory model price a layer with its kind's census."""
+
+    def test_the_resolver_states_each_kinds_census(self):
+        """
+        Feature: resolve_hf_model_spec's census_seq_len.
+        Description: The hybrid model resolved twice with a census at 48
+            tokens, and a spec of config_overrides alone.
+        Expectation: The spec states each kind's record at that length, the
+            census runs once; with no checkpoint config there is none.
+        """
+        model = {"pretrained_model_name_or_path": "local/qwen3_5_moe"}
+        with patch(_HF_CONFIG, return_value=_qwen35_text()), patch(
+                "hyper_parallel.auto_parallel._hf_model_spec.census_activations", wraps=census_activations) as run:
+            spec = resolve_hf_model_spec(model, census_seq_len=48)
+            self.assertEqual(resolve_hf_model_spec(model, census_seq_len=48), spec)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(sorted(spec["activations"]), ["full_attention", "linear_attention"])
+        self.assertEqual(spec["activations"]["linear_attention"]["seq_length"], 48)
+        overrides = {"name": "llama", "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+                     "intermediate_size": 128, "vocab_size": 128}
+        with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING"):
+            plain = resolve_hf_model_spec({"config_overrides": overrides}, census_seq_len=48)
+        self.assertNotIn("activations", plain)
+
+    def test_each_kind_binds_its_record(self):
+        """
+        Feature: the Hyper parser's context.census.
+        Description: The hybrid model parsed with a census and without, and
+            its vision-language checkpoint trained with its tower.
+        Expectation: With it, the config holds each kind's record at the
+            dataset's length and each kind binds its own, the tower none;
+            without it, there is none.
+        """
+        ccfg = _evaluator(_qwen35_text(), census=True).ccfg
+        self.assertEqual({record.seq_length for record in ccfg.census.values()}, {4096})
+        self.assertIsNone(ccfg.kind_activations)
+        bind_layer_stack(ccfg)
+        for kind, fields in ccfg.layer_binding.items():
+            self.assertIs(fields["kind_activations"], ccfg.census[kind])
+        self.assertIsNone(_evaluator(_qwen35_text()).ccfg.census)
+        towers = _evaluator(_qwen35(_qwen35_text()), target=_IMAGE_TEXT, census=True).ccfg.mm_ccfgs
+        self.assertEqual(towers["text"].census, ccfg.census)
+        self.assertIsNone(towers["vision"].census)
+        self.assertIsNone(towers["vision"].kind_activations)
+
+    def test_a_layer_is_priced_with_its_kinds_census(self):
+        """
+        Feature: the census on the memory path.
+        Description: The hybrid model without recompute on one stage, and
+            fully recomputed on two, each with a census.
+        Expectation: Each layer keeps its kind's census bytes for the
+            micro-batch's 4096 tokens; the first stage's last layer, which
+            recomputes, holds its kind's working set in its backward.
+        """
+        evaluator = _evaluator(_qwen35_text(), census=True)
+        census = evaluator.ccfg.census
+        log = evaluator.estimate_peak_insight()[0]["Node Log"]
+        for index, kind in enumerate(("linear_attention", "full_attention")):
+            kept = 4096 * (census[kind].saved + census[kind].saved_tp) / 2 ** 20
+            self.assertAlmostEqual(log[(0, 0, index, "N")]["_activ"], kept, delta=1)
+        log = _evaluator(_qwen35_text(), mode="full", pp=2, census=True).estimate_peak_insight()[0]["Node Log"]
+        working = [value["_activ"] for key, value in log.items() if str(key[2]).startswith("rec_")]
+        linear = census["linear_attention"]
+        self.assertAlmostEqual(working[0], 4096 * (linear.working + linear.working_tp) / 2 ** 20, delta=1)
 
 
 if __name__ == "__main__":
