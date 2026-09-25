@@ -88,6 +88,9 @@ class SwitchProfile:
             gathers recomputed)``. Only ``gather`` acts on it: FSDP that
             reshards holds two layers' gathered parameters in a backward and
             none between the layer's passes, in the buffers the gathers take.
+        first_working: The same for the backward a stage runs last, its
+            first layer's, as a micro-batch's backward ends: one layer's
+            gathered parameters, with none left to prefetch.
     """
 
     forward_time: float
@@ -96,6 +99,7 @@ class SwitchProfile:
     full: Cost
     counts: Tuple[int, ...] = ()
     working: Tuple[float, float] = (0.0, 0.0)
+    first_working: Tuple[float, float] = (0.0, 0.0)
 
     def selective(self, recompute: Iterable[str]) -> Cost:
         """The cost of recomputing the ops *recompute* names: the plain layer's, plus what each costs alone."""

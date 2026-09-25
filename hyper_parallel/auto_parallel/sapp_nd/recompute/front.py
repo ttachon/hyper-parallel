@@ -59,6 +59,8 @@ class LayerOption:
         working_extra: What the working set of the option's backward holds
             beyond what it keeps at one micro-batch; see
             :attr:`SwitchProfile.working`.
+        first_working_extra: The same for a stage's first layer's backward,
+            the last it runs; see :attr:`SwitchProfile.first_working`.
     """
 
     recompute: Optional[FrozenSet[str]]
@@ -70,6 +72,7 @@ class LayerOption:
     names: Tuple[str, ...] = ()
     excess: Tuple[Tuple[int, float], ...] = ()
     working_extra: float = 0.0
+    first_working_extra: float = 0.0
 
     def memory(self, in_flight: int) -> float:
         """The bytes a layer running the option keeps with *in_flight* micro-batches in flight."""
@@ -149,25 +152,33 @@ def price_option(
         names=_names(recompute, configured or {}),
         excess=tuple((count, excess) for count, excess in zip(profile.counts, cost.excess) if excess),
         working_extra=profile.working[int(recompute is None or "gather" in recompute)],
+        first_working_extra=profile.first_working[int(recompute is None or "gather" in recompute)],
     )
 
 
-def _working(recompute: Optional[FrozenSet[str]], cost: Cost, profile: SwitchProfile) -> float:
-    """The working set of the backward of a layer recomputing *recompute*: the plain layer's for full recompute."""
+def _working(
+    recompute: Optional[FrozenSet[str]], cost: Cost, extras: Tuple[float, float], profile: SwitchProfile
+) -> float:
+    """A working set of the backward of a layer recomputing *recompute*, the plain layer's for full recompute.
+
+    *extras* are what it holds beyond what the layer keeps at one
+    micro-batch, the gathers kept and recomputed.
+    """
     if recompute is None:
-        return _working(frozenset(), profile.plain, profile)
-    return cost.memory_per_micro_batch + cost.memory_once + profile.working[int("gather" in recompute)]
+        return _working(frozenset(), profile.plain, extras, profile)
+    return cost.memory_per_micro_batch + cost.memory_once + extras[int("gather" in recompute)]
 
 
 def _compared(
     recompute: Optional[FrozenSet[str]], cost: Cost, profile: SwitchProfile
 ) -> Tuple[float, ...]:
-    """What an option is compared on: its two memories, backward time, memory at each count and working set."""
+    """What an option is compared on: its two memories, backward time, memory at each count and working sets."""
     at = (
         count * cost.memory_per_micro_batch + cost.memory_once - excess
         for count, excess in zip(profile.counts, cost.excess)
     )
-    return cost.values() + tuple(at) + (_working(recompute, cost, profile),)
+    workings = (_working(recompute, cost, extras, profile) for extras in (profile.working, profile.first_working))
+    return cost.values() + tuple(at) + tuple(workings)
 
 
 def build_front(

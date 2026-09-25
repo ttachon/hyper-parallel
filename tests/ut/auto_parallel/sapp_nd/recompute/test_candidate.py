@@ -151,6 +151,28 @@ def _stage_peaks_of(evaluator: EvaluatorV2, choice: RecomputeChoice) -> List[flo
         evaluator.set_config(own)
 
 
+def _stage_points_of(evaluator: EvaluatorV2, choice: Any) -> List[float]:
+    """The memory model's stage memory, in MB, as a micro-batch's backward ends, with *choice* stated as ranges."""
+    ranges = []
+    for item in choice.ranges:
+        if item.option.recompute is None:
+            ranges.append(RecomputeRange(first=item.first, count=item.count, option="full"))
+        elif not item.option.recompute:
+            ranges.append(RecomputeRange(first=item.first, count=item.count, option="none"))
+        else:
+            ranges.append(RecomputeRange(first=item.first, count=item.count, option="selective",
+                                         ops=dict.fromkeys(item.option.recompute, "recompute")))
+    config = copy.deepcopy(evaluator.ccfg)
+    apply_exec(config, ExecSpec(recompute=tuple(ranges)))
+    own = evaluator.ccfg
+    evaluator.set_config(config)
+    try:
+        insights = evaluator.estimate_peak_insight()
+        return [insight["Static"] + backward for insight, (_, backward) in zip(insights, evaluator.peak_points)]
+    finally:
+        evaluator.set_config(own)
+
+
 def _with_capacity(evaluator: EvaluatorV2, megabytes: float) -> EvaluatorV2:
     """*evaluator*, its device holding *megabytes*."""
     evaluator.ccfg.device_capacity.set(Memory.from_mb(megabytes))
@@ -485,6 +507,47 @@ class TestWorkingSet(unittest.TestCase):
                 LayerRange(ending.index + 1, total - ending.index - 1, None, kept_plain),
             )))
             self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(original))
+        self.assertGreater(recomputing_gathers, 1)
+
+    def test_each_option_of_the_first_layer_keeps_what_the_backward_end_priced_whole_keeps(self):
+        """
+        Feature: the working set of the backward a stage runs last.
+        Description: The same model, every layer plain but the first
+            stage's first, which runs each option of its kind's front in
+            turn, stated as recompute ranges and the whole config priced
+            with them.
+        Expectation: As a micro-batch's backward ends, the first stage
+            keeps what the search says it keeps, to its MB: the first
+            layer's backward holds its own gathered parameters alone, with
+            none left to prefetch.
+        """
+        # pylint: disable=protected-access
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_RESHARDING, handle)
+            evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        counts = micro_batches_in_flight(evaluator)
+        profiles = layer_profiles(evaluator, Hard.Device_A2, most_in_flight=max(max(row) for row in counts),
+                                  in_flight=[count for row in counts for count in row])
+        fronts = {key: build_front(profile) for key, profile in profiles.items()}
+        layers, ends = Candidate._body_layers(evaluator, fronts, counts)
+        layers, fronts, _, own = Candidate._charge_working_sets(layers, ends, fronts, None)
+        _, peaks = Candidate._stages(evaluator, layers, fronts, own)
+        self.assertIsNotNone(peaks[0].backward)
+        first = layers[0][0]
+        plain = {layer.index: Candidate._plain(fronts[layer.key]) for stage in layers for layer in stage}
+        total = sum(len(stage) for stage in layers)
+        kept_plain = own.get(plain[1], plain[1])
+        recomputing_gathers = 0
+        for option in fronts[first.key]:
+            recomputing_gathers += option.recompute is None or "gather" in option.recompute
+            chosen = {**plain, first.index: option}
+            mine = peaks[0].backward + Candidate._backward_kept(layers[0], chosen, fronts, own)
+            whole = _stage_points_of(evaluator, SimpleNamespace(ranges=(
+                LayerRange(0, 1, None, option), LayerRange(1, total - 1, None, kept_plain),
+            )))
+            self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(option))
         self.assertGreater(recomputing_gathers, 1)
 
 

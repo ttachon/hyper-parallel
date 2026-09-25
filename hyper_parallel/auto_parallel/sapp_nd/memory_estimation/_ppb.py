@@ -205,8 +205,11 @@ class _PPB:
             alone[name] = measured if name == "gather" else measured[:3] + plain[3:]
         ctx.current_node = LayerType.FULL_REC_LAYER
         full = self._dynamic_mem(many, counts)
-        ctx.current_node = LayerType.NOT_REC_LAYER
-        working = (self._working_extra(ctx), self._selective(ccfg, ctx, dict(keep, gather=0), self._working_extra))
+        workings = []
+        for gathered in (2, 1):
+            ctx.current_node = LayerType.NOT_REC_LAYER
+            workings.append((self._working_extra(ctx, gathered), self._selective(
+                ccfg, ctx, dict(keep, gather=0), lambda at, gathered=gathered: self._working_extra(at, gathered))))
 
         def _cost(memory: Tuple[float, float, float, Tuple[float, ...]], backward: float) -> Cost:
             """A measurement as a cost: activations and growing buffers per micro-batch, the rest once."""
@@ -223,17 +226,19 @@ class _PPB:
             },
             full=_cost(full, self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]),
             counts=counts,
-            working=working,
+            working=workings[0],
+            first_working=workings[1],
         )
 
-    def _working_extra(self, ctx: Context) -> float:
+    def _working_extra(self, ctx: Context, gathered: int) -> float:
         """What the working set of the current layer's backward holds beyond what it keeps at one micro-batch.
 
-        The working set that ends warm-up, which holds two layers' gathered
-        parameters under FSDP that reshards: the layer's own and the next's.
+        Under FSDP that reshards, the backward holds *gathered* layers'
+        parameters: two, its own and the next's, in the working set that
+        ends warm-up, and one in the first layer's as the backward ends.
         """
         kept = sum(self._inner_dynamic_mem(ppb=True))
-        ctx.working_set = 2
+        ctx.working_set = gathered
         try:
             return sum(self._inner_dynamic_mem(default_micro_factor=1)) - kept
         finally:

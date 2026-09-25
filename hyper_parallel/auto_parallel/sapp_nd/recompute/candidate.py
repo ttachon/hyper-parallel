@@ -299,15 +299,15 @@ def _plain(options: Sequence[LayerOption]) -> LayerOption:
     return next(option for option in options if option.recompute == frozenset())
 
 
-def _working(option: LayerOption, options: Sequence[LayerOption]) -> float:
-    """The working set a layer running *option* ends warm-up on.
+def _working(option: LayerOption, options: Sequence[LayerOption], first: bool = False) -> float:
+    """The working set a layer running *option* ends warm-up on, or with *first*, the backward on a stage's first layer.
 
     What it keeps at one micro-batch and what its backward holds beyond, and
     for a fully recomputed layer the plain layer's, *options* being its
     kind's.
     """
     run = option if option.recompute is not None else _plain(options)
-    return _kept(run, 1) + run.working_extra
+    return _kept(run, 1) + (run.first_working_extra if first else run.working_extra)
 
 
 def _charge_working_sets(
@@ -367,7 +367,7 @@ def _first_working(
     """
     options = fronts[_kind_key(layer.key)]
     option = own.get(option, option)
-    return _working(_plain(options) if option.link_bandwidth else option, options)
+    return _working(_plain(options) if option.link_bandwidth else option, options, first=True)
 
 
 def _backward_kept(
