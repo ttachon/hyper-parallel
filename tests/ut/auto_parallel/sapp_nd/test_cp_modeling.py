@@ -2123,19 +2123,23 @@ class TestCPRingPeakCorrection(unittest.TestCase):
         """
         Feature: Linear activations (qkv, proj, ffn, norm) scale with s not s²
         Description: Since linear activations only scale with s (not s²),
-                     Ring and Ulysses should produce identical values for
-                     qkv, proj, ffn, norm — both just divide by cp.
-        Expectation: Ring qkv/proj/ffn/norm == Ulysses qkv/proj/ffn/norm
+                     Ring and Ulysses produce identical values for ffn and
+                     norm, both divided by cp; Ring keeps the keys and values
+                     it all-gathers whole.
+        Expectation: Ring ffn/norm == Ulysses ffn/norm; Ring qkv exceeds
+                     Ulysses qkv by the keys and values of the other three
+                     quarters of the sequence.
         """
         ccfg_ring = _make_ccfg(cp=4, cp_algo="colossalai_cp", t=1)
         ccfg_ulysses = _make_ccfg(cp=4, cp_algo="ulysses_cp", t=1)
         ctx = Context()
         ctx.micro_factor = 1
 
+        kv = ccfg_ring.s * ccfg_ring.b * ccfg_ring.bytes_compute * 2 * ccfg_ring.dh * ccfg_ring.n_kv
         self.assertAlmostEqual(
-            EvalAttn.attn_qkv_activations(ccfg_ring, ctx),
-            EvalAttn.attn_qkv_activations(ccfg_ulysses, ctx), places=4,
-            msg="qkv should be same for Ring and Ulysses (linear /cp)")
+            EvalAttn.attn_qkv_activations(ccfg_ring, ctx) - EvalAttn.attn_qkv_activations(ccfg_ulysses, ctx),
+            kv * 3 / 4, places=1,
+            msg="Ring keeps the whole sequence's keys and values")
         self.assertAlmostEqual(
             EvalFFn.ffn_activations(ccfg_ring, ctx),
             EvalFFn.ffn_activations(ccfg_ulysses, ctx), places=4,
@@ -2157,11 +2161,11 @@ class TestCPRecFactor(unittest.TestCase):
         """
         Feature: attn_qkv_activations /cp
         Description: QKV linear activations scale with s, so /cp is correct
-                     for both Ring and Ulysses
+                     under Ulysses CP, which splits the heads
         Expectation: cp=4 → qkv activations = 1/4 of cp=1
         """
-        ccfg_1 = _make_ccfg(cp=1, t=1)
-        ccfg_4 = _make_ccfg(cp=4, t=1)
+        ccfg_1 = _make_ccfg(cp=1, t=1, cp_algo="ulysses_cp")
+        ccfg_4 = _make_ccfg(cp=4, t=1, cp_algo="ulysses_cp")
         ctx = Context()
         ctx.micro_factor = 1
 

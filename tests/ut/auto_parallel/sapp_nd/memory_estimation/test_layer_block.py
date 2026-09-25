@@ -50,6 +50,36 @@ class TestAttentionScore(unittest.TestCase):
 
 
 
+def _qkv(cp: int, cp_algo: str = "colossalai_cp", n_linrec: int = 0) -> float:
+    """The q, k and v activations of a layer of 4 query and 2 key heads 32 wide, width 128, at *cp*."""
+    ccfg = SimpleNamespace(
+        s=64, b=1, h=128, a=4, n_kv=2, dh=32, dc_kv=0, n_attMM=4, n_attParamCast=0, n_attBMM=2,
+        bytes_compute=2, t=1, cp=cp, cp_algo=cp_algo, n_linrec=n_linrec, rec_op=Config({"attBMM": 1}),
+    )
+    return EvalAttn.attn_qkv_activations(ccfg, SimpleNamespace(current_node=LayerType.NOT_REC_LAYER,
+                                                              micro_factor=1))
+
+
+class TestKeysAndValuesUnderCp(unittest.TestCase):
+    """What a CP rank keeps of a layer's keys and values."""
+
+    def test_gathered_keys_and_values_stay_whole(self):
+        """
+        Feature: EvalAttn.attn_qkv_activations and kv_shards.
+        Description: A layer without CP, and at CP 4 under colossalai,
+            hybrid and Ulysses CP, and as a linear-attention layer.
+        Expectation: Colossal-AI and hybrid CP keep the whole sequence's
+            keys and values, 2 heads of 32 each, and a quarter of the rest;
+            Ulysses CP and a linear-attention layer keep a quarter of all.
+        """
+        whole = _qkv(1)
+        kv = 64 * 2 * 2 * 2 * 32
+        for algo in ("colossalai_cp", "hybrid_cp"):
+            self.assertEqual(_qkv(4, algo), (whole - kv) / 4 + kv)
+        self.assertEqual(_qkv(4, "ulysses_cp"), whole / 4)
+        self.assertEqual(_qkv(4, n_linrec=1), whole / 4)
+
+
 def _norms(n_qk_norm: int, norm_switch: int = 1) -> SimpleNamespace:
     """A layer with two norms, 4 query and 2 key heads 32 wide, and *n_qk_norm* QK-norms."""
     return SimpleNamespace(

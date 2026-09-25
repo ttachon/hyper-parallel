@@ -19,6 +19,7 @@ from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
     CPMemoryBreakdown,
     CPAlgo,
@@ -197,13 +198,17 @@ class EvalBody:
         What the layer keeps between its passes, or its backward's working
         set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
         of the sequence: TP splits one part, sequence parallelism the
-        other.  A selective layer's switches drop parts the census does not
-        tell apart: its formulas price it.
+        other, and CP that gathers keys and values leaves them whole
+        (:meth:`EvalAttn.kv_shards`).  A selective layer's switches drop
+        parts the census does not tell apart: its formulas price it.
         """
         tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
         kept = census.saved / max(1, ccfg.sp) + census.saved_tp / max(1, ccfg.t)
         held = census.working / max(1, ccfg.sp) + census.working_tp / max(1, ccfg.t)
-        return EvalUtils.census_bytes(ctx, tokens, kept, held)
+        # A census counts a rank's share of the keys and values; where CP
+        # gathers them the attention keeps the rest of the sequence's too.
+        gathered = EvalAttn.gathered_kv_bytes(ccfg)
+        return EvalUtils.census_bytes(ctx, tokens, kept + gathered, held + gathered)
 
     # Full recompute
 
