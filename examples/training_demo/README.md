@@ -272,7 +272,7 @@ python examples/training_demo/sweep_qwen3_5_moe.py --only classify --only compar
 | `fetch` | copies the profiles from the node holding `profiling.rank` |
 | `classify` | `nd.trace_classify` per run, merged into one CSV |
 | `compare` | `run_nd --real_csv`, printing measured against estimated shares, then ND's rank of each strategy when a ranking exists |
-| `plot` | `sweep.pdf`/`.png`: the step split and the peak memory across the sweep |
+| `plot` | `sweep.pdf`/`.png`: the step split and the peak memory across the sweep; `memory.pdf`/`.png`: the measured peak against ND's estimate |
 
 A strategy that dies is not waited out. One dead rank ends the job, but it
 does not end the other ranks: they wait in the collective it never joins until
@@ -301,11 +301,17 @@ no cost to the numbers being timed. The memory pass is for the detail that the
 peak alone does not give: `operator_memory.csv`, `memory_record.csv` and the
 allocator snapshot `.pkl`, which opens at pytorch.org/memory_viz.
 
-Two plots come out. `run_nd` writes its own per-configuration comparison to
-`nd/real_all.pdf`, measured against estimated shares with the idle remainder.
-The `plot` stage adds the view across the sweep that no single configuration
-shows: the measured step split into ND's parts, and peak device memory, with
-the x axis labelled by whichever dimensions actually vary.
+`run_nd` writes its own per-configuration comparison to `nd/`:
+`real_all.pdf`, measured against estimated parts with the idle remainder;
+`real_all_no_idle.pdf`, the same without idle and ordered by the step less
+idle, since idle is half of a short step and does not reproduce between runs;
+and `real_all_estimates.csv`, ND's estimate of every measured strategy with its
+peak memory. The `plot` stage adds the view across the sweep that no single
+configuration shows: the measured step split into ND's parts, and peak device
+memory with ND's estimate beside it, with the x axis labelled by whichever
+dimensions actually vary. Memory also gets `memory.pdf` on its own. The trainer
+logs the maximum over ranks in GiB while ND models one rank, in MiB converted
+to GiB, with a 1 GiB safety margin in its peak.
 
 The ND input yaml, `nd_model.yaml`, is generated rather than reused. The launch
 overrides the config's layer count, sequence length, recompute mode and batch

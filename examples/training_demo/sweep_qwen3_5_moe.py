@@ -329,6 +329,16 @@ class Sweep:
         return self.out / "real_all.csv"
 
     @property
+    def nd_dir(self) -> Path:
+        """Where compare writes ND's plots and estimates."""
+        return self.out / "nd"
+
+    @property
+    def estimates_csv(self) -> Path:
+        """ND's estimate of every measured strategy, memory included."""
+        return self.nd_dir / f"{self.merged_csv.stem}_estimates.csv"
+
+    @property
     def ranking_csv(self) -> Path:
         """ND's order of every configuration it keeps at this sweep's shape."""
         return self.out / "nd_ranking.csv"
@@ -854,22 +864,34 @@ def spearman(first: Sequence[float], second: Sequence[float]) -> Optional[float]
     return covariance / spread if spread else None
 
 
+def _nd_estimates(sweep: Sweep) -> Dict[Tuple[int, ...], Dict[str, str]]:
+    """ND's estimate of each measured strategy, as compare wrote it, by strategy."""
+    return {_strategy_key(row): row for row in _read_rows(sweep.estimates_csv)}
+
+
 def _ranking_table(sweep: Sweep, ranking: Sequence[Dict[str, str]],
                    measured: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
-    """One row per measured strategy with ND's rank, score and memory, in ND's order."""
+    """One row per measured strategy with ND's rank, score and memory, in ND's order.
+
+    ND's memory comes from compare's estimates, which cover every measured
+    strategy, and from the ranking only for a strategy they lack.
+    """
     nd_of: Dict[Tuple[int, ...], Dict[str, str]] = {}
     for row in ranking:
         nd_of.setdefault(_strategy_key(row), row)
+    estimates = _nd_estimates(sweep)
     peaks = {_strategy_key(row): row for row in _read_rows(sweep.out / "memory.csv")}
     times = [float(row["time"]) for row in measured]
     table = []
     for row, step, place in zip(measured, times, _ranks(times)):
         key = _strategy_key(row)
         nd_row = nd_of.get(key, {})
+        memory_row = estimates.get(key, nd_row)
         table.append({
             "strategy": _tag_of(key), "nd_rank": nd_row.get("rank", ""),
             "nd_score": nd_row.get("score", ""),
-            "nd_memory_gib": (f"{float(nd_row['memory_mb']) / 1024:.1f}" if nd_row else ""),
+            "nd_memory_gib": (f"{float(memory_row['memory_mb']) / 1024:.1f}"
+                              if memory_row else ""),
             "measured_ms": f"{step:.1f}", "measured_rank": f"{place:g}",
             "peak_allocated_gib": peaks.get(key, {}).get("max_allocated_gb", ""),
         })
@@ -945,7 +967,7 @@ def stage_compare(sweep: Sweep) -> None:
         sweep.python, "-m", RUN_ND,
         "-y", str(nd_yaml), "-f", sweep.args.framework,
         "-d", str(sweep.world), "-A", sweep.args.arch,
-        "--real_csv", str(sweep.merged_csv), "-o", str(sweep.out / "nd"),
+        "--real_csv", str(sweep.merged_csv), "-o", str(sweep.nd_dir),
     ], check=False)
     ranking, why = load_ranking(sweep)
     if ranking:
@@ -1012,11 +1034,67 @@ def _varying_dims(rows: Sequence[Dict[str, str]]) -> List[str]:
     return varying or names[:1]
 
 
+def _draw_time(axis: Any, timing: Sequence[Dict[str, str]]) -> None:
+    """Stack each strategy's measured step, split into ND's parts and idle."""
+    varying = _varying_dims(timing)
+    labels = [_strategy_label(row, varying) for row in timing]
+    parts = [c for c in timing[0] if c == "comp" or c.endswith("_wait")]
+    parts = [c for c in parts if any(float(row[c]) for row in timing)]
+    bottom = [0.0] * len(timing)
+    for part in parts:
+        values = [float(row[part]) for row in timing]
+        axis.bar(labels, values, bottom=bottom, label=part)
+        bottom = [b + v for b, v in zip(bottom, values)]
+    idle = [float(row["time"]) - b for row, b in zip(timing, bottom)]
+    axis.bar(labels, idle, bottom=bottom, label="idle")
+    axis.set_ylabel("step (ms)")
+    axis.set_title("Measured step, split into ND's parts")
+    axis.legend(fontsize="small", ncol=2)
+    axis.tick_params(axis="x", rotation=45)
+
+
+def _draw_memory(axis: Any, memory: Sequence[Dict[str, str]],
+                 estimates: Dict[Tuple[int, ...], Dict[str, str]]) -> int:
+    """Draw each strategy's peak device memory, and ND's estimate where it has one.
+
+    The trainer logs the maximum over ranks, in GiB; ND models one rank and
+    reports MiB, converted here, and its peak includes a 1 GiB safety margin.
+
+    Returns:
+        How many strategies have an ND estimate.
+    """
+    varying = _varying_dims(memory)
+    labels = [_strategy_label(row, varying) for row in memory]
+    for column, style in (("max_allocated_gb", "o-"), ("max_reserved_gb", "s--")):
+        axis.plot(labels, [float(row[column]) for row in memory], style, label=column)
+    nd_rows = [estimates.get(_strategy_key(row)) for row in memory]
+    drawn = sum(1 for row in nd_rows if row)
+    if drawn:
+        axis.plot(labels, [float(row["memory_mb"]) / 1024 if row else float("nan")
+                           for row in nd_rows], "^:", label="ND estimate")
+    axis.set_ylabel("peak per device (GiB)")
+    axis.set_title("Peak device memory, measured and ND's" if drawn else "Peak device memory")
+    axis.set_ylim(bottom=0)
+    axis.grid(True, alpha=0.3)
+    axis.legend(fontsize="small")
+    axis.tick_params(axis="x", rotation=45)
+    return drawn
+
+
+def _save(figure: Any, out: Path) -> None:
+    """Write a figure as PDF and PNG."""
+    figure.tight_layout()
+    figure.savefig(out, bbox_inches="tight")
+    figure.savefig(out.with_suffix(".png"), dpi=150, bbox_inches="tight")
+
+
 def stage_plot(sweep: Sweep) -> None:
     """Draw the sweep: where each step goes, and what it costs in memory.
 
-    ND already plots its estimate against each configuration; this is the view
-    across the sweep, which no single configuration shows.
+    ND already plots its estimate against each configuration, with and without
+    idle; this is the view across the sweep, which no single configuration
+    shows. Memory also gets a figure of its own, the measured peak against
+    ND's estimate, which compare writes to ``nd/<csv stem>_estimates.csv``.
     """
     try:
         import matplotlib  # pylint: disable=import-outside-toplevel
@@ -1032,48 +1110,28 @@ def stage_plot(sweep: Sweep) -> None:
     if not timing and not memory:
         print("nothing to plot: no classified CSV and no memory.csv", flush=True)
         return
+    estimates = _nd_estimates(sweep)
 
     panels = [name for name, rows in (("time", timing), ("memory", memory)) if rows]
     figure, axes = plt.subplots(len(panels), 1, figsize=(2 + 1.4 * max(
         len(timing), len(memory)), 4 * len(panels)), squeeze=False)
-
     if timing:
-        axis = axes[panels.index("time")][0]
-        varying = _varying_dims(timing)
-        labels = [_strategy_label(row, varying) for row in timing]
-        parts = [c for c in timing[0] if c == "comp" or c.endswith("_wait")]
-        parts = [c for c in parts if any(float(row[c]) for row in timing)]
-        bottom = [0.0] * len(timing)
-        for part in parts:
-            values = [float(row[part]) for row in timing]
-            axis.bar(labels, values, bottom=bottom, label=part)
-            bottom = [b + v for b, v in zip(bottom, values)]
-        idle = [float(row["time"]) - b for row, b in zip(timing, bottom)]
-        axis.bar(labels, idle, bottom=bottom, label="idle")
-        axis.set_ylabel("step (ms)")
-        axis.set_title("Measured step, split into ND's parts")
-        axis.legend(fontsize="small", ncol=2)
-        axis.tick_params(axis="x", rotation=45)
+        _draw_time(axes[panels.index("time")][0], timing)
+    if memory:
+        _draw_memory(axes[panels.index("memory")][0], memory, estimates)
+    _save(figure, sweep.out / "sweep.pdf")
+    plt.close(figure)
+    print(f"sweep plot: {sweep.out / 'sweep.pdf'} (and .png)", flush=True)
 
     if memory:
-        axis = axes[panels.index("memory")][0]
-        varying = _varying_dims(memory)
-        labels = [_strategy_label(row, varying) for row in memory]
-        for column, style in (("max_allocated_gb", "o-"), ("max_reserved_gb", "s--")):
-            axis.plot(labels, [float(row[column]) for row in memory], style,
-                      label=column)
-        axis.set_ylabel("peak per device (GiB)")
-        axis.set_title("Peak device memory")
-        axis.grid(True, alpha=0.3)
-        axis.legend(fontsize="small")
-        axis.tick_params(axis="x", rotation=45)
-
-    figure.tight_layout()
-    out = sweep.out / "sweep.pdf"
-    figure.savefig(out, bbox_inches="tight")
-    figure.savefig(out.with_suffix(".png"), dpi=150, bbox_inches="tight")
-    plt.close(figure)
-    print(f"sweep plot: {out} (and .png)", flush=True)
+        figure, axis = plt.subplots(figsize=(2 + 1.4 * len(memory), 4))
+        drawn = _draw_memory(axis, memory, estimates)
+        _save(figure, sweep.out / "memory.pdf")
+        plt.close(figure)
+        missing = ("" if drawn == len(memory) else
+                   f"; ND's estimate for {drawn} of {len(memory)}: run compare "
+                   f"first, it writes {sweep.estimates_csv.name}")
+        print(f"memory plot: {sweep.out / 'memory.pdf'} (and .png){missing}", flush=True)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
