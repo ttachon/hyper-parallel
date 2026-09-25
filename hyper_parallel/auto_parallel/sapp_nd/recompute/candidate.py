@@ -25,15 +25,15 @@ stage by stage.
 
 At the end of warm-up, the memory model also charges each stage one layer's
 working set at one micro-batch: the plain layer's if the stage's last layer is
-fully recomputed, the layer's own otherwise. The budget keeps room for the
-heaviest of these, whatever option the last layer runs.
+fully recomputed, the layer's own otherwise. So that layer's options each keep
+the working set they end warm-up on too, and the knapsack weighs it with them.
 
 A runtime that runs every layer one way, such as HyperParallel's trainer with
 its ``activation_checkpoint.mode``, gets the fastest of its modes that fits
 instead, from the same budgets: see :data:`MODES`.
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
 
@@ -59,6 +59,8 @@ SCHEDULES = ("1f1b",)
 # config sets recomputed, or everything recomputed.
 MODES = ("off", "selective", "full")
 _ENDS = (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER)
+# Marks the front of a layer that ends warm-up, whose options keep its working set.
+_ENDS_WARM_UP = "ends warm-up"
 
 
 @dataclass(frozen=True)
@@ -237,50 +239,73 @@ def _body_layers(
     return layers, ends
 
 
-def _reserve(options: Sequence[LayerOption]) -> float:
-    """The largest working set a layer of a kind can end warm-up on, whatever option it runs.
-
-    A layer ends it on its own working set at one micro-batch, and a fully
-    recomputed one on the plain layer's.
-    """
-    return max(_kept(option, 1) for option in options if option.recompute is not None)
-
-
 def _plain(options: Sequence[LayerOption]) -> LayerOption:
     """A kind's plain option."""
     return next(option for option in options if option.recompute == frozenset())
 
 
-def _stage(
-    layers: Sequence[_Layer],
-    ends: Sequence[_Layer],
+def _working(option: LayerOption, options: Sequence[LayerOption]) -> float:
+    """The working set a layer running *option* ends warm-up on.
+
+    Its own at one micro-batch, and for a fully recomputed layer the plain
+    layer's, *options* being its kind's.
+    """
+    return _kept(option if option.recompute is not None else _plain(options), 1)
+
+
+def _charge_working_sets(
+    layers: List[List[_Layer]],
+    ends: Sequence[Sequence[_Layer]],
     fronts: Dict[Hashable, Tuple[LayerOption, ...]],
-    peak: float,
-    capacity: float,
-) -> Tuple[Stage, float]:
+    by_mode: Optional[Dict[Hashable, Dict[str, LayerOption]]],
+) -> Tuple[Any, ...]:
+    """Give each layer that ends warm-up a front whose options keep its working set too.
+
+    Its kind's options, each with the working set it ends warm-up on added to
+    what it keeps once, so that the knapsack weighs the working set with the
+    option instead of keeping room for the heaviest.
+
+    Returns:
+        ``(layers, fronts, by_mode, own)``: the layers, those that end warm-up
+        on their new front; the fronts and the options by mode with the new
+        fronts added; and each added option's option of its kind.
+    """
+    fronts = dict(fronts)
+    by_mode = None if by_mode is None else dict(by_mode)
+    own = {}
+    ending = {layer.index for stage_ends in ends for layer in stage_ends}
+    for stage_layers in layers:
+        for position, layer in enumerate(stage_layers):
+            if layer.index not in ending:
+                continue
+            key = layer.key + (_ENDS_WARM_UP,)
+            options = fronts[layer.key]
+            charged = {
+                option: replace(option, memory_once=option.memory_once + _working(option, options))
+                for option in options
+            }
+            fronts[key] = tuple(charged.values())
+            if by_mode is not None:
+                by_mode[key] = {mode: charged[option] for mode, option in by_mode[layer.key].items()}
+            own.update({new: old for old, new in charged.items()})
+            stage_layers[position] = replace(layer, key=key, own=charged[layer.own])
+    return layers, fronts, by_mode, own
+
+
+def _stage(layers: Sequence[_Layer], peak: float, capacity: float) -> Tuple[Stage, float]:
     """A stage for the knapsack, and the bytes it keeps outside the choice.
 
     Args:
-        layers: The stage's body layers.
-        ends: The layers its warm-up ends on.
-        fronts: Each kind's options.
+        layers: The stage's body layers, the one that ends warm-up charged
+            its working set (:func:`_charge_working_sets`).
         peak: The memory model's peak for the stage, in MB.
         capacity: The device's memory, in MB.
 
     Returns:
         ``(stage, fixed)``: *fixed* is what the stage keeps whatever its
-        layers run, the room for the end of warm-up included.
+        layers run.
     """
-    kept = sum(_kept(layer.own, layer.in_flight) for layer in layers)
-    working = 0.0
-    reserved = 0.0
-    for layer in ends:
-        options = fronts[layer.key]
-        # A fully recomputed layer ends warm-up on the plain layer's working set.
-        run = layer.own if layer.own.recompute is not None else _plain(options)
-        working += _kept(run, 1)
-        reserved += _reserve(options)
-    fixed = peak * MEGABYTE - kept - working + reserved
+    fixed = peak * MEGABYTE - sum(_kept(layer.own, layer.in_flight) for layer in layers)
     groups = {}
     for layer in layers:
         groups[layer.key, layer.in_flight] = groups.get((layer.key, layer.in_flight), 0) + 1
@@ -320,12 +345,20 @@ def _ranges(layers: Sequence[_Layer], chosen: Dict[int, LayerOption]) -> Tuple[L
 
 
 def _result(
-    layers: Sequence[Sequence[_Layer]], fixed: Sequence[float], chosen: Dict[int, LayerOption], mode: Optional[str]
+    layers: Sequence[Sequence[_Layer]],
+    fixed: Sequence[float],
+    chosen: Dict[int, LayerOption],
+    mode: Optional[str],
+    own: Mapping[LayerOption, LayerOption],
 ) -> RecomputeChoice:
-    """The choice of *chosen* options, with each stage's memory and time saved."""
+    """The choice of *chosen* options, with each stage's memory and time saved.
+
+    *own* maps an option charged a working set to its option of its kind,
+    which the ranges report.
+    """
     every = [layer for stage_layers in layers for layer in stage_layers]
     return RecomputeChoice(
-        ranges=_ranges(every, chosen),
+        ranges=_ranges(every, {index: own.get(option, option) for index, option in chosen.items()}),
         stage_memory=tuple(
             (kept + sum(_kept(chosen[layer.index], layer.in_flight) for layer in stage_layers)) / MEGABYTE
             for kept, stage_layers in zip(fixed, layers)
@@ -376,17 +409,12 @@ def _offered(
     return {key: tuple(options.values()) for key, options in by_mode.items()}, by_mode
 
 
-def _stages(
-    evaluator: EvaluatorV2,
-    layers: Sequence[Sequence[_Layer]],
-    ends: Sequence[Sequence[_Layer]],
-    fronts: Dict[Hashable, Tuple[LayerOption, ...]],
-) -> Tuple[List[Stage], List[float]]:
+def _stages(evaluator: EvaluatorV2, layers: Sequence[Sequence[_Layer]]) -> Tuple[List[Stage], List[float]]:
     """Every stage for the knapsack, and the bytes each keeps outside the choice."""
     capacity = evaluator.ccfg.device_capacity.to_mb().size
     stages, fixed = [], []
-    for stage_layers, stage_ends, insight in zip(layers, ends, evaluator.estimate_peak_insight()):
-        stage, kept = _stage(stage_layers, stage_ends, fronts, insight["Static"] + insight["Dynamic"], capacity)
+    for stage_layers, insight in zip(layers, evaluator.estimate_peak_insight()):
+        stage, kept = _stage(stage_layers, insight["Static"] + insight["Dynamic"], capacity)
         stages.append(stage)
         fixed.append(kept)
     return stages, fixed
@@ -427,15 +455,15 @@ def choose_recompute(
     found = _body_layers(evaluator, fronts, counts)
     if found is None:
         return None
-    layers, ends = found
-    stages, fixed = _stages(evaluator, layers, ends, fronts)
+    layers, fronts, by_mode, own = _charge_working_sets(*found, fronts, by_mode)
+    stages, fixed = _stages(evaluator, layers)
     if by_mode is not None:
         one = _one_mode(layers, stages, by_mode, modes)
-        return None if one is None else _result(layers, fixed, one[1], one[0])
+        return None if one is None else _result(layers, fixed, one[1], one[0], own)
     choice = pp_lite(stages, fronts, bucket)
     if choice is None:
         return None
-    return _result(layers, fixed, _assign([layer for stage in layers for layer in stage], choice), None)
+    return _result(layers, fixed, _assign([layer for stage in layers for layer in stage], choice), None, own)
 
 
 def option_label(option: LayerOption) -> str:

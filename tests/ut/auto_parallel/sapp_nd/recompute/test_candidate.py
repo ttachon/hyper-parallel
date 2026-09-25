@@ -33,9 +33,11 @@ import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pyl
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel import _hf_model_spec
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec, RecomputeRange
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
@@ -110,6 +112,27 @@ def _stage_peaks(evaluator: EvaluatorV2, full_rec: bool) -> List[float]:
     """The memory model's peak of each stage, every layer fully recomputed or plain."""
     config = copy.deepcopy(evaluator.ccfg)
     config.full_rec, config.sel_rec = full_rec, False
+    own = evaluator.ccfg
+    evaluator.set_config(config)
+    try:
+        return [insight["Static"] + insight["Dynamic"] for insight in evaluator.estimate_peak_insight()]
+    finally:
+        evaluator.set_config(own)
+
+
+def _stage_peaks_of(evaluator: EvaluatorV2, choice: RecomputeChoice) -> List[float]:
+    """The memory model's peak of each stage with *choice* stated as recompute ranges."""
+    ranges = []
+    for item in choice.ranges:
+        if item.option.recompute is None:
+            ranges.append(RecomputeRange(first=item.first, count=item.count, option="full"))
+        elif not item.option.recompute:
+            ranges.append(RecomputeRange(first=item.first, count=item.count, option="none"))
+        else:
+            ranges.append(RecomputeRange(first=item.first, count=item.count, option="selective",
+                                         ops=dict.fromkeys(item.option.recompute, "recompute")))
+    config = copy.deepcopy(evaluator.ccfg)
+    apply_exec(config, ExecSpec(recompute=tuple(ranges)))
     own = evaluator.ccfg
     evaluator.set_config(config)
     try:
@@ -267,6 +290,32 @@ class TestStageMemory(unittest.TestCase):
             saved.append(sum(choice.stage_savings))
         self.assertEqual(saved, sorted(saved, reverse=True))
         self.assertGreater(saved[0], saved[-1])
+
+    def test_a_mix_keeps_what_the_config_priced_whole_keeps(self):
+        """
+        Feature: choose_recompute.
+        Description: Devices between all plain and all fully recomputed, one
+            and two chunks per stage. Each choice that holds one selective
+            setting at most is stated as recompute ranges and the whole
+            config priced with them.
+        Expectation: Each stage keeps what the choice says it keeps, to its
+            MB, a choice whose last layer ends warm-up on a selective option
+            included.
+        """
+        selective_ends = 0
+        for interleave in (1, 2):
+            evaluator = self._evaluator(interleave)
+            plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
+            for share in (0.7, 0.4, 0.35, 0.2, 0.175):
+                choice = choose_recompute(_with_capacity(evaluator, full + 16 + share * (plain - full)),
+                                          Hard.Device_A2)
+                settings = {item.option.recompute for item in choice.ranges if item.option.recompute}
+                if len(settings) > 1:
+                    continue
+                selective_ends += bool(choice.ranges[-1].option.recompute)
+                for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
+                    self.assertLessEqual(abs(mine - model), 1.0, (interleave, share, describe(choice)))
+        self.assertGreater(selective_ends, 0)
 
 
 class TestOneMode(unittest.TestCase):
