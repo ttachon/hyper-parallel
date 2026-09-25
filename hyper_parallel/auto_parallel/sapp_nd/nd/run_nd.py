@@ -261,9 +261,8 @@ if __name__ == "__main__":
         "--mem_for_ppb",
         type=str,
         default="0GB",
-        help="Device memory budget the search must fit in, e.g. '58GB'. "
-        "Overrides the yaml capacity and cluster.device_memory_gb. "
-        "To RESERVE memory instead of capping it, use -mem/--mem_for_ppb.",
+        help="Memory to reserve for pipeline balancing, taken out of the "
+        "memory budget ND allows (default 0GB).",
     )
     parser.add_argument(
         "-c",
@@ -279,8 +278,9 @@ if __name__ == "__main__":
         "--max_mem",
         type=str,
         default=None,
-        help="Memory to reserve for pipeline balancing. "
-        "Will be decreased from the memory budget allowed by ND (default 0GB)",
+        help="Device memory budget the search must fit in, e.g. '58GB'. "
+        "Overrides the yaml capacity and cluster.device_memory_gb. "
+        "To reserve memory instead of capping it, use -mem/--mem_for_ppb.",
     )
     parser.add_argument(
         "--train-yaml",
