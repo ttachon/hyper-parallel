@@ -316,8 +316,11 @@ class TestDeriveFamily(unittest.TestCase):
         Description: At t=2: the default family, with a sliced recompute
             input; Qwen, whose family shards activations, and a run that
             says otherwise; a vision tower, with Qwen's language model and
-            with none.
-        Expectation: shard_recompute_input and shard_output_activ.
+            with none; Qwen with its loss on logits gathered whole, and on
+            logits sharded over the vocabulary.
+        Expectation: shard_recompute_input and shard_output_activ: the
+            output layer's activations split only where the loss runs on
+            sharded logits, as every family's does unless its run says not.
         """
         cases = [
             ({}, (1, 1)),
@@ -327,6 +330,8 @@ class TestDeriveFamily(unittest.TestCase):
             ({"shard_activations": True}, (2, 2)),
             ({"arch": "vision", "inherited_arch": "qwen"}, (2, 2)),
             ({"arch": "vision"}, (1, 1)),
+            ({"arch": "qwen", "loss_parallel": False}, (2, 1)),
+            ({"arch": "qwen", "loss_parallel": True}, (2, 2)),
         ]
         for facts, want in cases:
             ccfg = _config(**facts)

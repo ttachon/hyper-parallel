@@ -373,7 +373,7 @@ class CostModelParserHyperV2(_CostModelParser):
         # model it was cloned from.
         apply_exec(cc, ExecSpec(
             vocab_emb_dp=False, tie_embeddings=False, mtp_in_offset=False, grouped_gemm=False,
-            capacity_factor=1, offset=self._front_loaded_offset(cc.n_lay),
+            capacity_factor=1, offset=self._front_loaded_offset(cc.n_lay), loss_parallel=True,
         ), strict=False)
         return cc
 
@@ -711,6 +711,9 @@ class CostModelParserHyperV2(_CostModelParser):
             "tie_embeddings": self._tie_word_embeddings,
             "frozen": False,
             "grad_clip": max_grad_norm > 0,
+            # The trainer's lm_head gathers the logits whole on every TP rank
+            # unless the loss runs on them sharded.
+            "loss_parallel": bool(self._get_cfg_attr(accel, "loss_parallel", False)),
             "cp_algo": cp_algo,
             # Always a string: GlobalConfig.max_op only bounds OP by the data
             # parallel degree when this reads as a non-muon optimizer name,

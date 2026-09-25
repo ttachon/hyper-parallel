@@ -366,12 +366,16 @@ def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:
     keeps, and ``shard_output_activ`` the output layer's activations.  Both
     are the TP degree when the run shards the activations between layers
     (``shard_activations``), and 1 otherwise; a recomputed layer's input is
-    sliced over TP too when the run's recompute slices it.
+    sliced over TP too when the run's recompute slices it, and the output
+    layer's activations only where the loss runs on logits sharded over the
+    vocabulary (``loss_parallel``, which derive gives as ``shards_logits``):
+    otherwise every rank gathers them whole.
     """
     sharded = _stated(ccfg, "shard_activations", run)
     sliced = sharded or getattr(ccfg, "recompute_slice_activation", False)
+    ccfg.shards_logits = bool(_stated(ccfg, "loss_parallel", run))
     ccfg.shard_recompute_input = ccfg.t if sliced else 1
-    ccfg.shard_output_activ = ccfg.t if sharded else 1
+    ccfg.shard_output_activ = ccfg.t if sharded and ccfg.shards_logits else 1
 
 
 def derive_qk_norm(ccfg: Any) -> None:

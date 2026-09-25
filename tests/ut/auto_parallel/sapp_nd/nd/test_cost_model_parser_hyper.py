@@ -669,6 +669,27 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.shard_recompute_input, 1)
         self.assertTrue(ccfg.is_shard_mtp_param)
 
+    def test_the_loss_runs_on_the_logits_the_trainer_gathers(self):
+        """
+        Feature: loss_parallel, stated by the Hyper parser.
+        Description: A Qwen model at TP 2 with sequence parallelism, as
+            HyperParallel's trainer runs it by default, and with
+            accelerator.loss_parallel.
+        Expectation: By default every TP rank holds the logits whole: the
+            output layer's activations are not split; with loss_parallel
+            they are, over TP.
+        """
+        got = []
+        for accelerator in ({}, {"loss_parallel": True}):
+            config = _auto_models_config(accelerator=dict(
+                {"tp_size": 2, "ep_size": 1, "pp_size": 1, "sequence_parallel": True}, **accelerator))
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+                mock_hf.return_value = self._hf_config(model_type="qwen3", num_experts=1)
+                ccfg = _make_ccfg(config)
+            derive(ccfg)
+            got.append((ccfg.loss_parallel, ccfg.shard_output_activ))
+        self.assertEqual(got, [(False, 1), (True, 2)])
+
     # ---- L0: Device capacity ---------------------------------------------
 
     def test_device_capacity_from_config(self):

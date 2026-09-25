@@ -180,13 +180,15 @@ class EvalTailSingle:
 
         What the layer keeps between its passes, or its backward's working
         set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
-        of the sequence.  Every TP rank holds them whole: HyperParallel
-        computes its loss over the whole vocabulary unless the run turns on
-        its loss_parallel, which the memory model does not read.
+        of the sequence.  Sequence parallelism splits the part the
+        vocabulary does not scale, and TP the part it does where the loss
+        runs on logits sharded over it (``shards_logits``); otherwise every
+        TP rank holds them whole.
         """
         tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
-        kept = census.saved + census.saved_tp
-        held = census.working + census.working_tp
+        vocab_shards = max(1, ccfg.t) if ccfg.shards_logits else 1
+        kept = census.saved / max(1, ccfg.sp) + census.saved_tp / vocab_shards
+        held = census.working / max(1, ccfg.sp) + census.working_tp / vocab_shards
         return EvalUtils.census_bytes(ctx, tokens, kept, held)
 
     @staticmethod

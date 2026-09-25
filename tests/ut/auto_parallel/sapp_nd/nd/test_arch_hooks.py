@@ -159,23 +159,23 @@ class TestDispatchReadsTheArch(unittest.TestCase):
         Feature: dispatch on ccfg.arch.
         Description: A config named like a Qwen model but declaring the
             default arch must not get Qwen's activation sharding.
-        Expectation: shard_output_activ stays 1 under tp=2.
+        Expectation: shard_recompute_input stays 1 under tp=2.
         """
         ccfg = _ccfg("qwen2_72b", arch="default")
         check_and_apply_custom_hook(ccfg)
         self.assertEqual(ccfg.arch, "default")
-        self.assertEqual(ccfg.shard_output_activ, 1)
+        self.assertEqual(ccfg.shard_recompute_input, 1)
 
     def test_the_declared_arch_is_read(self):
         """
         Feature: dispatch on ccfg.arch.
         Description: A config with a neutral name declaring the qwen arch gets
             Qwen's activation sharding.
-        Expectation: shard_output_activ follows tp=2.
+        Expectation: shard_recompute_input follows tp=2.
         """
         ccfg = _ccfg("unit", arch="qwen")
         check_and_apply_custom_hook(ccfg)
-        self.assertEqual(ccfg.shard_output_activ, 2)
+        self.assertEqual(ccfg.shard_recompute_input, 2)
 
     def test_a_config_with_no_arch_gets_the_default_counts(self):
         """

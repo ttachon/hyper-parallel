@@ -64,8 +64,9 @@ FFN_FLAVOURS = ("dense", "moe")
 # The run of a family's model when its producer states none of it, and the
 # only execution-spec fields a profile's ``run`` may change: the byte widths
 # of gradients, optimizer states, norm activations and dropout masks, whether
-# gradients take memory without pipeline parallelism, and whether tensor
-# parallelism shards the activations between layers.
+# gradients take memory without pipeline parallelism, whether tensor
+# parallelism shards the activations between layers, and whether the loss
+# runs on logits sharded over the vocabulary.
 DEFAULT_RUN = MappingProxyType({
     "grad_bytes": 4,
     "optimizer_state_bytes": 4,
@@ -75,6 +76,7 @@ DEFAULT_RUN = MappingProxyType({
     "dropout_bytes": 0,
     "grad_accumulation": False,
     "shard_activations": False,
+    "loss_parallel": True,
     "reshard_params": False,
     "deferred_grad_accumulation": False,
     "overlapped_grad_reduce": False,

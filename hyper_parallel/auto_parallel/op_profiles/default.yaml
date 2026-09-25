@@ -19,8 +19,9 @@
 # layer's reduce-scatter output until the backward ends (false),
 # overlapped_grad_reduce, whether it holds a layer's whole gradients while
 # the next layer's backward runs and the root's until the backward ends
-# (false), and shard_activations, whether tensor parallelism shards the activations
-# between layers and the output layer's (false).  Under model, an MLA
+# (false), shard_activations, whether tensor parallelism shards the activations
+# between layers and the output layer's (false), and loss_parallel, whether the
+# loss runs on logits sharded over the vocabulary (true).  Under model, an MLA
 # family states the v_head_dim a model that declares none has.
 kinds:
   decoder:

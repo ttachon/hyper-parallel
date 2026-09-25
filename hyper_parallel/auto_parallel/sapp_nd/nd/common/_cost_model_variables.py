@@ -80,6 +80,10 @@ class _CostModVar:
     # Whether TP shards the activations between layers and the output
     # layer's; None takes the family's (derive).
     shard_activations: bool = None
+    # Whether the loss runs on logits sharded over the vocabulary, as stated,
+    # None taking its family's; and as derive gives it.
+    loss_parallel: bool = None
+    shards_logits: bool = True
     sp: float = 0
     vp: float = 0
     os_max_shard: float = 0
