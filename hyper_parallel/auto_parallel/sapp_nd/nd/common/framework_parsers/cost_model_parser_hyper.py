@@ -175,6 +175,7 @@ class CostModelParserHyperV2(_CostModelParser):
         # hidden_size / num_attention_heads (Qwen3 has h/a = 64, head_dim 128).
         head_dim = self._spec_int(spec, "head_dim")
         ccfg.dh = head_dim if head_dim else (ccfg.h / ccfg.a if ccfg.a else 0)
+        ccfg.v_head_dim = self._spec_int(spec, "v_head_dim") or None
         ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
         ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
@@ -227,7 +228,7 @@ class CostModelParserHyperV2(_CostModelParser):
         # Vision runs first; the language model drives the search space.
         self.ccfg.mm_order = ["vision", "text"]
         self.ccfg.mm_main = "text"
-        # Each submodule is priced by its own arch, through the arch hooks.
+        # Each submodule is priced by its own arch.
         self.ccfg.hooks_dict = None
         self.ccfg.n_lay = 0
         self.ccfg.layer_stack = None
@@ -241,9 +242,9 @@ class CostModelParserHyperV2(_CostModelParser):
     def _clone_submodule(self, name: str) -> Any:
         """Return a submodule cost config seeded from the parsed parent.
 
-        The loop below copies references, so every mutable container the
-        arch hooks write to has to be rebuilt: each submodule runs its own
-        hook and must not see the others' overrides.
+        The loop below copies references, so every mutable container a
+        submodule writes to has to be rebuilt: each submodule is priced by
+        its own family and must not see the others' overrides.
         """
         cc = type(self.ccfg)({})
         for key, value in self.ccfg.__dict__.items():
@@ -271,8 +272,8 @@ class CostModelParserHyperV2(_CostModelParser):
         cc = self._clone_submodule(str(vision_spec.get("name", "vision")))
         self._apply_spec(cc, vision_spec)
         # A tower is priced with the vision profile.  Its name carries the
-        # language model's type: the family it implies is the one whose hook
-        # the tower inherits, and whose op counts that hook reads.
+        # language model's type: the family it implies is the one whose
+        # activation sharding the tower takes.
         self.config_op_counts(cc)
         cc.inherited_arch, cc.arch = cc.arch, VISION_ARCH
         cc.v = 0  # patch embedding, not a vocabulary table
@@ -505,7 +506,12 @@ class CostModelParserHyperV2(_CostModelParser):
         }
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int, dp: int, tp: int) -> Dict[str, Any]:
-        """Optimizer and gradient sharding."""
+        """Optimizer and gradient sharding.
+
+        HyperParallel's FSDP holds every gradient sharded as its parameter,
+        from the first backward to the optimizer step, whatever the pipeline
+        degree.
+        """
         is_auto_models = is_auto_models_schema(self.config)
         optimizer_parallel = (
             dp_shard > 1
@@ -521,6 +527,8 @@ class CostModelParserHyperV2(_CostModelParser):
             "optimizer_parallel": optimizer_parallel,
             "optimizer_shard": weight_shard if weight_shard >= 1 else dp * tp,
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
+            "grad_shard_as_params": True,
+            "grad_accumulation": True,
         }
 
     def _parse_batch(self, dp: int, pp: int) -> Dict[str, Any]:
@@ -633,22 +641,22 @@ class CostModelParserHyperV2(_CostModelParser):
         mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
         model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
         init_dtype = self._get_cfg_attr(self.config, "model_init_dtype", None)
+        param_bytes = self._bytes_from_dtype(
+            self._get_cfg_attr(mix_precision, "param_dtype", None)
+            or init_dtype
+            or model_dtype
+            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+        )
         return {
-            "param_bytes": self._bytes_from_dtype(
-                self._get_cfg_attr(mix_precision, "param_dtype", None)
-                or init_dtype
-                or model_dtype
-                or self._get_cfg_attr(model_raw, "param_init_type", "float32")
-            ),
+            "param_bytes": param_bytes,
+            # FSDP keeps each gradient in its parameter's dtype.
+            "grad_bytes": param_bytes,
             "compute_bytes": self._bytes_from_dtype(
                 model_dtype
                 or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")
             ),
             "softmax_bytes": self._bytes_from_dtype(
                 self._get_cfg_attr(model_raw, "softmax_compute_type", "float32")),
-            "grad_bytes": 4,
-            "optimizer_state_bytes": 4,
-            "norm_bytes": 4,
         }
 
     def _init_moe_run(self, etp: int) -> Dict[str, Any]:
@@ -711,8 +719,8 @@ class CostModelParserHyperV2(_CostModelParser):
         ``recompute_config`` flag: when it is set (DeepSeek-V3), a recomputed
         layer keeps its input sliced over ``ccfg.t``, and when it is not
         (Qwen), whole.  :func:`derive` computes the sharding factors from
-        them; the ``custom_qwen`` arch hook then shards the activations of
-        Qwen-family models over ``ccfg.t``.
+        them, and from the activation sharding of the model's family, which
+        for Qwen shards them over ``ccfg.t`` in any case.
         """
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))

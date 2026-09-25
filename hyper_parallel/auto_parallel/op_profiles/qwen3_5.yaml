@@ -2,6 +2,9 @@
 # full-attention layers, named by the values of the model's layer_types.  A
 # linear layer keeps no score matrix, so it runs none of the ops that scale
 # with the square of the sequence, and adds the delta rule's state update.
+# Its run shards activations as Qwen's does.
+run:
+  shard_activations: true
 default: full_attention
 kinds:
   full_attention:

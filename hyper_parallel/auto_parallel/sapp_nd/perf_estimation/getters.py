@@ -17,6 +17,7 @@
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, apply_layer_kind, layer_groups
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 
@@ -37,28 +38,6 @@ def get_layer_group_configs(cfg):
             configs[kind.name] = deepcopy(cfg)
             apply_layer_kind(CWrap(configs[kind.name]), kind)
     return [(configs[kind.name], count) for kind, count in groups]
-
-
-def get_model_order(cfg: Any, stages: List) -> List[Tuple[int, int, int]]:
-    """Positions ``(stage, chunk, index)`` of the regular layers, in model order.
-
-    Model order runs chunk by chunk across the stages, and back up them in
-    the second chunk of a V schedule; walking the stages one at a time is
-    only the same order without interleaving.  This is the order the memory
-    backbone gives layers their groups in.
-    """
-    positions = [
-        (stage_id, chunk_id, lay_id)
-        for chunk_id in range(cfg.vp)
-        for stage_id in range(cfg.p)
-        for lay_id, layer in enumerate(stages[stage_id][chunk_id])
-        if layer not in (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER)
-    ]
-    if cfg.pp_sched == "zero_bubble_v":
-        # First-chunk entries less the embedding, as the memory backbone counts.
-        first = sum(len(stage[0]) for stage in stages) - 1
-        positions = positions[:first] + positions[first:][::-1]
-    return positions
 
 
 def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int, int], Any]:

@@ -1,5 +1,8 @@
 # T5: an encoder stack then a decoder stack of the same depth.  A decoder
 # layer adds cross-attention, so it runs twice the attention projections.
+# Both keep a one-byte dropout mask.
+run:
+  dropout_bytes: 1
 kinds:
   encoder:
     ops:

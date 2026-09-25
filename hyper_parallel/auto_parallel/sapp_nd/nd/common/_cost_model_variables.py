@@ -39,12 +39,12 @@ class _CostModVar:
     config_format: str = None
     multimodal: bool = False
     model_name: str = None
-    # Op profile the arch hooks price the model with, and its op counts per
-    # layer kind; both settled by the parser, never matched from model_name.
+    # Op profile the model is priced with, and its op counts per layer kind;
+    # both settled by the parser, never matched from model_name.
     arch: str = None
     op_counts: dict = None
-    # A vision tower's arch is the vision profile; this is the family whose
-    # hook it inherits, its language model's, which runs first.
+    # A vision tower's arch is the vision profile; this is its language
+    # model's family, whose activation sharding it takes.
     inherited_arch: str = None
     device_capacity: Memory = Memory.zero()  # float = 0
     mm_ccfgs: any = None
@@ -54,8 +54,8 @@ class _CostModVar:
     # hook from the config it is applied to.
     layer_stack: any = None
     layer_binding: dict = None
-    # Fields the family hook gives every layer of the stack on top of its
-    # kind's, such as t5's byte widths.
+    # Fields the family gives every layer of the stack on top of its kind's,
+    # such as cm's sharding (derive).
     layer_fields: dict = None
     overwrite_eval_functions: dict = None
     parser: any = None
@@ -69,6 +69,9 @@ class _CostModVar:
     # Whether activations are split along the sequence over the TP group;
     # derive sets the factor sp from it.
     sequence_parallel: bool = False
+    # Whether TP shards the activations between layers and the output
+    # layer's; None takes the family's (derive).
+    shard_activations: bool = None
     sp: float = 0
     vp: float = 0
     os_max_shard: float = 0
@@ -83,6 +86,10 @@ class _CostModVar:
     sel_rec_rule: str = "hyperparallel"
     # Whether a recomputed layer keeps its input sliced over tensor parallelism.
     recompute_slice_activation: bool = False
+    # How each layer recomputes, as ranges over the layers in model order
+    # (ExecSpec.recompute), when a spec states them; they replace full_rec
+    # and sel_rec, and the partition generator places them.
+    recompute_ranges: tuple = None
     pp_sched: str = None
     n_s_split: float = 0
     cp_algo: str = "colossalai_cp"
@@ -99,6 +106,8 @@ class _CostModVar:
     n_lay: float = 0
     n_kv: float = 0
     dh: float = 0
+    # An MLA model's value-head width, at which its family prices dh (derive).
+    v_head_dim: float = None
     dc_kv: float = 0
     dc_q: float = 0
     dhr: float = 0
@@ -174,6 +183,8 @@ class _CostModVar:
     # feature flag
     has_op: bool = False
     has_grad_shard: bool = False
+    # Whether each gradient is sharded as its parameter is, as FSDP holds it.
+    grad_shard_as_params: bool = False
     freeze: bool = False
     has_fa: bool = False
     attn_output_gate: bool = False
@@ -201,9 +212,18 @@ class _CostModVar:
     bytes_p: float = 0
     bytes_compute: float = 0
     bytes_softmax: float = 0
+    # The widths the run states, None taking its family's, and whether its
+    # gradients take memory without pipeline parallelism; derive gives the
+    # estimators bytes_grad, bytes_os, bytes_norm and bytes_dropout from them.
+    grad_bytes: float = None
+    optimizer_state_bytes: float = None
+    norm_bytes: float = None
+    dropout_bytes: float = None
+    grad_accumulation: bool = None
     bytes_grad: float = 0
     bytes_os: float = 0
     bytes_norm: float = 0
+    bytes_dropout: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
         """Initialise from a config path and optional hooks/framework/source."""

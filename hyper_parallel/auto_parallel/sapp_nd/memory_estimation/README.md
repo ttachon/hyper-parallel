@@ -176,14 +176,17 @@ To add a parser for a new input format:
    input declares one, and let it be inferred from `model_name` otherwise.
 6. State facts only, and call `derive()` (`nd/common/derive.py`) at the
    end of `parse()`. It computes every derived field from them: the expert
-   degrees, the sharding factors, the communication flags, `rec_op` and
-   `s_fa`.
+   degrees, the sharding factors, the communication flags, `rec_op`, `s_fa`
+   and the byte widths.
 
 The op counts of each architecture family (how many attention projections,
 softmaxes, norms and so on one layer runs, per layer kind) are data, in
-`hyper_parallel/auto_parallel/op_profiles/<arch>.yaml`. The arch hooks read
-them from `ccfg.op_counts` and are chosen by `ccfg.arch`, never by matching the
-model name. A model spec can declare its own counts under `ops`.
+`hyper_parallel/auto_parallel/op_profiles/<arch>.yaml`, chosen by `ccfg.arch`,
+never by matching the model name. A model spec can declare its own counts
+under `ops`. A profile also states what a model of the family has when its
+parser states nothing: the run's byte widths, whether its gradients take memory
+without pipeline parallelism and whether TP shards its activations (`run`),
+and an MLA family's value-head width (`model`). `derive()` reads them.
 
 The parser is responsible for validating user input before it reaches memory
 formulas. At minimum, it should normalize model metadata, model hyperparameters,
@@ -221,16 +224,19 @@ class CostModelParserNewFramework(_CostModelParser):
 | Parallel strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `pp_sched` |
 | Pipeline layout | `offset`, `pp_partition` |
 | Recompute | `full_rec`, `sel_rec`, `sel_rec_rule`, `recompute_slice_activation`, and `sel_comm_rec` under the MindFormers rule |
-| Features | `has_op`, `has_grad_shard`, `has_fa`, `vocab_emb_dp`, `emb_dp_sharded` |
-| Model size | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `a`, `n_kv`, `dh` |
+| Features | `has_op`, `has_grad_shard`, `has_fa`, `vocab_emb_dp`, `emb_dp_sharded`; `shard_activations` and `grad_accumulation` when the input states them |
+| Model size | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `a`, `n_kv`, `dh`, and `v_head_dim` for an MLA model that declares it |
 | MoE | `n_exp`, `n_chosen_exp`, `n_shared_exp`, `hff_exp`, `cap_fact`, `etp` |
-| Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`, `bytes_grad`, `bytes_os`, `bytes_norm` |
+| Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`; `grad_bytes`, `optimizer_state_bytes`, `norm_bytes` and `dropout_bytes` when the input states them |
 | Batch | `b`, `m`, `gbs` |
 | Layer stack | `layer_stack`, through `config_layer_stack()` |
 | Formula overrides | `overwrite_eval_functions` |
 
 `derive()` computes the rest: `t_exp`, `d_exp`, the `shard_*` factors, the
-`comm_*` flags, `rec_op` and `s_fa`.
+`comm_*` flags, `rec_op`, `s_fa`, the byte widths the estimators read
+(`bytes_grad`, `bytes_os`, `bytes_norm`, `bytes_dropout`), an MLA family's
+`dh`, and cm's `layer_fields`. A fact the input does not state takes the
+default of the model's family, from its op profile.
 
 ## 6. CostModelConfig Fields
 
@@ -242,13 +248,13 @@ and the memory module.
 | --- | --- | --- |
 | Input | `config`, `config_format`, `parser` | Original config object, normalized source format, and active parser instance |
 | Model | `model_name`, `device_capacity` | Model identifier and per-device memory capacity |
-| Op profile | `arch`, `op_counts`, `inherited_arch` | Architecture family that selects the arch hook, and its op counts per layer kind; a vision tower's arch is `vision`, and `inherited_arch` names the family whose hook it runs first |
-| Layer stack | `layer_stack`, `layer_binding`, `layer_fields` | The kind of every layer, as data; the fields each kind assigns, bound when the arch hook runs; the fields a family gives every layer on top of its kind's |
+| Op profile | `arch`, `op_counts`, `inherited_arch` | Architecture family whose op profile prices the model, and its op counts per layer kind; a vision tower's arch is `vision`, and `inherited_arch` names its language model's family, whose activation sharding it takes |
+| Layer stack | `layer_stack`, `layer_binding`, `layer_fields` | The kind of every layer, as data; the fields each kind assigns, bound when the family is applied; the fields a family gives every layer on top of its kind's |
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order`, `hooks_dict` | Used when one config is split into multiple model components, each priced by its own `arch` unless a hook class names its hook in `hooks_dict` |
 | Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |
-| Recompute | `full_rec`, `sel_rec`, `sel_comm_rec`, `sel_rec_rule`, `recompute_slice_activation`, `rec_op` | Full and selective recomputation controls; `rec_op` holds the switches of the selective recompute that `sel_rec_rule` names |
-| Model shape | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh`, `dc_kv`, `dc_q`, `dhr` | Layer count, hidden sizes, sequence sizes, attention heads, and MLA-related dimensions |
+| Recompute | `full_rec`, `sel_rec`, `sel_comm_rec`, `sel_rec_rule`, `recompute_slice_activation`, `recompute_ranges`, `rec_op` | Full and selective recomputation controls; `recompute_ranges`, when an ExecSpec states them, give each layer its option in model order and replace `full_rec` and `sel_rec`; `rec_op` holds the switches of the one selective setting a config prices |
+| Model shape | `n_lay`, `n_mtp`, `h`, `hff`, `v`, `s`, `s_fa`, `a`, `n_kv`, `dh`, `v_head_dim`, `dc_kv`, `dc_q`, `dhr` | Layer count, hidden sizes, sequence sizes, attention heads, and MLA-related dimensions |
 | FFN shape | `k_1st_dense`, `multiple_of`, `fdm` | Feedforward hidden-size derivation helpers |
 | MoE shape | `n_exp`, `n_chosen_exp`, `n_shared_exp`, `hff_exp`, `cap_fact`, `etp`, `t_exp`, `d_exp` | Expert count, expert selection, capacity factor, expert TP, and derived expert DP |
 | Optimizer shard | `shard_p_os_non_exp_partial`, `shard_p_os_non_exp`, `shard_grad_non_exp` | Non-expert parameter, optimizer-state, and gradient sharding factors |
@@ -257,8 +263,8 @@ and the memory module.
 | Feature flags | `has_op`, `has_grad_shard`, `freeze`, `has_fa`, `has_clip`, `gmm`, `vocab_emb_dp`, `emb_dp_sharded`, `tie_emb_out`, `emb_out_in_offset` | Optional model and training behavior switches |
 | MTP flags | `n_mtp`, `is_mtp_in_offset`, `is_shard_mtp_param` | Multi-token prediction layer placement and sharding controls |
 | Batch | `b`, `m`, `gbs` | Micro batch size, number of micro batches, and global batch size |
-| Activation shard | `shard_embed`, `shard_output_activ`, `shard_recompute_input` | Embedding, output activation, and recompute input sharding factors |
-| Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`, `bytes_grad`, `bytes_os`, `bytes_norm` | Byte widths for parameters, compute, softmax, gradients, optimizer states, and norm |
+| Activation shard | `shard_activations`, `shard_embed`, `shard_output_activ`, `shard_recompute_input` | Whether TP shards the activations between layers, and the embedding, output activation, and recompute input sharding factors |
+| Precision | `bytes_p`, `bytes_compute`, `bytes_softmax`, `grad_bytes`, `optimizer_state_bytes`, `norm_bytes`, `dropout_bytes`, `grad_accumulation`, `bytes_grad`, `bytes_os`, `bytes_norm`, `bytes_dropout` | Byte widths for parameters, compute and softmax; the gradient, optimizer-state, norm and dropout widths the run states, and whether its gradients take memory without PP; and the widths derived from them |
 | Customization | `overwrite_eval_functions` | Function overrides resolved by the hook manager |
 
 Strategy fields should be updated through `e.set_strategy()` after evaluator
@@ -384,8 +390,8 @@ with `config_layer_stack()`, from the stack the model spec states or from the
 layer counts: `k_1st_dense` dense layers then MoE layers, the two halves of an
 encoder-decoder, or one kind. Each estimator gives a layer its kind with
 `arch_hooks.apply_layer_kind()`: the kind's op counts, then the fields of its
-attention and feed-forward flavours, bound from the config as the arch hook
-left it. A stack whose one kind is what the arch hook already sets applies
+attention and feed-forward flavours, bound from the config as applying its
+family left it. A stack whose one kind is the family's default kind applies
 nothing per layer.
 
 When calling hooks, the following input function signatures are expected:

@@ -251,9 +251,6 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.bytes_softmax = (
             4 if mod.attention_softmax_in_fp32 else 2
         )  # softmax output
-        cc.bytes_grad = 4
-        cc.bytes_os = 4
-        cc.bytes_norm = 4
 
         # Optimizer parallel factors
         cc.os_max_shard = cc.d * cc.t

@@ -35,6 +35,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     layer_groups,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import exec_of
+from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
@@ -50,8 +51,9 @@ class _ParserCostModelConfig:
     """Minimal cost-model object for parser unit tests.
 
     Mirrors the helper in ``test_run_nd.py``.  A permissive ``__getattr__``
-    returns 0 for any attribute not explicitly set, matching
-    ``_CostModVar``'s default behaviour.
+    returns, for an attribute not explicitly set, the default ``_CostModVar``
+    declares, such as ``None`` for a run fact no parser states, and 0 for
+    one it does not declare, as ``_CostModVar`` does.
     """
 
     def __init__(self, input_config: Any = None) -> None:
@@ -60,9 +62,8 @@ class _ParserCostModelConfig:
         self.hooks_dict = {}
         self.source_code = None
 
-    def __getattr__(self, attr: str) -> int:
-        _ = attr
-        return 0
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(_CostModVar, attr, 0)
 
     @staticmethod
     def fp_bytes(precision: str) -> int:
@@ -561,7 +562,8 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Feature: _init_bytes.
         Description: Bytes from dtype fields in model section.
         Expectation: bytes_p=4 (float32), bytes_compute=2 (bfloat16),
-            bytes_softmax=4 (float32), bytes_grad=4, bytes_os=4, bytes_norm=4.
+            bytes_softmax=4 (float32); the family's bytes_grad=4, bytes_os=4
+            and bytes_norm=4, which the parser leaves to derive.
         """
         cfg = _dense_overrides(model={
             "param_init_type": "float32",
@@ -1094,12 +1096,11 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertNotIn("num_params_norm", ccfg.overwrite_eval_functions)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
-    def test_the_tower_inherits_its_language_models_hook(self, mock_hf):
+    def test_the_tower_inherits_its_language_models_sharding(self, mock_hf):
         """
         Feature: vision tower as data.
         Description: The tower's arch is the vision profile, and it names its
-            language model's family as the hook it inherits; the arch hooks
-            apply both, with no hook of the parser's.
+            language model's family, whose activation sharding it takes.
         Expectation: Qwen's activation sharding, then the tower's two-matmul
             MLP, with no gated triple to cast.
         """
@@ -1342,6 +1343,39 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(parser._bytes_from_dtype("float8"), 1)
         self.assertEqual(parser._bytes_from_dtype("float64"), 8)
         self.assertEqual(parser._bytes_from_dtype(""), 4)
+
+
+class TestGradientsAsFsdpHoldsThem(unittest.TestCase):
+    """A HyperParallel run holds each gradient as its parameter."""
+
+    @staticmethod
+    def _stages(pp: int) -> list:
+        """The per-stage memory of a MoE model under FSDP at *pp* stages."""
+        config = _moe_overrides(train={"accelerator": {
+            "dp_shard": 4, "dp_replicate": 1, "tp_degree": 2, "pipeline_parallel_degree": pp,
+            "expert_parallel_degree": 2,
+        }})
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(config, handle)
+            evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        return evaluator.estimate_peak_insight()
+
+    def test_gradients_weigh_what_the_parameters_do(self):
+        """
+        Feature: HyperParallel's gradient memory.
+        Description: A MoE model sharded over 4 ranks at TP 2 and EP 2,
+            without pipeline parallelism and on two stages.
+        Expectation: On every stage the gradients take exactly the
+            parameters' memory: their dtype and their sharding, at any
+            pipeline degree.
+        """
+        for pp in (1, 2):
+            for stage in self._stages(pp):
+                with self.subTest(pp=pp):
+                    self.assertGreater(stage["ModelParameters"], 0)
+                    self.assertEqual(stage["AccumulGradients"], stage["ModelParameters"])
 
 
 class TestHybridLayerStack(unittest.TestCase):

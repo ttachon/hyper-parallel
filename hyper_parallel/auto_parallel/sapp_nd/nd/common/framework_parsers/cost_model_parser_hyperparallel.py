@@ -263,6 +263,10 @@ class CostModelParserHyperparallel(_CostModelParser):
         """training feature vars"""
         self.ccfg.has_op = True  # Assuming
         self.ccfg.has_grad_shard = True  # Assuming FSDP
+        # FSDP holds every gradient sharded as its parameter, at any
+        # pipeline degree.
+        self.ccfg.grad_shard_as_params = True
+        self.ccfg.grad_accumulation = True
         self.ccfg.freeze = False
         self.ccfg.has_fa = True  # Assuming
         self.ccfg.vp_less_mem = False
@@ -287,8 +291,6 @@ class CostModelParserHyperparallel(_CostModelParser):
     def __init_bytes(self):
         """fp bytes vars"""
         self.ccfg.bytes_p = 4
+        self.ccfg.grad_bytes = self.ccfg.bytes_p  # FSDP: the parameters' dtype
         self.ccfg.bytes_compute = 2
         self.ccfg.bytes_softmax = 4
-        self.ccfg.bytes_grad = 4
-        self.ccfg.bytes_os = 4
-        self.ccfg.bytes_norm = 4
