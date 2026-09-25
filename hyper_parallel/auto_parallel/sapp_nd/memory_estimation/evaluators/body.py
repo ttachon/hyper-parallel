@@ -156,6 +156,16 @@ class EvalBody:
         non_exp_mem = non_exp_p * ccfg.bytes_grad / ccfg.shard_grad_non_exp
         return non_exp_mem + routed_mem + shared_mem
 
+    @staticmethod
+    def reduced_grad_layer(ccfg: CostModelConfig, ctx: Context) -> Tuple[float, float]:
+        """The layer's gradients FSDP reduce-scatters, whole as its backward computes them and sharded."""
+        non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
+        return EvalUtils.reduced_grads(ccfg, (
+            (non_exp_p, ccfg.t, ccfg.shard_grad_non_exp),
+            (routed_p / ccfg.ep, ccfg.t_exp, ccfg.shard_grad_exp),
+            (shared_p, ccfg.t_exp, ccfg.shard_grad_exp_partial),
+        ))
+
     # No recompute and select recompute
 
     @staticmethod

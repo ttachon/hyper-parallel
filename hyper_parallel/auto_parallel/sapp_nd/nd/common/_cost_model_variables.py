@@ -178,6 +178,9 @@ class _CostModVar:
 
     # shard
     shard_embed: float = 0
+    # Over how many of the ranks that shard the embedding table its layer
+    # gathers it to compute with it.
+    gather_embed: float = 1
     shard_output_activ: float = 0
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
@@ -213,6 +216,9 @@ class _CostModVar:
     # backward ends, adding it to the accumulated gradient only then, as
     # HyperParallel's does; PyTorch's FSDP2 adds it as soon as it is reduced.
     defers_grads: bool = False
+    # Whether FSDP holds a layer's whole gradients while the next layer's
+    # backward runs, and the root's until the backward ends.
+    overlaps_grad_reduce: bool = False
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:

@@ -44,6 +44,20 @@ class EvalUtils:
     """Utility methods class, PP Microbatch factor formulas"""
 
     @staticmethod
+    def reduced_grads(ccfg: CostModelConfig, parts: tuple) -> tuple:
+        """What the gradients FSDP reduce-scatters weigh, whole and sharded.
+
+        Each part is its parameter count, the ranks the backward computes
+        its gradient over and the ranks the gradient is kept over.  A part
+        no other rank shards is not reduce-scattered: the gradient the
+        backward computes is the one it keeps.
+        """
+        reduced = [(size, computed, kept) for size, computed, kept in parts if kept > computed]
+        whole = sum(size / computed for size, computed, _ in reduced)
+        sharded = sum(size / kept for size, _, kept in reduced)
+        return whole * ccfg.bytes_grad, sharded * ccfg.bytes_grad
+
+    @staticmethod
     def mb(x: Union[float, dict, tuple]) -> int:
         """Convert Byte to MB"""
         if isinstance(x, dict):
