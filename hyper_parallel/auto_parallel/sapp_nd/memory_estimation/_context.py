@@ -157,6 +157,9 @@ class Context:
         # How many chunks the schedule splits a micro-batch's sequence into,
         # as the micro factor of the node being evaluated counts them.
         self.seq_chunks = 1
+        # Whether the node evaluated is a layer's working set in its
+        # backward, rather than what it keeps between its passes.
+        self.working_set = False
         self.head_node, self.tail_node = None, None
         self.current_node = None
         self.current_stage_id, self.current_chunk_id = -1, -1

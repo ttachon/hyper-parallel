@@ -1407,6 +1407,65 @@ class TestGradientsAsFsdpHoldsThem(unittest.TestCase):
                     self.assertEqual(stage["AccumulGradients"], stage["ModelParameters"])
 
 
+class TestFsdpResharding(unittest.TestCase):
+    """HyperParallel's FSDP frees a layer's gathered parameters once it has run."""
+
+    @staticmethod
+    def _stage(fsdp: Dict[str, Any]) -> Dict[str, Any]:
+        """Stage 0 of a dense model at DP shard 4 and PP 2, fully recomputed, under *fsdp*."""
+        config = _auto_models_config(accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 2}, fsdp_config=fsdp)
+        with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+            mock_hf.return_value = SimpleNamespace(
+                model_type="llama", hidden_size=1024, num_hidden_layers=4, num_attention_heads=8,
+                num_key_value_heads=8, intermediate_size=2816, vocab_size=32000, max_position_embeddings=4096,
+            )
+            with tempfile.TemporaryDirectory() as folder:
+                path = os.path.join(folder, "train.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(config, handle)
+                evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        return evaluator.estimate_peak_insight()[0]["Node Log"]
+
+    def test_a_layer_keeps_no_gathered_parameters(self):
+        """
+        Feature: FSDP resharding on the memory path.
+        Description: A dense model at DP shard 4, with HyperParallel's
+            default FSDP, and with reshard_after_forward off.
+        Expectation: Kept gathered, each layer keeps its gathered
+            parameters, and so does the working set that ends warm-up.
+            Resharded, no layer keeps any, and that working set holds two
+            layers', its own and the next one's, prefetched.
+        """
+        def gathered(log):
+            """Each layer's gathered parameters, then the working set's."""
+            layers = [value.get("ag_comm", 0) for key, value in log.items() if isinstance(key[2], int)]
+            working = [value["ag_comm"] for key, value in log.items() if str(key[2]).startswith("rec_")]
+            return layers, working
+
+        kept = gathered(self._stage({"dp_shard_size": 4, "reshard_after_forward": False}))
+        layer = kept[1][0]
+        self.assertGreater(layer, 0)
+        self.assertEqual(kept, ([layer, layer], [layer]))
+        freed = gathered(self._stage({"dp_shard_size": 4}))
+        self.assertEqual(freed[0], [0, 0])
+        # The log keeps whole MB, of two layers as of one.
+        self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
+
+    def test_the_run_states_whether_it_reshards(self):
+        """
+        Feature: _reshards_params.
+        Description: HyperParallel's default FSDP, and FSDP that keeps a
+            layer's gathered parameters after its forward, or after its
+            backward.
+        Expectation: The default frees them; keeping them either way keeps them.
+        """
+        got = []
+        for fsdp in ({}, {"reshard_after_forward": False}, {"reshard_after_backward": False}):
+            ccfg = _make_ccfg(_dense_overrides(fsdp_config=fsdp))
+            got.append(ccfg.reshards)
+        self.assertEqual(got, [True, False, False])
+
+
 class TestHybridLayerStack(unittest.TestCase):
     """A hybrid stack prices each layer with its own attention flavour."""
 
