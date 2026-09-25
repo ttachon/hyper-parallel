@@ -15,6 +15,7 @@
 """Tail submodule"""
 from __future__ import annotations
 from typing import TYPE_CHECKING
+from hyper_parallel.auto_parallel._layer_census import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
@@ -163,12 +164,30 @@ class EvalTailSingle:
     @staticmethod
     def activ_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
         """activation mem (lmhead)"""
+        census = getattr(ccfg, "output_census", None)
+        if isinstance(census, KindActivations):
+            return EvalTailSingle.census_out_single(ccfg, ctx, census)
         micro_factor = ctx.micro_factor
         last_norm = ccfg.s * ccfg.b * ccfg.bytes_norm * ccfg.h
         lm_head = ccfg.s * ccfg.b * ccfg.bytes_compute * ccfg.v
         activ_size = last_norm + lm_head
         activ_size /= ccfg.shard_output_activ
         return micro_factor * activ_size
+
+    @staticmethod
+    def census_out_single(ccfg: CostModelConfig, ctx: Context, census: KindActivations) -> float:
+        """The output layer's activations, as its census measured them (lmhead).
+
+        What the layer keeps between its passes, or its backward's working
+        set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
+        of the sequence.  Every TP rank holds them whole: HyperParallel
+        computes its loss over the whole vocabulary unless the run turns on
+        its loss_parallel, which the memory model does not read.
+        """
+        tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
+        kept = census.saved + census.saved_tp
+        held = census.working + census.working_tp
+        return EvalUtils.census_bytes(ctx, tokens, kept, held)
 
     @staticmethod
     def comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:

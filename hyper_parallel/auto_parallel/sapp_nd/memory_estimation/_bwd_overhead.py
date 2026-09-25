@@ -54,17 +54,21 @@ class _BackwardOverhead:
         # print("here11",id(self.backbone._ccfg))
         return stages[stage_id][chunk_id][lay_id]
 
-    def _working_set(self, gathered: int = 2) -> float:
+    def _working_set(self, gathered: int = 2, on_saved: bool = False) -> float:
         """The dynamic memory of the node set up, as the working set of its backward.
 
         Under FSDP that reshards, a layer's backward holds *gathered* layers'
-        parameters: its own and the next layer's, prefetched.
+        parameters: its own and the next layer's, prefetched.  *on_saved*
+        says the stage's dynamic memory counts what the node keeps for this
+        backward already, as it does where the node does not recompute.
         """
         self._ctx.working_set = gathered
+        self._ctx.working_on_saved = on_saved
         try:
             return sum(self._inner_dynamic_mem(default_micro_factor=1))
         finally:
             self._ctx.working_set = 0
+            self._ctx.working_on_saved = False
 
     def first_layer_working_set(self, stages: list, stage_id: int, record_lay_types: dict) -> Tuple[float, float]:
         """The working set of the backward of the stage's first layer, the last it runs, unlogged.
@@ -175,7 +179,7 @@ class _BackwardOverhead:
             else:
                 self._ctx.current_node = last_node
                 self._ctx.current_lay_id = f"G_{self._ctx.current_lay_id}"
-                res = self._working_set()
+                res = self._working_set(on_saved=True)
                 if (
                     last_node == LayerType.OUTPUT_LAYER
                     and self._ccfg.n_mtp > 0
@@ -193,7 +197,7 @@ class _BackwardOverhead:
                             f"G_{self._ctx.current_lay_id}"
                         )
                         self._ctx.current_node = last_mtp
-                    res += self._working_set()
+                    res += self._working_set(on_saved=last_mtp != LayerType.FULL_REC_LAYER)
         return res
 
     def __stage_bwd_overhead_zbv(

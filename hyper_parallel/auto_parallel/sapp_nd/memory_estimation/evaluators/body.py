@@ -15,6 +15,7 @@
 """Body module"""
 from __future__ import annotations
 from typing import TYPE_CHECKING, NamedTuple
+from hyper_parallel.auto_parallel._layer_census import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
@@ -27,6 +28,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
     detect_attention_type,
     compute_kv_dim,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -171,6 +173,9 @@ class EvalBody:
     @staticmethod
     def layer_activ(ccfg: CostModelConfig, ctx: Context) -> float:
         """activations"""
+        census = getattr(ccfg, "kind_activations", None)
+        if isinstance(census, KindActivations) and ctx.current_node != LayerType.SEL_REC_LAYER:
+            return EvalBody.census_activ(ccfg, ctx, census)
         attn_size = sum(
             [
                 ctx.attn_qkv_activ(ccfg, ctx),
@@ -184,6 +189,21 @@ class EvalBody:
             ffn_size = ctx.ffn_moe_activ(ccfg, ctx)
         norm_size = ctx.norm_activ(ccfg, ctx)
         return attn_size + ffn_size + norm_size
+
+    @staticmethod
+    def census_activ(ccfg: CostModelConfig, ctx: Context, census: KindActivations) -> float:
+        """A layer's activations, as the census of its kind measured them.
+
+        What the layer keeps between its passes, or its backward's working
+        set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
+        of the sequence: TP splits one part, sequence parallelism the
+        other.  A selective layer's switches drop parts the census does not
+        tell apart: its formulas price it.
+        """
+        tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
+        kept = census.saved / max(1, ccfg.sp) + census.saved_tp / max(1, ccfg.t)
+        held = census.working / max(1, ccfg.sp) + census.working_tp / max(1, ccfg.t)
+        return EvalUtils.census_bytes(ctx, tokens, kept, held)
 
     # Full recompute
 

@@ -24,8 +24,11 @@ function-local because ``transformers`` is not a hard dependency of
 ``hyper_parallel`` (``requirements.txt`` only pins numpy) and the non-Hyper
 cost-model backends must keep working without it.
 """
+import copy
 import logging
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from hyper_parallel.auto_parallel._layer_census import census_activations, census_output_activations
 
 logger = logging.getLogger(__name__)
 
@@ -266,9 +269,59 @@ def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(overrides) if isinstance(overrides, Mapping) else {}
 
 
+# The censuses this process has run, by config, layer stack and length: a
+# harness pricing several runs of one model runs one.
+_CENSUSES: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+
+def _census(text_config: Any, layers: Any, seq_length: int) -> Dict[str, Any]:
+    """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
+    key = (
+        text_config.to_json_string(),
+        tuple((group["kind"], int(group["count"])) for group in layers),
+        int(seq_length),
+    )
+    if key not in _CENSUSES:
+        logger.info("census of each layer kind and of the output layer at %d tokens", seq_length)
+        kinds = census_activations(text_config, layers, seq_length)
+        _CENSUSES[key] = {
+            "activations": {kind: record.to_dict() for kind, record in kinds.items()},
+            "output_activations": census_output_activations(text_config, seq_length).to_dict(),
+        }
+    return copy.deepcopy(_CENSUSES[key])
+
+
+def _no_census(census_seq_len: int) -> None:
+    """Warn that a census asked for cannot run: it builds layers from the checkpoint's config."""
+    if census_seq_len:
+        logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
+
+
+def _census_layers(spec: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """The groups of body layers a census tells apart, in model order, or None.
+
+    The Hyper parser prices a hybrid model's layers by the attention flavour
+    its ``layer_types`` states, and any other model's as one kind; None
+    where the first layers are dense (``first_k_dense_replace``), a kind
+    the parser prices through the model's family.
+    """
+    if spec.get("first_k_dense_replace"):
+        return None
+    count = int(spec.get("num_hidden_layers") or 0)
+    kinds = [str(kind) for kind in (spec.get("layer_types") or [])[:count]] or ["decoder"] * count
+    groups: List[Dict[str, Any]] = []
+    for kind in kinds:
+        if groups and groups[-1]["kind"] == kind:
+            groups[-1]["count"] += 1
+        else:
+            groups.append({"kind": kind, "count": 1})
+    return groups
+
+
 def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
 ) -> Dict[str, Any]:
     """Return canonical cost-model fields for a Trainer ``model`` section.
 
@@ -287,6 +340,13 @@ def resolve_hf_model_spec(
     Args:
         model_raw: The ``model`` section, as a plain mapping.
         visual_seq_len: Optional override for the encoder sequence length.
+        census_seq_len: The tokens to run a census of each layer kind of
+            the language model at, and of its output layer
+            (:mod:`hyper_parallel.auto_parallel._layer_census`), which the
+            spec states as ``"activations"`` and ``"output_activations"``;
+            0 runs none.  The census builds its layers from the checkpoint's
+            config: a spec from ``config_overrides`` alone gets none, and an
+            override of a model field does not reach it.
 
     Returns:
         A dict of canonical model fields, always carrying ``"name"``.
@@ -301,6 +361,7 @@ def resolve_hf_model_spec(
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
+            _no_census(census_seq_len)
             return _settle_qk_norm(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path "
@@ -316,6 +377,7 @@ def resolve_hf_model_spec(
                 "falling back to model.config_overrides", exc,
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
+            _no_census(census_seq_len)
             return _settle_qk_norm(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
@@ -336,4 +398,12 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    return _settle_qk_norm(spec)
+    spec = _settle_qk_norm(spec)
+    if census_seq_len:
+        layers = _census_layers(spec)
+        if layers is None:
+            logger.warning("no census of %s: its first layers are dense, a kind a census does not tell apart",
+                           spec["name"])
+        else:
+            spec.update(_census(_text_tower(model_config), layers, census_seq_len))
+    return spec

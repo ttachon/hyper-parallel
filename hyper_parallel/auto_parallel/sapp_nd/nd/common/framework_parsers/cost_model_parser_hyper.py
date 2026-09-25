@@ -58,6 +58,8 @@ search config).  Give them only to cost one fixed strategy::
     context:
       max_device_memory: "64GB"
       device_num: 64
+      census: true                   # price each layer kind's activations
+                                     # from a census of a fake layer of it
 
 ``model.config_overrides`` stays supported for standalone search configs,
 and wins over anything read from the checkpoint.
@@ -79,6 +81,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._layer_census import KindActivations, activations_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -235,9 +238,11 @@ class CostModelParserHyperV2(_CostModelParser):
         The AutoModels trainer trains the model Transformers builds, which
         has no MTP layer (:meth:`_without_mtp`), and a vision tower only
         where its model class builds one (:meth:`_builds_vision_tower`).
+        ``context.census`` has the resolver run a census of each layer kind
+        (:meth:`_config_census`).
         """
         spec = resolve_hf_model_spec(
-            self._model_section(), self._visual_seq_len_override()
+            self._model_section(), self._visual_seq_len_override(), self._census_seq_len()
         )
         if is_auto_models_schema(self.config):
             spec = self._without_mtp(spec)
@@ -254,7 +259,31 @@ class CostModelParserHyperV2(_CostModelParser):
             "conv": self._spec_int(spec, "linear_conv_kernel_dim"),
         }
         self._apply_spec(self.ccfg, spec)
+        self._config_census(spec)
         self._resolve_device_capacity()
+
+    def _config_census(self, spec: Dict[str, Any]) -> None:
+        """Hold the census the spec states: each layer kind's record, and the output layer's.
+
+        The memory model prices a layer whose kind has a record with it,
+        rather than with its formulas, and the output layer with its own;
+        :meth:`_init_layer_stack` binds each kind's record.
+        """
+        census, output = spec.get("activations"), spec.get("output_activations")
+        self.ccfg.census = activations_from_dict(census) if census else None
+        self.ccfg.output_census = KindActivations.from_dict(output, "output_activations") if output else None
+
+    def _census_seq_len(self) -> int:
+        """The tokens to run a census of each layer kind at, 0 unless ``context.census`` asks for one.
+
+        A census gives bytes per token, which hardly depend on the length:
+        it runs at the dataset's, else at 4096 tokens, never at the model's
+        context limit.
+        """
+        ctx = self._get_cfg_attr(self.config, "context", Config({}))
+        if not self._get_cfg_attr(ctx, "census", False):
+            return 0
+        return self._dataset_seq_len() or 4096
 
     def _model_section(self) -> Dict[str, Any]:
         """Return the ``model`` section as a plain mapping."""
@@ -360,8 +389,14 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg = ccfg if ccfg is not None else self.ccfg
         total = int(ccfg.n_lay + ccfg.n_mtp)
         kinds = [str(k) for k in self._layer_types[: int(ccfg.n_lay)]]
+        # A census binds a stack of one kind its record here, and each group
+        # of a hybrid stack its own as the group's hook applies.
+        census = getattr(ccfg, "census", None) or {}
+        ccfg.kind_activations = None
         if not kinds or len(set(kinds)) <= 1 and "linear" not in "".join(kinds):
             ccfg.layer_custom_config = [(total, None)]
+            if len(census) == 1:
+                ccfg.kind_activations = next(iter(census.values()))
             return
 
         groups = []
@@ -389,7 +424,8 @@ class CostModelParserHyperV2(_CostModelParser):
         linear = dict(self._linear_attn)
 
         def apply(lccfg: Any) -> None:
-            """Give *lccfg* this group's attention flavour."""
+            """Give *lccfg* this group's attention flavour, and its census record."""
+            lccfg.kind_activations = (getattr(lccfg, "census", None) or {}).get(kind)
             if "linear" not in kind:
                 _restore_full_attention(lccfg)
                 return
@@ -512,6 +548,8 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
         cc.layer_custom_config = [(cc.n_lay, None)]
+        # The language model's census is not the tower's.
+        cc.census = cc.kind_activations = cc.output_census = None
         cc.offset = self._front_loaded_offset(cc.n_lay)
         return cc
 
@@ -533,8 +571,8 @@ class CostModelParserHyperV2(_CostModelParser):
         stages[0] = head
         return stages
 
-    def _resolve_sequence_length(self) -> None:
-        """Prefer the Trainer dataset sequence length over the model limit."""
+    def _dataset_seq_len(self) -> int:
+        """The sequence length the dataset states, the legacy ``data.max_seq_len`` too, else 0."""
         data_raw = self._get_cfg_attr(self.config, "data", Config({}))
         legacy_seq_len = self._get_cfg_attr(data_raw, "max_seq_len", 0)
 
@@ -543,8 +581,11 @@ class CostModelParserHyperV2(_CostModelParser):
             dataset_raw, "data_transform", Config({}),
         )
         trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
-        seq_len = int(trainer_seq_len or legacy_seq_len or self.ccfg.s or 4096)
-        self.ccfg.s = seq_len
+        return int(trainer_seq_len or legacy_seq_len or 0)
+
+    def _resolve_sequence_length(self) -> None:
+        """Prefer the Trainer dataset sequence length over the model limit."""
+        self.ccfg.s = int(self._dataset_seq_len() or self.ccfg.s or 4096)
 
     def _resolve_device_capacity(self) -> None:
         """Set device capacity from config or default (64 GB)."""
