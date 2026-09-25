@@ -33,6 +33,10 @@ def _apply_cli_overrides(search_cfg, cli_args):
         search_cfg: The search config read from ``-s/--search-config``.
         cli_args: The parsed CLI namespace.
     """
+    if cli_args.device_type is not None:
+        # -A sets the device the search prices, as it does on the CLI path;
+        # only the search config's device_type reached the search before.
+        search_cfg.cluster_spec["device_type"] = cli_args.device_type
     if cli_args.global_batch_size is not None:
         search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
     if cli_args.max_mem is not None:
@@ -244,8 +248,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-A",
         "--device_type",
-        default="A2",
-        help="choose device type between A2 or A3",
+        default=None,
+        help="choose device type between A2 or A3: A2 unless given, or a search config states one",
     )
     parser.add_argument(
         "-swap_os",
@@ -383,7 +387,7 @@ if __name__ == "__main__":
     Debug.set_output_dir(args.output_dir)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
-    machine = Hard.Machine(args.devices, args.device_type)
+    machine = Hard.Machine(args.devices, args.device_type or "A2")
 
     if args.framework == "hyperparallel2":
         if args.yaml_config is None or args.train_yaml is None or args.accelerate_yaml is None:
