@@ -137,6 +137,19 @@ class TestCostModelRoundTrip(unittest.TestCase):
         self.assertEqual(yaml_dict["model"]["config_overrides"]["head_dim"], 128)
         self.assertEqual(_parse(yaml_dict).dh, 128)
 
+    def test_the_tie_and_the_qk_norm_survive_the_round_trip(self) -> None:
+        """
+        Feature: model facts through the search runner.
+        Description: A qwen3_moe spec stating tied embeddings and no QK-norm,
+            which its name alone would infer.
+        Expectation: The parser prices one table for both ends and no
+            QK-norm, as the spec states.
+        """
+        config = _normalized_config()
+        config.model_spec.update(tie_word_embeddings=True, qk_norm=False)
+        ccfg = _parse(_build_hp_yaml_dict(config))
+        self.assertEqual((ccfg.tie_emb_out, ccfg.qk_norm), (True, False))
+
     def test_device_num_reaches_the_parser(self) -> None:
         """
         Feature: cluster size propagation.
