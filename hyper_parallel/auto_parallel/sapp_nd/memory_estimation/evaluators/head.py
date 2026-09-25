@@ -56,7 +56,7 @@ class EvalHead:
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim_table
         b_os /= ccfg.cp
         return param_size * b_os
 

@@ -195,6 +195,25 @@ class TestDeriveFamily(unittest.TestCase):
             got = (ccfg.bytes_grad, ccfg.bytes_os, ccfg.bytes_norm, ccfg.bytes_dropout)
             self.assertEqual(got, want, f"{facts}: bytes_grad, bytes_os, bytes_norm, bytes_dropout={got}")
 
+    def test_optimizer_bytes(self):
+        """
+        Feature: derive_byte_widths, the optimizer's bytes per parameter.
+        Description: The default fp32 AdamW; bf16 states; Muon's one bf16
+            momentum; fp32 states with an fp32 copy of the parameters.
+        Expectation: A layer's parameter keeps its optimizer's states and
+            any copy; the embedding and output tables AdamW's two states.
+        """
+        cases = [
+            ({}, (8, 8)),
+            ({"optimizer_state_bytes": 2}, (4, 4)),
+            ({"optimizer_state_bytes": 2, "optimizer_states": 1}, (2, 4)),
+            ({"optimizer_state_bytes": 4, "main_param_bytes": 4}, (12, 12)),
+        ]
+        for facts, want in cases:
+            ccfg = _config(p=2, **facts)
+            derive(ccfg)
+            self.assertEqual((ccfg.bytes_optim, ccfg.bytes_optim_table), want, f"{facts}")
+
     def test_activation_sharding(self):
         """
         Feature: derive_activation_sharding.

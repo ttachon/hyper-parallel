@@ -65,6 +65,8 @@ CONFIG_FIELDS = {
     "softmax_bytes": "bytes_softmax",
     "grad_bytes": "grad_bytes",
     "optimizer_state_bytes": "optimizer_state_bytes",
+    "optimizer_states": "optimizer_states",
+    "main_param_bytes": "main_param_bytes",
     "norm_bytes": "norm_bytes",
     "dropout_bytes": "dropout_bytes",
     "flash_attention": "has_fa",

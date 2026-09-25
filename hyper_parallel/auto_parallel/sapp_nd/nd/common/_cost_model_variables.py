@@ -221,11 +221,17 @@ class _CostModVar:
     # estimators bytes_grad, bytes_os, bytes_norm and bytes_dropout from them.
     grad_bytes: float = None
     optimizer_state_bytes: float = None
+    optimizer_states: float = None
+    main_param_bytes: float = None
     norm_bytes: float = None
     dropout_bytes: float = None
     grad_accumulation: bool = None
     bytes_grad: float = 0
     bytes_os: float = 0
+    # What the optimizer keeps per parameter: a layer's, and the embedding
+    # and output tables', which keep AdamW's two states (derive).
+    bytes_optim: float = 0
+    bytes_optim_table: float = 0
     bytes_norm: float = 0
     bytes_dropout: float = 0
 

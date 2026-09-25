@@ -576,8 +576,9 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Feature: _init_bytes.
         Description: Bytes from dtype fields in model section.
         Expectation: bytes_p=4 (float32), bytes_compute=2 (bfloat16),
-            bytes_softmax=4 (float32); the family's bytes_grad=4, bytes_os=4
-            and bytes_norm=4, which the parser leaves to derive.
+            bytes_softmax=4 (float32); the family's bytes_grad=4 and
+            bytes_norm=4, which the parser leaves to derive; bytes_os=4, the
+            stored parameters' width, which the optimizer's states take.
         """
         cfg = _dense_overrides(model={
             "param_init_type": "float32",
@@ -591,6 +592,24 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.bytes_grad, 4)
         self.assertEqual(ccfg.bytes_os, 4)
         self.assertEqual(ccfg.bytes_norm, 4)
+
+    def test_optimizer_states_follow_the_stored_parameters(self):
+        """
+        Feature: _optimizer_states.
+        Description: A bf16 model trained with AdamW, with Muon, and with
+            fp32 main parameters.
+        Expectation: AdamW's two moments and Muon's one momentum take the
+            stored parameters' bf16: 4 and 2 bytes per layer parameter, the
+            tables' AdamW 4; fp32 main parameters keep fp32 states and an
+            fp32 copy, 12 bytes per parameter.
+        """
+        got = []
+        for optimizer in ({"max_grad_norm": 1.0},
+                          {"_target_": "hyper_parallel.components.optim.Muon"},
+                          {"fp32_main_params": True}):
+            ccfg = _make_ccfg(_dense_overrides(model={"torch_dtype": "bfloat16"}, train={"optimizer": optimizer}))
+            got.append((ccfg.bytes_os, ccfg.bytes_optim, ccfg.bytes_optim_table))
+        self.assertEqual(got, [(2, 4, 4), (2, 2, 4), (4, 12, 12)])
 
     def test_top_level_model_init_dtype_sizes_the_parameters(self):
         """

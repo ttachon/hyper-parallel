@@ -68,6 +68,8 @@ def _make_ccfg(
     ccfg.n_ffMM = 1
     ccfg.bytes_p = bytes_p
     ccfg.bytes_os = bytes_os
+    # AdamW's two states and no copy of the parameters, as derive gives them.
+    ccfg.bytes_optim = 2 * bytes_os
     ccfg.bytes_grad = bytes_grad
     ccfg.shard_p_os_non_exp_partial = shard_p_os_non_exp_partial
     ccfg.shard_p_os_exp = shard_p_os_exp

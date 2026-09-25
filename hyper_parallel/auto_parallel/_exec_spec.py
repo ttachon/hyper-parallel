@@ -203,6 +203,12 @@ class ExecSpec:
             optimizer_state_bytes, norm_bytes, dropout_bytes: Bytes per
             element of the parameters, activations, softmax outputs,
             gradients, optimizer states, norm activations and dropout masks.
+        optimizer_states: How many states the optimizer keeps per parameter
+            of a layer: AdamW's two moments, or Muon's one momentum.  The
+            embedding and output tables keep AdamW's two.
+        main_param_bytes: Bytes per element of the copy of the parameters
+            the optimizer keeps, 0 when it keeps none, as HyperParallel's
+            fp32 main parameters keep one.
         flash_attention, grad_clip, grouped_gemm, tie_embeddings: Kernels
             and features the run uses.
         vocab_emb_dp: Whether the vocabulary embedding runs data parallel.
@@ -256,6 +262,8 @@ class ExecSpec:
     softmax_bytes: Optional[int] = None
     grad_bytes: Optional[int] = None
     optimizer_state_bytes: Optional[int] = None
+    optimizer_states: Optional[int] = None
+    main_param_bytes: Optional[int] = None
     norm_bytes: Optional[int] = None
     dropout_bytes: Optional[int] = None
 
@@ -335,9 +343,9 @@ class ExecSpec:
 # none of them is kept as it is.
 _KINDS: Dict[str, tuple] = {
     "count": ("dp", "tp", "pp", "vpp", "cp", "ep", "micro_batch_size", "micro_batch_num",
-              "global_batch_size", "optimizer_shard", "seq_split", "seq_length"),
+              "global_batch_size", "optimizer_shard", "seq_split", "seq_length", "optimizer_states"),
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
-             "optimizer_state_bytes", "norm_bytes", "dropout_bytes"),
+             "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
     "flag": ("sequence_parallel", "shard_activations", "optimizer_parallel", "grad_shard",
              "grad_shard_as_params", "grad_accumulation", "mtp_in_offset", "emb_out_in_offset",
              "recompute_slice_activation", "flash_attention", "grad_clip", "grouped_gemm",

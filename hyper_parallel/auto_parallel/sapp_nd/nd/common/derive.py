@@ -305,11 +305,17 @@ def derive_byte_widths(ccfg: Any, run: Mapping[str, Any]) -> None:
     """Set the byte widths the estimators read from those the run states, else its family's.
 
     Gradients take memory only under pipeline parallelism, unless the run
-    accumulates them without it too (``grad_accumulation``).
+    accumulates them without it too (``grad_accumulation``).  The optimizer
+    keeps, per parameter, its states and any copy of the parameters: a
+    layer's parameter as many states as its optimizer has, the embedding
+    and output tables' AdamW's two.
     """
     accumulates = ccfg.p > 1 or _stated(ccfg, "grad_accumulation", run)
     ccfg.bytes_grad = _stated(ccfg, "grad_bytes", run) if accumulates else 0
     ccfg.bytes_os = _stated(ccfg, "optimizer_state_bytes", run)
+    main_copy = _stated(ccfg, "main_param_bytes", run)
+    ccfg.bytes_optim = _stated(ccfg, "optimizer_states", run) * ccfg.bytes_os + main_copy
+    ccfg.bytes_optim_table = 2 * ccfg.bytes_os + main_copy
     ccfg.bytes_norm = _stated(ccfg, "norm_bytes", run)
     ccfg.bytes_dropout = _stated(ccfg, "dropout_bytes", run)
 
