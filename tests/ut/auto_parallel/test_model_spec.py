@@ -268,6 +268,14 @@ class TestModelKeysOnly(unittest.TestCase):
         with self.assertRaisesRegex(ModelSpecError, "attn_output_gate"):
             ModelSpec.from_dict(dict(_dense(), attn_output_gate="yes"))
 
+    def test_a_tie_is_a_boolean_fact(self):
+        """tie_word_embeddings is typed, round-trips, and refuses a string."""
+        spec = ModelSpec.from_dict(dict(_dense(), tie_word_embeddings=True))
+        self.assertIs(spec.tie_word_embeddings, True)
+        self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+        with self.assertRaisesRegex(ModelSpecError, "tie_word_embeddings"):
+            ModelSpec.from_dict(dict(_dense(), tie_word_embeddings="yes"))
+
 
 class TestVisionTower(unittest.TestCase):
     """A multimodal spec nests its tower rather than flattening it."""

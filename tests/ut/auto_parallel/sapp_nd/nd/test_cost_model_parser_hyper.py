@@ -540,6 +540,19 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertFalse(ccfg.freeze)
         self.assertEqual(ccfg.cp_algo, "colossalai_cp")
 
+    def test_feature_flags_tied_embeddings(self):
+        """
+        Feature: _parse_feature_flags, tied embeddings.
+        Description: A model whose config ties its output head to its
+            embedding, and the same model untied.
+        Expectation: tie_emb_out follows the model's tie_word_embeddings.
+        """
+        cfg = _dense_overrides()
+        cfg["model"]["config_overrides"]["tie_word_embeddings"] = True
+        self.assertTrue(_make_ccfg(cfg).tie_emb_out)
+        cfg["model"]["config_overrides"]["tie_word_embeddings"] = False
+        self.assertFalse(_make_ccfg(cfg).tie_emb_out)
+
     def test_feature_flags_clip(self):
         """
         Feature: _parse_feature_flags — clip.
