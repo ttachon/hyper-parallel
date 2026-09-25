@@ -1652,6 +1652,46 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(first, second)
 
+    def test_toml_flavors_as_torchtitan_states_them(self) -> None:
+        """
+        Feature: the TOML parser, on the fields a TorchTitan flavor may leave out.
+        Description: A DeepSeek-style flavor that states its experts and no
+            moe_enabled, the same flavor with moe_enabled False, and one that
+            states ffn_dim_multiplier as None, TorchTitan's default.
+        Expectation: The first runs its experts, the second is dense, and the
+            third parses with no multiplier.
+        """
+        experts = ("dim=64, inter_dim=128, vocab_size=256, n_heads=4, n_layers=4, n_kv_heads=0, "
+                   "kv_lora_rank=0, q_lora_rank=0, qk_rope_head_dim=0, n_dense_layers=1, moe_inter_dim=32, "
+                   "moe_args=MoEArgs(num_experts=8, top_k=2, num_shared_experts=1), multiple_of=1")
+        toml = Config({
+            "model": {"name": "deepseek_v3", "flavor": "tiny"},
+            "parallelism": {
+                "data_parallel_replicate_degree": 1, "data_parallel_shard_degree": 2,
+                "tensor_parallel_degree": 1, "pipeline_parallel_degree": 1, "context_parallel_degree": 1,
+                "expert_parallel_degree": 1, "expert_tensor_parallel_degree": 0,
+                "pipeline_parallel_schedule": "1F1B",
+            },
+            "activation_checkpoint": {"mode": "full"},
+            "training": {"seq_len": 128, "local_batch_size": 1},
+        })
+        cases = (
+            (experts + ", ffn_dim_multiplier=1", (8, 2, 1, 1)),
+            (experts + ", moe_enabled=False, ffn_dim_multiplier=1", (1, 1, 0, 1)),
+            (experts + ", ffn_dim_multiplier=None", (8, 2, 1, 1)),
+        )
+        for args, want in cases:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                source_path = os.path.join(tmp_dir, "__init__.py")
+                with open(source_path, "w", encoding="utf-8") as source_file:
+                    source_file.write(
+                        "def get_train_spec():\n    return TrainSpec(model_args=model_args)\n"
+                        f"model_args = {{'tiny': ModelArgs({args})}}\n"
+                    )
+                ccfg = CostModelConfig(toml, framework="hyperparallel", source_code=source_path)
+                got = (ccfg.n_exp, ccfg.n_chosen_exp, ccfg.n_shared_exp, ccfg.fdm)
+                self.assertEqual(got, want, args)
+
     def test_comm_overlap_fields_in_parsers(self) -> None:
         """
         Feature: TestSappNDRunND.
