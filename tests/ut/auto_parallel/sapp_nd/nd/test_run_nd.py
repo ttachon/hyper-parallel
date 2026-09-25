@@ -1400,6 +1400,71 @@ class TestSappNDRunND(unittest.TestCase):
                 plot_idle=True,
             )
 
+    def test_a_comparison_writes_a_plot_without_idle_and_its_estimates(self) -> None:
+        """
+        Feature: the files run_nd --real_csv writes beside its plot.
+        Description: Two measured configurations whose order by step and by
+            step less idle differ, compared with idle.
+        Expectation: A second plot without idle, ordered by step less idle, and a
+            CSV of ND's estimate of each configuration with its memory.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
+        runner.memory_estim = lambda: 2048
+
+        def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
+            """Fill one part the way estimate_performance does and return the score."""
+            debugger.info[Debug.PerfParts.DP_COMM] = 4.0
+            return 10.0
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = os.path.join(tmp_dir, "real.csv")
+            with open(csv_path, "w", encoding="utf-8") as csv_file:
+                # OP 2: step 12, idle 10. OP 4: step 10, idle 1.
+                csv_file.write("DP,OP,time,comp,dp_wait\n8,2,12,1,1\n8,4,10,5,4\n")
+            with patch.object(Par, "estimate_performance", side_effect=fake_estimate), \
+                    patch.object(Debug, "plot_vs_real_comm_classified") as plot:
+                configs_estimated, _ = runner.compare_with_csv(csv_path, output_path=tmp_dir, plot_idle=True)
+            with open(os.path.join(tmp_dir, "real_estimates.csv"), newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+
+        self.assertEqual([entry[0].val(Dim.OP) for entry in configs_estimated], [4, 2])
+        (with_idle, first_kwargs), (without_idle, second_kwargs) = plot.call_args_list
+        self.assertEqual((first_kwargs["plot_idle"], first_kwargs.get("suffix", "")), (True, ""))
+        self.assertEqual((second_kwargs["plot_idle"], second_kwargs["suffix"]), (False, "_no_idle"))
+        self.assertEqual([entry[0].val(Dim.OP) for entry in with_idle[0]], [4, 2])
+        self.assertEqual([entry[0].val(Dim.OP) for entry in without_idle[0]], [2, 4])
+        self.assertEqual(rows[0][:5], ["DP", "OP", "time", "memory_mb", "score"])
+        self.assertEqual([row[:5] for row in rows[1:]], [["8", "4", "10.0", "2048", "10.0"],
+                                                         ["8", "2", "12.0", "2048", "10.0"]])
+        self.assertEqual(rows[1][5 + Debug.PerfParts.DP_COMM.value - 1], "4.0")
+
+    def test_the_measured_stack_adds_up_to_the_step(self) -> None:
+        """
+        Feature: the measured bars of ND's comparison plot.
+        Description: A classified row with FSDP, sequence-parallel, CP and pipeline waits.
+        Expectation: FSDP counts as DP and sequence parallel as MP, CP has a bar of
+            its own, and with idle the stack adds up to the measured step.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = os.path.join(tmp_dir, "real.csv")
+            with open(csv_path, "w", encoding="utf-8") as csv_file:
+                csv_file.write("DP,EP,time,comp,dp_wait,mp_wait,ep_wait,cp_wait,pp_wait,op_wait,sp_wait\n")
+                csv_file.write("8,2,100,30,5,4,6,7,3,20,2\n")
+            dims, time, waits = Debug.get_comm_classified_data(csv_path, plot_idle=True)[0]
+        bars = Debug.measured_bars(waits, plot_idle=True)
+        self.assertEqual(bars, [30.0, 25.0, 6.0, 6.0, 7.0, 3.0, 23.0])
+        self.assertAlmostEqual(sum(bars), time)
+        self.assertEqual(len(Debug.measured_bars(waits)), len(Debug.MEASURED_BARS))
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        real_data = []
+        plot.parse_data([(dims, 1, time, 90.0, [90.0], waits)], real_data=real_data)
+        self.assertEqual(real_data, [tuple(bars[:-1])])
+
     def test_the_degree_table_reads_a_boolean_dimension(self) -> None:
         """
         Feature: the degree table under ND's plot of a search.
@@ -2407,8 +2472,10 @@ class TestSappNDRunND(unittest.TestCase):
         with patch.object(Par.Debug, "get_real_data", return_value=([("cfg", 10)], 1)), \
                 patch.object(Par.Debug, "plot_vs_real") as plot_vs_real, \
                 patch.object(Par.Debug, "correlation_topk", return_value=(0.9, 1)), \
-                patch.object(Par.Debug, "get_comm_classified_data", return_value=[("cfg", 10, 2)]), \
+                patch.object(Par.Debug, "get_comm_classified_data",
+                             return_value=[("cfg", 1, 10, 2.0, [], {"IDLE": 3.0})]), \
                 patch.object(Par.Debug, "plot_vs_real_comm_classified") as plot_vs_real_comm, \
+                patch.object(Par.Debug, "write_estimates_csv") as write_estimates, \
                 patch.object(Par.Debug, "correlation_with_classified_comms", return_value=0.8):
             self.assertEqual(runner.test_from_csv("profile.csv", "out"), (0.9, 1, 1))
             self.assertEqual(
@@ -2417,4 +2484,6 @@ class TestSappNDRunND(unittest.TestCase):
             )
 
         plot_vs_real.assert_called_once()
-        plot_vs_real_comm.assert_called_once()
+        # With idle, once as measured and once without the idle remainder.
+        self.assertEqual(plot_vs_real_comm.call_count, 2)
+        write_estimates.assert_called_once()

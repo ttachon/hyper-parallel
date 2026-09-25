@@ -639,10 +639,17 @@ class ParallelizeLayer:
     ) -> Tuple[list, Any]:
         """Estimate every measured configuration of a classified profiling CSV.
 
+        With ``output_path``, three files named after the CSV go there: the
+        real-versus-estimate plot, ``<stem>.pdf``; with ``plot_idle``, the same
+        plot without idle, ``<stem>_no_idle.pdf``, ordered by the measured step
+        less idle; and ND's estimate of each configuration, memory included,
+        ``<stem>_estimates.csv``. Idle is half the step or more on a short
+        one and differs from run to run, while ND estimates none of it.
+
         Args:
             csv_f: CSV read by ``Debug.get_comm_classified_data``, e.g. written by
                 ``nd.trace_classify``.
-            output_path: Directory for ND's real-versus-estimate plot; no plot when None.
+            output_path: Directory for ND's plots and estimates; none are written when None.
             plot_idle: Whether the measured bars include the idle remainder.
 
         Returns:
@@ -656,14 +663,29 @@ class ParallelizeLayer:
         )
 
         if output_path is not None:
+            title = self.plot_title()
             Debug.plot_vs_real_comm_classified(
                 configs_estimated,
                 csv_f,
                 output_path,
                 debug_parts,
-                title=self.plot_title(),
+                title=title,
                 plot_idle=plot_idle,
             )
+            if plot_idle:
+                Debug.plot_vs_real_comm_classified(
+                    sorted(configs_estimated, key=Debug.busy_time),
+                    csv_f,
+                    output_path,
+                    debug_parts,
+                    title=title,
+                    plot_idle=False,
+                    suffix="_no_idle",
+                )
+            stem = os.path.splitext(os.path.basename(csv_f))[0]
+            estimates = os.path.join(output_path, f"{stem}_estimates.csv")
+            Debug.write_estimates_csv(configs_estimated, estimates)
+            logger.output("ND's estimate of every configuration written to %s", estimates)
 
         return configs_estimated, Debug.correlation_with_classified_comms(configs_estimated)
 

@@ -139,7 +139,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-mppb`, `--manual_pipeline_balance`: read offset and recompute from yaml.
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
-- `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plot is written there.
+- `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plots and its estimates are written there.
 - `--ranking_csv`: also write every configuration the search keeps, in ND's order, to a CSV: rank, degrees, peak memory in MB, score and the parts of the score. Scores keep full precision, so configurations ND cannot tell apart show as ties. This is what a sweep reads to profile ND's best configurations.
 
 ## Comparing with a Profiled Run
@@ -171,6 +171,8 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd -f hyper_v2 -y train.ya
 ```
 
 ND estimates every configuration in the CSV and prints, per configuration, each part's measured value and share next to ND's share of its own score, then the correlation and distance of every part across configurations. Shares make the two comparable despite ND's score units. Correlations need at least two configurations. ND has no idle term, so the measured idle share is what the estimate does not account for.
+
+With `-o`, three files named after the CSV go to that directory: `real.pdf`, the measured parts beside ND's, idle included; `real_no_idle.pdf`, the same without idle and ordered by the measured step less idle, since idle can be half of a short step and differ from run to run; and `real_estimates.csv`, ND's estimate of every configuration with its degrees, the measured step, ND's peak memory in MB, the score and its parts. The measured bars count FSDP waits (`op_wait`) as DP and sequence-parallel waits (`sp_wait`) as MP, as the correlations do.
 
 ## Structure
 
