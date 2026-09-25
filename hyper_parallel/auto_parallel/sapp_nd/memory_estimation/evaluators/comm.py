@@ -73,6 +73,39 @@ class EvalLayerComm:
         return non_exp + exp
 
     @staticmethod
+    def fsdp_layer_parts(ccfg: CostModelConfig, ctx: Context) -> tuple:
+        """A layer's parameters as FSDP holds them, for :meth:`fsdp_traffic`.
+
+        The non-expert parameters, the routed and the shared experts, each as
+        its count, the ranks the layer computes it over, the ranks that shard
+        it and the ranks that hold it, a shard or a copy.
+        """
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        return (
+            (non_exp, ccfg.t, ccfg.shard_p_os_non_exp_partial, ccfg.d * ccfg.cp * ccfg.t),
+            (routed / ccfg.ep, ccfg.t_exp, ccfg.shard_p_os_exp, ccfg.d_exp * ccfg.cp * ccfg.t_exp),
+            (shared, ccfg.t_exp, ccfg.shard_p_os_exp_partial, ccfg.d * ccfg.cp * ccfg.t_exp),
+        )
+
+    @staticmethod
+    def fsdp_traffic(ccfg: CostModelConfig, parts: tuple, gathers: float, reduces: float) -> float:
+        """The bytes a rank moves in one micro-batch for a module FSDP shards.
+
+        Each ring collective over a part's n shards moves (n - 1) / n of the
+        part a rank.  FSDP gathers a part's parameters *gathers* times a
+        micro-batch and reduce-scatters its gradient once, and the ranks
+        holding copies of a shard all-reduce it *reduces* times a micro-batch.
+        """
+        total = 0.0
+        for size, computed, kept, group in parts:
+            whole = size / max(1, computed)
+            shards = max(1.0, kept / max(1, computed))
+            copies = max(1.0, group / max(1, kept))
+            total += (shards - 1) / shards * whole * (gathers * ccfg.bytes_p + ccfg.bytes_grad)
+            total += 2 * (copies - 1) / copies * whole / shards * ccfg.bytes_grad * reduces
+        return total
+
+    @staticmethod
     def tp_comm_non_exp(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """TP comm for non-expert parameters"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER

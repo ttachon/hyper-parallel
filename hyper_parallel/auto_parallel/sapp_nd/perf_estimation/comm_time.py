@@ -474,14 +474,47 @@ def prepare_context():
     return ctx
 
 
+def fsdp_root_parts(cfg, layer) -> tuple:
+    """The root's table, the embedding's or the output layer's, as FSDP holds it.
+
+    The parts are as :meth:`EvalLayerComm.fsdp_layer_parts` gives a layer's;
+    a table the output layer shares is its.
+    """
+    if layer == LayerType.EMBEDDING_LAYER:
+        if EvalHead.shares_output_table(cfg):
+            return ()
+        tp = cfg.shard_embed / max(1, cfg.gather_embed or 1)
+        return ((EvalHead.num_params_embed(cfg, None), tp, cfg.shard_embed, cfg.d * tp),)
+    return ((EvalTail.num_params_output(cfg, None), cfg.t, cfg.shard_p_os_non_exp_partial, cfg.d * cfg.cp * cfg.t),)
+
+
+def _fsdp_rounds(cfg) -> tuple:
+    """How many times a micro-batch FSDP gathers a layer's and the root's parameters, and all-reduces.
+
+    Resharded after its forward and its backward, a layer is gathered for
+    both, and the root, kept through its backward, once; kept gathered, each
+    is gathered once a step.  The copies of a shard all-reduce once a step,
+    after the reduce-scatters, where an FSDP group shards the parameters,
+    and every micro-batch where none does.
+    """
+    micro = max(1, cfg.m)
+    reshards = bool(getattr(cfg, "reshards", False))
+    shards = cfg.shard_p_os_non_exp_partial > cfg.t * cfg.cp
+    return (2 if reshards else 1 / micro), (1 if reshards else 1 / micro), (1 / micro if shards else 1)
+
+
 def _accumulate_stage_comm(param, stage, stage_id):
     """Sum the per-layer DP, TP, EP and CP communication volumes of one stage.
 
     A body layer is priced on the walk's config, in its own kind; the
     embedding and the output layer on the model's config, as its family left
-    it, whichever layer the walk reached last.
+    it, whichever layer the walk reached last.  Under FSDP (grad_shard_as_params),
+    a layer's DP volume, and the root's, is the traffic its collectives
+    move a micro-batch (:meth:`EvalLayerComm.fsdp_traffic`).
     """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
+    fsdp = bool(getattr(param["cfg"], "grad_shard_as_params", False))
+    layer_gathers, root_gathers, reduces = _fsdp_rounds(param["cfg"]) if fsdp else (0, 0, 0)
     for chunk_id, chunk in enumerate(stage):
         for lay_id, layer in enumerate(chunk):
             param["ctx"].current_node = layer
@@ -495,7 +528,13 @@ def _accumulate_stage_comm(param, stage, stage_id):
                 logger.info("is layer moe ? %s", cfg.n_exp > 1)
                 param["ctx"].current_node = LayerType.NOT_REC_LAYER
                 logger.info("param ctx %s", param["ctx"])
-                comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
+                if fsdp:
+                    parts = EvalLayerComm.fsdp_layer_parts(cfg, param["ctx"])
+                    comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, parts, layer_gathers, reduces)
+                else:
+                    comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
+            elif fsdp and not is_body:
+                comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, fsdp_root_parts(cfg, layer), root_gathers, reduces)
 
             comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
                 cfg, param["ctx"], 1
