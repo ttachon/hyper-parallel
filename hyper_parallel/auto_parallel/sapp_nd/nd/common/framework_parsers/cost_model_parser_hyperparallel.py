@@ -205,15 +205,7 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.emb_out_in_offset = True
         self.ccfg.n_s_split = 1
         self.ccfg.cp_algo = "colossalai_cp"
-        self.ccfg.rec_op = Config({
-            "attBMM": 1,
-            "headCast": 1,
-            "dropout": 1,
-            "softmax": 1,
-            "normOp": 1,
-            "gather": 1,
-            "ffAct": 1,
-        })
+        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
         self.ccfg.pp_partition = None
 
     def __parse_hyperparam(self):
