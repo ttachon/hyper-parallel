@@ -196,7 +196,8 @@ sapp_nd/
 - `SP`: Megatron sequence parallelism.
 - `EP`: expert parallelism.
 - `PP`: pipeline parallelism.
-- `OP`: optimizer or ZeRO-DP parallelism.
+- `OP`: optimizer or ZeRO-DP parallelism: how many data-parallel ranks the
+  optimizer shards a parameter over, on top of TP.
 - `MB`: micro-batch number.
 - `MBS`: micro-batch size.
 - `VPP`: virtual pipeline parallelism.

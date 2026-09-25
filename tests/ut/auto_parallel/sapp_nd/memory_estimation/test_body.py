@@ -623,11 +623,13 @@ class TestConfigOptimizerShard(unittest.TestCase):
     @staticmethod
     def _make_parser_ccfg(
         n_exp=8, d_exp=4, cp=1, t_exp=1, ep=2,
-        has_op=True, has_grad_shard=True, os_max_shard=1,
+        has_op=True, has_grad_shard=True, os_max_shard=1, d=4, t=1,
     ):
         """Create a mock _CostModVar for parser-level shard tests."""
         from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
         ccfg = MagicMock(spec=_CostModVar)
+        ccfg.d = d
+        ccfg.t = t
         ccfg.n_exp = n_exp
         ccfg.d_exp = d_exp
         ccfg.cp = cp
@@ -675,9 +677,9 @@ class TestConfigOptimizerShard(unittest.TestCase):
     def test_gradient_sharding_rules(self):
         """BD-H04: gradients are sharded by one of three rules.
 
-        At d=4, t=2, t_exp=2 and an optimizer shard of 4: as the parameters
-        are when FSDP holds them so, over the whole optimizer shard under
-        gradient sharding, and over TP alone otherwise.
+        At d=4, t=2, t_exp=2 and an optimizer shard of 2 data-parallel ranks:
+        as the parameters are when FSDP holds them so, over the whole
+        optimizer shard under gradient sharding, and over TP alone otherwise.
         """
         cases = [
             ({"grads_as_params": True, "has_grad_shard": False}, (4, 8, 1)),
@@ -686,14 +688,26 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ]
         for flags, want in cases:
             with self.subTest(**flags):
-                ccfg = self._make_parser_ccfg(n_exp=1, d_exp=4, t_exp=2, os_max_shard=4)
-                ccfg.d = 4
-                ccfg.t = 2
+                ccfg = self._make_parser_ccfg(n_exp=1, d_exp=4, t_exp=2, os_max_shard=2, d=4, t=2)
                 for name, value in flags.items():
                     setattr(ccfg, name, value)
                 _CostModelParser.config_optimizer_shard(None, ccfg)
                 got = (ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial)
                 self.assertEqual(got, want)
+
+    def test_parameters_are_sharded_over_tp_and_the_optimizer_ranks(self):
+        """BD-H05: a parameter is sharded over TP times the optimizer's data-parallel ranks.
+
+        At TP 4 and DP 8, over 2, 8, 3 and 16 ranks and without optimizer
+        sharding: never fewer than TP; a count that does not divide DP
+        shards over all of it; without optimizer sharding, over TP alone.
+        """
+        cases = [(2, True, 8), (8, True, 32), (3, True, 32), (16, True, 32), (2, False, 4)]
+        for ranks, has_op, want in cases:
+            with self.subTest(ranks=ranks, has_op=has_op):
+                ccfg = self._make_parser_ccfg(n_exp=1, os_max_shard=ranks, has_op=has_op, d=8, t=4)
+                _CostModelParser.config_optimizer_shard(None, ccfg)
+                self.assertEqual(ccfg.shard_p_os_non_exp_partial, want)
 
 
 if __name__ == "__main__":

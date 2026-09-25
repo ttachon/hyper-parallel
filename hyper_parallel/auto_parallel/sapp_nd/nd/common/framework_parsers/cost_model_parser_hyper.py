@@ -661,14 +661,14 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         self.ccfg.op_weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (dp_shard if is_auto_models else self.ccfg.d * self.ccfg.t))
+        ) or (dp_shard if is_auto_models else self.ccfg.d))
         self.ccfg.has_grad_shard = bool(self._get_cfg_attr(accel,
                                                              "gradient_accumulation_shard",
                                                              False))
         self.ccfg.grads_as_params = True
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
-            else self.ccfg.d * self.ccfg.t
+            else self.ccfg.d
         )
 
     def _parse_batch(self):

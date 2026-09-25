@@ -38,7 +38,7 @@ class CostModelParserMindspeed(_CostModelParser):
         self.ccfg.b = self.config.tmp.mbs
         self.ccfg.d = self.config.tmp.dp  # DP
         self.ccfg.t = self.config.tmp.tp  # TP
-        self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+        self.ccfg.os_max_shard = self.ccfg.d
         self.ccfg.cp = self.config.tmp.cp  # CP
         self.ccfg.vp = self.config.tmp.vpp  # VPP
         self.ccfg.ep = self.config.tmp.ep  # EP
@@ -269,7 +269,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.bytes_norm = 4
 
         # Optimizer parallel factors
-        cc.os_max_shard = cc.d * cc.t
+        cc.os_max_shard = cc.d
         self.config_optimizer_shard(cc)
 
         # Other factors
