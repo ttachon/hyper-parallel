@@ -350,6 +350,24 @@ class TestAscendTraceClassify(unittest.TestCase):
         self.assertEqual(TC.ascend_site("all_gather", "collective", with_tp)[0], TC.UNCLASSIFIED)
         self.assertEqual(TC.ascend_site("broadcast", "collective", self.dims)[0], TC.UNCLASSIFIED)
 
+    def test_context_parallelism_takes_what_only_it_can_send(self):
+        """
+        Feature: trace_classify.ascend_site under context parallelism.
+        Description: p2p and all-to-all with CP 2, with and without pipeline and
+            expert parallelism.
+        Expectation: p2p is CP at one pipeline stage and PP otherwise; all-to-all is
+            CP without expert parallelism and EP otherwise; gathers stay unclassified.
+        """
+        with_ep = TC.parse_dims("DP=32,PP=1,CP=2,EP=16")
+        self.assertEqual(TC.ascend_site("p2p", "p2p", with_ep), (TC.CP_WAIT, "context p2p"))
+        self.assertEqual(TC.ascend_site("all_to_all", "collective", with_ep)[0], TC.EP_WAIT)
+        self.assertEqual(TC.ascend_site("all_gather", "collective", with_ep)[0], TC.UNCLASSIFIED)
+        without_ep = TC.parse_dims("DP=32,PP=1,CP=2,EP=1")
+        self.assertEqual(TC.ascend_site("all_to_all", "collective", without_ep),
+                         (TC.CP_WAIT, "context all-to-all"))
+        with_pp = TC.parse_dims("DP=16,PP=2,CP=2,EP=1")
+        self.assertEqual(TC.ascend_site("p2p", "p2p", with_pp)[0], TC.PP_WAIT)
+
     def test_split_apportions_exposed_communication(self):
         """
         Feature: trace_classify.split_ascend_output.

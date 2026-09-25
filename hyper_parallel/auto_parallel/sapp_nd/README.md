@@ -161,7 +161,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify profiling_dp64_
     --dims DP=64,MP=1,PP=1,CP=1,EP=16,MB=1,OP=2 --csv real.csv
 ```
 
-`step_trace_time.csv` gives the closed top-level split of each step, and `communication.json` apportions the exposed communication over the axes in proportion to each axis's share of HCCL elapse time. Two consequences worth knowing. Device compute is not attributed to a pass, so it lands in `UNSPLIT_COMPUTE` and leaves `FW_COMPUTE`, `BW_COMPUTE` and `RECOMPUTE` empty. And the axis of a collective comes from its kind, since all-to-all is expert parallelism and gathers and reduce-scatters are FSDP; when TP or CP is active those two are ambiguous and stay unclassified until the rank sets of `communication_matrix.json` are read.
+`step_trace_time.csv` gives the closed top-level split of each step, and `communication.json` apportions the exposed communication over the axes in proportion to each axis's share of HCCL elapse time. Two consequences worth knowing. Device compute is not attributed to a pass, so it lands in `UNSPLIT_COMPUTE` and leaves `FW_COMPUTE`, `BW_COMPUTE` and `RECOMPUTE` empty. And the axis of a collective comes from its kind, since all-to-all is expert parallelism and gathers and reduce-scatters are FSDP; when TP or CP is active those two are ambiguous and stay unclassified until the rank sets of `communication_matrix.json` are read. Context parallelism takes what only it can send: point to point when there is a single pipeline stage, and all-to-all when there is no expert parallelism.
 
 Then run ND on the same model and cluster with `--real_csv`:
 

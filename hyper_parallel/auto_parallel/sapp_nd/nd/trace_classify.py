@@ -432,6 +432,12 @@ def ascend_site(kind: str, section: str, dims: Dict[str, str]) -> Tuple[str, str
     those operators need the rank sets of ``communication_matrix.json`` to be
     told apart and stay unclassified here.
 
+    Context parallelism sends point to point, as the Qwen3.5 Gated DeltaNet
+    wrapper does, and exchanges all-to-all under Ulysses. Point to point is
+    counted as context parallelism when there is a single pipeline stage, and
+    all-to-all when there is no expert parallelism: the degrees leave it no
+    other owner. Otherwise they keep the pipeline and expert columns.
+
     Args:
         kind: Collective kind from ``collective_kind``.
         section: ``"collective"`` or ``"p2p"``, the section of ``communication.json``.
@@ -440,9 +446,14 @@ def ascend_site(kind: str, section: str, dims: Dict[str, str]) -> Tuple[str, str
     Returns:
         ``(column, label)``.
     """
+    context = int(dims.get("CP", 1)) > 1
     if section == "p2p" or kind == "p2p":
+        if context and int(dims.get("PP", 1)) <= 1:
+            return CP_WAIT, "context p2p"
         return PP_WAIT, "pipeline p2p"
     if kind == "all_to_all":
+        if context and int(dims.get("EP", 1)) <= 1:
+            return CP_WAIT, "context all-to-all"
         return EP_WAIT, "expert all-to-all"
     if kind in ("all_gather", "reduce_scatter"):
         if int(dims.get("MP", 1)) > 1 or int(dims.get("CP", 1)) > 1:
