@@ -1400,6 +1400,28 @@ class TestSappNDRunND(unittest.TestCase):
                 plot_idle=True,
             )
 
+    def test_the_measured_stack_adds_up_to_the_step(self) -> None:
+        """
+        Feature: the measured bars of ND's comparison plot.
+        Description: A classified row with FSDP, sequence-parallel, CP and pipeline waits.
+        Expectation: FSDP counts as DP and sequence parallel as MP, CP has a bar of
+            its own, and with idle the stack adds up to the measured step.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = os.path.join(tmp_dir, "real.csv")
+            with open(csv_path, "w", encoding="utf-8") as csv_file:
+                csv_file.write("DP,EP,time,comp,dp_wait,mp_wait,ep_wait,cp_wait,pp_wait,op_wait,sp_wait\n")
+                csv_file.write("8,2,100,30,5,4,6,7,3,20,2\n")
+            dims, time, waits = Debug.get_comm_classified_data(csv_path, plot_idle=True)[0]
+        bars = Debug.measured_bars(waits, plot_idle=True)
+        self.assertEqual(bars, [30.0, 25.0, 6.0, 6.0, 7.0, 3.0, 23.0])
+        self.assertAlmostEqual(sum(bars), time)
+        self.assertEqual(len(Debug.measured_bars(waits)), len(Debug.MEASURED_BARS))
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        real_data = []
+        plot.parse_data([(dims, 1, time, 90.0, [90.0], waits)], real_data=real_data)
+        self.assertEqual(real_data, [tuple(bars[:-1])])
+
     def test_the_degree_table_reads_a_boolean_dimension(self) -> None:
         """
         Feature: the degree table under ND's plot of a search.

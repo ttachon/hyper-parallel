@@ -272,6 +272,40 @@ def set_twin_handles(ax1, data_frame, dbg_cols):
     leg.legend_handles[-1].set_facecolor(pp_color)  # type: ignore
 
 
+# The measured parts of the comparison plot, named by the ND part each is set
+# against: FSDP waits count as DP and sequence-parallel waits as MP, as they
+# do in the correlations.
+MEASURED_BARS = ("COMPUTATION", "DP_COMM", "MP_COMM", "EP_COMM", "CP_COMM", "BUBBLE")
+
+
+def measured_bars(waits: dict, plot_idle: bool = False) -> list:
+    """Return one configuration's measured parts in ``MEASURED_BARS`` order.
+
+    Every wait column of the classified CSV lands in one bar, ``op_wait`` in
+    DP's and ``sp_wait`` in MP's as ``real_in_parts`` counts them, so with idle
+    the stack adds up to the measured step. A part the CSV lacks is zero.
+
+    Args:
+        waits: A configuration's measured parts, as ``get_comm_classified_data`` reads them.
+        plot_idle: Whether to append the idle remainder.
+    """
+    def part(name: str) -> float:
+        """The measured part *name*, zero when the CSV does not have it."""
+        return waits.get(name) or 0.0
+
+    bars = [
+        part("comp"),
+        part("dp_wait") + part("op_wait"),
+        part("mp_wait") + part("sp_wait"),
+        part("ep_wait"),
+        part("cp_wait"),
+        part("BUBBLE"),
+    ]
+    if plot_idle:
+        bars.append(part("IDLE"))
+    return bars
+
+
 def _cell_number(text):
     """Read one cell of the degree table as a number.
 
@@ -372,18 +406,8 @@ class Plot:
                     tuple([cfg_e[0], cfg_e[2], cfg_e[3]] + cfg_e[4])
                 )
                 if real_data is not None:
-                    waits = cfg_e[5]
-                    logger.info(waits)
-                    wait_list = [
-                        waits["comp"],
-                        waits["dp_wait"],
-                        waits["mp_wait"],
-                        waits["ep_wait"],
-                        waits["BUBBLE"],
-                    ]
-                    if plot_idle:
-                        wait_list.append(waits["IDLE"])
-                    real_data.append(tuple(wait_list))
+                    logger.info(cfg_e[5])
+                    real_data.append(tuple(measured_bars(cfg_e[5], plot_idle)))
             except IndexError:
                 score = cfg_e[2]
                 if i >= self.top or (min_e is not None and score > min_e * 20):
@@ -482,13 +506,7 @@ def plot_vs_real_comm_classified(
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "real", "estim"] + plot.dbg_cols)
     )
-    real_cols = [
-        "COMPUTATION",
-        "DP_COMM",
-        "MP_COMM",
-        "EP_COMM",
-        "BUBBLE",
-    ]
+    real_cols = list(MEASURED_BARS)
     if plot_idle:
         real_cols.append("IDLE")
     real_df = pd.DataFrame(real_data, columns=real_cols)
