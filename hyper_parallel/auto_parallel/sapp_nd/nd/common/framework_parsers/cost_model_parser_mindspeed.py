@@ -44,6 +44,8 @@ class CostModelParserMindspeed(_CostModelParser):
         self.ccfg.ep = self.config.tmp.ep  # EP
         ccfgs = self.__search_and_parse_mods_ccfg(self.ccfg.config)
         self.ccfg.multimodal = len(ccfgs) > 1
+        if len(ccfgs) == 1:
+            self.__adopt_module(next(iter(ccfgs.values())))
         if self.ccfg.multimodal:
             if not self.ccfg.hooks_dict:
                 raise TypeError(
@@ -84,6 +86,29 @@ class CostModelParserMindspeed(_CostModelParser):
                 else:
                     self.__complete_unimodal_pp_plan(m, cc, num_layer_per_stage)
         self.ccfg.overwrite_eval_functions = {}
+
+    # What a config keeps of its own when it takes its one module's parse.
+    _KEPT_FROM_CONFIG = ("config", "config_path", "parser", "hooks_dict", "device_capacity",
+                         "multimodal", "mm_ccfgs", "mm_order")
+
+    def __adopt_module(self, module):
+        """Make a config of one module that module: its model, run and derived fields."""
+        for key, value in vars(module).items():
+            if key not in self._KEPT_FROM_CONFIG:
+                object.__setattr__(self.ccfg, key, value)
+
+    @staticmethod
+    def __recompute_count(full_rec):
+        """The layers a module recomputes on each of its stages, as its parse states them."""
+        while isinstance(full_rec, list):
+            full_rec = next((count for count in full_rec if count), 0)
+        return int(full_rec or 0)
+
+    def __completed_recompute(self, cc):
+        """The module's own recompute, on the stages its completed plan puts it on."""
+        own = self.__recompute_count(cc.full_rec)
+        per_stage = [[min(own, count) for count in chunk] for chunk in cc.pp_partition]
+        return per_stage if cc.vp > 1 else per_stage[0]
 
     def __complete_unimodal_pp_plan(self, m, cc, num_layer_per_stage):
         """Try to follow previous pp plan"""
@@ -127,9 +152,7 @@ class CostModelParserMindspeed(_CostModelParser):
             for v_idx in range(self.ccfg.vp)
         ]
         cc.p, cc.vp = self.ccfg.p, self.ccfg.vp
-        cc.full_rec = (
-            self.ccfg.mm_ccfgs[self.ccfg.mm_order[previous_mod_idx]].full_rec is True
-        )
+        cc.full_rec = self.__completed_recompute(cc)
         cc.sel_rec = False
 
     def __search_and_parse_mods_ccfg(self, field):
@@ -147,11 +170,11 @@ class CostModelParserMindspeed(_CostModelParser):
 
     def __config_parse_json_parallelism(self, cc, mod):
         """MindSpeed format for parallelism"""
-        cc.t = max(cc.tensor_model_parallel_size, self.config.tmp.tp)
-        cc.p = max(cc.pipeline_model_parallel_size, self.config.tmp.pp)
+        cc.t = max(mod.tensor_model_parallel_size, self.config.tmp.tp)
+        cc.p = max(mod.pipeline_model_parallel_size, self.config.tmp.pp)
         cc.cp = self.config.tmp.cp
         cc.d = self.config.tmp.dp
-        cc.ep = max(cc.expert_model_parallel_size, self.config.tmp.ep)
+        cc.ep = max(mod.expert_model_parallel_size, self.config.tmp.ep)
         cc.sp = cc.t if mod.sequence_parallel else 1
         if cc.cp > 1 and cc.sp > 1:
             logger.warning(
