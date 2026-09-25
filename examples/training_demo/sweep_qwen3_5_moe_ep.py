@@ -58,7 +58,7 @@ PEAK_PATTERN = re.compile(
     r"memory/device_max_reserved_gb=([0-9.]+)"
 )
 REMOTE_PROFILES = "output/sweep_ep_profiles"
-STAGES = ("mirror", "run", "fetch", "classify", "compare", "plot")
+STAGES = ("mirror", "data", "run", "fetch", "classify", "compare", "plot")
 
 
 def _run(command: Sequence[str], *, capture: bool = False, check: bool = True) -> str:
@@ -233,6 +233,15 @@ class Sweep:
         """Interpreter for the analysis steps, which must import hyper_parallel."""
         return self.args.python or sys.executable
 
+    @property
+    def required_samples(self) -> int:
+        """Samples the longest configuration consumes, with a margin."""
+        import yaml  # pylint: disable=import-outside-toplevel
+
+        raw = yaml.safe_load(self.args.config.read_text(encoding="utf-8"))
+        iters = int(raw["training"]["train_iters"])
+        return max(point.gbs for point in self.points) * iters * 2
+
     def kit(self, *command: str) -> List[str]:
         """Build a cluster-kit invocation bound to this sweep's config."""
         return [self.args.cluster, "-c", str(self.args.cluster_env), *command]
@@ -261,6 +270,25 @@ def mirror_code(sweep: Sweep) -> None:
         ])
 
 
+def stage_data(sweep: Sweep) -> None:
+    """Rebuild the Indexed Dataset on every node at the sweep's sequence length.
+
+    Its documents are exactly seq_length long, so raising the sequence without
+    rebuilding leaves the reader with samples of the wrong size. The generator
+    is deterministic, so every node produces identical files and none has to be
+    shipped. cluster exec runs inside REPO_DIR with the environment hook
+    sourced, so both the relative path and the interpreter resolve.
+    """
+    samples = sweep.args.samples or sweep.required_samples
+    print(f"rebuilding the dataset: {samples} samples of {sweep.args.seq_len} tokens",
+          flush=True)
+    _run(sweep.kit("exec",
+                   "python -m examples.training_demo.prepare_parallel_data "
+                   "--output-dir ./output/training_demo/data "
+                   f"--num-samples {samples} --seq-length {sweep.args.seq_len}"),
+         check=False)
+
+
 def _dir_name(point: Point, memory: bool) -> str:
     """Directory name for one strategy's timing or memory pass."""
     return f"{point.tag}_mem" if memory else point.tag
@@ -277,6 +305,9 @@ def launch(sweep: Sweep, point: Point, memory: bool = False) -> Optional[str]:
     command = sweep.kit(
         "torchrun", "-n", str(len(sweep.env["nodes"])),
         "scripts/train_lm.py", str(sweep.args.config.relative_to(REPO_ROOT)),
+        f"--model.num_hidden_layers={sweep.args.layers}",
+        f"--dataset.data_config.seq_length={sweep.args.seq_len}",
+        f"--activation_checkpoint.mode={sweep.args.activation_checkpoint}",
         f"--training.global_batch_size={point.gbs}",
         f"--training.micro_batch_size={sweep.args.micro_batch_size}",
         f"--accelerator.tp_size={point.tp}",
@@ -535,6 +566,18 @@ def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
                         help="default is the world size, which holds the work "
                              "per step fixed so strategies stay comparable")
     parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--layers", type=int, default=32,
+                        help="decoder layers kept by the crop; a multiple of 4 "
+                             "preserves the 3 linear to 1 full attention ratio")
+    parser.add_argument("--seq-len", type=int, default=8192,
+                        help="training sequence length; the dataset is rebuilt "
+                             "to match, since its documents are exactly this long")
+    parser.add_argument("--activation-checkpoint", default="full",
+                        choices=("off", "full", "selective"),
+                        help="recompute mode; a real run at this size needs full")
+    parser.add_argument("--samples", type=int, default=0,
+                        help="documents to generate; default covers the longest "
+                             "configuration's global batch times train_iters, doubled")
     parser.add_argument("--num-experts", type=int, default=256,
                         help="routed experts, used to reject an ep that cannot divide them")
 
@@ -669,6 +712,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     stages = set(args.only or STAGES)
     for name, run_stage in (
             ("mirror", mirror_code),
+            ("data", stage_data),
             ("run", stage_run),
             ("fetch", stage_fetch),
             ("classify", stage_classify),

@@ -207,6 +207,9 @@ python examples/training_demo/sweep_qwen3_5_moe_ep.py --ep 2,16 --cp 1,2 --op 16
 | `--op` | `fsdp_config.dp_shard_size`, ND's `OP` | `dp * cp` |
 | `--tp`, `--pp` | refused above 1 on this model, see below | `1` |
 | `--global-batch-size` | `training.global_batch_size` | the world size |
+| `--layers` | `model.num_hidden_layers` | `32` |
+| `--seq-len` | `dataset.data_config.seq_length`, and rebuilds the dataset | `8192` |
+| `--activation-checkpoint` | `activation_checkpoint.mode` | `full` |
 
 The derived degrees follow the trainer's own arithmetic, so a strategy is
 labelled in the classified CSV as it actually ran:
@@ -220,6 +223,19 @@ labelled in the classified CSV as it actually ran:
   together.
 - `edp_shard_size = world / ep`, since expert weights are sharded by EP over
   the whole device mesh.
+
+The sweep defaults to a shape worth calibrating against rather than the light
+one the single-node demo uses: 32 layers, sequence 8192 and full recompute.
+The yaml itself stays small so the smoke test stays quick. Two consequences
+worth knowing before the first run at that shape:
+
+- The dataset is rebuilt by the `data` stage because its documents are exactly
+  `seq_length` long, so raising the sequence without rebuilding would leave the
+  reader with samples of the wrong size.
+- The un-sharded cross-entropy over a 248320 vocabulary is the dominant memory
+  term at long sequence and is immune to recompute. If a configuration runs out
+  of memory, that is the first place to look: raising `--cp` shards the sequence
+  and therefore the logits, which is why ND's own search reaches for it.
 
 `--tp` and `--pp` above 1 are refused rather than run: TP shards the Gated
 DeltaNet `conv1d` while its `groups` and `conv_dim` stay global, so the forward
@@ -237,6 +253,7 @@ python examples/training_demo/sweep_qwen3_5_moe_ep.py --only classify --only com
 | stage | what it does |
 |---|---|
 | `mirror` | makes every node's tree identical, excluding `output/` |
+| `data` | rebuilds the Indexed Dataset on every node at `--seq-len` |
 | `run` | launches each degree and waits on the kit's rc file, not the pid |
 | `fetch` | copies the profiles from the node holding `profiling.rank` |
 | `classify` | `nd.trace_classify` per run, merged into one CSV |
