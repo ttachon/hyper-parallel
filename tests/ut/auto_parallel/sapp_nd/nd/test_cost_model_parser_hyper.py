@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import yaml
 
+from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -948,12 +949,13 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: MTP depth resolution.
         Description: Transformers spells MTP depth num_nextn_predict_layers.
-        Expectation: n_mtp picks up the alias and enters offset balancing.
+        Expectation: The model spec picks up the alias: the checkpoint has
+            the layer, which the AutoModels trainer does not build.
         """
         mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
-        ccfg = _make_ccfg(_auto_models_config())
-        self.assertEqual(ccfg.n_mtp, 1)
-        self.assertTrue(ccfg.is_mtp_in_offset)
+        spec = resolve_hf_model_spec(_auto_models_config()["model"])
+        self.assertEqual(spec["mtp_depth"], 1)
+        self.assertEqual(_make_ccfg(_auto_models_config()).n_mtp, 0)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_mtp_depth_prefers_internal_name(self, mock_hf):
@@ -963,8 +965,29 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Expectation: The internal mtp_depth wins.
         """
         mock_hf.return_value = self._hf_config(mtp_depth=3, num_nextn_predict_layers=1)
+        spec = resolve_hf_model_spec(_auto_models_config()["model"])
+        self.assertEqual(spec["mtp_depth"], 3)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_the_trainer_builds_no_mtp_layer(self, mock_hf):
+        """
+        Feature: _without_mtp.
+        Description: A checkpoint with an MTP layer, under the AutoModels
+            trainer and under the legacy schema.
+        Expectation: The AutoModels trainer builds the Transformers model,
+            which has none: no MTP layer is priced, none enters offset
+            balancing and the stack holds the body alone.  The legacy
+            schema keeps its MTP layer.
+        """
+        mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
         ccfg = _make_ccfg(_auto_models_config())
-        self.assertEqual(ccfg.n_mtp, 3)
+        self.assertEqual(ccfg.n_mtp, 0)
+        self.assertFalse(ccfg.is_mtp_in_offset)
+        self.assertEqual(sum(count for count, _ in ccfg.layer_custom_config), ccfg.n_lay)
+        legacy = _make_ccfg(_dense_overrides(
+            model={"config_overrides": {"num_hidden_layers": 8, "mtp_depth": 1}},
+        ))
+        self.assertEqual(legacy.n_mtp, 1)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_missing_field_falls_back_to_overrides(self, mock_hf):
