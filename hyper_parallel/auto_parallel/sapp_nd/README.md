@@ -126,6 +126,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-t TOP_CONFIG_NUMBER]
     [-mem MEM_FOR_PPB]
     [--real_csv REAL_CSV [-o OUTPUT_DIR]]
+    [--ranking_csv RANKING_CSV]
 ```
 
 - `-y`, `--yaml_config`: path to the framework yaml configuration file.
@@ -139,6 +140,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
 - `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plot is written there.
+- `--ranking_csv`: also write every configuration the search keeps, in ND's order, to a CSV: rank, degrees, peak memory in MB, score and the parts of the score. Scores keep full precision, so configurations ND cannot tell apart show as ties. This is what a sweep reads to profile ND's best configurations.
 
 ## Comparing with a Profiled Run
 

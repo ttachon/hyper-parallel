@@ -18,6 +18,7 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_run_nd.py
 """
 import copy
+import csv
 import json
 import os
 import runpy
@@ -1414,6 +1415,74 @@ class TestSappNDRunND(unittest.TestCase):
         finally:
             plt.close(figure)
         self.assertEqual(plot.cell_text, [["8"], ["True"], [128]])
+
+    def test_the_ranking_keeps_nd_order_and_every_digit(self) -> None:
+        """
+        Feature: the CSV of a search's configurations in ND's order.
+        Description: Two configurations, one with its score split into parts and
+            one without.
+        Expectation: Rows keep ND's order and rank, scores keep full precision,
+            and missing parts are blank.
+        """
+        first = Dim.Dimensions([(Dim.DP, 8), (Dim.SP, False), (Dim.OP, 4)],
+                               all_dims=[Dim.DP, Dim.SP, Dim.OP])
+        second = Dim.Dimensions([(Dim.DP, 4), (Dim.SP, True), (Dim.OP, 2)],
+                                all_dims=[Dim.DP, Dim.SP, Dim.OP])
+        parts = [str(part) for part in Debug.PerfParts][:-2]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "nested", "ranking.csv")
+            Debug.write_ranking_csv(
+                [(first, 100, 91599458344632.31, [1.5] * len(parts)), (second, 120, 1e14, [])], path)
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+        self.assertEqual(rows[0], ["rank", "DP", "SP", "OP", "memory_mb", "score"] + parts)
+        self.assertEqual(rows[1][:6], ["1", "8", "False", "4", "100", "91599458344632.31"])
+        self.assertEqual(float(rows[1][5]), 91599458344632.31)
+        self.assertEqual(rows[1][6:], ["1.5"] * len(parts))
+        self.assertEqual(rows[2][:6], ["2", "4", "True", "2", "120", "100000000000000.0"])
+        self.assertEqual(rows[2][6:], [""] * len(parts))
+
+    def test_the_ranking_is_written_before_the_plot(self) -> None:
+        """
+        Feature: a search asked to write its ranking.
+        Description: The search orders one configuration and its plot then fails.
+        Expectation: The ranking is on disk all the same.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.OP, 4)], all_dims=[Dim.DP, Dim.OP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = True
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False),
+                                        dimensions=[Dim.DP, Dim.OP])
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Debug, "plot_nd", side_effect=ValueError("plot")), \
+                patch.object(Debug, "output_dir", return_value=tmp_dir):
+            path = os.path.join(tmp_dir, "ranking.csv")
+            with self.assertRaises(ValueError):
+                runner.run_generation_to_ordering(None, ranking_csv=path)
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+        self.assertEqual(rows[1][:5], ["1", "8", "4", "100", "2.5"])
+
+    def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
+        """
+        Feature: run_nd --ranking_csv.
+        Description: Run the CLI search on a fake Parallelize with and without the flag.
+        Expectation: The search receives the path, and None when the flag is absent.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            ranking = os.path.join(tmp_dir, "ranking.csv")
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"]
+            for extra, expected in (([], None), (["--ranking_csv", ranking], ranking)):
+                with patch.object(sys, "argv", argv + extra):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(_FakeParallelize.instances[-1].last_run_kwargs()["ranking_csv"], expected)
 
     def test_arch_hook_variants(self) -> None:
         """

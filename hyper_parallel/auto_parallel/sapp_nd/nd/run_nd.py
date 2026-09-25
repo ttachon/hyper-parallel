@@ -337,6 +337,13 @@ if __name__ == "__main__":
         help="Instead of searching, compare ND's estimate with the configurations "
         "measured in a classified profiling CSV (see nd.trace_classify).",
     )
+    parser.add_argument(
+        "--ranking_csv",
+        type=str,
+        default=None,
+        help="Also write every configuration the search keeps, in ND's order, "
+        "to this CSV: rank, degrees, memory in MB, score and its parts.",
+    )
 
     args = parser.parse_args()
     if args.real_csv is not None and not os.path.isfile(args.real_csv):
@@ -424,4 +431,5 @@ if __name__ == "__main__":
         threads_num=None,  # args.threads_num
         top_num=args.top_config_number,
         cache_file=args.cache_file,
+        ranking_csv=args.ranking_csv,
     )

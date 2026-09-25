@@ -521,8 +521,14 @@ class ParallelizeLayer:
         threads_num: Any = None,
         top_num: Any = None,
         cache_file: Any = None,
+        ranking_csv: Optional[str] = None,
     ) -> Any:
-        """Test some functions"""
+        """Search, order and print the configurations that fit memory.
+
+        ``ranking_csv``, when given, receives every one of them in ND's order.
+        It is written before anything is plotted, so a plot that fails cannot
+        take the ranking with it.
+        """
         start = time.time()
         space = self.generate_search_space(yaml_folder, threads_num)
         generation = time.time()
@@ -530,6 +536,13 @@ class ParallelizeLayer:
             space, threads_num, cache_file=cache_file
         )
         ordering = time.time()
+        if ranking_csv:
+            Debug.write_ranking_csv(scored_space, ranking_csv)
+            logger.output(
+                "ND's order of %d configuration(s) written to %s",
+                len(scored_space),
+                ranking_csv,
+            )
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )

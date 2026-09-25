@@ -415,6 +415,32 @@ def plot_nd(
     plot.close(output_path, "results")
 
 
+def write_ranking_csv(scored_space: list, path: str) -> None:
+    """Write a search's configurations in ND's order, best first.
+
+    One row per configuration that fits memory: its rank, its degrees, the
+    peak memory in MB, the score and the parts the score splits into, which
+    are blank when the search ran without debug output. Scores keep full
+    precision so that a reader can tell a tie from a near miss.
+
+    Args:
+        scored_space: ``(config, memory, score, parts)`` entries, as
+            ``ParallelizeLayer.order_search_space`` sorts them.
+        path: CSV file to write; its directory is created when missing.
+    """
+    parts = [part for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY}]
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    dims = [str(dim) for dim in scored_space[0][0].keys()] if scored_space else []
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["rank"] + dims + ["memory_mb", "score"] + [str(part) for part in parts])
+        for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
+            split = [repr(float(value)) for value in values] if values else [""] * len(parts)
+            writer.writerow([rank] + config.values() + [memory, repr(float(score))] + split)
+
+
 def plot_vs_real(
     configs_estimated, csv_f, output_path, debug_parts, title=None
 ):
