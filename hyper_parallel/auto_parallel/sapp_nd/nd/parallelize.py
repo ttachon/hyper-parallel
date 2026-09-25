@@ -66,14 +66,16 @@ class ParallelizeLayer:
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
 
-        if "mem_for_ppb" in extra_config:
-            reserve_mem = extra_config.pop("mem_for_ppb")
-            self.mem_eval._ccfg.device_capacity.decrease(reserve_mem)
-
+        # The cap replaces the device's capacity, and the reserve comes out
+        # of whichever capacity holds.
         if "max_mem" in extra_config:
             max_mem = extra_config.pop("max_mem")
             if max_mem is not None:
                 self.mem_eval._ccfg.device_capacity.set(max_mem)
+
+        if "mem_for_ppb" in extra_config:
+            reserve_mem = extra_config.pop("mem_for_ppb")
+            self.mem_eval._ccfg.device_capacity.decrease(reserve_mem)
 
         logger.debug("before global config init")
 
