@@ -54,13 +54,21 @@ class GlobalConfig:
             return parallel_config.val(dim)
         return dim.from_config(self.ccfg)
 
+    def accumulates_grads(self):
+        """Whether the run accumulates gradients over micro-batches without pipeline parallelism."""
+        return bool(getattr(self.ccfg, "accumulates_grads", False))
+
     def global_batch_size(self, parallel_config):
-        """Compute global batch size from hyperparameters"""
+        """Compute global batch size from hyperparameters.
+
+        Micro-batches multiply it under pipeline parallelism, and without it
+        in a run that accumulates gradients over them.
+        """
         dp = self.dim_val(Dim.DP, parallel_config)
         pp = self.dim_val(Dim.PP, parallel_config)
         mb = self.dim_val(Dim.MBN, parallel_config)
         bs = self.dim_val(Dim.MBS, parallel_config)
-        if pp > 1:
+        if pp > 1 or self.accumulates_grads():
             logger.info("GBS = %dDP * %dMB * %dBS", dp, mb, bs)
             return dp * mb * bs
         logger.info("GBS = %dDP * %dBS", dp, bs)
@@ -175,7 +183,7 @@ class GlobalConfig:
         if has_mbn_not_in and has_pp_in and has_dp_or_mbs_in:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)
-        return Dim.Dimensions(dims, all_dims=self.dimensions)
+        return Dim.Dimensions(dims, all_dims=self.dimensions, accumulates=self.accumulates_grads())
 
     def make_parallel_config(self, dtpc_p, mbsn, evos_p):
         """Create a parallel config from parallel values"""

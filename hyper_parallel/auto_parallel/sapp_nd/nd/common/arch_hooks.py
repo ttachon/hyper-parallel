@@ -105,6 +105,7 @@ def custom_llama2(ccfg):
     custom_default_transformer(ccfg)
     ccfg.n_gather = 4  # num gather (TP)
     ccfg.bytes_grad = _grad_bytes(ccfg, 2, without_pp=True)  # gradients
+    ccfg.accumulates_grads = True  # it keeps them without a pipeline too
 
 
 def custom_mixtral(ccfg):
