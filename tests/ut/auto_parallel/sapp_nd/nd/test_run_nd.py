@@ -1809,9 +1809,10 @@ class TestSappNDRunND(unittest.TestCase):
         ms_ccfg = _ParserCostModelConfig()
         ms_ccfg.config = ms_config
         CostModelParserMindspeed(ms_ccfg).parse()
-        self.assertEqual(ms_ccfg.model_name, "multi-unit")
+        # A config of one module is that module.
+        self.assertEqual(ms_ccfg.model_name, "vision")
         self.assertFalse(ms_ccfg.multimodal)
-        self.assertEqual(ms_ccfg.n_lay, 0)
+        self.assertEqual(ms_ccfg.n_lay, 2)
 
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
