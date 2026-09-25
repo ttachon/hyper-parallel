@@ -86,18 +86,30 @@ def read_cluster_env(env_path: Path) -> Dict[str, Any]:
     """
     script = (
         f'set -euo pipefail; source {shlex.quote(str(env_path))}; '
-        'printf "%s\\n" "${NODES[*]}" "${NPROC_PER_NODE:-8}" '
-        '"${REPO_DIR}" "${SSH_USER:-root}" "${LOG_DIR}"'
+        'printf "%s\\n" "${NODES[*]:-}" "${NPROC_PER_NODE:-8}" '
+        '"${REPO_DIR:-}" "${SSH_USER:-root}" "${LOG_DIR:-}"'
     )
-    out = subprocess.run(
-        ["bash", "-c", script], check=True, text=True, stdout=subprocess.PIPE
-    ).stdout.splitlines()
+    # Every optional key carries a default: the file is sourced under set -u,
+    # where one unset name aborts the shell before printf runs, so a missing
+    # LOG_DIR would otherwise read as a truncated answer rather than an error.
+    result = subprocess.run(
+        ["bash", "-c", script], check=False, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        raise SystemExit(
+            f"could not read {env_path}: {result.stderr.strip() or 'sourcing failed'}")
+    values = (result.stdout.splitlines() + [""] * 5)[:5]
+    if not values[0].split() or not values[2]:
+        raise SystemExit(f"{env_path} must set NODES and REPO_DIR")
+    repo_dir = values[2].rstrip("/")
     return {
-        "nodes": out[0].split(),
-        "nproc": int(out[1]),
-        "repo_dir": out[2].rstrip("/"),
-        "ssh_user": out[3],
-        "log_dir": out[4].rstrip("/"),
+        "nodes": values[0].split(),
+        "nproc": int(values[1]),
+        "repo_dir": repo_dir,
+        "ssh_user": values[3],
+        # The kit's own default when the config leaves it out.
+        "log_dir": (values[4] or f"{repo_dir}/scripts/cluster/logs").rstrip("/"),
     }
 
 
