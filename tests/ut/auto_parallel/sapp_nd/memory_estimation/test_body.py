@@ -522,7 +522,7 @@ class TestActCpLayer(unittest.TestCase):
     """Test EvalBody.act_cp_layer (CP activation memory breakdown)."""
 
     def _make_ccfg_cp(self, a=32, t=1, cp=2, s=1024, b=4,
-                       kv_lora_rank=0, n_kv=32, dh=128,
+                       dc_kv=0, n_kv=32, dh=128, dhr=0,
                        cp_algo="colossalai_cp", device_per_node=8,
                        h=4096):
         """Create a mock CostModelConfig for CP activation tests."""
@@ -532,9 +532,10 @@ class TestActCpLayer(unittest.TestCase):
         ccfg.cp = cp
         ccfg.s = s
         ccfg.b = b
-        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.dc_kv = dc_kv
         ccfg.n_kv = n_kv
         ccfg.dh = dh
+        ccfg.dhr = dhr
         ccfg.h = h
         ccfg.cp_algo = cp_algo
         ccfg.device_per_node = device_per_node
@@ -594,18 +595,21 @@ class TestActCpLayer(unittest.TestCase):
         with self.assertRaises(ValueError):
             EvalBody.act_cp_layer(ccfg, ctx)
 
-    def test_mla_uses_kv_lora_rank(self):
-        """BD-CP07: MLA (kv_lora_rank > 0) uses kv_lora_rank for kv_dim."""
-        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=512,
-                                   n_kv=32, dh=128, cp_algo="colossalai_cp")
+    def test_mla_keeps_every_heads_keys_and_values(self):
+        """BD-CP07: MLA (dc_kv > 0) keeps its heads' K and V, not the latent.
+
+        Each head's key is 128 wide plus the 64-wide rotary part and its
+        value 128 wide, so each of K and V is 32 * (2 * 128 + 64) / 2 wide.
+        """
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, dc_kv=512, n_kv=32, dh=128, dhr=64,
+                                   cp_algo="colossalai_cp")
         ctx = self._make_ctx_cp()
         result = EvalBody.act_cp_layer(ccfg, ctx)
-        # kv_dim = kv_lora_rank = 512 for MLA
-        self.assertGreater(result.kv_cache_memory, 0)
+        self.assertEqual(result.kv_cache_memory, 2 * 2 * (1024 / 2) * 4 * 32 * (2 * 128 + 64) / 2)
 
     def test_gqa_kv_dim(self):
         """BD-CP08: GQA (n_kv < a) uses n_kv * dh / t for kv_dim."""
-        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=0,
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, dc_kv=0,
                                    n_kv=8, dh=128, cp_algo="colossalai_cp")
         ctx = self._make_ctx_cp()
         result = EvalBody.act_cp_layer(ccfg, ctx)
