@@ -23,6 +23,22 @@ from abc import abstractmethod
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
 
+# The recompute switches of HyperParallel's selective activation checkpointing
+# (hyper_parallel/distributed/activation_checkpoint.py). It keeps the outputs of
+# matmul and attention kernels and of reduce-scatter, all-to-all and all-reduce,
+# and recomputes everything else, all-gathers included. A switch at 1 keeps the
+# op's activation and 0 recomputes it. The policy also recomputes every other
+# projection matmul, which has no switch, so that part is not priced.
+HYPER_SELECTIVE_REC_OP = {
+    "attBMM": 1,
+    "headCast": 0,
+    "dropout": 0,
+    "softmax": 0,
+    "normOp": 0,
+    "gather": 0,
+    "ffAct": 0,
+}
+
 
 class _CostModelParser(ABC):
     """abstract parser class"""
@@ -38,6 +54,22 @@ class _CostModelParser(ABC):
         Subclasses must implement this method to read framework-specific
         configuration values into the shared _CostModVar instance.
         """
+
+    @staticmethod
+    def hyper_rec_op(selective: bool | list) -> dict[str, int]:
+        """Recompute switches for a HyperParallel activation checkpoint mode.
+
+        Args:
+            selective: The parsed ``sel_rec``: truthy when the run uses
+                selective activation checkpointing.
+
+        Returns:
+            The switches for ``ccfg.rec_op``: :data:`HYPER_SELECTIVE_REC_OP`
+            for a selective run, and every op kept otherwise.
+        """
+        if selective:
+            return dict(HYPER_SELECTIVE_REC_OP)
+        return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
 
     def config_optimizer_shard(self, ccfg):
         """OP related variables"""

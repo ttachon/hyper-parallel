@@ -132,7 +132,8 @@ class EvalAttn:
             * (
                 ccfg.n_softmax
                 * (
-                    ccfg.rec_op.softmax * ccfg.bytes_softmax
+                    EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.softmax)
+                    * ccfg.bytes_softmax
                     + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.dropout)
                     * ccfg.bytes_dropout
                     + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.headCast)

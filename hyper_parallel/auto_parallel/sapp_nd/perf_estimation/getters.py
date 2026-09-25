@@ -79,13 +79,21 @@ def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int
 
 
 def get_recomp_factor(lccfg, layer, op_name):
-    """recomputation factor"""
+    """Whether a layer of this type runs the op again in its backward pass.
+
+    A selective layer recomputes exactly the ops whose switch in
+    ``lccfg.rec_op`` is 0. A switch at 1 keeps the op's activation, which is
+    how the memory model's ``EvalUtils.rec_coeff`` reads it, and an op with no
+    switch is kept. The switches are read from ``vars`` because a ``Config``
+    answers 0 for any attribute it lacks.
+    """
     if layer == LayerType.FULL_REC_LAYER:
         return 1
     if layer == LayerType.NOT_REC_LAYER:
         return 0
     if layer == LayerType.SEL_REC_LAYER:
-        return getattr(lccfg.rec_op, op_name, 0)
+        switches = vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
+        return int(not switches.get(op_name, 1))
     logger.warning("Unrecognized recompute type %s", layer)
     return 0
 

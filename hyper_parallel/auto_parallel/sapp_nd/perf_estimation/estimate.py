@@ -86,7 +86,7 @@ def op_table(cfg, attn=None):
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
-    table["n_ffAct"] = 21 * cfg.b * cfg.hff
+    table["n_ffAct"] = 21 * cfg.b * cfg.s * cfg.hff
 
     table["n_normOp"] = 30 * cfg.b * cfg.s * cfg.h * cfg.t / cfg.sp
     table["n_dropout"] = (
