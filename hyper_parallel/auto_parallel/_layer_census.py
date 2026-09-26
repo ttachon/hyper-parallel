@@ -143,8 +143,11 @@ def activations_from_dict(data: Any) -> Dict[str, KindActivations]:
 
 
 # The Transformers attention implementation the census registers its flash
-# attention under.
-_FLASH = "nd_census_flash"
+# attention under: a name Transformers does not take for a flash
+# attention's, as it does not take HyperParallel's default, sdpa, so a model
+# runs sdpa's path, and DeepSeek-V3's values are not padded to its queries'
+# width.
+_FLASH = "nd_census_attention"
 
 # The config fields a tensor-parallel rank holds a share of.
 _TP_FIELDS = (
@@ -162,12 +165,12 @@ _QK_NORMS = ("q_norm", "k_norm")
 
 def _flash_outputs(query: torch.Tensor, key: torch.Tensor,
                    value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Flash attention's outputs, shapes only: one of the queries' shape and two fp32 statistics."""
-    del key, value
+    """Flash attention's outputs, shapes only: each head's, as wide as its values, and two fp32 statistics."""
+    del key
     batch, heads, seq, _ = query.shape
     stats = [torch.empty(batch, heads, seq, _FLASH_STATS, dtype=torch.float32, device=query.device)
              for _ in range(2)]
-    return torch.empty_like(query), stats[0], stats[1]
+    return query.new_empty(batch, heads, seq, value.shape[-1]), stats[0], stats[1]
 
 
 # Flash attention as one op, as the runtime's kernel is: HyperParallel's
