@@ -31,8 +31,10 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     _selective_contexts,
     activations_from_dict,
     census_activations,
+    census_final_norm,
     census_layer,
     census_output_activations,
+    census_parameters,
     census_recomputed,
     tp_config,
 )
@@ -243,6 +245,25 @@ class TestLayerCensus(unittest.TestCase):
             self.assertGreater(record.selective_tp, 0)
             for share in (record.selective_attention_mm, record.selective_ffn_mm):
                 self.assertTrue(0 < share < 1, share)
+
+    def test_a_layers_parameters_by_part(self):
+        """
+        Feature: census_parameters and census_final_norm.
+        Description: Each kind's layer of the model of width 64, with 4
+            routed experts and a shared expert, each 32 wide.
+        Expectation: The router holds a weight per expert; the routed
+            experts three projections each; the shared expert its three and
+            its gate; the norms two RMSNorms of the width, and in the
+            full-attention layer the per-head query and key norms beside
+            them.  The final norm is one RMSNorm.
+        """
+        config = _qwen35_text()
+        for index, norms in ((0, 2 * 64), (1, 2 * 64 + 2 * 16)):
+            parts = census_parameters(config, index)
+            self.assertEqual((parts["router"], parts["routed"], parts["shared"], parts["norm"]),
+                             (64 * 4, 4 * 3 * 64 * 32, 3 * 64 * 32 + 64, norms))
+            self.assertGreater(parts["attention"], 0)
+        self.assertEqual(census_final_norm(config), 64)
 
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """

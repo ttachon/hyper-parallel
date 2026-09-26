@@ -471,6 +471,8 @@ class CostModelParserHyperV2(_CostModelParser):
                 e = CWrap(e)
             e.set_ccfg(apply)
 
+        # Verify mode names each group by its kind.
+        hook.kind = kind
         return hook
 
     # -- Multimodal ----------------------------------------------------
