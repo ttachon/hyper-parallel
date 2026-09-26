@@ -37,6 +37,11 @@ HyperParallel's trainer runs them by default, dropping the model's logits
 before the backward as the trainer does; half the vocabulary tells the
 bytes a vocabulary-parallel loss splits.  A model spec states a census as
 :class:`KindActivations` records.
+
+A layer's parameters are counted by part, as ND prices its parts: the
+attention's, the norms', the dense feed-forward's, the routed experts', the
+shared expert's and the router's (:func:`census_parameters`), for verify
+mode to set beside what ND prices.
 """
 from __future__ import annotations
 
@@ -144,6 +149,10 @@ _TP_FIELDS = (
 
 # The softmax statistics flash attention keeps per head and token.
 _FLASH_STATS = 8
+
+# The per-head query and key norms an attention holds, which ND prices with
+# the layer's norms.
+_QK_NORMS = ("q_norm", "k_norm")
 
 
 def _flash_outputs(query: torch.Tensor, key: torch.Tensor,
@@ -543,6 +552,55 @@ def census_recomputed(config: Any, layer_index: int, seq_length: int) -> Tuple[f
                                  context_fn=functools.partial(_selective_contexts, ledger))
         _run(layer, hidden, _positions(rotary, hidden, seq_length), call)
     return ledger.share(attention=True), ledger.share(attention=False)
+
+
+def _parameter_part(name: str) -> str:
+    """The part of a decoder layer the parameter at path *name* belongs to, as ND prices the parts.
+
+    The layer's norms and its attention's per-head query and key norms are
+    its norms; the rest of a child named for attention is its attention.
+    Of the feed-forward, a shared expert's parameters, the routed experts'
+    and the router's are parts of their own, and the rest is the dense
+    feed-forward's.
+    """
+    segments = name.split(".")
+    module = segments[-2] if len(segments) > 1 else ""
+    if "norm" in segments[0] or module in _QK_NORMS:
+        return "norm"
+    if "attn" in segments[0] or "attention" in segments[0]:
+        return "attention"
+    if any("shared" in segment for segment in segments):
+        return "shared"
+    if "experts" in segments:
+        return "routed"
+    if module in ("gate", "router"):
+        return "router"
+    return "ffn"
+
+
+def census_parameters(config: Any, layer_index: int) -> Dict[str, int]:
+    """The parameters of layer *layer_index* of *config*, by part.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+
+    Returns:
+        The parameter count of each part the layer has
+        (:func:`_parameter_part`).
+    """
+    parts: Dict[str, int] = {}
+    with _fake_layer(config, layer_index) as (layer, _):
+        for name, param in layer.named_parameters():
+            part = _parameter_part(name)
+            parts[part] = parts.get(part, 0) + param.numel()
+    return parts
+
+
+def census_final_norm(config: Any) -> int:
+    """The parameters of *config*'s final norm, of the class of a layer's input norm."""
+    with _fake_layer(config, 0) as (layer, _):
+        return sum(param.numel() for param in layer.input_layernorm.parameters())
 
 
 def census_output(config: Any, seq_length: int) -> Tuple[int, int]:

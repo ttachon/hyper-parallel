@@ -277,6 +277,12 @@ def _model_path(model_raw: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
+    config = _get_hf_config(model_raw)
+    return config, _text_tower(config)
+
+
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the fields the model section states itself, as a plain dict.
 
