@@ -130,15 +130,18 @@ def _flavour_tables(cfg, attn=None):
 
     A MoE layer's feed-forward entry prices the experts each token runs,
     the shared experts, as wide as a routed one, and, spread over the
-    layer's feed-forward matmuls, the router and the shared experts' gate.
+    layer's feed-forward matmuls, the router and the shared experts' gate;
+    its activation function's entry the same experts, which run it at
+    their width, where a dense layer's runs it at the dense width.
     """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
     n_ff = getattr(attn if attn is not None else cfg, "n_ffMM", 0) or 3
     gate = 1 if cfg.n_shared_exp and getattr(cfg, "shared_expert_gate", None) else 0
-    width = (cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
-             + (cfg.n_exp + gate) / n_ff)
+    experts = cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
+    width = experts + (cfg.n_exp + gate) / n_ff
     exp["n_ffMM"] *= width / cfg.hff
+    exp["n_ffAct"] *= experts / cfg.hff
     return base, exp
 
 

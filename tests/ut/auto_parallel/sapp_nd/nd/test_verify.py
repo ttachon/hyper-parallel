@@ -22,8 +22,18 @@ from unittest.mock import patch
 
 import yaml
 
-from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters
-from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_flops, verify_parameters
+from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters, census_saved_ops
+from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    census_spec_yaml,
+    report,
+    report_spec,
+    verify_activations,
+    verify_estimate,
+    verify_flops,
+    verify_parameters,
+    verify_spec,
+)
 
 _HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
 _RUN_ND = "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd"
@@ -60,8 +70,8 @@ def _one_kind(config_cls, **fields):
                       intermediate_size=128, vocab_size=128, **fields)
 
 
-def _train_yaml(folder: str) -> str:
-    """A train yaml of the model on two ranks at DP shard 2."""
+def _train_yaml(folder: str, census: bool = False) -> str:
+    """A train yaml of the model on two ranks at DP shard 2, stating a census of its layers where asked."""
     config = {
         "model": {"_target_": "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained",
                   "pretrained_model_name_or_path": "local/qwen3_5_moe", "torch_dtype": "bfloat16"},
@@ -70,7 +80,7 @@ def _train_yaml(folder: str) -> str:
         "fsdp_config": {"dp_shard_size": 2},
         "activation_checkpoint": {"mode": "off"},
         "dataset": {"data_transform": {"max_seq_len": 4096}},
-        "context": {"device_num": 2},
+        "context": {"device_num": 2, "census": census},
     }
     path = os.path.join(folder, "train.yaml")
     with open(path, "w", encoding="utf-8") as handle:
@@ -221,6 +231,113 @@ class TestVerifyFlops(unittest.TestCase):
                          (sum(row.nd for row in rows[:-1]), sum(row.census for row in rows[:-1])))
 
 
+class TestVerifyActivations(unittest.TestCase):
+    """Verify mode sets what the op records price a layer keeping for each op beside the census's."""
+
+    def test_each_op_beside_its_census(self):
+        """
+        Feature: verify_activations.
+        Description: A Llama of one layer kind, width 64, on 4096 tokens.
+        Expectation: A row per op either prices or measures, in bytes a
+            token of the whole layer: the census's the layer's own, the
+            records' those of its slots, such as the score cast the census
+            never sees; then the layer's whole, the sum of the rows.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        config = _one_kind(LlamaConfig)
+        with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+            rows = verify_activations(_train_yaml(folder))
+        census = census_saved_ops(config, 0, 4096)
+        by = {row.part: row for row in rows}
+        for part, row in by.items():
+            if part != "total":
+                self.assertEqual(row.census, census.get(part, 0.0), part)
+        self.assertLessEqual({op for op, size in census.items() if size}, set(by))
+        self.assertEqual(by["ffAct"].nd, 2 * 128)
+        self.assertEqual((by["total"].nd, by["total"].census),
+                         (sum(row.nd for row in rows[:-1]), sum(census.values())))
+        self.assertEqual({row.where for row in rows}, {"decoder x2"})
+
+
+class TestVerifySpec(unittest.TestCase):
+    """Verify mode sets the census's model spec beside the resolver's, and prices the run with each."""
+
+    def test_the_census_spec_beside_the_resolvers(self):
+        """
+        Feature: verify_spec and report_spec.
+        Description: The hybrid model, whose fields the resolver reads and
+            the census measures alike.
+        Expectation: A row per field, each op count of each kind one, and
+            the layer stack as its groups; every field agrees, and the
+            report says so.
+        """
+        with patch(_HF_CONFIG, return_value=_qwen35_text()), tempfile.TemporaryDirectory() as folder:
+            rows = verify_spec(_train_yaml(folder))
+        fields = {row.field: row for row in rows}
+        self.assertEqual(fields["layers"].census, (("linear_attention", 1), ("full_attention", 1)))
+        self.assertEqual((fields["ops.linear_attention.linrec"].census, fields["ops.full_attention.attBMM"].census),
+                         (1, 2))
+        self.assertTrue(all(row.resolved == row.census for row in rows))
+        lines = report_spec(rows)
+        self.assertEqual(lines[-1], f"{len(rows)} fields agree, 0 differ")
+        self.assertTrue(any("2 groups: linear_attention x1, full_attention x1" in line for line in lines))
+
+    def test_a_field_that_differs_is_marked_and_priced(self):
+        """
+        Feature: verify_spec and verify_estimate of a Mixtral.
+        Description: A Mixtral of 4 experts, whose profile states five norms
+            and two score softmaxes a layer, and whose layers run two and
+            one.
+        Expectation: Those two fields differ, and the report marks them;
+            the run priced with the census's spec keeps fewer activations.
+        """
+        from transformers import MixtralConfig  # pylint: disable=C0415
+        config = _one_kind(MixtralConfig, num_local_experts=4)
+        with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+            path = _train_yaml(folder)
+            rows = verify_spec(path)
+            peak, _ = verify_estimate(path)
+        differ = {row.field: (row.resolved, row.census) for row in rows if row.resolved != row.census}
+        self.assertEqual(differ, {"ops.decoder.normOp": (5, 2), "ops.decoder.softmax": (2, 1)})
+        self.assertEqual(sum("<- differs" in line for line in report_spec(rows)), 2)
+        self.assertLess(peak.census, peak.nd)
+
+    def test_the_run_priced_with_each_spec(self):
+        """
+        Feature: verify_estimate.
+        Description: The hybrid model's run, with and without a census of
+            its layers' activations.
+        Expectation: The resolver's spec and the census's price the run's
+            peak memory and its step's time alike, to the bit.
+        """
+        for census in (False, True):
+            with patch(_HF_CONFIG, return_value=_qwen35_text()), tempfile.TemporaryDirectory() as folder:
+                rows = verify_estimate(_train_yaml(folder, census))
+            self.assertEqual([row.part for row in rows], ["peak MB", "time score"])
+            for row in rows:
+                self.assertEqual(row.nd, row.census, (census, row.part))
+                self.assertGreater(row.nd, 0)
+
+    def test_the_census_spec_is_written(self):
+        """
+        Feature: census_spec_yaml.
+        Description: The hybrid model's train yaml, with and without a
+            census of its layers' activations.
+        Expectation: model_spec.yaml in the folder given, a model spec
+            carrying the census's stack and op counts, and its records where
+            the run states a census.
+        """
+        for census in (False, True):
+            with patch(_HF_CONFIG, return_value=_qwen35_text()), tempfile.TemporaryDirectory() as folder:
+                path = census_spec_yaml(_train_yaml(folder, census), os.path.join(folder, "out"))
+                with open(path, encoding="utf-8") as handle:
+                    data = yaml.safe_load(handle)
+            self.assertEqual(os.path.basename(path), "model_spec.yaml")
+            spec = ModelSpec.from_dict(data)
+            self.assertEqual(sorted(spec.ops), ["full_attention", "linear_attention"])
+            self.assertEqual(spec.activations is not None, census)
+
+
 class TestRunNdVerify(unittest.TestCase):
     """run_nd -V prints the verify report and exits."""
 
@@ -230,8 +347,9 @@ class TestRunNdVerify(unittest.TestCase):
         Description: The hybrid model's train yaml under -f hyper_v2, and
             under the default framework.
         Expectation: With hyper_v2, the parameters' report, a row per part,
-            then the FLOPs', and exit 0; otherwise the parser refuses the
-            flag.
+            then the FLOPs', the model spec's and the run's priced with each
+            spec, the census's spec written in the -o folder, and exit 0;
+            otherwise the parser refuses the flag.
         """
         with tempfile.TemporaryDirectory() as folder, patch(_HF_CONFIG, return_value=_qwen35_text()):
             path = _train_yaml(folder)
@@ -245,6 +363,10 @@ class TestRunNdVerify(unittest.TestCase):
             self.assertTrue(any("linear_attention x1" in line and "router" in line for line in logs.output))
             self.assertTrue(any("Forward FLOPs" in line for line in logs.output))
             self.assertTrue(any("linear_attention x1" in line and "linrec" in line for line in logs.output))
+            self.assertTrue(any("fields agree, 0 differ" in line for line in logs.output))
+            self.assertTrue(any("full_attention x1" in line and "attBMM" in line for line in logs.output))
+            self.assertTrue(any("peak MB" in line for line in logs.output))
+            self.assertTrue(os.path.isfile(os.path.join(folder, "model_spec.yaml")))
             with patch.object(sys, "argv", ["run_nd.py", "-y", path, "-V"]), self.assertRaises(SystemExit) as done:
                 runpy.run_module(_RUN_ND, run_name="__main__")
             self.assertEqual(done.exception.code, 2)

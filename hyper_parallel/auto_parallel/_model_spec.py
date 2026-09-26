@@ -228,9 +228,12 @@ def check_layer_counts(layers: Tuple[LayerGroup, ...], num_layers: int, mtp_dept
 
 
 # The fields a census record states in pairs: what a layer keeps under
-# HyperParallel's selective activation checkpointing, and the shares of its
-# matmul FLOPs that recomputes.
-_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"))
+# HyperParallel's selective activation checkpointing, the shares of its
+# matmul FLOPs that recomputes, and what it keeps for each op.
+_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"), ("ops", "ops_tp"))
+
+# The census record's fields that map ops to bytes per token.
+_BY_OP = ("ops", "ops_tp")
 
 
 @dataclass(frozen=True)
@@ -247,7 +250,10 @@ class KindActivations:
     activation checkpointing, whose backward recomputes the rest and holds
     the same working set, and ``selective_attention_mm`` and
     ``selective_ffn_mm`` the shares of the FLOPs of its attention's
-    projections and of the rest of its matmuls that recomputes; a record
+    projections and of the rest of its matmuls that recomputes.  ``ops`` and
+    ``ops_tp`` are what it keeps for each op of the op vector, the two parts
+    of ``saved`` and ``saved_tp``, and ``other`` for its own code: the op
+    records of shared decision S1, as the census fills them.  A record
     states each pair whole or not at all.
     """
 
@@ -260,11 +266,17 @@ class KindActivations:
     selective_tp: Optional[float] = None
     selective_attention_mm: Optional[float] = None
     selective_ffn_mm: Optional[float] = None
+    ops: Optional[Mapping[str, float]] = None
+    ops_tp: Optional[Mapping[str, float]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return the record as a plain mapping, the selective part only when stated."""
-        return {spec_field.name: getattr(self, spec_field.name) for spec_field in fields(self)
-                if getattr(self, spec_field.name) is not None}
+        """Return the record as a plain mapping, the selective part and the ops only when stated."""
+        out = {spec_field.name: getattr(self, spec_field.name) for spec_field in fields(self)
+               if getattr(self, spec_field.name) is not None}
+        for name in _BY_OP:
+            if name in out:
+                out[name] = dict(out[name])
+        return out
 
     @staticmethod
     def _check_keys(data: Mapping[str, Any], names: Tuple[str, ...], where: str) -> None:
@@ -284,12 +296,25 @@ class KindActivations:
             raise ModelSpecError(f"{where} must map the record's fields to their values, got {data!r}")
         names = tuple(spec_field.name for spec_field in fields(cls))
         cls._check_keys(data, names, where)
-        sizes = {name: float(data[name]) for name in names if name != "seq_length" and data.get(name) is not None}
+        sizes = {name: float(data[name]) for name in names
+                 if name != "seq_length" and name not in _BY_OP and data.get(name) is not None}
         if any(size < 0 for size in sizes.values()):
             raise ModelSpecError(f"{where}: bytes per token cannot be negative, got {sizes}")
         if any(sizes.get(name, 0) > 1 for name in _PAIRED[1]):
             raise ModelSpecError(f"{where}: a share of FLOPs cannot exceed 1, got {sizes}")
-        return cls(seq_length=_as_count(data["seq_length"], f"{where}.seq_length"), **sizes)
+        by_op = {name: _op_bytes(data[name], f"{where}.{name}") for name in _BY_OP if data.get(name) is not None}
+        return cls(seq_length=_as_count(data["seq_length"], f"{where}.seq_length"), **sizes, **by_op)
+
+
+def _op_bytes(data: Any, where: str) -> Dict[str, float]:
+    """Parse ``{op: bytes per token}``, the ops of the op vector and ``other``, refusing a negative size."""
+    known = [spec_field.name for spec_field in fields(OpCounts)] + ["other"]
+    if not isinstance(data, Mapping) or any(op not in known for op in data):
+        raise ModelSpecError(f"{where} must map ops of {known} to bytes per token, got {data!r}")
+    sizes = {str(op): float(size) for op, size in data.items()}
+    if any(size < 0 for size in sizes.values()):
+        raise ModelSpecError(f"{where}: bytes per token cannot be negative, got {sizes}")
+    return sizes
 
 
 def activations_from_dict(data: Any) -> Dict[str, KindActivations]:

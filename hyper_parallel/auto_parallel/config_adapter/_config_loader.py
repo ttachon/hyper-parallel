@@ -102,9 +102,10 @@ _MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype"
 _RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer")
 
 # The ``context`` keys of a train.yaml that state how the cost model prices
-# the run: a census of the layers, and a vision tower's token count.  The
-# device count and the memory budget are a search's own.
-_RUN_CONTEXT_KEYS = ("census", "visual_seq_len")
+# the run: a census of the layers, the census's spec of the model, and a
+# vision tower's token count.  The device count and the memory budget are a
+# search's own.
+_RUN_CONTEXT_KEYS = ("census", "census_spec", "visual_seq_len")
 
 # The keys of a legacy train.yaml's ``train`` section that are not its
 # training settings: recompute, the search's, and precision, which the cost
@@ -150,6 +151,7 @@ def _load_auto_models_model_spec(
     model_raw: Dict[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    census_spec: bool = False,
 ) -> Dict[str, Any]:
     """Resolve model dimensions through the shared AutoModels path.
 
@@ -157,7 +159,7 @@ def _load_auto_models_model_spec(
     SAPP-ND parser cannot disagree about field names or fallbacks.  The run
     keys of ``config_overrides`` ride along, as the adapter hands them on.
     """
-    spec = resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len)
+    spec = resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, census_spec)
     spec.update(exec_overrides(model_raw))
     return _normalize_model_spec(spec)
 
@@ -463,7 +465,7 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
     # this reader resolves: the search hands ND the spec, its records in it.
     census_seq_len = int(seq_len or 4096) if context_raw.get("census") else 0
     model_spec = _load_auto_models_model_spec(
-        model_raw, context_raw.get("visual_seq_len"), census_seq_len,
+        model_raw, context_raw.get("visual_seq_len"), census_seq_len, bool(context_raw.get("census_spec")),
     )
     if seq_len:
         model_spec["max_position_embeddings"] = seq_len

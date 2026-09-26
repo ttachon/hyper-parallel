@@ -26,7 +26,16 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
-from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_flops, verify_parameters
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    census_spec_yaml,
+    report,
+    report_spec,
+    verify_activations,
+    verify_estimate,
+    verify_flops,
+    verify_parameters,
+    verify_spec,
+)
 
 
 def _host_link(cli_parser, cli_args, device):
@@ -418,9 +427,11 @@ if __name__ == "__main__":
         "-V",
         "--verify",
         action="store_true",
-        help="Verify mode (hyper_v2 only): set the parameters ND prices of each "
-        "part of the model -y trains beside those of the Transformers layers "
-        "its checkpoint builds, and exit.",
+        help="Verify mode (hyper_v2 only): set the parameters and FLOPs ND prices "
+        "of each part of the model -y trains beside those of the Transformers "
+        "layers its checkpoint builds, and the model spec the resolver reads "
+        "beside the one the census measures, with the run priced with each; "
+        "with -o, write the census's spec there; and exit.",
     )
     parser.add_argument(
         "-o",
@@ -467,6 +478,17 @@ if __name__ == "__main__":
         logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
         for line in report(verify_flops(args.yaml_config)):
             logger.output(line)
+        logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
+        for line in report(verify_activations(args.yaml_config)):
+            logger.output(line)
+        logger.output("Model spec as ND prices it: read from the checkpoint's config, and measured by the census")
+        for line in report_spec(verify_spec(args.yaml_config)):
+            logger.output(line)
+        logger.output("The run priced with each spec: the resolver's in the ND column, the census's beside it")
+        for line in report(verify_estimate(args.yaml_config, args.device_type or "A2")):
+            logger.output(line)
+        if args.output_dir:
+            logger.output(f"census spec written to {census_spec_yaml(args.yaml_config, args.output_dir)}")
         sys.exit(0)
 
     if args.framework == "hyper_v2" and args.search_config:
