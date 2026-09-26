@@ -17,10 +17,16 @@
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/memory_estimation/test_layer_block.py -v
 """
+import itertools
 import unittest
 from types import SimpleNamespace
 
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn, EvalFFn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import (
+    EvalAttn,
+    EvalFFn,
+    EvalNorm,
+    EvalRecords,
+)
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -190,6 +196,68 @@ class TestExpertWidth(unittest.TestCase):
         self.assertEqual(EvalFFn.routed_exp_activations(ccfg, ctx), 16 * 2 * per_token)
         self.assertEqual(EvalFFn.shared_exp_activations(ccfg, ctx), 16 * per_token)
         self.assertEqual(EvalFFn.num_params_shared_expert(ccfg, None), 3 * (32 * 64 + 32))
+
+
+# The switches a layer's activations answer to; gather acts on its communication.
+_ACTIVATION_SWITCHES = ("attBMM", "softmax", "dropout", "headCast", "normOp", "ffAct")
+
+
+def _layer(n_exp: int) -> SimpleNamespace:
+    """A layer of width 64 over 16 tokens, 4 query and 2 key heads 16 wide; dense 128 wide or 4 experts 32 wide."""
+    return SimpleNamespace(
+        s=16, b=1, h=64, a=4, n_kv=2, dh=16, dc_kv=0, s_fa=16, t=2, cp=1, sp=2, cp_algo="colossalai_cp",
+        n_attMM=4, n_attParamCast=0, n_attBMM=2, n_softmax=1, n_dropout=1, n_ffMM=3, n_ffBMM=0, n_ffParamCast=0,
+        n_normOp=2, n_qknorm=1, n_linrec=0, hff=128, hff_exp=32, n_exp=n_exp, n_chosen_exp=2, n_shared_exp=1,
+        gmm=True, cap_fact=1, bytes_compute=2, bytes_softmax=4, bytes_dropout=1, bytes_norm=4,
+        rec_op=Config({name: 1 for name in _ACTIVATION_SWITCHES + ("gather",)}))
+
+
+class TestRecords(unittest.TestCase):
+    """The op records price a selective layer under any setting of its switches, as its formulas do."""
+
+    def test_a_setting_is_priced_without_setting_it(self):
+        """
+        Feature: EvalRecords.layer_bytes and op_bytes.
+        Description: A selective dense layer and a selective MoE layer,
+            under every setting of the six switches their activations
+            answer to: priced from the records with the setting given, and
+            by the formulas with the config's switches set to it.
+        Expectation: The same bytes in every part, to the bit; and what an
+            op keeps alone is what dropping it saves.
+        """
+        ctx = SimpleNamespace(current_node=LayerType.SEL_REC_LAYER, micro_factor=1, dropless_tok_factor=1)
+        for n_exp in (1, 4):
+            layer = _layer(n_exp)
+            ffn = EvalFFn.ffn_activations if n_exp == 1 else EvalFFn.ffn_moe_activations
+            for kept in itertools.product((0, 1), repeat=len(_ACTIVATION_SWITCHES)):
+                setting = dict(zip(_ACTIVATION_SWITCHES, kept))
+                layer.rec_op = Config({**setting, "gather": 1})
+                formulas = {
+                    "attention": sum(fun(layer, ctx) for fun in (
+                        EvalAttn.attn_qkv_activations, EvalAttn.attn_score_activations,
+                        EvalAttn.attn_proj_activations)),
+                    "ffn": ffn(layer, ctx), "norm": EvalNorm.norm_activations(layer, ctx)}
+                self.assertEqual(EvalRecords.layer_bytes(_layer(n_exp), ctx, setting), formulas, setting)
+            everything = sum(EvalRecords.layer_bytes(layer, ctx, dict.fromkeys(_ACTIVATION_SWITCHES, 1)).values())
+            for name in _ACTIVATION_SWITCHES:
+                without = sum(EvalRecords.layer_bytes(
+                    layer, ctx, {**dict.fromkeys(_ACTIVATION_SWITCHES, 1), name: 0}).values())
+                self.assertAlmostEqual(sum(EvalRecords.op_bytes(layer, ctx, name).values()), everything - without,
+                                       msg=f"{n_exp} experts, {name}")
+
+    def test_a_layer_holds_its_feed_forwards_slots(self):
+        """
+        Feature: EvalRecords.layer_slots.
+        Description: A dense layer and a MoE one.
+        Expectation: The dense one holds the dense feed-forward's slot, the
+            MoE one its routed and shared experts' and its router's; both
+            hold the attention's and the norms'.
+        """
+        ctx = SimpleNamespace(current_node=LayerType.NOT_REC_LAYER, micro_factor=1, dropless_tok_factor=1)
+        common = {"qkv": "attention", "score": "attention", "proj": "attention", "norm": "norm"}
+        self.assertEqual(EvalRecords.layer_slots(_layer(1), ctx), {**common, "ffn": "ffn"})
+        self.assertEqual(EvalRecords.layer_slots(_layer(4), ctx),
+                         {**common, "routed": "ffn", "shared": "ffn", "router": "ffn"})
 
 
 def _norms(n_qk_norm: int, norm_switch: int = 1) -> SimpleNamespace:
