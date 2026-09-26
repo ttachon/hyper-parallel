@@ -242,6 +242,10 @@ class _CostModVar:
     # Whether FSDP holds a layer's whole gradients while the next layer's
     # backward runs, and the root's until the backward ends.
     overlaps_grad_reduce: bool = False
+    # Whether a layer keeps the weight casts the formulas price beside its
+    # matmuls; None where no parser says, then where the optimizer does not
+    # shard.
+    keeps_param_casts: bool = None
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:

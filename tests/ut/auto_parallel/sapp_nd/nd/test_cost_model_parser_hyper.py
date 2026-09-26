@@ -30,7 +30,11 @@ from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import _optimizer_bytes
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    _optimizer_bytes,
+    custom_default_transformer,
+    keeps_param_casts,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
@@ -447,6 +451,24 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         ccfg2 = _make_ccfg(cfg2)
         self.assertFalse(ccfg2.has_op)
         self.assertEqual(ccfg2.os_max_shard, ccfg2.d)
+
+    def test_layers_keep_no_weight_cast(self):
+        """
+        Feature: the run facts of HyperParallel's FSDP.
+        Description: A run whose optimizer does not shard; then a config no
+            parser has seen, with and without optimizer sharding.
+        Expectation: HyperParallel's layers keep no cast of their weights,
+            which its FSDP gathers in the compute dtype, so no cast is
+            counted beside the matmuls, as at any dp_shard; unsaid, a layer
+            keeps them exactly where the optimizer does not shard.
+        """
+        cfg = _dense_overrides(train={"accelerator": {"enable_parallel_optimizer": False}})
+        ccfg = _make_ccfg(cfg)
+        custom_default_transformer(ccfg)
+        self.assertFalse(ccfg.has_op)
+        self.assertEqual((ccfg.keeps_param_casts, ccfg.n_attParamCast, ccfg.n_ffParamCast), (False, 0, 0))
+        self.assertEqual([keeps_param_casts(SimpleNamespace(has_op=has_op)) for has_op in (False, True)],
+                         [True, False])
 
     def test_parallelism_grad_accum_shard(self):
         """
