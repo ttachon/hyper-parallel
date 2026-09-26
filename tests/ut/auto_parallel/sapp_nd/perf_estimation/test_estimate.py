@@ -141,5 +141,21 @@ class TestOpTable(unittest.TestCase):
         base, experts = _flavour_tables(cfg)
         self.assertEqual(experts["n_ffMM"], base["n_ffMM"] / 1024 * (3 * 64 + (8 + 1) / 3))
 
+    def test_the_delta_rule_runs_in_chunks(self):
+        """
+        Feature: the load of the gated delta rule.
+        Description: A linear-attention group of 32 value heads, keys and
+            values 128 wide, on 128 tokens.
+        Expectation: Per token and value head, forward and backward, three
+            times what a chunk of 64 tokens runs over each of its tokens:
+            its keys against its keys and its queries, its solved weights
+            against its values and its decayed keys, its scores against its
+            new values, 2 x 64 x (3 x 128 + 2 x 128), and the state read
+            twice and written once, 6 x 128 x 128.
+        """
+        cfg = SimpleNamespace(**{**vars(_cfg(128)), "lin_n_v": 32, "lin_d_k": 128, "lin_d_v": 128})
+        self.assertEqual(op_table(cfg)["n_linrec"],
+                         3 * 128 * 32 * (2 * 64 * (3 * 128 + 2 * 128) + 6 * 128 * 128) * 2 / 2)
+
 if __name__ == "__main__":
     unittest.main()

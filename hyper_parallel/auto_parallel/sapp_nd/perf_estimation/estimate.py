@@ -43,6 +43,9 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
 GENERALIZE_PIPELINE_CALCULATION = False
 MANUAL_P2P_RATIO = 0.002
 BACKWARD_RATIO = 2
+# The chunk the gated delta rule's kernel and Transformers' own
+# implementation run a sequence in.
+GDN_CHUNK = 64
 
 
 def op_table(cfg, attn=None):
@@ -71,16 +74,17 @@ def op_table(cfg, attn=None):
             + 2 * att.n_kv * d_h
         )
     )
-    # Delta-rule state update and readout: linear in the sequence, where an
-    # attention score is quadratic. The entry exists only for a group that
-    # declares the flavour, so no other config needs to carry the count.
-    state = (
-        getattr(att, "lin_n_v", 0)
-        * getattr(att, "lin_d_k", 0)
-        * getattr(att, "lin_d_v", 0)
-    )
-    if state:
-        table["n_linrec"] = 6 * cfg.b * cfg.s * state
+    # The chunked gated delta rule, per value head: within a chunk of
+    # GDN_CHUNK tokens, its keys against its keys and its queries, its
+    # solved weights against its values and its decayed keys, and its
+    # scores against its new values; the state read twice and written once
+    # a chunk.  Linear in the sequence, where an attention score is
+    # quadratic.  The entry exists only for a group that declares the
+    # flavour, so no other config needs to carry the count.
+    n_v, d_k, d_v = (getattr(att, name, 0) for name in ("lin_n_v", "lin_d_k", "lin_d_v"))
+    if n_v * d_k * d_v:
+        table["n_linrec"] = (3 * cfg.b * cfg.s * n_v
+                             * (2 * GDN_CHUNK * (3 * d_k + 2 * d_v) + 6 * d_k * d_v))
     table["n_ffMM"] = 6 * cfg.b * cfg.s * cfg.h * cfg.hff
     # Every head's queries against every key, as wide as a head's queries
     # and keys, an MLA head's with its rotary part; then the weights
