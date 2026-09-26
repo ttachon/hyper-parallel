@@ -132,10 +132,11 @@ class CostModelParserHyperV2(_CostModelParser):
         has no MTP layer (:meth:`_without_mtp`), and a vision tower only
         where its model class builds one (:meth:`_builds_vision_tower`).
         ``context.census`` has the resolver run a census of each layer kind
-        (:meth:`_config_census`).
+        (:meth:`_config_census`), and ``context.census_spec`` has it state
+        the census's spec of the model rather than its own.
         """
         spec = resolve_hf_model_spec(
-            self._model_section(), self._visual_seq_len_override(), self._census_seq_len()
+            self._model_section(), self._visual_seq_len_override(), self._census_seq_len(), self._census_spec(),
         )
         if is_auto_models_schema(self.config):
             spec = self._without_mtp(spec)
@@ -179,6 +180,11 @@ class CostModelParserHyperV2(_CostModelParser):
         if not self._get_cfg_attr(ctx, "census", False):
             return 0
         return self._dataset_seq_len() or 4096
+
+    def _census_spec(self) -> bool:
+        """Whether ``context.census_spec`` asks for the census's spec of the model rather than the resolver's."""
+        ctx = self._get_cfg_attr(self.config, "context", Config({}))
+        return bool(self._get_cfg_attr(ctx, "census_spec", False))
 
     # The AutoModels classes that build a vision-language checkpoint's
     # vision tower; every other named class builds the language model alone.

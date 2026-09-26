@@ -39,6 +39,7 @@ from hyper_parallel.auto_parallel._op_profiles import (
     infer_shared_expert_gate,
     resolve_ops,
 )
+from hyper_parallel.auto_parallel._spec_census import census_model_spec
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +364,7 @@ def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    census_spec: bool = False,
 ) -> Dict[str, Any]:
     """Return canonical cost-model fields for a Trainer ``model`` section.
 
@@ -389,6 +391,12 @@ def resolve_hf_model_spec(
             census builds its layers from the checkpoint's config: a spec
             from ``config_overrides`` alone gets none, and an override of a
             model field does not reach it.
+        census_spec: Whether the language model's fields, its layer stack
+            and its op counts are the census's, measured on the layers
+            Transformers builds of the checkpoint
+            (:func:`~hyper_parallel.auto_parallel._spec_census.census_model_spec`),
+            rather than read from its config's fields.  A spec from
+            ``config_overrides`` alone is the overrides' either way.
 
     Returns:
         A dict of canonical model fields, always carrying ``"name"``.
@@ -427,10 +435,14 @@ def resolve_hf_model_spec(
             "available offline (warm the HF_HOME cache, or pass local_files_only)"
         ) from exc
 
-    spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
-    _derive_shared_experts(spec)
-    _derive_dense_ffn_width(spec)
-    spec["name"] = str(getattr(model_config, "model_type", None) or model_path)
+    name = str(getattr(model_config, "model_type", None) or model_path)
+    if census_spec:
+        spec = census_model_spec(model_config, explicit.get("arch"), name)
+    else:
+        spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
+        _derive_shared_experts(spec)
+        _derive_dense_ffn_width(spec)
+        spec["name"] = name
 
     vision_config = getattr(model_config, "vision_config", None)
     if vision_config is not None:
@@ -451,6 +463,7 @@ def resolve_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    census_spec: bool = False,
 ) -> ModelSpec:
     """Return the typed :class:`ModelSpec` for a Trainer ``model`` section.
 
@@ -460,7 +473,8 @@ def resolve_model_spec(
     Args:
         model_raw: The ``model`` section, as a plain mapping.
         visual_seq_len: Optional override for the encoder sequence length.
-        census_seq_len: As :func:`resolve_hf_model_spec` takes it.
+        census_seq_len, census_spec: As :func:`resolve_hf_model_spec`
+            takes them.
 
     Returns:
         A validated spec.
@@ -470,4 +484,4 @@ def resolve_model_spec(
         ValueError: If neither a pretrained path nor overrides can supply
             the model dimensions.
     """
-    return ModelSpec.from_dict(resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len))
+    return ModelSpec.from_dict(resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, census_spec))

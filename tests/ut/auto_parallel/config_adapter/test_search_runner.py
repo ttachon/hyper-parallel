@@ -640,6 +640,39 @@ class TestCensusInASearch(unittest.TestCase):
         self.assertEqual(sorted(ccfg.census), ["full_attention", "linear_attention"])
         self.assertEqual(ccfg.output_census.seq_length, 64)
 
+    def test_the_census_spec_reaches_nd(self):
+        """
+        Feature: context.census_spec through the search runner.
+        Description: A train.yaml of a Mixtral of 4 experts asking for the
+            census's spec, whose layers run two norms where the family's
+            profile states five, read as a search reads it, and the yaml
+            the search hands ND.
+        Expectation: The reader states the census's op counts, the option
+            rides in the run, and ND prices the layers' two norms.
+        """
+        from transformers import MixtralConfig  # pylint: disable=C0415
+        text = MixtralConfig(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                             intermediate_size=128, num_local_experts=4, vocab_size=128)
+        train = {
+            "model": {"pretrained_model_name_or_path": "local/mixtral", "torch_dtype": "bfloat16"},
+            "training": {"global_batch_size": 4, "micro_batch_size": 1},
+            "dataset": {"data_transform": {"max_seq_len": 64}},
+            "context": {"census_spec": True},
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(train, handle)
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config", return_value=text):
+                config = read_hp_yaml_config(path)
+            self.assertEqual(config.model_spec["ops"]["decoder"]["normOp"], 2)
+            self.assertEqual(config.run["context"], {"census_spec": True})
+            search_path = os.path.join(folder, "search.yaml")
+            with open(search_path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_search_yaml(config), handle)
+            ccfg = EvaluatorV2(search_path, framework="hyper_v2", log_level=0).ccfg
+        self.assertEqual(ccfg.n_normOp, 2)
+
 
 class TestSearchStrategies(unittest.TestCase):
     """End-to-end tests for search_strategies with mocked ND."""
