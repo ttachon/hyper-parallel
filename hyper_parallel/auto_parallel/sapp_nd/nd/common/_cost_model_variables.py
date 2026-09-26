@@ -124,6 +124,8 @@ class _CostModVar:
     dh: float = 0
     # An MLA model's value-head width, at which its family prices dh (derive).
     v_head_dim: float = None
+    # An MLA model's non-rotary key-head width, its value heads' unless stated.
+    qk_nope_head_dim: float = None
     dc_kv: float = 0
     dc_q: float = 0
     dhr: float = 0

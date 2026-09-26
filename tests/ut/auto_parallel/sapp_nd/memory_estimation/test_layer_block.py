@@ -80,6 +80,34 @@ class TestKeysAndValuesUnderCp(unittest.TestCase):
         self.assertEqual(_qkv(4, n_linrec=1), whole / 4)
 
 
+def _mla(**fields) -> SimpleNamespace:
+    """DeepSeek-V3's attention: width 7168, 128 heads, latents of 1536 and 512, heads 128 and 64 wide."""
+    return SimpleNamespace(**{"h": 7168, "a": 128, "n_kv": 128, "dh": 128, "dhr": 64, "dc_q": 1536, "dc_kv": 512,
+                              "n_attMM": 4, "qk_nope_head_dim": None, **fields})
+
+
+class TestMlaParameters(unittest.TestCase):
+    """What an MLA layer's attention holds."""
+
+    def test_the_shared_latent_is_counted_once(self):
+        """
+        Feature: EvalAttn.num_params_mla.
+        Description: DeepSeek-V3's attention; the same without a query
+            latent; and with non-rotary key heads 192 wide.
+        Expectation: The query latent's two projections and norm, the one
+            down-projection the keys and values share with the rotary key,
+            their latent's norm, their up-projection and the output
+            projection: 187107328, the count of the model Transformers
+            builds.  Without a query latent, one projection to every head;
+            a wider key widens the two up-projections.
+        """
+        self.assertEqual(EvalAttn.num_params_mla(_mla(), None), 187107328)
+        without = 187107328 - (7168 * 1536 + 1536 + 1536 * 128 * 192) + 7168 * 128 * 192
+        self.assertEqual(EvalAttn.num_params_mla(_mla(dc_q=0), None), without)
+        wider = 187107328 + 64 * 128 * (1536 + 512)
+        self.assertEqual(EvalAttn.num_params_mla(_mla(qk_nope_head_dim=192), None), wider)
+
+
 def _norms(n_qk_norm: int, norm_switch: int = 1) -> SimpleNamespace:
     """A layer with two norms, 4 query and 2 key heads 32 wide, and *n_qk_norm* QK-norms."""
     return SimpleNamespace(

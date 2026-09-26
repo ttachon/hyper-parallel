@@ -31,25 +31,27 @@ class EvalAttn:
 
     @staticmethod
     def num_params_mla(ccfg: CostModelConfig, _) -> float:
-        """Parameters count for Multi-Head Latent Attention"""
-        # W_up_q = ccfg.dc_q * ccfg.dh * ccfg.a
-        # W_up_k = ccfg.dc_kv * ccfg.dh * ccfg.n_kv
-        # W_up_v = ccfg.dc_kv * ccfg.dh * ccfg.n_kv
-        # W_down_q = ccfg.dc_q * ccfg.h
-        # W_down_kv = ccfg.dc_kv * ccfg.h
-        # W_q_rope = ccfg.a * ccfg.dhr * ccfg.dc_q
-        # W_k_rope = ccfg.dhr * ccfg.h
-        # Wo = ccfg.h * ccfg.a * ccfg.dh
+        """Parameters count for Multi-Head Latent Attention.
 
-        c_kv_fact = ccfg.dc_kv * (ccfg.n_kv * ccfg.dh + ccfg.h)
-        c_q_fact = ccfg.dc_q * (ccfg.a * ccfg.dh + ccfg.h + ccfg.a * ccfg.dhr)
-        rest_fact = (ccfg.h * ccfg.a * ccfg.dh) + (ccfg.h * ccfg.dhr)
-        res = (
-            0.5 * ccfg.n_attMM * c_kv_fact
-            + 0.25 * ccfg.n_attMM * c_q_fact
-            + 0.25 * ccfg.n_attMM * rest_fact
-        )
-        return res
+        The queries: a down-projection to their latent, its norm and an
+        up-projection to every head's non-rotary and rotary part, or one
+        projection where the model has no query latent.  The keys and
+        values: one down-projection to their shared latent beside the
+        rotary key, its norm, and an up-projection to every head's
+        non-rotary key and value.  The output projection from the values.
+        Each head's non-rotary key is ``qk_nope_head_dim`` wide, ``dh``,
+        its value head's width, unless the model states it.
+        """
+        d_qk = getattr(ccfg, "qk_nope_head_dim", None) or ccfg.dh
+        heads_q = ccfg.a * (d_qk + ccfg.dhr)
+        if ccfg.dc_q:
+            query = ccfg.h * ccfg.dc_q + ccfg.dc_q + ccfg.dc_q * heads_q
+        else:
+            query = ccfg.h * heads_q
+        key_value = (ccfg.h * (ccfg.dc_kv + ccfg.dhr) + ccfg.dc_kv
+                     + ccfg.dc_kv * ccfg.n_kv * (d_qk + ccfg.dh))
+        output = ccfg.a * ccfg.dh * ccfg.h
+        return 0.25 * ccfg.n_attMM * (query + key_value + output)
 
     @staticmethod
     def num_params_attn(ccfg: CostModelConfig, ctx: Context) -> float:

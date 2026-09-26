@@ -257,6 +257,7 @@ class CostModelParserHyperV2(_CostModelParser):
         head_dim = self._spec_int(spec, "head_dim")
         ccfg.dh = head_dim if head_dim else (ccfg.h / ccfg.a if ccfg.a else 0)
         ccfg.v_head_dim = self._spec_int(spec, "v_head_dim") or None
+        ccfg.qk_nope_head_dim = self._spec_int(spec, "qk_nope_head_dim") or None
         ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
         ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
