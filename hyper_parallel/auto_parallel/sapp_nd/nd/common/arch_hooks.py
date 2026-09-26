@@ -132,9 +132,11 @@ def custom_mixtral(ccfg):
     ccfg.n_ffParamCast = (
         ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
-    ccfg.n_softmax = 2  # num softmax
+    # The layers Transformers builds run one score softmax, the router's
+    # being the router's own, and two norms.
+    ccfg.n_softmax = 1  # num softmax
     ccfg.n_dropout = 0  # num dropout
-    ccfg.n_normOp = 5  # num normalization
+    ccfg.n_normOp = 2  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
     ccfg.bytes_grad = _grad_bytes(ccfg, 2)  # gradients
     _optimizer_bytes(ccfg, 4)
