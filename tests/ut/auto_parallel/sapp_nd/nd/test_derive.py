@@ -296,6 +296,23 @@ class TestDeriveFamily(unittest.TestCase):
             got.append(ccfg.defers_grads)
         self.assertEqual(got, [False, True])
 
+    def test_param_casts(self):
+        """
+        Feature: derive_param_casts.
+        Description: Runs whose optimizer shards and does not, stating
+            nothing, and runs that state whether their layers keep a cast of
+            their weights, as HyperParallel's states none.
+        Expectation: Stated by no one, a layer keeps the casts exactly where
+            the optimizer does not shard; what a run states wins.
+        """
+        got = []
+        for facts in ({"has_op": True}, {"has_op": False}, {"has_op": False, "param_casts": False},
+                      {"has_op": True, "param_casts": True}):
+            ccfg = _config(**facts)
+            derive(ccfg)
+            got.append(ccfg.keeps_param_casts)
+        self.assertEqual(got, [False, True, False, True])
+
     def test_overlapped_grad_reduce(self):
         """
         Feature: derive_resharding, the gradients FSDP holds whole.

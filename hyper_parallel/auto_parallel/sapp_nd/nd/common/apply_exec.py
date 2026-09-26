@@ -53,6 +53,7 @@ CONFIG_FIELDS = {
     "reshard_params": "reshard_params",
     "deferred_grad_accumulation": "deferred_grad_accumulation",
     "overlapped_grad_reduce": "overlapped_grad_reduce",
+    "param_casts": "param_casts",
     "pp_schedule": "pp_sched",
     "offset": "offset",
     "seq_split": "n_s_split",

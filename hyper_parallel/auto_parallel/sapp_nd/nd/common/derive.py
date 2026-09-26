@@ -166,6 +166,16 @@ def derive_optimizer_sharding(ccfg: Any) -> None:
     ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial = grads
 
 
+def derive_param_casts(ccfg: Any) -> None:
+    """Set whether a layer keeps the weight casts the formulas price beside its matmuls, ``keeps_param_casts``.
+
+    The run states it as ``param_casts``; unstated, a layer keeps them where
+    the optimizer does not shard, the formulas' convention.
+    """
+    stated = getattr(ccfg, "param_casts", None)
+    ccfg.keeps_param_casts = (not ccfg.has_op) if stated is None else bool(stated)
+
+
 def derive_comm_flags(ccfg: Any) -> None:
     """Set the communication factors and the transitional overlaps."""
     ccfg.comm_d_non_exp = (
@@ -457,6 +467,7 @@ def derive(ccfg: Any, strict: bool = True) -> None:
     derive_sequence_parallel(ccfg)
     derive_expert_degrees(ccfg, strict)
     derive_optimizer_sharding(ccfg)
+    derive_param_casts(ccfg)
     derive_comm_flags(ccfg)
     derive_embedding_sharding(ccfg)
     derive_recompute_ranges(ccfg)

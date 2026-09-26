@@ -444,6 +444,20 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertFalse(ccfg2.has_op)
         self.assertEqual(ccfg2.os_max_shard, ccfg2.d)
 
+    def test_layers_keep_no_weight_cast(self):
+        """
+        Feature: the run facts of HyperParallel's FSDP.
+        Description: A run whose optimizer does not shard.
+        Expectation: Its layers keep no cast of their weights, which its
+            FSDP gathers in the compute dtype: no cast is counted beside the
+            matmuls, as at any dp_shard.
+        """
+        cfg = _dense_overrides(train={"accelerator": {"enable_parallel_optimizer": False}})
+        ccfg = _make_ccfg(cfg)
+        check_and_apply_custom_hook(CWrap(ccfg))
+        self.assertFalse(ccfg.has_op)
+        self.assertEqual((ccfg.keeps_param_casts, ccfg.n_attParamCast, ccfg.n_ffParamCast), (False, 0, 0))
+
     def test_parallelism_grad_accum_shard(self):
         """
         Feature: _parse_parallelism — gradient accumulation shard.

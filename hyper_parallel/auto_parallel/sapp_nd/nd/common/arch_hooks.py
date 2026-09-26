@@ -97,9 +97,14 @@ def apply_op_counts(ccfg: Any, counts: OpCounts) -> None:
     """Set one layer kind's op counts on *ccfg*, each as ``n_<op>``."""
     for name, count in counts.to_dict().items():
         setattr(ccfg, "n_" + name, count)
-    # Parameters are cast when the optimizer does not shard them.
-    ccfg.n_attParamCast = ccfg.n_attMM if not ccfg.has_op else 0
-    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
+    # A layer keeps a cast beside each matmul where the run says it does,
+    # derive's keeps_param_casts; a config derive has not seen, where the
+    # optimizer does not shard.
+    casts = getattr(ccfg, "keeps_param_casts", None)
+    if casts is None:
+        casts = not ccfg.has_op
+    ccfg.n_attParamCast = ccfg.n_attMM if casts else 0
+    ccfg.n_ffParamCast = ccfg.n_ffMM if casts else 0
 
 
 # The fields an attention flavour assigns.  Every kind of a stack whose kinds

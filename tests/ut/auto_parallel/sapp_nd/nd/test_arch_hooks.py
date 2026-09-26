@@ -151,6 +151,24 @@ def _legacy_state(arch: str, kind: str, has_op: bool, p: int) -> dict:
     return state
 
 
+class TestParamCasts(unittest.TestCase):
+    """A layer keeps a cast beside each matmul as its run says, else where the optimizer does not shard."""
+
+    def test_the_run_decides(self):
+        """
+        Feature: the cast counts applying a family sets.
+        Description: A config whose optimizer does not shard, derive not
+            run; then derive saying its layers keep no cast; then keep them.
+        Expectation: Unsaid, a cast per matmul; said, as said.
+        """
+        got = []
+        for casts in (None, False, True):
+            cfg = _bare("default", has_op=False, keeps_param_casts=casts)
+            check_and_apply_custom_hook(CWrap(cfg))
+            got.append((cfg.n_attParamCast, cfg.n_ffParamCast))
+        self.assertEqual(got, [(4, 3), (0, 0), (4, 3)])
+
+
 class TestDispatchReadsTheArch(unittest.TestCase):
     """The family is chosen by the declared arch, never by the model name."""
 

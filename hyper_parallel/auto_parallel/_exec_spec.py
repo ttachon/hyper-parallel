@@ -200,6 +200,11 @@ class ExecSpec:
             once the layer has run, forward or backward, and gathers them
             again when it runs next, as HyperParallel's does by default;
             the root's, the embedding and output tables, stay gathered.
+        param_casts: Whether a layer keeps, beside each matmul's input, the
+            cast the formulas price where the optimizer does not shard
+            (``n_attParamCast``, ``n_ffParamCast``); unstated, it does
+            exactly there.  HyperParallel's FSDP gathers its weights in the
+            compute dtype, and its layers keep none at any ``dp_shard``.
         pp_schedule: The pipeline schedule, such as ``1f1b``.
         offset: How many layers each pipeline stage holds beyond an even
             split, per stage or per chunk and stage.
@@ -268,6 +273,7 @@ class ExecSpec:
     deferred_grad_accumulation: Optional[bool] = None
     overlapped_grad_reduce: Optional[bool] = None
     reshard_params: Optional[bool] = None
+    param_casts: Optional[bool] = None
 
     pp_schedule: Optional[str] = None
     offset: Optional[Union[int, list]] = None
@@ -375,7 +381,7 @@ _KINDS: Dict[str, tuple] = {
              "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
     "flag": ("sequence_parallel", "shard_activations", "loss_parallel", "optimizer_parallel", "grad_shard",
              "grad_shard_as_params", "grad_accumulation", "deferred_grad_accumulation",
-             "overlapped_grad_reduce", "reshard_params",
+             "overlapped_grad_reduce", "reshard_params", "param_casts",
              "mtp_in_offset",
              "emb_out_in_offset",
              "recompute_slice_activation", "flash_attention", "grad_clip", "grouped_gemm",

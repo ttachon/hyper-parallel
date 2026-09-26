@@ -273,6 +273,10 @@ class _CostModVar:
     # None taking its family's; and as derive gives it.
     overlapped_grad_reduce: bool = None
     overlaps_grad_reduce: bool = False
+    # Whether a layer keeps the weight casts the formulas price, as stated,
+    # None where the optimizer does not shard; and as derive gives it.
+    param_casts: bool = None
+    keeps_param_casts: bool = None
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the optimizer keeps per parameter: a layer's, and the embedding

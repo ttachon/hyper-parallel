@@ -644,6 +644,9 @@ class CostModelParserHyperV2(_CostModelParser):
             # backward runs, and the root's in its backward hook.
             "overlapped_grad_reduce": True,
             "reshard_params": self._reshards_params(),
+            # It gathers the weights in the compute dtype, and a layer keeps
+            # no cast of them, whatever dp_shard.
+            "param_casts": False,
         }
 
     def _reshards_params(self) -> bool:
