@@ -235,5 +235,35 @@ class TestQkNorm(unittest.TestCase):
                          [False, True])
 
 
+class TestVectors(unittest.TestCase):
+    """The biases and norms a Transformers model's layers hold are settled with its spec."""
+
+    _MODEL = {"hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000}
+    _FACTS = ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "layer_norms", "shared_expert_gate")
+
+    def _facts(self, model_type: str, **stated: Any) -> Any:
+        """The vector facts the spec of a *model_type* config stating *stated* settles on."""
+        with _stub_registry(_Recorder(SimpleNamespace(model_type=model_type, **self._MODEL, **stated))):
+            spec = resolve_hf_model_spec({"pretrained_model_name_or_path": "local/model"})
+        return tuple(spec[name] for name in self._FACTS)
+
+    def test_each_family_holds_its_own(self):
+        """
+        Feature: the vector facts of a Transformers config.
+        Description: A Llama config stating attention_bias and mlp_bias, a
+            Qwen2 one stating neither, a Qwen2-MoE and a Qwen3.5-MoE one,
+            and a Mixtral one.
+        Expectation: Llama biases all four projections and its
+            feed-forward; Qwen2's generation its query, key and value
+            projections; Qwen's MoE generations gate their shared expert;
+            each layer holds two RMSNorms, and nothing else is biased.
+        """
+        self.assertEqual(self._facts("llama", attention_bias=True, mlp_bias=True), (True, True, True, False, 2, False))
+        self.assertEqual(self._facts("qwen2"), (True, False, False, False, 2, False))
+        self.assertEqual(self._facts("qwen2_moe")[0::5], (True, True))
+        self.assertEqual(self._facts("qwen3_5_moe")[0::5], (False, True))
+        self.assertEqual(self._facts("mixtral"), (False, False, False, False, 2, False))
+
+
 if __name__ == "__main__":
     unittest.main()

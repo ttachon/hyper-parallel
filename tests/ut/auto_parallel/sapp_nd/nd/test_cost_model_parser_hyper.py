@@ -1739,8 +1739,9 @@ class TestHybridLayerStack(unittest.TestCase):
         evaluator.estimate_peak()
 
         full = ("full", 8, 128, 2, 1, 0, 0, 1)
-        # Conv over q, k and v, plus two gates per value head.
-        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16, 0)
+        # Conv over q, k and v, two gates per value head, each head's decay
+        # and time-step bias, and the output norm's weight.
+        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16 + 2 * 16 + 64, 0)
         self.assertEqual([seen[lay_id] for lay_id in sorted(seen)],
                          [linear, linear, full, linear, full])
 

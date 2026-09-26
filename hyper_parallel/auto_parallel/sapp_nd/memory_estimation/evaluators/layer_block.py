@@ -26,6 +26,33 @@ if TYPE_CHECKING:
 mb = EvalUtils.mb
 
 
+def _bias(ccfg: CostModelConfig, stated: str, width: float) -> float:
+    """A projection's bias: *width* where the model states one, none where it states none.
+
+    Where the model states neither, as a parser that reads no bias does,
+    each projection is counted a bias of the hidden width, the formulas'
+    convention.
+    """
+    has_bias = getattr(ccfg, stated, None)
+    if has_bias is None:
+        return ccfg.h
+    return width if has_bias else 0
+
+
+def _mlp_biases(ccfg: CostModelConfig, width: float) -> float:
+    """The biases of one feed-forward of *width*, or one expert's, as :func:`_bias` counts a projection's.
+
+    Stated, each projection into the width has one of it and the last,
+    back to the hidden width, one of that; unstated, each projection one of
+    the width.
+    """
+    n_mm = max(ccfg.n_ffMM, ccfg.n_ffBMM)
+    has_bias = getattr(ccfg, "mlp_bias", None)
+    if has_bias is None:
+        return n_mm * width
+    return (n_mm - 1) * width + ccfg.h if has_bias else 0
+
+
 class EvalAttn:
     """Attention formulas class"""
 
@@ -64,11 +91,11 @@ class EvalAttn:
             d_q = ccfg.a * d_h
             q_fact = 2 if ccfg.attn_output_gate else 1
             return 0.25 * ccfg.n_attMM * (
-                q_fact * ccfg.h * d_q + ccfg.h
+                q_fact * ccfg.h * d_q + _bias(ccfg, "qkv_bias", q_fact * d_q)
             ) + 0.25 * ccfg.n_attMM * (
-                ccfg.h * d_q + ccfg.h
+                ccfg.h * d_q + _bias(ccfg, "o_bias", ccfg.h)
             ) + 0.5 * ccfg.n_attMM * (
-                ccfg.h * ccfg.n_kv * d_h + ccfg.h
+                ccfg.h * ccfg.n_kv * d_h + _bias(ccfg, "qkv_bias", ccfg.n_kv * d_h)
             ) + ccfg.attn_extra_p
         return EvalAttn.num_params_mla(ccfg, ctx)
 
@@ -203,18 +230,14 @@ class EvalFFn:
     @staticmethod
     def num_params_ffn(ccfg: CostModelConfig, _) -> float:
         """Parameters count"""
-        experts_param_size = (
-            (ccfg.n_exp + ccfg.n_shared_exp)
-            * max(ccfg.n_ffMM, ccfg.n_ffBMM)
-            * (ccfg.hff * ccfg.h + ccfg.hff)
-        )
-        return experts_param_size
+        return (ccfg.n_exp + ccfg.n_shared_exp) * (
+            max(ccfg.n_ffMM, ccfg.n_ffBMM) * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff))
 
     @staticmethod
     def num_params_routed_expert(ccfg: CostModelConfig, _) -> float:
         """Routed expert parameters count (with ETP correction)"""
         hff_sliced = ccfg.hff_exp / max(ccfg.etp, 1)
-        return ccfg.n_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (hff_sliced * ccfg.h + hff_sliced)
+        return ccfg.n_exp * (max(ccfg.n_ffMM, ccfg.n_ffBMM) * hff_sliced * ccfg.h + _mlp_biases(ccfg, hff_sliced))
 
     @staticmethod
     def num_params_router(ccfg: CostModelConfig, _) -> float:
@@ -223,8 +246,10 @@ class EvalFFn:
 
     @staticmethod
     def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
-        """Shared expert parameters count"""
-        return ccfg.n_shared_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (ccfg.hff * ccfg.h + ccfg.hff)
+        """Shared expert parameters count, and the weight that gates its output where the model has one"""
+        gate = ccfg.h if ccfg.n_shared_exp and getattr(ccfg, "shared_expert_gate", None) else 0
+        n_mm = max(ccfg.n_ffMM, ccfg.n_ffBMM)
+        return ccfg.n_shared_exp * (n_mm * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff)) + gate
 
     @staticmethod
     def ffn_activations(ccfg: CostModelConfig, ctx: Context) -> float:
@@ -296,8 +321,18 @@ class EvalNorm:
 
     @staticmethod
     def num_params_norm(ccfg: CostModelConfig, _) -> float:
-        """Parameters count: the layer's norms, and a QK-norm's query and key weights"""
-        return ccfg.n_normOp * 2 * ccfg.h + getattr(ccfg, "n_qknorm", 0) * 2 * EvalNorm.head_dim(ccfg)
+        """Parameters count: the layer's norms, and a QK-norm's query and key weights.
+
+        A model that states its norms holds a weight in each, and a bias
+        beside it in a LayerNorm; one that does not is counted two vectors
+        per norm op.
+        """
+        layer_norms = getattr(ccfg, "layer_norms", None)
+        if layer_norms is None:
+            vectors = ccfg.n_normOp * 2
+        else:
+            vectors = layer_norms * (2 if getattr(ccfg, "norm_bias", None) else 1)
+        return vectors * ccfg.h + getattr(ccfg, "n_qknorm", 0) * 2 * EvalNorm.head_dim(ccfg)
 
     @staticmethod
     def norm_activations(ccfg: CostModelConfig, ctx: Context) -> float:

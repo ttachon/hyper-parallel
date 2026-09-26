@@ -69,6 +69,11 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "v_head_dim": ("v_head_dim",),
     "attn_output_gate": ("attn_output_gate",),
     "tie_word_embeddings": ("tie_word_embeddings",),
+    # Llama's attention_bias biases all four projections; Qwen2's configs
+    # state none and bias the query, key and value projections alone.
+    "qkv_bias": ("qkv_bias", "attention_bias"),
+    "o_bias": ("o_bias", "attention_bias"),
+    "mlp_bias": ("mlp_bias",),
     # Stated by a few families; Qwen3's config does not state its own.
     "qk_norm": ("qk_norm", "use_qk_norm", "qk_layernorm"),
     # A hybrid stack states its layers; without this every layer is costed
@@ -114,10 +119,50 @@ def infer_qk_norm(name: Any) -> bool:
     return any(pattern in lowered for pattern in _QK_NORM_NAMES)
 
 
-def _settle_qk_norm(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Settle whether the language model normalizes queries and keys, from its name if nothing states it."""
+# What a lower-cased model name contains when its attention projects queries,
+# keys and values with a bias and its output without, which its Transformers
+# config does not state: the Qwen2 generation.
+_QKV_BIAS_NAMES = ("qwen2",)
+
+# What a lower-cased model name contains when its MoE layer gates its shared
+# expert's output with a weight of its own: Qwen2-MoE, Qwen3.5 and Qwen3-Next.
+_SHARED_EXPERT_GATE_NAMES = ("qwen2_moe", "qwen3_5", "qwen3_next")
+
+
+def infer_qkv_bias(name: Any) -> bool:
+    """Return whether a model named *name* biases its query, key and value projections.
+
+    For a Transformers config that states no ``attention_bias``, as the
+    Qwen2 generation's, whose projections have one.
+    """
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _QKV_BIAS_NAMES)
+
+
+def infer_shared_expert_gate(name: Any) -> bool:
+    """Return whether a model named *name* gates its shared expert's output with a weight of its own."""
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _SHARED_EXPERT_GATE_NAMES)
+
+
+def _settle_facts(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Settle what the language model's config does not state, from its name where nothing states it.
+
+    Whether its attention normalizes queries and keys, and the biases and
+    norms its layers hold: a Transformers decoder layer holds two RMSNorms,
+    no bias unless its config states one or its family has one, and a
+    shared expert gated where its family gates it.
+    """
+    name = spec.get("name")
     if spec.get("qk_norm") is None:
-        spec["qk_norm"] = infer_qk_norm(spec.get("name"))
+        spec["qk_norm"] = infer_qk_norm(name)
+    if spec.get("qkv_bias") is None:
+        spec["qkv_bias"] = infer_qkv_bias(name)
+    for fact in ("o_bias", "mlp_bias", "norm_bias"):
+        spec[fact] = bool(spec.get(fact))
+    spec["layer_norms"] = spec.get("layer_norms") or 2
+    if spec.get("shared_expert_gate") is None:
+        spec["shared_expert_gate"] = infer_shared_expert_gate(name)
     return spec
 
 
@@ -374,7 +419,7 @@ def resolve_hf_model_spec(
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
             _no_census(census_seq_len, explicit)
-            return _settle_qk_norm(explicit)
+            return _settle_facts(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path "
             "or model.config_overrides for Auto Parallel search"
@@ -390,7 +435,7 @@ def resolve_hf_model_spec(
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
             _no_census(census_seq_len, explicit)
-            return _settle_qk_norm(explicit)
+            return _settle_facts(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "
@@ -410,7 +455,7 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    spec = _settle_qk_norm(spec)
+    spec = _settle_facts(spec)
     if census_seq_len:
         layers = _census_layers(spec)
         if layers is None:

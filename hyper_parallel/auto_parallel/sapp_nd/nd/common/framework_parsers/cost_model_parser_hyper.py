@@ -339,6 +339,11 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
         # Qwen3 normalizes each head's queries and keys.
         self.state_qk_norm(ccfg, spec.get("qk_norm", False))
+        # The biases and norms the spec states; unstated, the parameter
+        # formulas count their own.
+        for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "shared_expert_gate"):
+            setattr(ccfg, name, None if spec.get(name) is None else bool(spec[name]))
+        ccfg.layer_norms = self._spec_int(spec, "layer_norms") or None
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""
@@ -460,10 +465,12 @@ class CostModelParserHyperV2(_CostModelParser):
             lccfg.n_linrec = 1
             # The kernel normalizes its queries and keys itself, with no weights.
             lccfg.n_qknorm = 0
-            # Short convolution over the projected stream, plus the two
-            # per-head gates the delta rule needs.
+            # Short convolution over the projected stream, the two per-head
+            # gates' projections the delta rule needs, each head's decay and
+            # time-step bias and the gated output norm's weight.
             qkv_width = 2 * linear["n_k"] * linear["d_k"] + linear["n_v"] * linear["d_v"]
-            lccfg.attn_extra_p = linear["conv"] * qkv_width + 2 * lccfg.h * linear["n_v"]
+            lccfg.attn_extra_p = (linear["conv"] * qkv_width + 2 * lccfg.h * linear["n_v"]
+                                  + 2 * linear["n_v"] + linear["d_v"])
 
         def hook(e: Any) -> None:
             """Apply the flavour through an evaluator or a bare config."""
