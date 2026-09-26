@@ -31,6 +31,14 @@ policy saves: every other matmul's, the attention kernel's and the
 convolution's; the matmuls it does not save its backward runs again, a share
 of the attention's projections and of the rest of the layer.
 
+What a layer saves is also told apart by the op of ND's op vector whose
+backward takes it (:class:`_SavedOps`), the records of shared decision S1 as
+the census fills them: the delta rule's, the attention kernel's (its
+inputs and output for the batched matmuls, its fp32 statistics for the
+softmax), a dropout's mask, what a norm saves, what the feed-forward's
+activation function saves, and the rest by the part of the layer saving it,
+the attention's projections or the feed-forward's.
+
 The output layer's census runs the final norm, the output projection and
 Transformers' causal-LM loss, which casts the logits to fp32, as
 HyperParallel's trainer runs them by default, dropping the model's logits
@@ -64,14 +72,18 @@ from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forb
 from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
 from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.auto_parallel._op_records import OPS
 from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
 
 # The fields a census record states in pairs: what a layer keeps under
-# HyperParallel's selective activation checkpointing, and the shares of its
-# matmul FLOPs that recomputes.
-_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"))
+# HyperParallel's selective activation checkpointing, the shares of its
+# matmul FLOPs that recomputes, and what it keeps for each op.
+_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"), ("ops", "ops_tp"))
+
+# The census record's fields that map ops to bytes per token.
+_BY_OP = ("ops", "ops_tp")
 
 
 @dataclass(frozen=True)
@@ -88,7 +100,11 @@ class KindActivations:
     recomputes the rest and holds the same working set, and
     ``selective_attention_mm`` and ``selective_ffn_mm`` the shares of the
     FLOPs of its attention's projections and of the rest of its matmuls
-    that recomputes; a record states each pair whole or not at all.
+    that recomputes.  ``ops`` and ``ops_tp`` are what it keeps for each op
+    of :data:`~hyper_parallel.auto_parallel._op_records.OPS`, the two parts
+    of ``saved`` and ``saved_tp``, and ``other`` for its own code: the op
+    records of shared decision S1, as the census fills them.  A record
+    states each pair whole or not at all.
     """
 
     saved: float
@@ -100,11 +116,17 @@ class KindActivations:
     selective_tp: Optional[float] = None
     selective_attention_mm: Optional[float] = None
     selective_ffn_mm: Optional[float] = None
+    ops: Optional[Mapping[str, float]] = None
+    ops_tp: Optional[Mapping[str, float]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return the record as a plain mapping, the selective part only when stated."""
-        return {record_field.name: getattr(self, record_field.name) for record_field in fields(self)
-                if getattr(self, record_field.name) is not None}
+        """Return the record as a plain mapping, the selective part and the ops only when stated."""
+        out = {record_field.name: getattr(self, record_field.name) for record_field in fields(self)
+               if getattr(self, record_field.name) is not None}
+        for name in _BY_OP:
+            if name in out:
+                out[name] = dict(out[name])
+        return out
 
     @staticmethod
     def _check_keys(data: Mapping[str, Any], names: Sequence[str], where: str) -> None:
@@ -124,7 +146,8 @@ class KindActivations:
             raise ValueError(f"{where} must map the record's fields to their values, got {data!r}")
         names = [record_field.name for record_field in fields(cls)]
         cls._check_keys(data, names, where)
-        sizes = {name: float(data[name]) for name in names if name != "seq_length" and data.get(name) is not None}
+        sizes = {name: float(data[name]) for name in names
+                 if name != "seq_length" and name not in _BY_OP and data.get(name) is not None}
         if any(size < 0 for size in sizes.values()):
             raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
         if any(sizes.get(name, 0) > 1 for name in _PAIRED[1]):
@@ -132,7 +155,19 @@ class KindActivations:
         seq_length = int(data["seq_length"])
         if seq_length <= 0:
             raise ValueError(f"{where}.seq_length must be positive, got {seq_length}")
-        return cls(seq_length=seq_length, **sizes)
+        by_op = {name: _op_bytes(data[name], f"{where}.{name}") for name in _BY_OP if data.get(name) is not None}
+        return cls(seq_length=seq_length, **sizes, **by_op)
+
+
+def _op_bytes(data: Any, where: str) -> Dict[str, float]:
+    """Parse ``{op: bytes per token}``, the ops of :data:`OPS` and ``other``, refusing a negative size."""
+    known = [*OPS, "other"]
+    if not isinstance(data, Mapping) or any(op not in known for op in data):
+        raise ValueError(f"{where} must map ops of {known} to bytes per token, got {data!r}")
+    sizes = {str(op): float(size) for op, size in data.items()}
+    if any(size < 0 for size in sizes.values()):
+        raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
+    return sizes
 
 
 def activations_from_dict(data: Any) -> Dict[str, KindActivations]:
@@ -306,7 +341,7 @@ class _LiveBytes(TorchDispatchMode):
 def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
              forward: Callable[[], torch.Tensor], backward: Callable[[torch.Tensor], None],
              grad_inputs: Iterable[torch.Tensor] = (), checkpointed: bool = False,
-             shared: Iterable[torch.Tensor] = ()) -> Tuple[int, int]:
+             shared: Iterable[torch.Tensor] = (), ops: Optional["_SavedOps"] = None) -> Tuple[int, int]:
     """Bytes a forward saves for its backward, and the activations the backward holds when it holds the most.
 
     Args:
@@ -320,6 +355,8 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
             checkpointing, whose own hooks hold what it keeps.
         shared: Tensors the model shares between its layers, which a
             checkpointed forward's count leaves out.
+        ops: Where given, tells each storage the forward saves apart by
+            the op saving it, counting its bytes into ``ops.saved``.
 
     Returns:
         The bytes the forward saves, its inputs included, and the bytes of
@@ -338,9 +375,13 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
     saved: Dict[int, int] = {}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
-        """Count a tensor autograd saves, unless it is a parameter's."""
+        """Count a tensor autograd saves, unless it is a parameter's, toward the op that first saves it."""
+        # Named before the storage is read, which dispatches ops of its own.
+        op = ops.op(tensor) if ops is not None else None
         address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
         if address not in stored:
+            if op is not None and address not in saved:
+                ops.saved[op] = ops.saved.get(op, 0) + tensor.untyped_storage().nbytes()
             saved[address] = tensor.untyped_storage().nbytes()
         return tensor
 
@@ -348,7 +389,8 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
     grads: List[Tuple[int, int]] = []
     handles = [p.register_hook(lambda grad: grads.append(live.key(grad))) for p in params]
     try:
-        with live, torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        with live, ops or contextlib.nullcontext(), \
+                torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
             for tensor in inputs:
                 live.track(tensor)
             out = forward()
@@ -364,6 +406,82 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
             handle.remove()
     grads += [live.key(p.grad) for p in params if p.grad is not None]
     return kept if checkpointed else sum(saved.values()), live.peak(start, left_out, grads)
+
+
+# The ops a matmul runs as.
+_MATMULS = ("mm", "addmm", "bmm", "_grouped_mm", "baddbmm")
+
+
+class _SavedOps(TorchDispatchMode):
+    """What each tensor a layer's forward saves is saved for: the op of ND's op vector whose backward takes it.
+
+    The delta rule's saves are its own (``linrec``); the attention kernel's
+    are its batched matmuls' (``attBMM``), its fp32 statistics the
+    softmax's; a dropout's mask is its own; what a norm saves, the norm's
+    (``normOp``), and what the feed-forward's activation function saves,
+    the function's (``ffAct``).  The rest counts toward the part of the
+    layer saving it: the attention's projections (``attMM``), the
+    feed-forward's (``ffMM``), or ``other`` for the layer's own code.
+    """
+
+    def __init__(self, layer: Any) -> None:
+        """Follow which of *layer*'s modules runs, and when its delta rule does."""
+        super().__init__()
+        self.saved: Dict[str, int] = {}
+        self.running: List[str] = []
+        self.func: Any = None
+        self.delta_rule = False
+        self.modules = dict(layer.named_modules())
+        for name, module in self.modules.items():
+            if name:
+                module.register_forward_pre_hook(functools.partial(self._enter, name))
+                module.register_forward_hook(self._leave)
+            if hasattr(module, "chunk_gated_delta_rule"):
+                module.chunk_gated_delta_rule = self._rule(module.chunk_gated_delta_rule)
+
+    def _rule(self, rule: Callable[..., Any]) -> Callable[..., Any]:
+        """*rule*, noting that it runs."""
+        def run(*args: Any, **kwargs: Any) -> Any:
+            self.delta_rule = True
+            try:
+                return rule(*args, **kwargs)
+            finally:
+                self.delta_rule = False
+        return run
+
+    def _enter(self, name: str, *_: Any) -> None:
+        """Note that the module at *name* runs."""
+        self.running.append(name)
+
+    def _leave(self, *_: Any) -> None:
+        """Note that the innermost module running has returned."""
+        self.running.pop()
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        # A tensor's metadata is read through prims, between an op and its saves.
+        if func.namespace != "prim":
+            self.func = func
+        return func(*args, **(kwargs or {}))
+
+    def op(self, tensor: torch.Tensor) -> str:
+        """The op that saves *tensor*, which the forward saves now."""
+        if self.delta_rule:
+            return "linrec"
+        if self.func is torch.ops.nd_census.flash_attention.default:
+            return "softmax" if tensor.dtype == torch.float32 else "attBMM"
+        if self.func is torch.ops.aten.native_dropout.default:
+            return "dropout"
+        name = self.running[-1] if self.running else ""
+        module = self.modules.get(name)
+        if name and "norm" in type(module).__name__.lower():
+            return "normOp"
+        part = name.split(".", maxsplit=1)[0]
+        if not part:
+            return "other"
+        attention = "attn" in part or "attention" in part
+        if not attention and type(module).__module__ in ("transformers.activations", "torch.nn.modules.activation"):
+            return "ffAct"
+        return "attMM" if attention else "ffMM"
 
 
 def _matmul_flops(func: Any, args: Sequence[Any]) -> int:
@@ -580,7 +698,8 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
     return counter.flops
 
 
-def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False) -> Tuple[int, int]:
+def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False,
+                 ops: Optional[Dict[str, int]] = None) -> Tuple[int, int]:
     """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
 
     Args:
@@ -589,6 +708,8 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         seq_length: Tokens of the micro-batch of one sequence it runs.
         selective: Whether the layer runs under HyperParallel's selective
             activation checkpointing, as its trainer wraps a layer.
+        ops: Where given, and the layer runs without checkpointing, takes
+            the bytes it saves by the op saving them (:class:`_SavedOps`).
 
     Returns:
         The bytes the forward keeps for the backward, its input included,
@@ -600,9 +721,13 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         if not selective:
-            return _measure(list(layer.parameters()), (hidden,),
-                            lambda: _run(layer, hidden, _positions(rotary, hidden, seq_length)),
-                            lambda out: out.backward(grad), grad_inputs=(grad,))
+            saved_ops = None if ops is None else _SavedOps(layer)
+            measured = _measure(list(layer.parameters()), (hidden,),
+                                lambda: _run(layer, hidden, _positions(rotary, hidden, seq_length)),
+                                lambda out: out.backward(grad), grad_inputs=(grad,), ops=saved_ops)
+            if saved_ops is not None:
+                ops.update(saved_ops.saved)
+            return measured
         # The model embeds the positions once for all its layers, outside
         # their checkpoints, and the trainer checkpoints each layer's call.
         positions = _positions(rotary, hidden, seq_length)
@@ -611,6 +736,23 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         return _measure(list(layer.parameters()), (hidden,), lambda: _run(layer, hidden, positions, call),
                         lambda out: out.backward(grad), grad_inputs=(grad,), checkpointed=True,
                         shared=tree_flatten(positions)[0])
+
+
+def census_saved_ops(config: Any, layer_index: int, seq_length: int) -> Dict[str, float]:
+    """What layer *layer_index* of *config* keeps for its backward for each op, per token, the whole layer.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+
+    Returns:
+        ``{op: bytes per token}``, by the op saving them
+        (:class:`_SavedOps`), which sum to what the layer keeps.
+    """
+    ops: Dict[str, int] = {}
+    census_layer(config, layer_index, seq_length, ops=ops)
+    return {op: size / seq_length for op, size in ops.items()}
 
 
 def census_recomputed(config: Any, layer_index: int, seq_length: int) -> Tuple[float, float]:
@@ -753,8 +895,9 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
         holds, the part TP splits is half the part at TP 1; what it keeps
-        under HyperParallel's selective activation checkpointing too, and
-        the shares of its matmul FLOPs that recomputes.
+        under HyperParallel's selective activation checkpointing too, the
+        shares of its matmul FLOPs that recomputes, and what it keeps for
+        each op, its records per op.
     """
     firsts: Dict[str, int] = {}
     index = 0
@@ -765,8 +908,11 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
         index += int(group["count"])
     out: Dict[str, KindActivations] = {}
     for kind, layer_index in firsts.items():
+        ops_1: Dict[str, int] = {}
+        ops_2: Dict[str, int] = {}
         (saved_1, working_1), (saved_2, working_2) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length) for tp in (1, 2))
+            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops)
+            for tp, ops in ((1, ops_1), (2, ops_2)))
         (kept_1, _), (kept_2, _) = (
             census_layer(tp_config(config, tp), layer_index, seq_length, selective=True) for tp in (1, 2))
         attention_mm, ffn_mm = census_recomputed(config, layer_index, seq_length)
@@ -780,5 +926,7 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
             selective_tp=max(0.0, 2 * (kept_1 - kept_2)) / seq_length,
             selective_attention_mm=attention_mm,
             selective_ffn_mm=ffn_mm,
+            ops={op: max(0.0, 2 * ops_2.get(op, 0) - ops_1[op]) / seq_length for op in sorted(ops_1)},
+            ops_tp={op: max(0.0, 2 * (ops_1[op] - ops_2.get(op, 0))) / seq_length for op in sorted(ops_1)},
         )
     return out

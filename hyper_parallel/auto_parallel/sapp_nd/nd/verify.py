@@ -29,20 +29,35 @@ beside what the time model's op table prices of the same forward: a third
 of each matmul entry, which prices the backward as twice the forward.  The
 table's feed-forward entry covers the whole feed-forward, its experts,
 shared expert and router included.
+
+Last, it sets what each kind keeps for its backward for each op, per
+token of the whole layer, as the op records price it (shared decision S1,
+:class:`~hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block.EvalRecords`)
+beside what the census measures each op saving
+(:func:`~hyper_parallel.auto_parallel._layer_census.census_saved_ops`).
 """
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 from typing import Any, Dict, List, NamedTuple, Tuple
 
 import yaml
 
 from hyper_parallel.auto_parallel._hf_model_spec import checkpoint_configs, is_auto_models_schema
-from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_flops, census_parameters
+from hyper_parallel.auto_parallel._layer_census import (
+    census_final_norm,
+    census_flops,
+    census_parameters,
+    census_saved_ops,
+)
+from hyper_parallel.auto_parallel._op_records import load_op_records
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalRecords
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import prepare_context
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import BACKWARD_RATIO, _flavour_tables
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_custom_configs
@@ -103,6 +118,18 @@ def nd_flops(ccfg: Any, lccfg: Any) -> Dict[str, float]:
     table = experts if lccfg.n_exp > 1 else base
     scale = ccfg.b * (1 + BACKWARD_RATIO) * ccfg.bytes_p / ccfg.t / ccfg.cp
     return {part: getattr(lccfg, op) * table[op] / scale for op, part in _FLOP_PARTS if op in table}
+
+
+def nd_saved_ops(lccfg: Any) -> Dict[str, float]:
+    """What the op records price a layer of *lccfg* keeping for each op, per token of the whole layer.
+
+    The records' slots evaluated on a copy of the layer's config at TP, CP
+    and sequence parallelism 1 and micro-batch 1, divided by its tokens.
+    """
+    whole = copy.copy(lccfg)
+    whole.t = whole.cp = whole.sp = whole.b = 1
+    ctx = SimpleNamespace(current_node=LayerType.NOT_REC_LAYER, micro_factor=1, dropless_tok_factor=1)
+    return {op: sum(EvalRecords.op_bytes(whole, ctx, op).values()) / whole.s for op in load_op_records().ops}
 
 
 def _text_model(ccfg: Any) -> Any:
@@ -172,6 +199,33 @@ def verify_parameters(yaml_path: str) -> List[VerifyRow]:
                           table + census_final_norm(text)))
     rows.append(VerifyRow("model", "total", sum(row.count * row.nd for row in rows),
                           sum(row.count * row.census for row in rows)))
+    return rows
+
+
+def verify_activations(yaml_path: str) -> List[VerifyRow]:
+    """What each kind of the model a train.yaml trains keeps for each op, the records' beside the census's.
+
+    Args:
+        yaml_path: An AutoModels train.yaml, whose model names a Transformers
+            checkpoint.
+
+    Returns:
+        A row per op either prices or measures of the first layer of each
+        kind of its language model, in bytes per token of the whole layer
+        at the run's length (:func:`nd_saved_ops`,
+        :func:`~hyper_parallel.auto_parallel._layer_census.census_saved_ops`),
+        the census's ``other`` its own code's, then the kind's whole.
+
+    Raises:
+        ValueError: The train.yaml names no Transformers checkpoint.
+    """
+    _, text, ccfg = _priced(yaml_path)
+    rows = []
+    for name, (index, count, lccfg) in _kinds(ccfg).items():
+        nd, census = nd_saved_ops(lccfg), census_saved_ops(text, index, int(ccfg.s))
+        rows += [VerifyRow(f"{name} x{count}", op, nd.get(op, 0.0), census.get(op, 0.0), count)
+                 for op in [*nd, "other"] if nd.get(op) or census.get(op)]
+        rows.append(VerifyRow(f"{name} x{count}", "total", sum(nd.values()), sum(census.values()), count))
     return rows
 
 

@@ -26,7 +26,12 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
-from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_flops, verify_parameters
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    report,
+    verify_activations,
+    verify_flops,
+    verify_parameters,
+)
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -424,6 +429,9 @@ if __name__ == "__main__":
             logger.output(line)
         logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
         for line in report(verify_flops(args.yaml_config)):
+            logger.output(line)
+        logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
+        for line in report(verify_activations(args.yaml_config)):
             logger.output(line)
         sys.exit(0)
 
