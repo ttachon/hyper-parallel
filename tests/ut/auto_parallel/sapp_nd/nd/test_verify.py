@@ -284,23 +284,27 @@ class TestVerifySpec(unittest.TestCase):
 
     def test_a_field_that_differs_is_marked_and_priced(self):
         """
-        Feature: verify_spec and verify_estimate of a Mixtral.
-        Description: A Mixtral of 4 experts, whose profile states five norms
-            and two score softmaxes a layer, and whose layers run two and
-            one.
-        Expectation: Those two fields differ, and the report marks them;
-            the run priced with the census's spec keeps fewer activations.
+        Feature: verify_spec and verify_estimate of an all-MoE Qwen2-MoE.
+        Description: A Qwen2-MoE whose every layer routes its tokens to 4
+            experts 32 wide and a shared expert 64 wide, its config stating
+            a dense width of 128 that no layer runs.
+        Expectation: The dense width differs, the census stating the shared
+            expert's as the resolver does for a model that states none, and
+            the report marks it; the run priced with either spec keeps the
+            same memory and takes the same time, to rounding.
         """
-        from transformers import MixtralConfig  # pylint: disable=C0415
-        config = _one_kind(MixtralConfig, num_local_experts=4)
+        from transformers import Qwen2MoeConfig  # pylint: disable=C0415
+        config = _one_kind(Qwen2MoeConfig, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
+                           shared_expert_intermediate_size=64)
         with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
             path = _train_yaml(folder)
             rows = verify_spec(path)
-            peak, _ = verify_estimate(path)
+            peak, time = verify_estimate(path)
         differ = {row.field: (row.resolved, row.census) for row in rows if row.resolved != row.census}
-        self.assertEqual(differ, {"ops.decoder.normOp": (5, 2), "ops.decoder.softmax": (2, 1)})
-        self.assertEqual(sum("<- differs" in line for line in report_spec(rows)), 2)
-        self.assertLess(peak.census, peak.nd)
+        self.assertEqual(differ, {"intermediate_size": (128, 64)})
+        self.assertEqual(sum("<- differs" in line for line in report_spec(rows)), 1)
+        self.assertEqual(peak.census, peak.nd)
+        self.assertAlmostEqual(time.census / time.nd, 1.0, places=12)
 
     def test_the_run_priced_with_each_spec(self):
         """

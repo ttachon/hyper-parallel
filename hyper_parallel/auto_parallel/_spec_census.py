@@ -125,12 +125,15 @@ def _linears(module: Any) -> List[Tuple[str, Any]]:
 
 
 def _down_width(module: Any, hidden: int) -> int:
-    """The width of a feed-forward *module*: the input of its projection back to the hidden width."""
-    widths = [child.in_features for _, child in _linears(module) if child.out_features == hidden
-              and child.in_features != hidden]
-    if not widths:
+    """The width of a feed-forward *module*: the input of its projection back to the hidden width.
+
+    Where every projection maps the hidden width to itself, the
+    feed-forward is as wide as the model.
+    """
+    back = [child.in_features for _, child in _linears(module) if child.out_features == hidden]
+    if not back:
         raise ModelSpecError(f"{type(module).__name__} holds no projection back to width {hidden}")
-    return widths[0]
+    return next((width for width in back if width != hidden), hidden)
 
 
 def _is_activation(module: Any) -> bool:
