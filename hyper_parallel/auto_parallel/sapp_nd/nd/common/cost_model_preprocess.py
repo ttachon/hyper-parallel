@@ -89,6 +89,11 @@ def compute_kv_dim(ccfg: Any) -> float:
 
 
 # class CostModelConfig(Config) :
+# What ``model_name`` says to target the config a strategy is set on
+# itself, which for a multimodal parent is neither of its submodules.
+_ITSELF = object()
+
+
 class CostModelConfig(PartitionGenerator):
     """cost model variables class"""
 
@@ -261,6 +266,8 @@ class CostModelConfig(PartitionGenerator):
 
     def __strategy_target(self, model_name):
         """Get the config object targeted by a strategy update."""
+        if model_name is _ITSELF:
+            return self
         if not self.multimodal:
             return self
         if model_name in self.mm_ccfgs:
@@ -268,6 +275,17 @@ class CostModelConfig(PartitionGenerator):
         raise TypeError(
             f"{self.model_name}:  model_name is required (multimodal)"
         )
+
+    def set_shared_strategy(self, **kwargs: Any) -> None:
+        """Apply a strategy to this config itself, a multimodal parent included.
+
+        :meth:`set_strategy` targets a submodule of a multimodal config,
+        never the parent; but the parent holds the strategy its submodules
+        share, and the partitions it combines are of that pipeline, so a
+        caller that gives every config of one pipeline its own placement
+        writes each of them through this.
+        """
+        self.set_strategy(**kwargs, model_name=_ITSELF)
 
     def set_strategy(self, **kwargs: Any) -> None:
         """overwrite parallelism"""

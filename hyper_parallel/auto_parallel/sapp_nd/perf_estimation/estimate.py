@@ -558,6 +558,53 @@ def _finalize_perf(perf, cache_file, debugger, memory):
     return perf
 
 
+def _stage_parts(cfg, ccfg, stages, device_type, debugger):
+    """One config's per-stage compute, recompute, communication and recomputed communication."""
+    # Only the plain walks record parts. A stage's time takes what the
+    # recompute walks add as RECOMPUTE alone; recorded as communication too,
+    # it made the parts outgrow the time, and the bubble, their difference,
+    # went negative.
+    compute_perfs = estimate_comp(
+        cfg, ccfg, stages, with_recomp=False, debugger=debugger
+    )
+    recompute_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
+        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
+    )
+    comm_perfs = estimate_comm(
+        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
+    )
+    recomm_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
+        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
+    )
+    return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
+
+
+def _submodule_parts(cfg, ccfg, device_type, debugger):
+    """A multimodal model's per-stage parts, every submodule's summed (F2).
+
+    The submodules of a vision-language model run on one pipeline, so a
+    stage's time is the work of the layers on it, whichever submodule they
+    belong to, as the memory model sums what they keep there
+    (``combine_partition_multimodal``).  Each is priced on its own
+    partitions and under its own family, on a copy, so no submodule leaves
+    state for the next.
+    """
+    partitions = cfg.generate_partitions_vpp()
+    totals = None
+    for name in cfg.mm_order:
+        sub = deepcopy(cfg.mm_ccfgs[name])
+        check_and_apply_custom_hook(sub)
+        parts = _stage_parts(sub, ccfg, partitions[name], device_type, debugger)
+        totals = parts if totals is None else tuple(
+            [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
+        )
+    return totals
+
+
 # performance estimation
 def estimate_performance(*args, **kwargs):
     """main estimation"""
@@ -604,30 +651,21 @@ def estimate_performance(*args, **kwargs):
     logger.info(stages)
     logger.info(ccfg)
 
-    # Only the plain walks record parts. A stage's time takes what the
-    # recompute walks add as RECOMPUTE alone; recorded as communication too,
-    # it made the parts outgrow the time, and the bubble, their difference,
-    # went negative.
-    compute_perfs = estimate_comp(
-        cfg, ccfg, stages, with_recomp=False, debugger=debugger
-    )
-    recompute_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
-    )
-    comm_perfs = estimate_comm(
-        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
-    )
+    if getattr(cfg, "multimodal", False):
+        compute_perfs, recompute_perfs, comm_perfs, recomm_perfs = _submodule_parts(
+            cfg, ccfg, device_type, debugger
+        )
+        timed = cfg.mm_ccfgs[getattr(cfg, "mm_main", None) or cfg.mm_order[-1]]
+        timed.n = cfg.n
+    else:
+        compute_perfs, recompute_perfs, comm_perfs, recomm_perfs = _stage_parts(
+            cfg, ccfg, stages, device_type, debugger
+        )
+        timed = cfg
     logger.info("PerfEst: comm_perfs %s", comm_perfs)
-    recomm_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
-    )
 
     stage_perfs = estimate_stage(
-        cfg,
+        timed,
         ccfg,
         compute_perfs,
         comm_perfs,
@@ -639,9 +677,9 @@ def estimate_performance(*args, **kwargs):
 
     stage_focused = kwargs.get("stage_focused", None)
     perf = estimate_perf(
-        cfg, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
+        timed, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
     )
-    perf += estimate_p2p(cfg, ccfg, stage_perfs, debugger=debugger)
+    perf += estimate_p2p(timed, ccfg, stage_perfs, debugger=debugger)
     logger.info("PerfEst: perf %s", perf)
 
     cache_file = kwargs.get("cache_file")

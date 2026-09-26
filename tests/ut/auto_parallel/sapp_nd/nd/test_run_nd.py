@@ -734,6 +734,7 @@ class TestSappNDRunND(unittest.TestCase):
         global_config.ccfg = fake_ccfg
         global_config.dimensions = Dim.ALL_DIMS.copy()
         global_config.balancing = _FakeBalancing()
+        global_config.siblings = []
         parallel_config = global_config.make_parallel_config(
             (2, 2, 2, 1),
             (4, 2),
@@ -811,6 +812,7 @@ class TestSappNDRunND(unittest.TestCase):
             gc.ccfg = ccfg
             gc.dimensions = Dim.ALL_DIMS.copy()
             gc.balancing = _FakeBalancing()
+            gc.siblings = []
             return gc
 
         # Dense model (n_exp=1) — fast-path, always True regardless of ep.
@@ -1377,6 +1379,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.enable_debug = False
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
+        runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
         runner.memory_estim = lambda: 32
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
@@ -1479,6 +1482,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.global_batch_size = 8
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
+        runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
         runner.memory_estim = lambda: 2048
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
@@ -1528,6 +1532,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.enable_debug = False
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=set_parallel_config)
+        runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
         runner.memory_estim = lambda: 32
         with tempfile.TemporaryDirectory() as tmp_dir:
             csv_path = os.path.join(tmp_dir, "real.csv")
@@ -2446,6 +2451,7 @@ class TestSappNDRunND(unittest.TestCase):
             write=lambda folder, config: writes.append((folder, config)),
         )
         runner.config = config_state
+        runner.priced = lambda: config_state.ccfg
         runner.machine = SimpleNamespace(number=16, device=Hard.Device_A2)
         runner.global_batch_size = 8
         runner.model_name = "unit"
@@ -2541,6 +2547,7 @@ class TestSappNDRunND(unittest.TestCase):
             set_parallel_config=lambda config: True,
         )
         runner.mem_eval = SimpleNamespace(get_strategy=lambda: {"dp": 2})
+        runner.priced = lambda: runner.config.ccfg
         runner.memory_estim = lambda: 32
 
         class _FakeDebug:
