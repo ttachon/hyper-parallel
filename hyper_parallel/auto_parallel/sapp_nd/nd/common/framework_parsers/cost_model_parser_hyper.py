@@ -68,6 +68,7 @@ and wins over anything read from the checkpoint.
 import logging
 from typing import Any, Dict, Tuple
 
+from hyper_parallel.auto_parallel.sapp_nd.nd.balancing_adapter import front_loaded_offset
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
@@ -405,15 +406,7 @@ class CostModelParserHyperV2(_CostModelParser):
 
     def _front_loaded_offset(self, n_lay: int):
         """Return an offset placing every layer on the first pipeline stage."""
-        per_stage = max(0, n_lay // max(1, self.ccfg.p) // max(1, self.ccfg.vp))
-        head = n_lay - per_stage
-        if self.ccfg.vp > 1:
-            chunks = [[-per_stage] * self.ccfg.p for _ in range(self.ccfg.vp)]
-            chunks[0][0] = head
-            return chunks
-        stages = [-per_stage] * self.ccfg.p
-        stages[0] = head
-        return stages
+        return front_loaded_offset(n_lay, self.ccfg.p, self.ccfg.vp)
 
     def _dataset_seq_len(self) -> int:
         """The sequence length the dataset states, the legacy ``data.max_seq_len`` too, else 0."""
