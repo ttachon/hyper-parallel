@@ -47,10 +47,11 @@ HYPER_SELECTIVE_REC_OP = {
 }
 
 
-def runs_hyper_selective(ccfg: Any) -> bool:
-    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches are its switches."""
-    switches = vars(ccfg.rec_op) if getattr(ccfg, "rec_op", None) is not None else {}
-    return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
+def runs_hyper_selective(ccfg: Any, switches: Any = None) -> bool:
+    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches, or *switches*, are its switches."""
+    stated = getattr(ccfg, "rec_op", None) if switches is None else switches
+    values = stated if isinstance(stated, Mapping) else vars(stated) if stated is not None else {}
+    return all(values.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
 def derive_sequence_parallel(ccfg: Any) -> None:

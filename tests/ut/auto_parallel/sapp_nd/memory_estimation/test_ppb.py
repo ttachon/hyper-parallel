@@ -24,9 +24,10 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _MEMORY_KEY, _OPTIONS, _PPB, _TIME_KEY
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import price_option
@@ -57,7 +58,7 @@ class _Memory:
     """
 
     def __init__(self, ctx: Context, ccfg: SimpleNamespace, dp: int = 0) -> None:
-        """Answer for the layer *ctx* is on, with *ccfg*'s switches."""
+        """Answer for the layer *ctx* is on, with the switches *ctx* carries, else *ccfg*'s."""
         self.ctx, self.ccfg, self.dp = ctx, ccfg, dp * MEGABYTE
 
     def __call__(self, ppb: bool = False, default_micro_factor: Optional[int] = None) -> Tuple[int, int]:
@@ -65,7 +66,8 @@ class _Memory:
         micro = 1 if ppb else default_micro_factor
         if self.ctx.current_node == LayerType.FULL_REC_LAYER:
             return MEGABYTE * micro, self.dp
-        switches = vars(self.ccfg.rec_op)
+        stated = EvalUtils.switches(self.ccfg, self.ctx)
+        switches = stated if isinstance(stated, Mapping) else vars(stated)
         selective = self.ctx.current_node == LayerType.SEL_REC_LAYER
         freed = sum(1 for op in _OPS if op != "gather" and selective and not switches[op])
         gathered = 0 if selective and not switches["gather"] else 2 * MEGABYTE * micro
@@ -130,6 +132,72 @@ def _withdraw(descriptions: list) -> list:
     """*descriptions*, once the options no body is better off with are withdrawn."""
     _PPB(SimpleNamespace(ppb_combined=[]), None).ppb_withdraw_dominated(descriptions)
     return descriptions
+
+
+class TestSwitchChannel(unittest.TestCase):
+    """A layer's switches reach the evaluators through its context, not its config."""
+
+    def test_the_context_states_the_switches_over_the_config(self):
+        """
+        Feature: EvalUtils.switches and switch.
+        Description: A config that keeps its gathers, evaluated with no
+            switches on its context, with some, and on a context that is
+            no Context.
+        Expectation: The context's switches where it states them, the
+            config's otherwise.
+        """
+        ccfg = SimpleNamespace(rec_op=SimpleNamespace(**_KEEP_ALL))
+        ctx = Context()
+        self.assertIs(EvalUtils.switches(ccfg, ctx), ccfg.rec_op)
+        self.assertEqual(EvalUtils.switch(ccfg, ctx, "gather"), 1)
+        ctx.switches = dict(_KEEP_ALL, gather=0)
+        self.assertEqual(EvalUtils.switch(ccfg, ctx, "gather"), 0)
+        self.assertEqual(EvalUtils.switch(ccfg, SimpleNamespace(), "gather"), 1)
+
+    def test_describing_and_profiling_set_no_switch_on_the_config(self):
+        """
+        Feature: _PPB._selective.
+        Description: Describe a selective body with a pricer, then profile a
+            body, each on a config whose switches are frozen, so that
+            setting one raises.
+        Expectation: The description and the profile are those of a config
+            whose switches can be set; the context carries none afterwards.
+        """
+        free, _ = _describe(LayerType.SEL_REC_LAYER, dict(_KEEP_ALL, ffAct=0), _Pricer())
+        profile, _, _ = _measure(0, (2, 3))
+        for profiles in (None, {}):
+            ctx = Context()
+            ctx.head_node, ctx.tail_node = "head", "tail"
+            ctx.current_node = LayerType.SEL_REC_LAYER if profiles is None else LayerType.NOT_REC_LAYER
+            switches = dict(_KEEP_ALL, ffAct=0) if profiles is None else _KEEP_ALL
+            ccfg = SimpleNamespace(model_name="unit", rec_op=_Frozen(switches))
+            ppb = _PPB(SimpleNamespace(ppb_combined=[]), _Memory(ctx, ccfg))
+            ppb.layer_times = _Pricer()
+            if profiles is None:
+                self.assertEqual(ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE), free)
+            else:
+                ppb.profiles = profiles
+                ppb.profile_in_flight, ppb.profile_counts = 3, (2, 3)
+                ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+                self.assertEqual(profiles["unit", None], profile)
+            self.assertIsNone(ctx.switches)
+
+
+class _Frozen(SimpleNamespace):
+    """Switches that refuse to be set once built."""
+
+    def __init__(self, switches: dict) -> None:
+        """Hold *switches*."""
+        super().__init__()
+        self.__dict__.update(switches)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Refuse."""
+        raise AttributeError(f"switch {name} set on a config")
+
+    def __delattr__(self, name: str) -> None:
+        """Refuse."""
+        raise AttributeError(f"switch {name} removed from a config")
 
 
 class TestTimedDescription(unittest.TestCase):

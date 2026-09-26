@@ -181,7 +181,7 @@ class EvalBody:
         census = getattr(ccfg, "kind_activations", None)
         if isinstance(census, KindActivations) and (
                 ctx.current_node != LayerType.SEL_REC_LAYER
-                or census.selective is not None and runs_hyper_selective(ccfg)):
+                or census.selective is not None and runs_hyper_selective(ccfg, EvalUtils.switches(ccfg, ctx))):
             return EvalBody.census_activ(ccfg, ctx, census)
         attn_size = sum(
             [

@@ -259,14 +259,14 @@ class EvalRecords:
                 layer's (``SEL_REC_LAYER``) dropping what its switches drop.
             slot: The slot.
             switches: A selective layer's switches, 1 to keep an op's
-                activations and 0 to drop them; the config's own where
-                omitted.
+                activations and 0 to drop them; where omitted, those the
+                context carries, else the config's own.
             overrides: Values that stand for the config's fields.
             only: An op to price alone, whatever the switches say.
         """
         records = load_op_records()
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        stated = ccfg.rec_op if switches is None else switches
+        stated = EvalUtils.switches(ccfg, ctx) if switches is None else switches
 
         def keep(op: str) -> Any:
             switch = records.ops[op].switch

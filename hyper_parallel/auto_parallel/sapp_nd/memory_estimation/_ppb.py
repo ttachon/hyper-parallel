@@ -170,7 +170,7 @@ class _PPB:
         if timed:
             switches = self.selective_switches(ccfg)
             for name in ("COMM", "BOTH"):
-                dyn[name] = self._selective_dynamic_mem(ccfg, ctx, switches[name], many)
+                dyn[name] = self._selective(ccfg, ctx, switches[name], lambda _: self._dynamic_mem(many))
         ctx.current_node = LayerType.FULL_REC_LAYER
         dyn["FULL"] = self._dynamic_mem(many)
         desc["type"] = "BODY"
@@ -221,7 +221,8 @@ class _PPB:
             if name == "gather":
                 alone[name] = self._selective(ccfg, ctx, dict(keep, gather=0), _measure)
             else:
-                alone[name] = self._selective_dynamic_mem(ccfg, ctx, dict(keep, **{name: 0}), many)[:3] + base[3:]
+                measured = self._selective(ccfg, ctx, dict(keep, **{name: 0}), lambda _: self._dynamic_mem(many))
+                alone[name] = measured[:3] + base[3:]
         policy = dict(HYPER_SELECTIVE_REC_OP)
         whole = {frozenset(name for name, state in policy.items() if not state): self._selective(
             ccfg, ctx, policy, _measure)} if census else {}
@@ -295,28 +296,20 @@ class _PPB:
         excess = tuple(one + (count - 1) * per_micro_batch - kept for count, kept in zip(counts, at))
         return activation, per_micro_batch, one - per_micro_batch, excess
 
-    def _selective_dynamic_mem(
-        self, ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], many: int, counts: Tuple[int, ...] = ()
-    ) -> Tuple[float, float, float, Tuple[float, ...]]:
-        """:meth:`_dynamic_mem` of a selective layer with *switches*; the config's own are restored."""
-        return self._selective(ccfg, ctx, switches, lambda _: self._dynamic_mem(many, counts))
-
     @staticmethod
     def _selective(ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], measure: Callable) -> Any:
-        """*measure* of *ctx*, the current layer selective with *switches*; the config's own are restored."""
-        rec_op = ccfg.rec_op
-        before = dict(vars(rec_op))
+        """*measure* of *ctx*, the current layer selective with *switches*.
+
+        The context carries them to the evaluators, over the config's own,
+        which the measure leaves as they are.
+        """
+        before = ctx.switches
         ctx.current_node = LayerType.SEL_REC_LAYER
+        ctx.switches = {**vars(ccfg.rec_op), **switches}
         try:
-            for name, value in switches.items():
-                setattr(rec_op, name, value)
             return measure(ctx)
         finally:
-            for name in switches:
-                if name in before:
-                    setattr(rec_op, name, before[name])
-                else:
-                    delattr(rec_op, name)
+            ctx.switches = before
 
     def _time_ppb(self, desc: dict, ccfg: CostModelConfig, kind: Optional[LayerKind]) -> None:
         """Add the layer's forward time and the backward time of each option, where the balancer reads them."""

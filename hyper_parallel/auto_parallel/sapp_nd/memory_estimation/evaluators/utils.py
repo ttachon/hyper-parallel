@@ -14,7 +14,7 @@
 # ============================================================================
 """Utility submodule"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping
 import operator
 import ast
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -91,6 +91,18 @@ class EvalUtils:
     def rec_coeff(rec_layer: bool, rec_op: bool) -> bool:
         """Masking coefficient for select recompute"""
         return int(not rec_layer) | rec_op
+
+    @staticmethod
+    def switches(ccfg: CostModelConfig, ctx: Context) -> Any:
+        """The switches of the layer *ctx* evaluates: the context's where it states them, else its config's."""
+        stated = getattr(ctx, "switches", None)
+        return stated if isinstance(stated, Mapping) else ccfg.rec_op
+
+    @staticmethod
+    def switch(ccfg: CostModelConfig, ctx: Context, name: str) -> Any:
+        """One recompute switch of the layer *ctx* evaluates, 1 to keep the op's activation and 0 to recompute it."""
+        stated = EvalUtils.switches(ccfg, ctx)
+        return stated[name] if isinstance(stated, Mapping) else getattr(stated, name)
 
     @classmethod
     def eval_expr_insight(cls, **kwargs):

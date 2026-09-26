@@ -22,7 +22,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import patch
 
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
@@ -224,12 +224,13 @@ class TestPPBExceptionRecovery(unittest.TestCase):
                          "enable_node_log should be restored to False, not hard-coded True")
 
     @staticmethod
-    def _timed_ppb_failing_under_comm(ccfg: SimpleNamespace) -> _PPB:
-        """A timed _PPB whose _inner_dynamic_mem raises once the gathers are recomputed, as COMM sets them."""
+    def _timed_ppb_failing_under_comm(ccfg: SimpleNamespace, ctx: Context) -> _PPB:
+        """A timed _PPB whose _inner_dynamic_mem raises once the gathers are recomputed, as COMM's switches say."""
 
         def _inner(**_kwargs: Any) -> tuple:
             """Raise under recomputed gathers, return a valid result otherwise."""
-            if not getattr(ccfg.rec_op, "gather", 1):
+            stated = EvalUtils.switches(ccfg, ctx)
+            if not (stated.get("gather", 1) if isinstance(stated, Mapping) else getattr(stated, "gather", 1)):
                 raise RuntimeError("injected failure")
             return (2 * MEGABYTE, 3 * MEGABYTE)
 
@@ -237,32 +238,35 @@ class TestPPBExceptionRecovery(unittest.TestCase):
         ppb.layer_times = lambda *_args: (1.0, 1.0)
         return ppb
 
-    def test_timed_lay_ppb_restores_rec_op_on_exception(self) -> None:
+    def test_timed_lay_ppb_leaves_rec_op_and_clears_the_switches_on_exception(self) -> None:
         """
         Feature: TestPPBExceptionRecovery.
         Description: With a pricer, _inner_dynamic_mem raises while lay_ppb
-            sizes COMM, the first option whose switches it sets on the config.
-        Expectation: ccfg.rec_op attributes are restored to their original values.
+            sizes COMM, the first option whose switches the context carries.
+        Expectation: ccfg.rec_op keeps its values, and the context carries no
+            switches once lay_ppb has raised.
         """
         _, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
         original_vals = dict(vars(ccfg.rec_op))
         with self.assertRaises(RuntimeError):
-            self._timed_ppb_failing_under_comm(ccfg).lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+            self._timed_ppb_failing_under_comm(ccfg, ctx).lay_ppb(ccfg, ctx, 4 * MEGABYTE)
         self.assertEqual(vars(ccfg.rec_op), original_vals)
+        self.assertIsNone(ctx.switches)
 
-    def test_timed_lay_ppb_removes_the_switches_it_added_on_exception(self) -> None:
+    def test_timed_lay_ppb_sets_no_switch_on_the_config_on_exception(self) -> None:
         """
         Feature: TestPPBExceptionRecovery.
         Description: The config sets a single switch; with a pricer,
             _inner_dynamic_mem raises while lay_ppb sizes COMM.
-        Expectation: The switches COMM set are removed again; the config's
-            own is kept.
+        Expectation: The config keeps its single switch, none added, and
+            the context carries no switches once lay_ppb has raised.
         """
         _, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
         ccfg.rec_op = SimpleNamespace(softmax=0)
         with self.assertRaises(RuntimeError):
-            self._timed_ppb_failing_under_comm(ccfg).lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+            self._timed_ppb_failing_under_comm(ccfg, ctx).lay_ppb(ccfg, ctx, 4 * MEGABYTE)
         self.assertEqual(vars(ccfg.rec_op), {"softmax": 0})
+        self.assertIsNone(ctx.switches)
 
 
 class TestSappNDMemoryEstimation(unittest.TestCase):
