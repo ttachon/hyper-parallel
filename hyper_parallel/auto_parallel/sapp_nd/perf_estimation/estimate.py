@@ -82,7 +82,11 @@ def op_table(cfg, attn=None):
     if state:
         table["n_linrec"] = 6 * cfg.b * cfg.s * state
     table["n_ffMM"] = 6 * cfg.b * cfg.s * cfg.h * cfg.hff
-    table["n_attBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.h
+    # Every head's queries against every key, as wide as a head's queries
+    # and keys, an MLA head's with its rotary part; then the weights
+    # against the values, as wide as a head's values.
+    d_qk = (getattr(att, "qk_nope_head_dim", None) or d_h) + (getattr(att, "dhr", 0) or 0)
+    table["n_attBMM"] = 3 * cfg.b * cfg.s * cfg.s * att.a * (d_qk + d_h)
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
