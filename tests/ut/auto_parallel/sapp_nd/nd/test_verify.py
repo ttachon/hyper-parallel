@@ -117,6 +117,19 @@ class TestVerifyParameters(unittest.TestCase):
         self.assertEqual((by[("embedding", "table")].nd, by[("embedding", "table")].census), (0, 0))
         self.assertGreater(by[("output", "table, norm")].census, 128 * 64)
 
+    def test_a_moe_layers_router_matches_its_census(self):
+        """
+        Feature: verify_parameters of a MoE layer's router.
+        Description: The hybrid model's two kinds and DeepSeek-V3's expert
+            layer, each of 4 experts at width 64.
+        Expectation: ND prices the weight per expert the router holds.
+        """
+        for config, kinds in ((_qwen35_text(), ("linear_attention x1", "full_attention x1")),
+                              (_deepseek_v3(), ("moe x1",))):
+            rows = {(row.where, row.part): row for row in _verify(config)}
+            for kind in kinds:
+                self.assertEqual((rows[(kind, "router")].nd, rows[(kind, "router")].census), (64 * 4, 64 * 4), kind)
+
     def test_mla_attention_matches_its_census(self):
         """
         Feature: verify_parameters of an MLA model.
