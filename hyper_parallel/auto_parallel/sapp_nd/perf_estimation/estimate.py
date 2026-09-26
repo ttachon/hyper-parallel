@@ -118,11 +118,19 @@ def op_table(cfg, attn=None):
 
 
 def _flavour_tables(cfg, attn=None):
-    """One (dense, expert) table pair for a given attention flavour."""
+    """One (dense, expert) table pair for a given attention flavour.
+
+    A MoE layer's feed-forward entry prices the experts each token runs,
+    the shared experts, as wide as a routed one, and, spread over the
+    layer's feed-forward matmuls, the router and the shared experts' gate.
+    """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
-    scale = cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
-    exp["n_ffMM"] *= scale
+    n_ff = getattr(attn if attn is not None else cfg, "n_ffMM", 0) or 3
+    gate = 1 if cfg.n_shared_exp and getattr(cfg, "shared_expert_gate", None) else 0
+    width = (cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
+             + (cfg.n_exp + gate) / n_ff)
+    exp["n_ffMM"] *= width / cfg.hff
     return base, exp
 
 

@@ -28,7 +28,11 @@ from typing import Any, Dict
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance, op_table
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
+    _flavour_tables,
+    estimate_performance,
+    op_table,
+)
 
 DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
@@ -121,6 +125,21 @@ class TestOpTable(unittest.TestCase):
         mla.dc_q = 0
         self.assertEqual(op_table(mla)["n_attMM"], 6 * s * direct / 4 * 2)
 
+
+    def test_a_moe_layer_prices_its_whole_feed_forward(self):
+        """
+        Feature: _flavour_tables, a MoE layer's feed-forward.
+        Description: A layer of width 512, its dense layers 1024 wide, with
+            8 experts 64 wide, 2 chosen, a shared expert and its gate, three
+            feed-forward matmuls.
+        Expectation: The feed-forward entry prices each token's two experts
+            and the shared expert, each 64 wide, and, over the three
+            matmuls, the router's 8 weights and the gate's one.
+        """
+        cfg = SimpleNamespace(**{**vars(_cfg(128)), "hff_exp": 64, "n_exp": 8, "n_chosen_exp": 2, "cap_fact": 1,
+                                 "n_shared_exp": 1, "shared_expert_gate": True, "n_ffMM": 3})
+        base, experts = _flavour_tables(cfg)
+        self.assertEqual(experts["n_ffMM"], base["n_ffMM"] / 1024 * (3 * 64 + (8 + 1) / 3))
 
 if __name__ == "__main__":
     unittest.main()
