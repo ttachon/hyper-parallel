@@ -118,6 +118,10 @@ class CostModelParserMindformers(_CostModelParser):
             if self.config.model.model_config.qk_rope_head_dim
             else 0
         )  # decoupled QK per head dimension
+        # An MLA model's value-head width, which its family prices dh at,
+        # and its heads' non-rotary key width, the value heads' unless stated.
+        self.ccfg.v_head_dim = self.config.model.model_config.v_head_dim or None
+        self.ccfg.qk_nope_head_dim = self.config.model.model_config.qk_nope_head_dim or None
         # Whether each head's queries and keys are normalized, as MindFormers'
         # Qwen3 states it.
         self.state_qk_norm(self.ccfg, self.config.model.model_config.qk_layernorm)

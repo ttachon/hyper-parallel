@@ -44,6 +44,16 @@ def _qwen35_text(tie: bool = False):
     })
 
 
+def _deepseek_v3(q_lora_rank=32):
+    """A two-layer DeepSeek-V3 config of width 64, one dense layer and one of 4 experts, its MLA heads 12, 4 and 8 wide."""
+    from transformers import DeepseekV3Config  # pylint: disable=C0415
+    return DeepseekV3Config(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        q_lora_rank=q_lora_rank, kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=8,
+        n_routed_experts=4, num_experts_per_tok=2, moe_intermediate_size=16, n_shared_experts=1,
+        first_k_dense_replace=1, intermediate_size=32, vocab_size=128, n_group=1, topk_group=1)
+
+
 def _train_yaml(folder: str) -> str:
     """A train yaml of the model on two ranks at DP shard 2."""
     config = {
@@ -106,6 +116,20 @@ class TestVerifyParameters(unittest.TestCase):
         by = {(row.where, row.part): row for row in _verify(_qwen35_text(tie=True))}
         self.assertEqual((by[("embedding", "table")].nd, by[("embedding", "table")].census), (0, 0))
         self.assertGreater(by[("output", "table, norm")].census, 128 * 64)
+
+    def test_mla_attention_matches_its_census(self):
+        """
+        Feature: verify_parameters of an MLA model.
+        Description: DeepSeek-V3's attention at width 64, with a query
+            latent and without, its non-rotary key heads wider than its
+            value heads.
+        Expectation: ND prices exactly the attention Transformers builds,
+            in the dense layer and in the expert one.
+        """
+        for q_lora_rank in (32, None):
+            rows = {(row.where, row.part): row for row in _verify(_deepseek_v3(q_lora_rank))}
+            for kind in ("dense x1", "moe x1"):
+                self.assertEqual(rows[(kind, "attention")].nd, rows[(kind, "attention")].census, kind)
 
     def test_a_train_yaml_without_a_checkpoint_is_refused(self):
         """

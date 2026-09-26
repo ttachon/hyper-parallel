@@ -63,13 +63,18 @@ def nd_parameters(lccfg: Any, ctx: Any) -> Dict[str, float]:
 
 
 def _groups(ccfg: Any) -> List[Any]:
-    """``(kind, count, config)`` per group of *ccfg*'s layer stack, in model order, as its hooks name the kinds."""
+    """``(kind, count, config)`` per group of *ccfg*'s layers, in model order, the kinds as its hooks name them.
+
+    A hybrid stack's hook states its kind; a family's hook is named for
+    it (DeepSeek's ``hook_dense`` and ``hook_moe``).  A group of no layer
+    is left out.
+    """
     hooks = ccfg.layer_custom_config or [(ccfg.n_lay, None)]
     configs = get_layer_custom_configs(ccfg)
     if len(configs) != len(hooks):
         hooks = [(count, None) for _, count in configs]
-    return [(getattr(hook, "kind", None) or "decoder", count, lccfg)
-            for (_, hook), (lccfg, count) in zip(hooks, configs)]
+    return [(getattr(hook, "kind", None) or getattr(hook, "__name__", "hook_decoder").removeprefix("hook_"),
+             count, lccfg) for (_, hook), (lccfg, count) in zip(hooks, configs) if count]
 
 
 def _text_model(ccfg: Any) -> Any:

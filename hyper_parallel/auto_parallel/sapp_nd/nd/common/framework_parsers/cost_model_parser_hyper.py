@@ -333,6 +333,8 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
         ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
+        ccfg.v_head_dim = self._spec_int(spec, "v_head_dim") or None
+        ccfg.qk_nope_head_dim = self._spec_int(spec, "qk_nope_head_dim") or None
         # Qwen3.5 fuses the output gate into q_proj, doubling its width.
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
         # Qwen3 normalizes each head's queries and keys.

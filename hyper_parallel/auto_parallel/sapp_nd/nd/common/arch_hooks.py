@@ -232,7 +232,8 @@ def custom_deepseek3(ccfg):
     saved.n_shared_exp = ccfg.n_shared_exp
     saved.ep = ccfg.ep
     custom_default_transformer(ccfg)
-    ccfg.dh = 128
+    # Its heads at the value heads' width, 128 unless the model states it.
+    ccfg.dh = getattr(ccfg, "v_head_dim", None) or 128
 
     def dense(c):
         c.hff = saved.hff
