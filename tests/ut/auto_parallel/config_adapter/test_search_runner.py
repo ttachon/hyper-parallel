@@ -29,6 +29,7 @@ from hyper_parallel.auto_parallel.config_adapter import _search_runner as sr
 from hyper_parallel.auto_parallel.config_adapter import read_hp_yaml_config
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -727,6 +728,17 @@ class TestSearchStrategies(unittest.TestCase):
         result = sr.search_strategies(config)
         self.assertEqual(result["activation_checkpoint"], "full")
         self.assertNotIn("recompute_per_layer", result)
+
+        # A train.yaml that states a census prices the trainer's selective
+        # mode, its policy, as well.
+        census = _make_full_config(run={"context": {"census": True}})
+        census.estimator["recompute_strategy"] = "auto"
+        mock_runner.recompute_choices = {mock_dims: SimpleNamespace(mode="selective")}
+        result = sr.search_strategies(census)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_CENSUS_MODES)
+        self.assertEqual(kwargs["recompute_selective"], HYPER_SELECTIVE_REC_OP)
+        self.assertEqual(result["activation_checkpoint"], "selective")
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",

@@ -508,10 +508,28 @@ def _one_mode(
     return best
 
 
+def _priced_modes(
+    modes: Optional[Sequence[str]], profiles: Mapping[Hashable, Any], selective: Optional[Mapping[str, int]]
+) -> Optional[Sequence[str]]:
+    """*modes*, less a runtime's own selective mode unless every kind's profile measures its setting whole."""
+    if modes is None or selective is None or "selective" not in modes:
+        return modes
+    setting = mode_recompute("selective", selective)
+    if all(setting in profile.whole for profile in profiles.values()):
+        return modes
+    return tuple(mode for mode in modes if mode != "selective")
+
+
 def _offered(
-    profiles: Dict[Hashable, Any], configured: Mapping[str, Any], modes: Optional[Sequence[str]]
+    profiles: Dict[Hashable, Any],
+    configured: Mapping[str, Any],
+    modes: Optional[Sequence[str]],
+    selective: Optional[Mapping[str, int]] = None,
 ) -> Tuple[Dict[Hashable, Tuple[LayerOption, ...]], Optional[Dict[Hashable, Dict[str, LayerOption]]]]:
     """Each kind's options: its front, or with *modes*, the option of each mode the profiles can price.
+
+    The selective mode recomputes what *selective* sets, else the config's
+    switches.
 
     Returns:
         ``(options, by_mode)``: each kind's options, and with *modes* each
@@ -520,8 +538,9 @@ def _offered(
     if modes is None:
         return {key: build_front(profile, configured) for key, profile in profiles.items()}, None
     offered = MODES if "selective" in modes else tuple(mode for mode in MODES if mode != "selective")
+    switches = {mode: selective if mode == "selective" and selective is not None else configured for mode in offered}
     by_mode = {
-        key: {mode: price_option(profile, mode_recompute(mode, configured), configured) for mode in offered}
+        key: {mode: price_option(profile, mode_recompute(mode, switches[mode]), configured) for mode in offered}
         for key, profile in profiles.items()
     }
     return {key: tuple(options.values()) for key, options in by_mode.items()}, by_mode
@@ -791,6 +810,7 @@ def choose_recompute(
     bucket: float = MEGABYTE,
     modes: Optional[Sequence[str]] = None,
     link: Optional[HostLink] = None,
+    selective: Optional[Mapping[str, int]] = None,
 ) -> Optional[RecomputeChoice]:
     """The fastest recompute option of every layer that fits, at the evaluator's current strategy.
 
@@ -806,6 +826,12 @@ def choose_recompute(
         link: For a choice per layer at one chunk per stage, the host link
             each stage's first layers may offload over; ``None`` keeps every
             layer's activations on the device.
+        selective: With *modes*, the switches the runtime's own selective
+            mode sets, 1 to keep an op and 0 to recompute it, where they are
+            not the config's, as HyperParallel's trainer runs its policy
+            whatever its train yaml's mode. The mode is offered where every
+            kind's profile measures that setting whole, as a census prices
+            it; the formulas do not price the matmuls the policy recomputes.
 
     Returns:
         The choice, or ``None`` when there is none to make: a multimodal
@@ -818,9 +844,10 @@ def choose_recompute(
         return None
     counts = micro_batches_in_flight(evaluator)
     profiles = layer_profiles(evaluator, device_type, ccfg, most_in_flight=max(max(row) for row in counts),
-                              each_switch=modes is None or "selective" in modes,
+                              each_switch=modes is None or ("selective" in modes and selective is None),
                               in_flight=[count for row in counts for count in row])
-    fronts, by_mode = _offered(profiles, configured_switches(evaluator), modes)
+    modes = _priced_modes(modes, profiles, selective)
+    fronts, by_mode = _offered(profiles, configured_switches(evaluator), modes, selective)
     found = _body_layers(evaluator, fronts, counts)
     if found is None:
         return None

@@ -37,9 +37,11 @@ logger = logging.getLogger(__name__)
 
 # The activation_checkpoint modes HyperParallel's trainer runs every layer
 # with, that recompute "auto" chooses among. Its selective mode recomputes
-# every other matmul, which the cost model's selective recompute does not
-# price, so it stays out until the cost model follows it.
+# every other matmul, which the cost model's formulas do not price; a census
+# of the layers measures it (IR phase 5), so a run that states one offers it
+# too, where the census priced it.
 TRAINER_RECOMPUTE_MODES = ("off", "full")
+TRAINER_CENSUS_MODES = ("off", "selective", "full")
 
 def _get_dim_module():
     """Lazy-import the sapp_nd dimensions module."""
@@ -261,8 +263,7 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if visual_seq_len:
         context["visual_seq_len"] = int(visual_seq_len)
 
-    # "auto" chooses per candidate; the search keeps the candidates that fit
-    # fully recomputed, so the model is described fully recomputed.
+    # Under "auto" the search keeps what fits fully recomputed: describe it so.
     gc_dict: Dict[str, Any] = {"mode": {"none": "off", "auto": "full"}.get(recompute, recompute)}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
@@ -553,14 +554,25 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
+    from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (  # pylint: disable=C0415
+        HYPER_SELECTIVE_REC_OP,
+    )
     auto = config.estimator.get("recompute_strategy") == "auto"
+    census = bool((hp_config.get("context") or {}).get("census"))
+    trainer = {
+        "auto_recompute": True,
+        "recompute_modes": TRAINER_CENSUS_MODES if census else TRAINER_RECOMPUTE_MODES,
+        # The trainer's selective mode runs its policy, whatever switches
+        # the mode the model is described with sets.
+        "recompute_selective": dict(HYPER_SELECTIVE_REC_OP),
+    }
     nd_runner = _Par.Parallelize(
         "hyper_v2",
         hp_config,
         machine,
         global_batch_size=config.constraint.get("global_batch_size", 0),
         dimensions=dims,
-        **({"auto_recompute": True, "recompute_modes": TRAINER_RECOMPUTE_MODES} if auto else {}),
+        **(trainer if auto else {}),
     )
     scored_space = nd_runner.run_generation_to_ordering(
         yaml_folder=None,

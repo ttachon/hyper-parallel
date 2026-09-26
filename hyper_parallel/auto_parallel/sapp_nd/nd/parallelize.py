@@ -78,6 +78,9 @@ class ParallelizeLayer:
         unknown = sorted(set(self.recompute_modes or ()) - set(MODES))
         if unknown:
             raise ValueError(f"unknown recompute modes {unknown}; expected some of {', '.join(MODES)}")
+        # The switches such a runtime's selective mode sets, where they are
+        # not the config's; see recompute.candidate.choose_recompute.
+        self.recompute_selective = extra_config.pop("recompute_selective", None)
         # With auto_offload, a choice per layer may offload each stage's first
         # layers over the host link: host_link, else the device's own.
         auto_offload = extra_config.pop("auto_offload", False)
@@ -517,7 +520,7 @@ class ParallelizeLayer:
             return None
         self.mem_eval.set_config(self.config.ccfg)
         choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
-                                  link=self.offload_link)
+                                  link=self.offload_link, selective=self.recompute_selective)
         if choice is not None:
             self.recompute_choices[parallel_config] = choice
         return choice

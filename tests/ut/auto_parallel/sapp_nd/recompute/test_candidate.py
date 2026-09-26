@@ -660,6 +660,65 @@ class TestCensus(unittest.TestCase):
             )))
             self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(option))
 
+    def test_the_runtimes_selective_mode_runs_the_policy_the_census_prices(self):
+        """
+        Feature: choose_recompute modes, with the runtime's own selective
+            switches.
+        Description: The model on a device between what it keeps with
+            every layer running HyperParallel's selective policy and what it
+            keeps plain, choosing among off, selective and full as the
+            trainer runs them, its selective mode the policy whatever the
+            config's switches.
+        Expectation: Selective, every layer running the policy, faster than
+            full recompute, and each stage keeps what the config priced
+            whole with the policy keeps, to its MB.
+        """
+        evaluator = self.evaluator
+        policy = SimpleNamespace(ranges=(LayerRange(0, self.total, None, _option(_POLICY)),))
+        selective = max(_stage_peaks_of(evaluator, policy))
+        plain = max(_stage_peaks(evaluator, full_rec=False))
+        self.assertLess(selective + 16, plain)
+        own = evaluator.ccfg.device_capacity.to_mb().size
+        try:
+            _with_capacity(evaluator, selective + 16)
+            choice = choose_recompute(evaluator, Hard.Device_A2, modes=MODES,
+                                      selective=dict(HYPER_SELECTIVE_REC_OP))
+            full = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        finally:
+            _with_capacity(evaluator, own)
+        self.assertEqual(choice.mode, "selective")
+        self.assertEqual({item.option.recompute for item in choice.ranges}, {_POLICY})
+        self.assertEqual(full.mode, "full")
+        self.assertGreater(sum(choice.stage_savings), sum(full.stage_savings))
+        for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
+            self.assertLessEqual(abs(mine - model), 1.0)
+
+
+class TestRuntimeSelective(unittest.TestCase):
+    """A runtime's own selective mode, where no census prices it."""
+
+    def test_without_a_census_the_mode_is_not_offered(self):
+        """
+        Feature: choose_recompute modes, with the runtime's own selective
+            switches.
+        Description: The resharding dense model, no census stating its
+            kind, on a device every mode fits, choosing among off,
+            selective and full with HyperParallel's policy as the selective
+            mode.
+        Expectation: Off, and the selective mode is left out: the formulas
+            do not price the matmuls the policy recomputes.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_RESHARDING, handle)
+            evaluator = _with_capacity(EvaluatorV2(path, framework="hyper_v2", log_level=0), 1024 * 1024)
+        choice = choose_recompute(evaluator, Hard.Device_A2, modes=MODES, selective=dict(HYPER_SELECTIVE_REC_OP))
+        self.assertEqual(choice.mode, "off")
+        # pylint: disable=protected-access
+        profiles = layer_profiles(evaluator, Hard.Device_A2, each_switch=False)
+        self.assertEqual(Candidate._priced_modes(MODES, profiles, HYPER_SELECTIVE_REC_OP), ("off", "full"))
+
 
 def _kind(per_micro_batch: int, once: int, forward: float) -> Tuple[LayerOption, ...]:
     """A kind's options, from its plain layer's MB per micro-batch and once and its forward time."""
