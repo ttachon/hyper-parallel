@@ -134,12 +134,15 @@ class TestOpTable(unittest.TestCase):
             feed-forward matmuls.
         Expectation: The feed-forward entry prices each token's two experts
             and the shared expert, each 64 wide, and, over the three
-            matmuls, the router's 8 weights and the gate's one.
+            matmuls, the router's 8 weights and the gate's one; the
+            activation function's entry the three experts' activations, each
+            64 wide, where the dense layers' is 1024 wide.
         """
         cfg = SimpleNamespace(**{**vars(_cfg(128)), "hff_exp": 64, "n_exp": 8, "n_chosen_exp": 2, "cap_fact": 1,
                                  "n_shared_exp": 1, "shared_expert_gate": True, "n_ffMM": 3})
         base, experts = _flavour_tables(cfg)
         self.assertEqual(experts["n_ffMM"], base["n_ffMM"] / 1024 * (3 * 64 + (8 + 1) / 3))
+        self.assertEqual((experts["n_ffAct"], base["n_ffAct"]), (21 * 128 * 3 * 64 * 2 / 2, 21 * 128 * 1024 * 2 / 2))
 
     def test_the_delta_rule_runs_in_chunks(self):
         """
