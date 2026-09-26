@@ -265,6 +265,11 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
         # Qwen3 normalizes each head's queries and keys.
         ccfg.qk_norm = bool(spec.get("qk_norm", False))
+        # The biases and norms the spec states; unstated, the parameter
+        # formulas count their own.
+        for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "shared_expert_gate"):
+            setattr(ccfg, name, None if spec.get(name) is None else bool(spec[name]))
+        ccfg.layer_norms = self._spec_int(spec, "layer_norms") or None
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""

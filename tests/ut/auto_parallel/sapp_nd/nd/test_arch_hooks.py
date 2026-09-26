@@ -428,8 +428,9 @@ class TestStackAsData(unittest.TestCase):
         Feature: linear attention.
         Description: Apply the linear kind of a model with 16 value heads of 64.
         Expectation: The value heads carry the q side, the key heads the kv
-            side, no score ops, one state update, and the convolution and
-            gates as extra parameters.
+            side, no score ops, one state update, and the convolution, the
+            gates' projections, each head's decay and time-step bias and the
+            output norm's weight as extra parameters.
         """
         ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _F]))
         check_and_apply_custom_hook(ccfg)
@@ -437,7 +438,7 @@ class TestStackAsData(unittest.TestCase):
         self.assertEqual(
             (ccfg.attn_kind, ccfg.a, ccfg.dh, ccfg.n_kv, ccfg.attn_output_gate,
              ccfg.n_softmax, ccfg.n_linrec, ccfg.attn_extra_p),
-            ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16),
+            ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16 + 2 * 16 + 64),
         )
 
     def test_only_a_full_layer_normalizes_queries_and_keys(self):

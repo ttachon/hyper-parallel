@@ -20,7 +20,8 @@ How to run this:
 import unittest
 from types import SimpleNamespace
 
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn, EvalFFn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
@@ -106,6 +107,60 @@ class TestMlaParameters(unittest.TestCase):
         self.assertEqual(EvalAttn.num_params_mla(_mla(dc_q=0), None), without)
         wider = 187107328 + 64 * 128 * (1536 + 512)
         self.assertEqual(EvalAttn.num_params_mla(_mla(qk_nope_head_dim=192), None), wider)
+
+
+def _vectors(**stated) -> SimpleNamespace:
+    """A layer of width 64, 4 query and 2 key heads 16 wide, a gated feed-forward 128 wide, a vocabulary of 100."""
+    return SimpleNamespace(**{"h": 64, "a": 4, "n_kv": 2, "dh": 16, "dc_kv": 0, "n_attMM": 4, "attn_output_gate": False,
+                              "attn_extra_p": 0, "n_ffMM": 3, "hff": 128, "hff_exp": 32, "etp": 1, "n_exp": 4,
+                              "n_shared_exp": 1, "n_normOp": 2, "n_qknorm": 0, "v": 100, "qkv_bias": None,
+                              "o_bias": None, "mlp_bias": None, "norm_bias": None, "layer_norms": None,
+                              "shared_expert_gate": None, **stated})
+
+
+class TestVectors(unittest.TestCase):
+    """The biases and norm weights a layer holds, as its model states them."""
+
+    def test_unstated_the_formulas_keep_their_convention(self):
+        """
+        Feature: the parameter formulas of a model that states no bias or norm.
+        Description: The layer with every fact unstated.
+        Expectation: A bias of the hidden width on each projection, one of
+            the feed-forward's width on each of its projections, two vectors
+            a norm op, and an output bias per vocabulary entry.
+        """
+        ccfg = _vectors()
+        weights = 64 * 64 * 2 + 64 * 32 * 2
+        self.assertEqual(EvalAttn.num_params_attn(ccfg, None), weights + 4 * 64)
+        self.assertEqual(EvalFFn.num_params_shared_expert(ccfg, None), 3 * (128 * 64 + 128))
+        self.assertEqual(EvalNorm.num_params_norm(ccfg, None), 2 * 2 * 64)
+        self.assertEqual(EvalTail.num_params_output(ccfg, None), 64 * 100 + 100)
+
+    def test_stated_each_vector_is_the_models(self):
+        """
+        Feature: the parameter formulas of a model that states its biases and norms.
+        Description: The layer biasing its query, key and value projections
+            and its feed-forward, as Qwen2 and a biased Llama do; then with
+            no bias, two RMSNorms and a gated shared expert; then with two
+            LayerNorms.
+        Expectation: Each bias as wide as its projection's output, none
+            where stated none; a weight per RMSNorm, a weight and a bias per
+            LayerNorm; the shared expert's gate a weight of the width; the
+            final norm at the output, and no bias there.
+        """
+        weights = 64 * 64 * 2 + 64 * 32 * 2
+        biased = _vectors(qkv_bias=True, o_bias=False, mlp_bias=True)
+        self.assertEqual(EvalAttn.num_params_attn(biased, None), weights + 64 + 2 * 32)
+        self.assertEqual(EvalFFn.num_params_routed_expert(biased, None), 4 * (3 * 32 * 64 + 2 * 32 + 64))
+        plain = _vectors(qkv_bias=False, o_bias=False, mlp_bias=False, norm_bias=False, layer_norms=2,
+                         shared_expert_gate=True)
+        self.assertEqual(EvalAttn.num_params_attn(plain, None), weights)
+        self.assertEqual(EvalFFn.num_params_shared_expert(plain, None), 3 * 128 * 64 + 64)
+        self.assertEqual(EvalNorm.num_params_norm(plain, None), 2 * 64)
+        self.assertEqual(EvalTail.num_params_output(plain, None), 64 * 100 + 64)
+        layer_norm = _vectors(norm_bias=True, layer_norms=2)
+        self.assertEqual(EvalNorm.num_params_norm(layer_norm, None), 4 * 64)
+        self.assertEqual(EvalTail.num_params_output(layer_norm, None), 64 * 100 + 2 * 64)
 
 
 def _norms(n_qk_norm: int, norm_switch: int = 1) -> SimpleNamespace:

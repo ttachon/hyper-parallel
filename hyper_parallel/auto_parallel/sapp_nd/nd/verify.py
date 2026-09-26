@@ -25,6 +25,7 @@ shows as the part it feeds.
 """
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, NamedTuple
 
 import yaml
@@ -33,7 +34,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import checkpoint_configs, is_a
 from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_groups
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook, layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import prepare_context
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_group_configs
@@ -89,7 +90,9 @@ def verify_parameters(yaml_path: str) -> List[VerifyRow]:
     if not isinstance(raw, dict) or not is_auto_models_schema(raw) or not isinstance(raw.get("model"), dict):
         raise ValueError(f"{yaml_path}: verify mode needs an AutoModels train.yaml naming a Transformers checkpoint")
     config, text = checkpoint_configs(raw["model"])
-    ccfg = _text_model(CostModelConfig(yaml_path, framework="hyper_v2"))
+    # The family's op counts and fields, as the estimates apply them, on a copy.
+    ccfg = copy.deepcopy(_text_model(CostModelConfig(yaml_path, framework="hyper_v2")))
+    check_and_apply_custom_hook(ccfg)
     ctx = prepare_context()
     kinds: Dict[str, List[Any]] = {}
     first = 0
