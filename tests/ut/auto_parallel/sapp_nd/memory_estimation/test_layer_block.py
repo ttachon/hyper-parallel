@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the attention and norm formulas of the memory model.
+"""Tests for the attention, feed-forward and norm formulas of the memory model.
 
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/memory_estimation/test_layer_block.py -v
@@ -110,7 +110,7 @@ class TestMlaParameters(unittest.TestCase):
 
 
 def _vectors(**stated) -> SimpleNamespace:
-    """A layer of width 64, 4 query and 2 key heads 16 wide, a gated feed-forward 128 wide, a vocabulary of 100."""
+    """A layer of width 64, 4 query and 2 key heads 16 wide, gated experts 32 wide, a vocabulary of 100."""
     return SimpleNamespace(**{"h": 64, "a": 4, "n_kv": 2, "dh": 16, "dc_kv": 0, "n_attMM": 4, "attn_output_gate": False,
                               "attn_extra_p": 0, "n_ffMM": 3, "hff": 128, "hff_exp": 32, "etp": 1, "n_exp": 4,
                               "n_shared_exp": 1, "n_normOp": 2, "n_qknorm": 0, "v": 100, "qkv_bias": None,
@@ -126,13 +126,13 @@ class TestVectors(unittest.TestCase):
         Feature: the parameter formulas of a model that states no bias or norm.
         Description: The layer with every fact unstated.
         Expectation: A bias of the hidden width on each projection, one of
-            the feed-forward's width on each of its projections, two vectors
-            a norm op, and an output bias per vocabulary entry.
+            the expert's width on each of its projections, two vectors a
+            norm op, and an output bias per vocabulary entry.
         """
         ccfg = _vectors()
         weights = 64 * 64 * 2 + 64 * 32 * 2
         self.assertEqual(EvalAttn.num_params_attn(ccfg, None), weights + 4 * 64)
-        self.assertEqual(EvalFFn.num_params_shared_expert(ccfg, None), 3 * (128 * 64 + 128))
+        self.assertEqual(EvalFFn.num_params_shared_expert(ccfg, None), 3 * (32 * 64 + 32))
         self.assertEqual(EvalNorm.num_params_norm(ccfg, None), 2 * 2 * 64)
         self.assertEqual(EvalTail.num_params_output(ccfg, None), 64 * 100 + 100)
 
@@ -155,12 +155,41 @@ class TestVectors(unittest.TestCase):
         plain = _vectors(qkv_bias=False, o_bias=False, mlp_bias=False, norm_bias=False, layer_norms=2,
                          shared_expert_gate=True)
         self.assertEqual(EvalAttn.num_params_attn(plain, None), weights)
-        self.assertEqual(EvalFFn.num_params_shared_expert(plain, None), 3 * 128 * 64 + 64)
+        self.assertEqual(EvalFFn.num_params_shared_expert(plain, None), 3 * 32 * 64 + 64)
         self.assertEqual(EvalNorm.num_params_norm(plain, None), 2 * 64)
         self.assertEqual(EvalTail.num_params_output(plain, None), 64 * 100 + 64)
         layer_norm = _vectors(norm_bias=True, layer_norms=2)
         self.assertEqual(EvalNorm.num_params_norm(layer_norm, None), 4 * 64)
         self.assertEqual(EvalTail.num_params_output(layer_norm, None), 64 * 100 + 2 * 64)
+
+
+def _experts(hff: int) -> SimpleNamespace:
+    """A MoE layer of width 64 over 16 tokens: 4 experts 32 wide, 2 chosen, one shared, the dense width *hff*."""
+    return SimpleNamespace(s=16, b=1, h=64, hff=hff, hff_exp=32, n_ffMM=3, n_ffParamCast=0, bytes_compute=2, t=1,
+                           cp=1, n_exp=4, n_chosen_exp=2, n_shared_exp=1, gmm=True, cap_fact=1, mlp_bias=None,
+                           shared_expert_gate=None, rec_op=Config({"ffAct": 1}))
+
+
+class TestExpertWidth(unittest.TestCase):
+    """A MoE layer's experts are as wide as the model states them, whatever its dense layers' width."""
+
+    def test_every_expert_is_hff_exp_wide(self):
+        """
+        Feature: EvalFFn's routed and shared expert activations and shared
+            expert parameters.
+        Description: The MoE layer of a model whose dense layers are 128
+            wide, four times its experts.
+        Expectation: Each of the 32 token-expert pairs and each token of
+            the shared expert keeps its input, two projections into 32 and
+            the activation's output, in bf16; the shared expert holds three
+            projections of 32 and their biases.
+        """
+        ccfg = _experts(128)
+        ctx = SimpleNamespace(current_node=LayerType.NOT_REC_LAYER, micro_factor=1, dropless_tok_factor=1)
+        per_token = 2 * (64 + 3 * 32)
+        self.assertEqual(EvalFFn.routed_exp_activations(ccfg, ctx), 16 * 2 * per_token)
+        self.assertEqual(EvalFFn.shared_exp_activations(ccfg, ctx), 16 * per_token)
+        self.assertEqual(EvalFFn.num_params_shared_expert(ccfg, None), 3 * (32 * 64 + 32))
 
 
 def _norms(n_qk_norm: int, norm_switch: int = 1) -> SimpleNamespace:

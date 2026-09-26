@@ -135,9 +135,9 @@ class EvalLayerComm:
         tp_comm_exp = 0.25 * ccfg.n_gather
         tp_comm_exp *= ccfg.s * ccfg.b * ccfg.hff * mb
         if ccfg.n_exp > 1:
-            # Routed experts use hff_exp, shared experts use hff
+            # Routed and shared experts, each hff_exp wide
             routed_comm = ccfg.n_exp / ccfg.ep * ccfg.hff_exp
-            shared_comm = ccfg.n_shared_exp * ccfg.hff
+            shared_comm = ccfg.n_shared_exp * ccfg.hff_exp
             tp_comm_exp = (
                 0.25
                 * ccfg.n_gather

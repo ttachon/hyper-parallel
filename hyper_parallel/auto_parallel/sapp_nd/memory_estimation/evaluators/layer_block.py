@@ -14,7 +14,7 @@
 # ============================================================================
 """Layer's blocks submodule"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import CPAlgo, _resolve_cp_algo
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -245,24 +245,31 @@ class EvalFFn:
 
     @staticmethod
     def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
-        """Shared expert parameters count, and the weight that gates its output where the model has one"""
+        """Shared expert parameters count, and the weight that gates its output where the model has one.
+
+        Every producer states the shared experts as a count of experts of
+        the routed ones' width, ``hff_exp``: one wide shared expert as that
+        many.
+        """
         gate = ccfg.h if ccfg.n_shared_exp and getattr(ccfg, "shared_expert_gate", None) else 0
-        return ccfg.n_shared_exp * (ccfg.n_ffMM * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff)) + gate
+        width = ccfg.hff_exp
+        return ccfg.n_shared_exp * (ccfg.n_ffMM * width * ccfg.h + _mlp_biases(ccfg, width)) + gate
 
     @staticmethod
-    def ffn_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """ "Activations count"""
+    def ffn_activations(ccfg: CostModelConfig, ctx: Context, width: Optional[float] = None) -> float:
+        """Activations of a feed-forward *width* wide, the model's dense width unless given"""
+        width = ccfg.hff if width is None else width
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         tok_size = ccfg.s * ccfg.b
         n_mm = ccfg.n_ffMM
         if n_mm % 2 == 0:
-            matmul = 0.5 * ccfg.h + 0.5 * ccfg.hff
+            matmul = 0.5 * ccfg.h + 0.5 * width
         else:
-            matmul = 1 / 3 * ccfg.h + 2 / 3 * ccfg.hff
+            matmul = 1 / 3 * ccfg.h + 2 / 3 * width
         matmul *= ccfg.bytes_compute * n_mm
-        activ_fun = ccfg.bytes_compute * ccfg.hff
+        activ_fun = ccfg.bytes_compute * width
         activ_fun *= EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.ffAct)
-        pcast = ccfg.bytes_compute * ccfg.hff * ccfg.n_ffParamCast
+        pcast = ccfg.bytes_compute * width * ccfg.n_ffParamCast
         activ_size = matmul + pcast + activ_fun
         micro_factor = ctx.micro_factor
         return micro_factor * tok_size * activ_size / (ccfg.t * ccfg.cp)
@@ -282,14 +289,14 @@ class EvalFFn:
 
     @staticmethod
     def shared_exp_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Shared expert activations"""
-        return ccfg.n_shared_exp * EvalFFn.ffn_activations(ccfg, ctx)
+        """Shared expert activations, each shared expert of the routed ones' width"""
+        return ccfg.n_shared_exp * EvalFFn.ffn_activations(ccfg, ctx, ccfg.hff_exp)
 
     @staticmethod
     def routed_exp_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """MoE topK activations"""
+        """MoE topK activations, each expert at its width"""
         tok_size = ccfg.s * ccfg.b
-        activ_size = EvalFFn.ffn_activations(ccfg, ctx) / tok_size
+        activ_size = EvalFFn.ffn_activations(ccfg, ctx, ccfg.hff_exp) / tok_size
         avg_num_toks = tok_size * ccfg.n_chosen_exp / ccfg.n_exp
         if not ccfg.gmm:  # Capacity mode
             expert_capacity = avg_num_toks * ccfg.cap_fact * ccfg.n_exp
