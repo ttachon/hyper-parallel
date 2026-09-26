@@ -84,7 +84,7 @@ def _make_ccfg(
 
 
 def _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, ffn_p=200.0,
-              routed_p=300.0, shared_p=100.0, swap_os=False):
+              routed_p=300.0, shared_p=100.0, swap_os=False, router_p=0.0):
     """Create a mock Context for body tests.
 
     The ctx.eval.num_p(ccfg, ctx) must return the 3-tuple that
@@ -104,6 +104,7 @@ def _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, ffn_p=200.0,
     ctx.ffn_shared_num_p = EvalFFn.num_params_shared_expert if shared_p == "real" else (
         lambda c, x: shared_p
     )
+    ctx.ffn_router_num_p = EvalFFn.num_params_router if router_p == "real" else (lambda c, x: router_p)
 
     # ctx.eval.num_p returns the tuple from EvalBody.num_params_layer
     ctx.eval = MagicMock()
@@ -135,6 +136,15 @@ class TestNumParamsLayer(unittest.TestCase):
         self.assertAlmostEqual(non_exp, 150.0)  # 100 + 50, no dense FFN
         self.assertAlmostEqual(routed, 300.0)
         self.assertAlmostEqual(shared, 100.0)
+
+    def test_a_moe_layers_router_is_a_non_expert_part(self):
+        """BD-N02b: a MoE layer's router, a weight per expert over the hidden width, is among its non-expert parts."""
+        ccfg = _make_ccfg(n_exp=8, n_shared_exp=1, h=4096)
+        ctx = _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, routed_p=300.0, shared_p=100.0, router_p="real")
+        non_exp, routed, shared = EvalBody.num_params_layer(ccfg, ctx)
+        self.assertEqual((non_exp, routed, shared), (150.0 + 4096 * 8, 300.0, 100.0))
+        dense = _make_ccfg(n_exp=1)
+        self.assertEqual(EvalBody.num_params_layer(dense, _make_ctx(dense, router_p="real"))[0], 350.0)
 
     def test_moe_no_shared_expert(self):
         """BD-N03: MoE without shared expert returns shared=0."""

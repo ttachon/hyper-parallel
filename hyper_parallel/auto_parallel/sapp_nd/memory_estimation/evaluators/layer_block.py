@@ -217,6 +217,11 @@ class EvalFFn:
         return ccfg.n_exp * ccfg.n_ffMM * (hff_sliced * ccfg.h + hff_sliced)
 
     @staticmethod
+    def num_params_router(ccfg: CostModelConfig, _) -> float:
+        """The router's parameters: a weight per routed expert, the hidden width wide, where the layer routes."""
+        return ccfg.h * ccfg.n_exp if ccfg.n_exp > 1 else 0
+
+    @staticmethod
     def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
         """Shared expert parameters count"""
         return ccfg.n_shared_exp * ccfg.n_ffMM * (ccfg.hff * ccfg.h + ccfg.hff)
