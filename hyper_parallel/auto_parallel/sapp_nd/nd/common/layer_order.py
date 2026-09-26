@@ -62,6 +62,12 @@ def stated_recompute(ccfg: Any) -> Optional[Tuple[Any, ...]]:
     return ranges if isinstance(ranges, tuple) else None
 
 
+def layer_switches(ccfg: Any) -> Optional[Tuple[Any, ...]]:
+    """Return each layer's own recompute switches in model order, or ``None`` where ``rec_op`` holds the one setting."""
+    switches = getattr(ccfg, "layer_switches", None)
+    return switches if isinstance(switches, tuple) else None
+
+
 def layer_recompute_types(ranges: Sequence[Any], layers: int) -> List[LayerType]:
     """Return the layer type of each of *layers* layers in model order.
 

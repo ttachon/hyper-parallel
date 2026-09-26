@@ -39,6 +39,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_configs_by_position,
+    get_layer_switches_by_position,
     get_table_quantity,
     selective_shares,
 )
@@ -145,8 +146,8 @@ def _flavour_tables(cfg, attn=None):
     return base, exp
 
 
-def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
-    """Price one regular layer with its group's config.
+def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp, switches=None):
+    """Price one regular layer with its group's config, and its own recompute *switches* where it has them.
 
     *tables* holds one table pair per attention flavour and gains one the
     first time a flavour is priced.
@@ -159,7 +160,8 @@ def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
         tables[kind][1] if (lcfg.n_exp > 1) else tables[kind][0],
         layer,
         with_recomp,
-        shares=selective_shares(lcfg, layer),
+        shares=selective_shares(lcfg, layer, switches),
+        switches=switches,
     )
     if ccfg.ttype == PerformanceType.TIME:
         flop = estimate_comp_flop_time(lcfg, flop)
@@ -173,6 +175,8 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
     # Full attention prices from the model's own attention dimensions.
     tables = {"full": _flavour_tables(cfg)}
     lccfg_at = get_layer_configs_by_position(cfg, stages)
+    # Each layer's own recompute switches, where the config states several.
+    switches_at = get_layer_switches_by_position(cfg, stages)
 
     flops = []
     for stage_id, stage in enumerate(stages):
@@ -196,8 +200,9 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
                     )
                     continue
 
+                position = (stage_id, chunk_id, lay_id)
                 flops[-1] += _regular_layer_flop(
-                    cfg, ccfg, lccfg_at[(stage_id, chunk_id, lay_id)], tables, layer, with_recomp
+                    cfg, ccfg, lccfg_at[position], tables, layer, with_recomp, switches_at.get(position)
                 )
 
     return flops
@@ -489,6 +494,9 @@ def _layer_alone(
     single = deepcopy(cfg)
     if switches is not None:
         single.rec_op = Config(dict(switches))
+    # The one layer runs *switches*, else the config's rec_op, whatever
+    # the layers of the model run.
+    single.layer_switches = None
     single.layer_stack = _one_layer_of(single.layer_stack, kind)
     single.n = single.d * single.t * single.p
     stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]

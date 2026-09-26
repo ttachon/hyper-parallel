@@ -282,18 +282,22 @@ def derive_recompute_ranges(ccfg: Any) -> None:
 
 
 def derive_recompute_switches(ccfg: Any) -> None:
-    """Set which activations a recomputed layer keeps, ``rec_op``.
+    """Set which activations a recomputed layer keeps: ``rec_op``, and each layer's own, ``layer_switches``.
 
     ``sel_rec_rule`` names the framework whose selective recompute the run
     uses: HyperParallel's recomputes a fixed set of ops, MindFormers' a set
     that depends on flash attention and sequence parallelism.  A selective
-    recompute range that states its ops sets them instead.  A config holds
-    one selective setting: pricing several at once in one config is the
-    search's per-layer channel.
+    recompute range that states its ops sets them instead.  Where the
+    ranges state several selective settings, ``layer_switches`` gives each
+    layer in model order its range's, None for a layer that is not
+    selective, and the estimates read each layer's through its context,
+    the per-layer channel; ``rec_op`` holds the first range's.  Otherwise
+    ``layer_switches`` is None and ``rec_op`` holds the one setting.
 
     Raises:
-        ValueError: When the config names no known rule, or its recompute
-            ranges state more than one selective setting.
+        ValueError: When the config names no known rule, or it is a
+            multimodal config whose ranges state several selective
+            settings.
     """
     ranges = stated_recompute(ccfg)
     selective = [item for item in ranges or () if item.option == "selective"]
@@ -305,14 +309,28 @@ def derive_recompute_switches(ccfg: Any) -> None:
     else:
         raise ValueError(f"Unknown selective recompute rule {ccfg.sel_rec_rule!r}")
     settings = {tuple(sorted((item.switches() or switches).items())) for item in selective}
+    ccfg.layer_switches = None
     if len(settings) > 1:
-        raise ValueError(
-            f"{ccfg.model_name}: its recompute ranges state {len(settings)} selective settings; "
-            "a config prices one"
-        )
-    if settings:
+        if getattr(ccfg, "multimodal", False):
+            raise ValueError(
+                f"{ccfg.model_name}: its recompute ranges state {len(settings)} selective settings; "
+                "a multimodal config prices one"
+            )
+        ccfg.layer_switches = _per_layer_switches(ccfg, selective, switches)
+        switches = dict(selective[0].switches() or switches)
+    elif settings:
         switches = dict(next(iter(settings)))
     ccfg.rec_op = Config(switches)
+
+
+def _per_layer_switches(ccfg: Any, selective: list, rule: Dict[str, int]) -> tuple:
+    """Each layer's switches in model order, its selective range's or else *rule*'s; None where none covers it."""
+    layers = int(ccfg.n_lay + ccfg.n_mtp)
+    per_layer = [None] * layers
+    for item in selective:
+        stop = layers if item.count is None else min(layers, item.first + item.count)
+        per_layer[item.first:stop] = [dict(item.switches() or rule)] * max(0, stop - item.first)
+    return tuple(per_layer)
 
 
 def derive_flash_attention_factor(ccfg: Any) -> None:

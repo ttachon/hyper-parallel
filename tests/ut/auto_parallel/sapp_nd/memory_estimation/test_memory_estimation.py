@@ -681,8 +681,8 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         overhead = _BackwardOverhead(backbone, ccfg, ctx, _dynamic_mem_for_overhead)
         stages = [[[LayerType.FULL_REC_LAYER, LayerType.OUTPUT_LAYER]]]
         record = {
-            (0, 0, 0): (ccfg, ctx, None),
-            (0, 0, 1): (ccfg, ctx, None),
+            (0, 0, 0): (ccfg, ctx, None, None),
+            (0, 0, 1): (ccfg, ctx, None, None),
         }
 
         self.assertEqual(overhead.estimate(stages, 0, record), 48)
@@ -698,8 +698,8 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         ccfg.vp = 2
         stages_zbv = [[[LayerType.NOT_REC_LAYER], [LayerType.FULL_REC_LAYER]]]
         record_zbv = {
-            (0, 0, 0): (ccfg, ctx, None),
-            (0, 1, 0): (ccfg, ctx, None),
+            (0, 0, 0): (ccfg, ctx, None, None),
+            (0, 1, 0): (ccfg, ctx, None, None),
         }
         self.assertEqual(overhead.estimate(stages_zbv, 0, record_zbv), 48)
 

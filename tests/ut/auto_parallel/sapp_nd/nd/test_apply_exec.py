@@ -34,9 +34,14 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import (
     exec_of,
     strategy_exec,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive_recompute_switches
+import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_comp
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     STRATEGY_GUARDED,
     CostModelConfig,
@@ -259,8 +264,8 @@ class TestApplyExec(unittest.TestCase):
         self.assertEqual(spec, want, f"strategy_exec gave {spec}")
 
 
-def _unit(pp: int = 2) -> CostModelConfig:
-    """A small dense Hyper model of 8 layers at *pp* stages, fully recomputed."""
+def _unit(pp: int = 2, **accelerator: Any) -> CostModelConfig:
+    """A small dense Hyper model of 8 layers at *pp* stages, fully recomputed; *accelerator* adds to its section."""
     return CostModelConfig({
         "model": {"name": "unit", "config_overrides": {
             "hidden_size": 1024, "num_hidden_layers": 8, "num_attention_heads": 8,
@@ -268,7 +273,7 @@ def _unit(pp: int = 2) -> CostModelConfig:
             "max_position_embeddings": 2048,
         }},
         "training": {"global_batch_size": 8, "micro_batch_size": 1},
-        "accelerator": {"tp_size": 2, "pp_size": pp},
+        "accelerator": {"tp_size": 2, "pp_size": pp, **accelerator},
         "fsdp_config": {"dp_shard_size": 2},
         "activation_checkpoint": {"mode": "full"},
         "dataset": {"data_transform": {"max_seq_len": 2048}},
@@ -280,6 +285,39 @@ def _layers(ccfg: Any) -> list:
     """Each layer's recompute type, in model order."""
     stages = ccfg.generate_partitions_vpp()
     return [stages[stage][chunk][lay].name[:3] for stage, chunk, lay in get_model_order(ccfg, stages)]
+
+
+def _recomputed(switches: Any) -> Any:
+    """The ops *switches* recompute, sorted; None for a layer with no switches of its own."""
+    if switches is None:
+        return None
+    values = switches if isinstance(switches, dict) else vars(switches)
+    return sorted(op for op, keep in values.items() if not keep)
+
+
+def _stage_ranges(stage_of: list, settings: tuple) -> tuple:
+    """Selective ranges over the runs of consecutive layers on one stage, each with its stage's setting."""
+    ranges, first = [], 0
+    for index in range(1, len(stage_of) + 1):
+        if index == len(stage_of) or stage_of[index] != stage_of[first]:
+            ranges.append(RecomputeRange(first=first, count=index - first, option="selective",
+                                         ops=settings[stage_of[first]]))
+            first = index
+    return tuple(ranges)
+
+
+def _priced(ranges: tuple, **accelerator: Any) -> tuple:
+    """Each stage's peak memory, and its compute and communication with recompute, with *ranges* stated."""
+    ccfg = _unit(**accelerator)
+    apply_exec(ccfg, ExecSpec(recompute=ranges))
+    memory = [insight["Static"] + insight["Dynamic"]
+              for insight in EvaluatorV2(None, ccfg=ccfg).estimate_peak_insight()]
+    hooked = copy.deepcopy(ccfg)
+    check_and_apply_custom_hook(hooked)
+    stages = hooked.generate_partitions_vpp()
+    compute = estimate_comp(copy.deepcopy(hooked), CustomConfig(), stages, with_recomp=True)
+    comm = estimate_comm(copy.deepcopy(hooked), CustomConfig(), stages, Hard.Device_A2, with_recomp=True)
+    return memory, compute, comm
 
 
 class TestRecomputeRanges(unittest.TestCase):
@@ -335,22 +373,79 @@ class TestRecomputeRanges(unittest.TestCase):
         self.assertEqual(_layers(ccfg), ["SEL"] * 8)
         self.assertEqual(vars(ccfg.rec_op), HYPER_SELECTIVE_REC_OP)
 
+    def test_several_selective_settings_give_each_layer_its_own(self):
+        """
+        Feature: derive.
+        Description: Three layers selective with the feed-forward activation
+            recomputed, one fully recomputed, the other four selective with
+            the norms recomputed; then one selective setting over every layer.
+        Expectation: Each selective layer holds its range's switches and the
+            full one none, and rec_op the first range's; with one setting,
+            no layer holds switches of its own.
+        """
+        ccfg = _unit()
+        apply_exec(ccfg, ExecSpec(recompute=(
+            RecomputeRange(first=0, count=3, option="selective", ops={"ffAct": "recompute"}),
+            RecomputeRange(first=3, count=1, option="full"),
+            RecomputeRange(first=4, option="selective", ops={"normOp": "recompute"}),
+        )))
+        self.assertEqual(_layers(ccfg), ["SEL"] * 3 + ["FUL"] + ["SEL"] * 4)
+        self.assertEqual([_recomputed(switches) for switches in ccfg.layer_switches],
+                         [["ffAct"]] * 3 + [None] + [["normOp"]] * 4)
+        self.assertEqual(_recomputed(ccfg.rec_op), ["ffAct"])
+        apply_exec(ccfg, ExecSpec(recompute=(RecomputeRange(option="selective", ops={"normOp": "recompute"}),)))
+        self.assertIsNone(ccfg.layer_switches)
+        self.assertEqual(_recomputed(ccfg.rec_op), ["normOp"])
+
     def test_what_a_config_cannot_price_is_refused(self):
         """
         Feature: derive.
-        Description: Two selective settings in one config, and a range past
-            the model's last layer.
-        Expectation: ValueError for each: a config prices one selective
-            setting, and every range covers layers the model has.
+        Description: Two selective settings in a multimodal config, and a
+            range past the model's last layer.
+        Expectation: ValueError for each: a multimodal config prices one
+            selective setting, and every range covers layers the model has.
         """
-        ccfg = _unit()
+        multimodal = _unit()
+        multimodal.multimodal = True
+        multimodal.recompute_ranges = (
+            RecomputeRange(first=0, count=4, option="selective", ops={"ffAct": "recompute"}),
+            RecomputeRange(first=4, option="selective", ops={"normOp": "recompute"}),
+        )
         with self.assertRaises(ValueError):
-            apply_exec(ccfg, ExecSpec(recompute=(
-                RecomputeRange(first=0, count=4, option="selective", ops={"ffAct": "recompute"}),
-                RecomputeRange(first=4, option="selective", ops={"normOp": "recompute"}),
-            )))
+            derive_recompute_switches(multimodal)
         with self.assertRaises(ValueError):
             apply_exec(_unit(), ExecSpec(recompute=(RecomputeRange(first=6, count=4, option="full"),)))
+
+
+class TestPerLayerSwitches(unittest.TestCase):
+    """A config that states several selective settings prices each layer with its own, S2's per-layer channel."""
+
+    def test_each_stage_prices_as_the_config_of_its_setting(self):
+        """
+        Feature: the per-layer channel.
+        Description: One config whose layers on the first stage are
+            selective with the feed-forward activation and the gathers
+            recomputed, and on the second with the norms recomputed; and
+            each setting over every layer, in a config of its own. Under
+            1F1B, interleaved 1F1B and a V schedule, whose second chunk
+            runs back up the stages.
+        Expectation: Each stage keeps the memory, and runs the compute and
+            the communication with recompute, of the config whose setting
+            it runs, all three of which differ from the other setting's.
+        """
+        settings = ({"ffAct": "recompute", "gather": "recompute"}, {"normOp": "recompute"})
+        for accelerator in ({}, {"pp_interleave_num": 2},
+                            {"pp_interleave_num": 2, "pipeline_scheduler": "zero_bubble_v"}):
+            with self.subTest(**accelerator):
+                probe = _unit(**accelerator)
+                stage_of = [stage for stage, _, _ in get_model_order(probe, probe.generate_partitions_vpp())]
+                mixed = _priced(_stage_ranges(stage_of, settings), **accelerator)
+                alone = [_priced((RecomputeRange(option="selective", ops=ops),), **accelerator) for ops in settings]
+                for stage in range(2):
+                    own = [part[stage] for part in alone[stage]]
+                    self.assertEqual([part[stage] for part in mixed], own, stage)
+                    for part, other in enumerate(alone[1 - stage]):
+                        self.assertNotEqual(other[stage], own[part], (stage, part))
 
 
 class TestStrategyGuard(unittest.TestCase):

@@ -329,14 +329,14 @@ class TestStageMemory(unittest.TestCase):
         """
         Feature: choose_recompute.
         Description: Devices between all plain and all fully recomputed, one
-            and two chunks per stage. Each choice that holds one selective
-            setting at most is stated as recompute ranges and the whole
+            and two chunks per stage. Each choice is stated as recompute
+            ranges, several selective settings included, and the whole
             config priced with them.
         Expectation: Each stage keeps what the choice says it keeps, to its
             MB, a choice whose last layer ends warm-up on a selective option
-            included.
+            and one that mixes selective settings included.
         """
-        selective_ends = 0
+        selective_ends = mixes = 0
         for interleave in (1, 2):
             evaluator = self._evaluator(interleave)
             plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
@@ -344,12 +344,12 @@ class TestStageMemory(unittest.TestCase):
                 choice = choose_recompute(_with_capacity(evaluator, full + 16 + share * (plain - full)),
                                           Hard.Device_A2)
                 settings = {item.option.recompute for item in choice.ranges if item.option.recompute}
-                if len(settings) > 1:
-                    continue
+                mixes += len(settings) > 1
                 selective_ends += bool(choice.ranges[-1].option.recompute)
                 for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
                     self.assertLessEqual(abs(mine - model), 1.0, (interleave, share, describe(choice)))
         self.assertGreater(selective_ends, 0)
+        self.assertGreater(mixes, 0)
 
     def test_a_stage_between_the_first_and_the_last_keeps_what_the_config_priced_whole_keeps(self):
         """
@@ -358,9 +358,8 @@ class TestStageMemory(unittest.TestCase):
             micro-batches, whose stages keep 4, 3, 2 and 1 in flight, and
             devices between all plain and all fully recomputed. On the second
             stage a DP buffer hides the dense layer's gathers of the first
-            micro-batches. Each choice that holds one selective setting at
-            most is stated as recompute ranges and the whole config priced
-            with them.
+            micro-batches. Each choice is stated as recompute ranges and the
+            whole config priced with them.
         Expectation: Each stage keeps what the choice says it keeps, to its
             MB.
         """
@@ -371,7 +370,6 @@ class TestStageMemory(unittest.TestCase):
         plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
         for share in (0.1, 0.5, 0.9):
             choice = choose_recompute(_with_capacity(evaluator, full + 16 + share * (plain - full)), Hard.Device_A2)
-            self.assertLessEqual(len({item.option.recompute for item in choice.ranges if item.option.recompute}), 1)
             for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
                 self.assertLessEqual(abs(mine - model), 1.0, (share, describe(choice)))
 
@@ -437,25 +435,20 @@ class TestTwoPeaks(unittest.TestCase):
         """
         Feature: choose_recompute.
         Description: Devices between all plain and all fully recomputed. Each
-            choice that holds one selective setting at most is stated as
-            recompute ranges and the whole config priced with them.
+            choice is stated as recompute ranges, several selective settings
+            included, and the whole config priced with them.
         Expectation: Every choice fits, and each stage keeps what the choice
             says it keeps, to its MB, one mode for every layer too.
         """
         evaluator = self._evaluator()
         plain, full = max(_stage_peaks(evaluator, full_rec=False)), max(_stage_peaks(evaluator, full_rec=True))
-        checked = 0
         for share in (0.7, 0.5, 0.3, 0.1, 0.0):
             capacity = full + 16 + share * (plain - full)
             for modes in (None, ("off", "full")):
                 choice = choose_recompute(_with_capacity(evaluator, capacity), Hard.Device_A2, modes=modes)
                 self.assertLessEqual(choice.memory, capacity)
-                if len({item.option.recompute for item in choice.ranges if item.option.recompute}) > 1:
-                    continue
-                checked += 1
                 for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
                     self.assertLessEqual(abs(mine - model), 1.0, (share, modes, describe(choice)))
-        self.assertGreater(checked, 5)
 
 
 # The dense model at DP shard 2: HyperParallel's FSDP reshards, so a layer's

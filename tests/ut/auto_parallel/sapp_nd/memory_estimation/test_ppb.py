@@ -182,6 +182,32 @@ class TestSwitchChannel(unittest.TestCase):
                 self.assertEqual(profiles["unit", None], profile)
             self.assertIsNone(ctx.switches)
 
+    def test_a_layer_with_switches_of_its_own_offers_them(self):
+        """
+        Feature: _PPB.lay_ppb.
+        Description: Describe a body with a pricer, on a config that
+            recomputes the softmax, while the context carries the layer's
+            own switches, which recompute the norms.
+        Expectation: The description of a config that recomputes the norms:
+            SLCT, COMM and BOTH priced with the layer's switches; the
+            context still carries them afterwards.
+        """
+        own = dict(_KEEP_ALL, normOp=0)
+        expected, _ = _describe(LayerType.NOT_REC_LAYER, own, _Pricer())
+        ctx = Context()
+        ctx.head_node, ctx.tail_node = "head", "tail"
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        ctx.switches = dict(own)
+        ccfg = SimpleNamespace(model_name="unit", rec_op=SimpleNamespace(**dict(_KEEP_ALL, softmax=0)))
+        pricer = _Pricer()
+        ppb = _PPB(SimpleNamespace(ppb_combined=[]), _Memory(ctx, ccfg))
+        ppb.layer_times = pricer
+        self.assertEqual(ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE), expected)
+        selective = {tuple(sorted(op for op, keep in switches.items() if not keep))
+                     for _, _, layer_type, switches in pricer.calls if layer_type == LayerType.SEL_REC_LAYER}
+        self.assertEqual(selective, {("normOp",), ("gather",), ("gather", "normOp")})
+        self.assertEqual(ctx.switches, own)
+
 
 class _Frozen(SimpleNamespace):
     """Switches that refuse to be set once built."""

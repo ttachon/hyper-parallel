@@ -18,7 +18,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, apply_layer_kind, layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import runs_hyper_selective
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order, layer_switches
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 
@@ -57,6 +57,19 @@ def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int
     }
 
 
+def get_layer_switches_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int, int], Any]:
+    """Map each regular layer's position to its own recompute switches, where its config's ranges state several.
+
+    Empty where the config's ``rec_op`` holds the one setting every
+    selective layer runs (:func:`layer_switches`).
+    """
+    switches = layer_switches(cfg)
+    if switches is None:
+        return {}
+    return {position: switches[idx] for idx, position in enumerate(get_model_order(cfg, stages))
+            if idx < len(switches)}
+
+
 # The switch an op answers to where it has none of its own: a QK-norm is a norm.
 _SWITCH_OF = {"qknorm": "normOp"}
 
@@ -65,48 +78,50 @@ _SWITCH_OF = {"qknorm": "normOp"}
 _CENSUS_SHARES = {"attMM": "selective_attention_mm", "ffMM": "selective_ffn_mm"}
 
 
-def selective_shares(lccfg, layer):
+def selective_shares(lccfg, layer, switches=None):
     """The share of each matmul op's FLOPs a selective layer runs again, as its kind's census measured it.
 
     Only for a layer of HyperParallel's selective policy, whose switches it
-    has (:func:`runs_hyper_selective`): the policy recomputes every other
-    matmul, which no switch covers.  Empty otherwise, and the switches
-    price every op.
+    has (:func:`runs_hyper_selective`), *switches* where the layer has its
+    own: the policy recomputes every other matmul, which no switch covers.
+    Empty otherwise, and the switches price every op.
     """
     census = getattr(lccfg, "kind_activations", None)
-    if layer != LayerType.SEL_REC_LAYER or census is None or not runs_hyper_selective(lccfg):
+    if layer != LayerType.SEL_REC_LAYER or census is None or not runs_hyper_selective(lccfg, switches):
         return {}
     return {op: getattr(census, name) for op, name in _CENSUS_SHARES.items()
             if getattr(census, name, None) is not None}
 
 
-def get_recomp_factor(lccfg, layer, op_name):
+def get_recomp_factor(lccfg, layer, op_name, switches=None):
     """Whether a layer of this type runs the op again in its backward pass.
 
     A selective layer recomputes exactly the ops whose switch in
     ``lccfg.rec_op`` is 0. A switch at 1 keeps the op's activation, which is
     how the memory model's ``EvalUtils.rec_coeff`` reads it, and an op with no
     switch is kept. The switches are read from ``vars`` because a ``Config``
-    answers 0 for any attribute it lacks.
+    answers 0 for any attribute it lacks.  *switches*, a layer's own where
+    it has them, stand for the config's.
     """
     if layer == LayerType.FULL_REC_LAYER:
         return 1
     if layer == LayerType.NOT_REC_LAYER:
         return 0
     if layer == LayerType.SEL_REC_LAYER:
-        switches = vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
+        if switches is None:
+            switches = vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
         return int(not switches.get(_SWITCH_OF.get(op_name, op_name), 1))
     logger.warning("Unrecognized recompute type %s", layer)
     return 0
 
 
-def get_table_quantity(lccfg, table, layer, with_recomp, shares=None):
-    """op compute load from given table; *shares* sets the recompute factor of the ops it names"""
+def get_table_quantity(lccfg, table, layer, with_recomp, shares=None, switches=None):
+    """op compute load from given table; *shares* sets the recompute factor of the ops it names, *switches* the rest"""
     shares = shares or {}
     qt_layer = 0
     for op, quantity in table.items():
         op_name = op[2:]
-        factor = shares[op_name] if op_name in shares else get_recomp_factor(lccfg, layer, op_name)
+        factor = shares[op_name] if op_name in shares else get_recomp_factor(lccfg, layer, op_name, switches)
 
         qt_layer += (
             (1 + with_recomp * factor)

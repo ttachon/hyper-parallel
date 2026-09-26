@@ -32,6 +32,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     check_and_apply_custom_hook,
     layer_kinds,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import layer_switches
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -44,7 +45,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, List, Tuple
+    from typing import Any, Dict, List, Optional, Tuple
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 EVAL_YML = os.path.join(current_dir, "configs_eval/default.yaml")
@@ -59,6 +60,9 @@ class _Backbone:
         self.eval_cfg = Config(kwargs.get("eval_yml", EVAL_YML))
         self._ctx = kwargs.get("ctx", Context())
         self._ccfg = kwargs.get("ccfg", None)
+        # During a walk, the regular layers' own recompute switches still to
+        # visit, where the config states several (derive's layer_switches).
+        self._switch_order = None
         self.framework = kwargs.get("framework", None)
         self.source_code = kwargs.get("source_code", None)
         self.hook_cls, self.config_path = None, None
@@ -396,6 +400,17 @@ class _Backbone:
             val = self._ctx.accu_mem_type[mem_type]
             stage_logs[stage_id].accu_mem_type[mem_type] += val
 
+    def __order_layer_switches(self, stages: list) -> Optional[list]:
+        """Each regular layer's own recompute switches, in the order the kinds take; None where rec_op holds them."""
+        per_layer = layer_switches(self._ccfg)
+        if per_layer is None:
+            return None
+        order = list(per_layer)
+        if self._ccfg.pp_sched == "zero_bubble_v":
+            first = sum(len(s[0]) for s in stages) - 1
+            order = order[:first] + order[first:][::-1]
+        return order
+
     def __order_layer_kinds(self, stages: list, kinds: list) -> list:
         """Check the layers' kinds against the partition, in the order the stages visit them."""
         flatten = list(kinds)
@@ -535,6 +550,8 @@ class _Backbone:
         insights = []
         # Compute peak memory
         flatten = self.__order_layer_kinds(stages, args[5])
+        self._switch_order = self.__order_layer_switches(stages)
+        self._ctx.switches = None
         if verbose:
             logger.info(
                 "Layer kinds in stage order\n%s",
@@ -573,6 +590,8 @@ class _Backbone:
             ppb_input = {"layers_description": ppb_lay_desc}
         if args[4]:  # Plot
             self.__plot_stages(stages, stage_misc["stat"], stage_misc["dyn"])
+        self._switch_order = None
+        self._ctx.switches = None
         return insights, ppb_input
 
     def __update_evaluator(self, node, verbose):
@@ -596,10 +615,16 @@ class _Backbone:
         kind = None
         if self.is_regular_layer(node) and flatten:
             kind = flatten.pop(0)
+        # The layer's own recompute switches, which its context carries.
+        switches = None
+        if self.is_regular_layer(node) and self._switch_order:
+            switches = self._switch_order.pop(0)
+        self._ctx.switches = switches
         record_lay_types[(stage_id, chunk_id, lay_id)] = (
             self._ccfg,
             self._ctx,
             kind,
+            switches,
         )
         if kind is not None:
             if verbose:

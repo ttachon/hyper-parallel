@@ -110,6 +110,11 @@ class _CostModVar:
     n_s_split: float = 0
     cp_algo: str = "colossalai_cp"
     rec_op: any = None
+    # Each layer's own recompute switches in model order, None for a layer
+    # that is not selective, where the recompute ranges state several
+    # selective settings; None where rec_op holds the one every selective
+    # layer runs (derive).
+    layer_switches: tuple = None
     pp_partition: list = None
 
     # hyperparameters

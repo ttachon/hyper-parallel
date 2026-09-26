@@ -15,7 +15,7 @@
 """PPB input module"""
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, TYPE_CHECKING
 
 from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
@@ -46,6 +46,12 @@ _TIME_KEY = {
     "BOTH": "both_comm_select_time",
     "FULL": "recompute_time",
 }
+
+
+def _layer_switches(ccfg: CostModelConfig, ctx: Optional[Context]) -> Dict[str, Any]:
+    """The switches of the layer *ctx* evaluates, its own where the context carries them, else the config's."""
+    stated = EvalUtils.switches(ccfg, ctx)
+    return dict(stated) if isinstance(stated, Mapping) else dict(vars(stated))
 
 
 class _PPB:
@@ -100,13 +106,14 @@ class _PPB:
                 ppb_lay_desc += [desc]
 
     @staticmethod
-    def selective_switches(ccfg: CostModelConfig) -> Dict[str, Dict[str, int]]:
+    def selective_switches(ccfg: CostModelConfig, ctx: Optional[Context] = None) -> Dict[str, Dict[str, int]]:
         """The recompute switches of each selective option.
 
-        SLCT is the selective recompute the config describes, COMM recomputes
-        the tensor-parallel gathers alone, and BOTH does both.
+        SLCT is the selective recompute the layer runs, its own where *ctx*
+        carries them, else the config's; COMM recomputes the tensor-parallel
+        gathers alone, and BOTH does both.
         """
-        rec_op = vars(ccfg.rec_op)
+        rec_op = _layer_switches(ccfg, ctx)
         keep = dict.fromkeys(SWITCHES, 1)
         configured = {name: int(bool(rec_op.get(name, 1))) for name in SWITCHES}
         return {"SLCT": configured, "COMM": dict(keep, gather=0), "BOTH": dict(configured, gather=0)}
@@ -149,7 +156,7 @@ class _PPB:
         finally:
             ctx.enable_node_log = original_enable_node_log
         if timed:
-            self._time_ppb(desc, ccfg, kind)
+            self._time_ppb(desc, ccfg, ctx, kind)
         return desc
 
     def _body_memory(self, desc: dict, ccfg: CostModelConfig, ctx: Context, res_stat: float, timed: bool) -> None:
@@ -168,7 +175,7 @@ class _PPB:
         ctx.current_node = LayerType.SEL_REC_LAYER
         dyn["SLCT"] = self._dynamic_mem(many)
         if timed:
-            switches = self.selective_switches(ccfg)
+            switches = self.selective_switches(ccfg, ctx)
             for name in ("COMM", "BOTH"):
                 dyn[name] = self._selective(ccfg, ctx, switches[name], lambda _: self._dynamic_mem(many))
         ctx.current_node = LayerType.FULL_REC_LAYER
@@ -214,15 +221,7 @@ class _PPB:
         # set is the same either way.
         full_working = self._working_extra(ctx, 2, on_saved=False) if census else plain[4]
         base = self._selective(ccfg, ctx, keep, _measure) if census else plain
-        alone = {}
-        for name in SWITCHES if self.profile_each_switch else ():
-            # Only gather acts on the buffers, so any other op recomputed
-            # alone leaves the split, and the working sets, as the base has them.
-            if name == "gather":
-                alone[name] = self._selective(ccfg, ctx, dict(keep, gather=0), _measure)
-            else:
-                measured = self._selective(ccfg, ctx, dict(keep, **{name: 0}), lambda _: self._dynamic_mem(many))
-                alone[name] = measured[:3] + base[3:]
+        alone = self._alone(ccfg, ctx, base, _measure, many) if self.profile_each_switch else {}
         policy = dict(HYPER_SELECTIVE_REC_OP)
         whole = {frozenset(name for name, state in policy.items() if not state): self._selective(
             ccfg, ctx, policy, _measure)} if census else {}
@@ -251,6 +250,24 @@ class _PPB:
                 for recompute, memory in whole.items()
             },
         )
+
+    def _alone(
+        self, ccfg: CostModelConfig, ctx: Context, base: Tuple[Any, ...], measure: Callable, many: int
+    ) -> Dict[str, Tuple[Any, ...]]:
+        """The current layer measured with each op alone recomputed, by *measure* as *base* was.
+
+        Only gather acts on the buffers, so any other op recomputed alone
+        leaves the split, and the working sets, as the base has them.
+        """
+        keep = dict.fromkeys(SWITCHES, 1)
+        alone = {}
+        for name in SWITCHES:
+            if name == "gather":
+                alone[name] = self._selective(ccfg, ctx, dict(keep, gather=0), measure)
+            else:
+                measured = self._selective(ccfg, ctx, dict(keep, **{name: 0}), lambda _: self._dynamic_mem(many))
+                alone[name] = measured[:3] + base[3:]
+        return alone
 
     def _workings(self, ctx: Context) -> Tuple[float, float]:
         """What the current layer's backward holds beyond what it keeps at one micro-batch, at both points.
@@ -300,18 +317,19 @@ class _PPB:
     def _selective(ccfg: CostModelConfig, ctx: Context, switches: Dict[str, int], measure: Callable) -> Any:
         """*measure* of *ctx*, the current layer selective with *switches*.
 
-        The context carries them to the evaluators, over the config's own,
-        which the measure leaves as they are.
+        The context carries them to the evaluators, over the layer's own,
+        and the config's are left as they are.
         """
         before = ctx.switches
+        stated = _layer_switches(ccfg, ctx)
         ctx.current_node = LayerType.SEL_REC_LAYER
-        ctx.switches = {**vars(ccfg.rec_op), **switches}
+        ctx.switches = {**stated, **switches}
         try:
             return measure(ctx)
         finally:
             ctx.switches = before
 
-    def _time_ppb(self, desc: dict, ccfg: CostModelConfig, kind: Optional[LayerKind]) -> None:
+    def _time_ppb(self, desc: dict, ccfg: CostModelConfig, ctx: Context, kind: Optional[LayerKind]) -> None:
         """Add the layer's forward time and the backward time of each option, where the balancer reads them."""
         end = {"HEAD": LayerType.EMBEDDING_LAYER, "TAIL": LayerType.OUTPUT_LAYER}.get(desc["type"])
         if end is not None:
@@ -320,7 +338,7 @@ class _PPB:
             desc["forward_time"], desc["backward_time"] = self.layer_times(
                 ccfg, kind, LayerType.NOT_REC_LAYER
             )
-            for name, switches in self.selective_switches(ccfg).items():
+            for name, switches in self.selective_switches(ccfg, ctx).items():
                 desc[_TIME_KEY[name]] = self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, switches)[1]
             desc["recompute_time"] = self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]
         desc["time"] = desc["forward_time"]

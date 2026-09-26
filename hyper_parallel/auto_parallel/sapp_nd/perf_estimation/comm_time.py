@@ -14,7 +14,7 @@
 # ============================================================================
 """Experimental : Comm time"""
 from copy import copy, deepcopy
-from typing import NamedTuple
+from typing import Mapping, NamedTuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -34,6 +34,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_blo
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import NetworkLevel, PerformanceType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_group_configs,
+    get_layer_switches_by_position,
     get_model_order,
     get_table_quantity,
 )
@@ -119,7 +120,12 @@ def _cp_comm_cost_common(ccfg, volumes, attention_type, kv_dim, cp_algo,
 def _cp_rec_factor(ccfg, ctx):
     """Recompute coefficient, matching the old cp_comm_non_exp."""
     rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
-    rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
+    # A layer's own switches, which the walk's context carries, else the config's.
+    stated = getattr(ctx, "switches", None) if ctx else None
+    if isinstance(stated, Mapping):
+        rec_op_gather = stated.get("gather", 0)
+    else:
+        rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
     return (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
 
 
@@ -515,7 +521,7 @@ def _recomputed_comm(cfg, ctx, layer):
     """
     def _volumes(node):
         ctx.current_node = node
-        kept = EvalUtils.rec_coeff(node == LayerType.SEL_REC_LAYER, cfg.rec_op.gather)
+        kept = EvalUtils.rec_coeff(node == LayerType.SEL_REC_LAYER, EvalUtils.switch(cfg, ctx, "gather"))
         return (
             EvalLayerComm.tp_comm_layer(cfg, ctx, 1),
             EvalLayerComm.ep_comm_layer(cfg, ctx, 1),
@@ -584,6 +590,8 @@ def _accumulate_stage_comm(param, stage, stage_id):
             position = (stage_id, chunk_id, lay_id)
             is_body = layer not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
             cfg = param["walk"] if is_body else param["cfg"]
+            # A layer's own recompute switches, where the config states several.
+            param["ctx"].switches = param["switches"].get(position) if is_body else None
             if is_body and position in param["kinds"]:
                 kind = param["kinds"][position]
                 if kind is not None:
@@ -643,6 +651,7 @@ def estimate_from_mem_comm(*args, **kwargs):
     # Each layer's kind, in model order; layers past the stack get no entry,
     # so no kind and no DP term.
     param["kinds"] = dict(zip(get_model_order(param["cfg"], param["stages"]), layer_kinds(param["cfg"])))
+    param["switches"] = get_layer_switches_by_position(param["cfg"], param["stages"])
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
     for stage_id, stage in enumerate(param["stages"]):
         comm = _accumulate_stage_comm(param, stage, stage_id)
