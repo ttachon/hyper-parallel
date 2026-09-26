@@ -108,7 +108,8 @@ class EvalBody:
         """Parameters count.
 
         Returns a 3-tuple (non_exp, routed, shared):
-          - non_exp: attention + norm params (and dense FFN if n_exp==1)
+          - non_exp: attention + norm params (and dense FFN if n_exp==1,
+            the router otherwise)
           - routed:  routed expert params (0 if n_exp==1)
           - shared:  shared expert params  (0 if n_shared_exp==0 or no pointer)
         """
@@ -118,6 +119,8 @@ class EvalBody:
         if ccfg.n_exp == 1:
             non_exp += ctx.ffn_num_p(ccfg, ctx)
         else:
+            if ctx.ffn_router_num_p is not None:
+                non_exp += ctx.ffn_router_num_p(ccfg, ctx)
             if ctx.ffn_routed_num_p is not None:
                 routed = ctx.ffn_routed_num_p(ccfg, ctx)
             if ctx.ffn_shared_num_p is not None:

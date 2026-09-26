@@ -58,7 +58,7 @@ def nd_parameters(lccfg: Any, ctx: Any) -> Dict[str, float]:
     else:
         parts["routed"] = ctx.ffn_routed_num_p(lccfg, ctx)
         parts["shared"] = ctx.ffn_shared_num_p(lccfg, ctx)
-        parts["router"] = 0.0
+        parts["router"] = ctx.ffn_router_num_p(lccfg, ctx)
     return parts
 
 
