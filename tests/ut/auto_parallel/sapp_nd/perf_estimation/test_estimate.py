@@ -87,5 +87,40 @@ class TestOpTable(unittest.TestCase):
                          (30 * 128 * (8 + 8) * 64 * 2 / 2, False))
 
 
+    def test_scores_run_at_the_heads_widths(self):
+        """
+        Feature: the load of the attention scores.
+        Description: 8 heads on width 512, 64 wide as h / a, then 128 wide;
+            then MLA heads whose keys are 64 wide and a rotary 32, values 64.
+        Expectation: Every head's queries against every key, then the
+            weights against the values: 3 b s^2 a (d_qk + d_v), each TP
+            rank its half, in the parameters' bytes.
+        """
+        s = 128
+        for fields, d_qk, d_v in (({}, 64, 64), ({"dh": 128}, 128, 128),
+                                  ({"dh": 64, "qk_nope_head_dim": 64, "dhr": 32}, 96, 64)):
+            cfg = SimpleNamespace(**{**vars(_cfg(s)), **fields})
+            self.assertEqual(op_table(cfg)["n_attBMM"], 3 * s * s * 8 * (d_qk + d_v) * 2 / 2, fields)
+
+    def test_mla_projections_as_the_model_holds_them(self):
+        """
+        Feature: the load of MLA's projections.
+        Description: DeepSeek-V3's attention: width 7168, 128 heads,
+            latents of 1536 and 512, heads 128 and a rotary 64 wide; then the
+            same without a query latent.
+        Expectation: Six multiply-adds a token per weight, forward and
+            backward, over the four attention matmuls: the 187105280
+            weights of the model's projections; without a query latent, one
+            projection to every head in place of the latent's two.
+        """
+        s = 128
+        mla = SimpleNamespace(**{**vars(_cfg(s)), "h": 7168, "a": 128, "n_kv": 128, "dh": 128, "dhr": 64,
+                                 "dc_q": 1536, "dc_kv": 512, "t": 1, "n_attMM": 4})
+        self.assertEqual(op_table(mla)["n_attMM"], 6 * s * 187105280 / 4 * 2)
+        direct = 187105280 - 1536 * (7168 + 128 * 192) + 7168 * 128 * 192
+        mla.dc_q = 0
+        self.assertEqual(op_table(mla)["n_attMM"], 6 * s * direct / 4 * 2)
+
+
 if __name__ == "__main__":
     unittest.main()

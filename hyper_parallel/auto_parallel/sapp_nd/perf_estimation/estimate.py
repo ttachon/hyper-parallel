@@ -100,18 +100,17 @@ def op_table(cfg, attn=None):
     table["n_dropout"] = (
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )
-    if cfg.dc_kv != 0:  # Deepseek
-        table["n_attMM"] = (
-            3
-            / 2
-            * (
-                2 * cfg.dc_kv * cfg.n_kv * cfg.dh
-                + cfg.dc_q * cfg.a * (cfg.dh + cfg.dhr)
-                + cfg.h * (cfg.a * cfg.dh + cfg.dhr)
-            )
-            * cfg.b
-            * cfg.s
-        )
+    if cfg.dc_kv != 0:  # MLA
+        # The queries' latent and its up-projection, or one projection to
+        # every head; the keys' and values' shared down-projection beside
+        # the rotary key; their up-projections, a head's key at its own
+        # width and its value at the value heads'; the output projection.
+        d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
+        heads = cfg.a * (d_nope + cfg.dhr)
+        query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
+        weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+                   + cfg.a * cfg.dh * cfg.h)
+        table["n_attMM"] = 6 * cfg.b * cfg.s * weights / (getattr(cfg, "n_attMM", 0) or 4)
     for op in table:
         table[op] *= cfg.bytes_p / cfg.t / cfg.cp
     # cfg.s *= cfg.cp
