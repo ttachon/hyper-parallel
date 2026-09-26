@@ -23,7 +23,7 @@ from unittest.mock import patch
 import yaml
 
 from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters
-from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_parameters
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_flops, verify_parameters
 
 _HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
 _RUN_ND = "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd"
@@ -82,6 +82,12 @@ def _verify(config):
     """verify_parameters of the train yaml of *config*."""
     with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
         return verify_parameters(_train_yaml(folder))
+
+
+def _verify_flops(config):
+    """verify_flops of the train yaml of *config*."""
+    with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+        return verify_flops(_train_yaml(folder))
 
 
 class TestVerifyParameters(unittest.TestCase):
@@ -178,6 +184,43 @@ class TestVerifyParameters(unittest.TestCase):
                 verify_parameters(path)
 
 
+class TestVerifyFlops(unittest.TestCase):
+    """Verify mode sets the forward FLOPs the time model prices beside the census's."""
+
+    def test_a_dense_layer_is_priced_as_it_runs(self):
+        """
+        Feature: verify_flops.
+        Description: A Llama of one layer kind, width 64, 4 query heads of
+            16 and 2 key heads, a feed-forward 128 wide.
+        Expectation: Its projections, its scores and its feed-forward are
+            priced as the census counts them, and so is the layers' whole.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        rows = _verify_flops(_one_kind(LlamaConfig))
+        self.assertEqual([row.part for row in rows], ["attention", "scores", "ffn", "total"])
+        for row in rows:
+            self.assertEqual(row.nd, row.census, row.part)
+
+    def test_each_kind_beside_its_census(self):
+        """
+        Feature: verify_flops.
+        Description: The hybrid model, a linear-attention layer and a
+            full-attention one, on 4096 tokens.
+        Expectation: A row per part each kind runs, the recurrence for the
+            linear kind and the scores for the full one; the feed-forward's
+            census sums the routed experts, the shared expert and its gate,
+            and the router; the total sums the rows by their layer counts.
+        """
+        rows = _verify_flops(_qwen35_text())
+        self.assertEqual([(row.where, row.part) for row in rows], [
+            ("linear_attention x1", "attention"), ("linear_attention x1", "linrec"), ("linear_attention x1", "ffn"),
+            ("full_attention x1", "attention"), ("full_attention x1", "scores"), ("full_attention x1", "ffn"),
+            ("layers", "total")])
+        self.assertEqual(rows[5].census, 2 * 4096 * (2 * 3 * 64 * 32 + 3 * 64 * 32 + 64 + 64 * 4))
+        self.assertEqual((rows[-1].nd, rows[-1].census),
+                         (sum(row.nd for row in rows[:-1]), sum(row.census for row in rows[:-1])))
+
+
 class TestRunNdVerify(unittest.TestCase):
     """run_nd -V prints the verify report and exits."""
 
@@ -186,8 +229,9 @@ class TestRunNdVerify(unittest.TestCase):
         Feature: run_nd -V.
         Description: The hybrid model's train yaml under -f hyper_v2, and
             under the default framework.
-        Expectation: With hyper_v2, the report's header and a row per part,
-            and exit 0; otherwise the parser refuses the flag.
+        Expectation: With hyper_v2, the parameters' report, a row per part,
+            then the FLOPs', and exit 0; otherwise the parser refuses the
+            flag.
         """
         with tempfile.TemporaryDirectory() as folder, patch(_HF_CONFIG, return_value=_qwen35_text()):
             path = _train_yaml(folder)
@@ -196,8 +240,11 @@ class TestRunNdVerify(unittest.TestCase):
                     self.assertRaises(SystemExit) as done:
                 runpy.run_module(_RUN_ND, run_name="__main__")
             self.assertEqual(done.exception.code, 0)
-            self.assertIn("census", logs.output[0])
+            self.assertIn("Parameters", logs.output[0])
+            self.assertIn("census", logs.output[1])
             self.assertTrue(any("linear_attention x1" in line and "router" in line for line in logs.output))
+            self.assertTrue(any("Forward FLOPs" in line for line in logs.output))
+            self.assertTrue(any("linear_attention x1" in line and "linrec" in line for line in logs.output))
             with patch.object(sys, "argv", ["run_nd.py", "-y", path, "-V"]), self.assertRaises(SystemExit) as done:
                 runpy.run_module(_RUN_ND, run_name="__main__")
             self.assertEqual(done.exception.code, 2)
