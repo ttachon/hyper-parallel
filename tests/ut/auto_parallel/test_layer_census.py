@@ -289,6 +289,24 @@ class TestLayerCensus(unittest.TestCase):
         self.assertGreater(linear["linrec"], 0)
         self.assertNotIn("scores", linear)
 
+    def test_mla_values_keep_their_width(self):
+        """
+        Feature: census_flops and census_layer on MLA.
+        Description: A DeepSeek-V3 layer of width 64 on 32 tokens: 4 heads
+            whose queries and keys are 16 wide, 12 and a rotary 4, and whose
+            values are 8.
+        Expectation: The scores run at the queries' and keys' width and the
+            values at their own, unpadded, as under HyperParallel's sdpa; the
+            layer runs its backward.
+        """
+        from transformers import DeepseekV3Config  # pylint: disable=C0415
+        config = DeepseekV3Config(
+            hidden_size=64, num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=4, q_lora_rank=32,
+            kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=8, intermediate_size=32,
+            first_k_dense_replace=1, vocab_size=128, n_group=1, topk_group=1)
+        self.assertEqual(census_flops(config, 0, 32)["scores"], 2 * 4 * 32 * 32 * (16 + 8))
+        self.assertGreater(census_layer(config, 0, 32)[0], 0)
+
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """
         Feature: census_output_activations.
