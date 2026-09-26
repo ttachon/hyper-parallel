@@ -76,6 +76,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
     custom_default_transformer,
+    keeps_param_casts,
 )
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
@@ -121,7 +122,7 @@ def custom_vision_tower(ccfg: Any) -> None:
     custom_default_transformer(ccfg)
     # ViT blocks use a plain two-matmul MLP, not the LLM's gated triple.
     ccfg.n_ffMM = 2
-    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
+    ccfg.n_ffParamCast = ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     ccfg.n_normOp = 2
     ccfg.n_gather = 4
 
@@ -789,6 +790,9 @@ class CostModelParserHyperV2(_CostModelParser):
         # It reduce-scatters a layer's gradients while the next layer's
         # backward runs, and the root's in its backward hook.
         self.ccfg.overlaps_grad_reduce = True
+        # It gathers the weights in the compute dtype, and a layer keeps no
+        # cast of them, whatever dp_shard.
+        self.ccfg.keeps_param_casts = False
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
             else self.ccfg.d

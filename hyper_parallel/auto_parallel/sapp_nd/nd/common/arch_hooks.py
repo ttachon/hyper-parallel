@@ -46,6 +46,16 @@ def _optimizer_bytes(ccfg, width):
     ccfg.bytes_optim_table = 2 * ccfg.bytes_os + main_copy
 
 
+def keeps_param_casts(ccfg):
+    """Whether a layer keeps a cast beside each matmul, as the formulas price it.
+
+    As the parser states it (``keeps_param_casts``); where none states it,
+    where the optimizer does not shard, the formulas' convention.
+    """
+    casts = getattr(ccfg, "keeps_param_casts", None)
+    return (not ccfg.has_op) if casts is None else bool(casts)
+
+
 class CWrap:
     """Temporary evaluator-like instance"""
 
@@ -83,12 +93,12 @@ def custom_default_transformer(ccfg):
     ccfg.n_attMM = 4  # num attention matmul
     ccfg.n_attBMM = 2  # num attention batch matmul
     ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
+        ccfg.n_attMM if keeps_param_casts(ccfg) else 0
     )  # num attention parameters cast
     ccfg.n_ffMM = 3  # num feedforward matmul
     ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
+        ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
     ccfg.n_softmax = 1  # num softmax
     ccfg.n_dropout = 0  # num dropout
@@ -113,14 +123,14 @@ def custom_mixtral(ccfg):
     ccfg.n_attMM = 4  # num attention matmul
     ccfg.n_attBMM = 2  # num attention batch matmul
     ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
+        ccfg.n_attMM if keeps_param_casts(ccfg) else 0
     )  # num attention parameters cast
     # A gated expert runs three projections, matmuls like every other
     # family's feed-forward.
     ccfg.n_ffMM = 3  # num feedforward matmul
     ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
+        ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
     ccfg.n_softmax = 2  # num softmax
     ccfg.n_dropout = 0  # num dropout
@@ -141,12 +151,12 @@ def custom_t5(ccfg):
         c.n_attMM = 4  # num attention matmul
         c.n_attBMM = 1  # num attention batch matmul
         c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
+            c.n_attMM if keeps_param_casts(c) else 0
         )  # num attention parameters cast
         c.n_ffMM = 2  # num feedforward matmul
         c.n_ffBMM = 0  # num feedforward batch matmul
         c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
+            c.n_ffMM if keeps_param_casts(c) else 0
         )  # num feedforward parameters cast
         c.n_softmax = 2  # num softmax
         c.n_dropout = 5  # num dropout
@@ -161,12 +171,12 @@ def custom_t5(ccfg):
         c.n_attMM = 8  # num attention matmul
         c.n_attBMM = 2  # num attention batch matmul
         c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
+            c.n_attMM if keeps_param_casts(c) else 0
         )  # num attention parameters cast
         c.n_ffMM = 2  # num feedforward matmul
         c.n_ffBMM = 0  # num feedforward batch matmul
         c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
+            c.n_ffMM if keeps_param_casts(c) else 0
         )  # num feedforward parameters cast
         c.n_softmax = 4  # num softmax
         c.n_dropout = 7  # num dropout
@@ -204,12 +214,12 @@ def custom_pangualpha(ccfg):
     ccfg.n_attMM = 4  # num attention matmul
     ccfg.n_attBMM = 1  # num attention batch matmul
     ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
+        ccfg.n_attMM if keeps_param_casts(ccfg) else 0
     )  # num attention parameters cast
     ccfg.n_ffMM = 2  # num feedforward matmul
     ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
+        ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
     ccfg.n_softmax = 2  # num softmax
     ccfg.n_dropout = 5  # num dropout
