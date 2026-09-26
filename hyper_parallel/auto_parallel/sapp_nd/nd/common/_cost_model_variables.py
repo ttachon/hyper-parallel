@@ -57,6 +57,14 @@ class _CostModVar:
     # Fields the family gives every layer of the stack on top of its kind's,
     # such as cm's sharding (derive).
     layer_fields: dict = None
+    # What a layer of each kind keeps and holds per token, as the model
+    # spec's census states it (an auto_parallel KindActivations per kind
+    # name), and the record of the kind of the layer priced, which the
+    # parser or the arch hook binds; with none, the formulas price it.
+    census: dict = None
+    kind_activations: any = None
+    # The output layer's record, as the census states it.
+    output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
 
@@ -72,6 +80,10 @@ class _CostModVar:
     # Whether TP shards the activations between layers and the output
     # layer's; None takes the family's (derive).
     shard_activations: bool = None
+    # Whether the loss runs on logits sharded over the vocabulary, as stated,
+    # None taking its family's; and as derive gives it.
+    loss_parallel: bool = None
+    shards_logits: bool = True
     sp: float = 0
     vp: float = 0
     os_max_shard: float = 0

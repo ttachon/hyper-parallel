@@ -15,6 +15,7 @@
 """Tail submodule"""
 from __future__ import annotations
 from typing import TYPE_CHECKING
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
@@ -93,7 +94,8 @@ class EvalMTP:
             return 0
         micro_factor = ctx.micro_factor
         res = micro_factor * ccfg.n_mtp * ccfg.bytes_compute
-        res *= ccfg.s * ccfg.b * 3 * ccfg.h
+        # A CP rank runs the layer on its own chunk of the sequence.
+        res *= ccfg.s * ccfg.b * 3 * ccfg.h / max(1, ccfg.cp)
         # Shared Head
         ctx.current_node = LayerType.EMBEDDING_LAYER
         res += ccfg.n_mtp * ctx.eval.dyn.activation(ccfg, ctx)
@@ -163,12 +165,34 @@ class EvalTailSingle:
     @staticmethod
     def activ_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
         """activation mem (lmhead)"""
+        census = getattr(ccfg, "output_census", None)
+        if isinstance(census, KindActivations):
+            return EvalTailSingle.census_out_single(ccfg, ctx, census)
         micro_factor = ctx.micro_factor
         last_norm = ccfg.s * ccfg.b * ccfg.bytes_norm * ccfg.h
         lm_head = ccfg.s * ccfg.b * ccfg.bytes_compute * ccfg.v
         activ_size = last_norm + lm_head
-        activ_size /= ccfg.shard_output_activ
+        # A CP rank computes the logits of its own chunk of the sequence: the
+        # output layer gathers none across CP.
+        activ_size /= ccfg.shard_output_activ * max(1, ccfg.cp)
         return micro_factor * activ_size
+
+    @staticmethod
+    def census_out_single(ccfg: CostModelConfig, ctx: Context, census: KindActivations) -> float:
+        """The output layer's activations, as its census measured them (lmhead).
+
+        What the layer keeps between its passes, or its backward's working
+        set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
+        of the sequence.  Sequence parallelism splits the part the
+        vocabulary does not scale, and TP the part it does where the loss
+        runs on logits sharded over it (``shards_logits``); otherwise every
+        TP rank holds them whole.
+        """
+        tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
+        vocab_shards = max(1, ccfg.t) if ccfg.shards_logits else 1
+        kept = census.saved / max(1, ccfg.sp) + census.saved_tp / vocab_shards
+        held = census.working / max(1, ccfg.sp) + census.working_tp / vocab_shards
+        return EvalUtils.census_bytes(ctx, tokens, kept, held)
 
     @staticmethod
     def comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:

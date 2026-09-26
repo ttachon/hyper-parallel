@@ -66,6 +66,21 @@ class TestDerive(unittest.TestCase):
             derive_embedding_sharding(ccfg)
             self.assertEqual(ccfg.shard_embed, expected, f"{fields}: shard_embed={ccfg.shard_embed}")
 
+    def test_fsdp_shards_the_embedding_over_its_group(self):
+        """
+        Feature: derive_embedding_sharding, under FSDP.
+        Description: A table over d=8 and t=2 whose FSDP group is 2 ranks,
+            as under HSDP, with and without FSDP.
+        Expectation: FSDP shards the table over its group and TP, and
+            gathers it over the group; otherwise it is split over d.
+        """
+        got = []
+        for fsdp in (True, False):
+            ccfg = _config(d=8, os_max_shard=2, grad_shard_as_params=fsdp)
+            derive_embedding_sharding(ccfg)
+            got.append((ccfg.shard_embed, ccfg.gather_embed))
+        self.assertEqual(got, [(4, 2), (16, 1)])
+
     def test_mindformers_recompute_switches(self):
         """
         Feature: derive_recompute_switches.
@@ -301,8 +316,11 @@ class TestDeriveFamily(unittest.TestCase):
         Description: At t=2: the default family, with a sliced recompute
             input; Qwen, whose family shards activations, and a run that
             says otherwise; a vision tower, with Qwen's language model and
-            with none.
-        Expectation: shard_recompute_input and shard_output_activ.
+            with none; Qwen with its loss on logits gathered whole, and on
+            logits sharded over the vocabulary.
+        Expectation: shard_recompute_input and shard_output_activ: the
+            output layer's activations split only where the loss runs on
+            sharded logits, as every family's does unless its run says not.
         """
         cases = [
             ({}, (1, 1)),
@@ -312,6 +330,8 @@ class TestDeriveFamily(unittest.TestCase):
             ({"shard_activations": True}, (2, 2)),
             ({"arch": "vision", "inherited_arch": "qwen"}, (2, 2)),
             ({"arch": "vision"}, (1, 1)),
+            ({"arch": "qwen", "loss_parallel": False}, (2, 1)),
+            ({"arch": "qwen", "loss_parallel": True}, (2, 2)),
         ]
         for facts, want in cases:
             ccfg = _config(**facts)

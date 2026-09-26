@@ -161,6 +161,9 @@ class Context:
         # its working set in its backward, 0 when it is what it keeps
         # between its passes.
         self.working_set = 0
+        # Whether the stage's dynamic memory counts what the node keeps for
+        # the backward whose working set it is.
+        self.working_on_saved = False
         # The gradient bytes of the node evaluated last.
         self.node_grad = 0
         self.head_node, self.tail_node = None, None

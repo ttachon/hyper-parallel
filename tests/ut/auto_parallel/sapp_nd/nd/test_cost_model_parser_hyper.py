@@ -669,6 +669,27 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.shard_recompute_input, 1)
         self.assertTrue(ccfg.is_shard_mtp_param)
 
+    def test_the_loss_runs_on_the_logits_the_trainer_gathers(self):
+        """
+        Feature: loss_parallel, stated by the Hyper parser.
+        Description: A Qwen model at TP 2 with sequence parallelism, as
+            HyperParallel's trainer runs it by default, and with
+            accelerator.loss_parallel.
+        Expectation: By default every TP rank holds the logits whole: the
+            output layer's activations are not split; with loss_parallel
+            they are, over TP.
+        """
+        got = []
+        for accelerator in ({}, {"loss_parallel": True}):
+            config = _auto_models_config(accelerator=dict(
+                {"tp_size": 2, "ep_size": 1, "pp_size": 1, "sequence_parallel": True}, **accelerator))
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+                mock_hf.return_value = self._hf_config(model_type="qwen3", num_experts=1)
+                ccfg = _make_ccfg(config)
+            derive(ccfg)
+            got.append((ccfg.loss_parallel, ccfg.shard_output_activ))
+        self.assertEqual(got, [(False, 1), (True, 2)])
+
     # ---- L0: Device capacity ---------------------------------------------
 
     def test_device_capacity_from_config(self):
@@ -1526,11 +1547,12 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
 
     @staticmethod
-    def _insight(micro_batches: int, **run: Any) -> Dict[str, Any]:
-        """Stage 0's insight, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
+    def _insight(micro_batches: int, devices: int = 4, **run: Any) -> Dict[str, Any]:
+        """Stage 0's insight, in MB, of a dense model at DP shard 4 over *devices* and PP 1, fully recomputed."""
         config = _auto_models_config(
             accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1}, fsdp_config={"dp_shard_size": 4},
-            training={"global_batch_size": 4 * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            training={"global_batch_size": devices * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            context={"device_num": devices},
         )
         with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
             mock_hf.return_value = SimpleNamespace(
@@ -1554,6 +1576,23 @@ class TestFsdpResharding(unittest.TestCase):
         grads = sum(value.get("accu_grad", 0) for key, value in stage["Node Log"].items() if isinstance(key[2], int))
         return stage["Dynamic"], grads
 
+    def test_the_output_layers_backward_gathers_no_table_again(self):
+        """
+        Feature: the root's gathered tables in a working set.
+        Description: The working set of the output layer's backward, which
+            ends warm-up on a single stage, under FSDP that reshards, and
+            with reshard_after_forward off.
+        Expectation: Resharding, FSDP's root keeps its tables gathered from
+            the forward on: the output layer keeps its table, and its
+            backward's working set gathers none again.  Kept gathered, as
+            before, the working set counts it.
+        """
+        log = self._insight(1)["Node Log"]
+        self.assertGreater(log[(0, 0, "", "O")]["ag_comm"], 0)
+        self.assertEqual(log[(0, 0, "G_", "O")].get("ag_comm", 0), 0)
+        kept = self._insight(1, reshard_params=False)["Node Log"]
+        self.assertEqual(kept[(0, 0, "G_", "O")]["ag_comm"], kept[(0, 0, "", "O")]["ag_comm"])
+
     def test_the_root_gathers_both_tables(self):
         """
         Feature: gather_embed, the embedding table FSDP gathers.
@@ -1564,6 +1603,19 @@ class TestFsdpResharding(unittest.TestCase):
         """
         log = self._insight(1)["Node Log"]
         self.assertEqual(log[(0, 0, "", "E")]["ag_comm"], log[(0, 0, "", "O")]["ag_comm"])
+
+    def test_hsdp_shards_both_tables_alike(self):
+        """
+        Feature: the embedding table under HSDP.
+        Description: DP 16 over 16 devices, its FSDP group 4 ranks, the
+            others replicas.
+        Expectation: The embedding table is sharded over the FSDP group, as
+            the output table: they weigh the same.
+        """
+        log = self._insight(1, devices=16)["Node Log"]
+        embedding, output = log[(0, 0, "", "E")], log[(0, 0, "", "O")]
+        self.assertEqual(embedding["model_param"], output["model_param"])
+        self.assertEqual(embedding["ag_comm"], output["ag_comm"])
 
     def test_the_backward_ends_holding_whole_gradients(self):
         """

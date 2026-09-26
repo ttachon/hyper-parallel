@@ -24,10 +24,12 @@ function-local because ``transformers`` is not a hard dependency of
 ``hyper_parallel`` (``requirements.txt`` only pins numpy) and the non-Hyper
 cost-model backends must keep working without it.
 """
+import copy
 import dataclasses
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from hyper_parallel.auto_parallel._layer_census import census_activations, census_output_activations
 from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel._op_profiles import infer_arch, infer_qk_norm, resolve_ops
@@ -298,9 +300,42 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
     return dataclasses.replace(typed, layers=layers, vision=vision, layer_types=None).to_dict()
 
 
+# The censuses this process has run, by config, layer stack and length: a
+# harness pricing several runs of one model runs one.
+_CENSUSES: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+
+def _census(text_config: Any, layers: Any, seq_length: int) -> Dict[str, Any]:
+    """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
+    key = (
+        text_config.to_json_string(),
+        tuple((group["kind"], int(group["count"]), bool(group.get("mtp"))) for group in layers),
+        int(seq_length),
+    )
+    if key not in _CENSUSES:
+        logger.info("census of each layer kind and of the output layer at %d tokens", seq_length)
+        kinds = census_activations(text_config, layers, seq_length)
+        _CENSUSES[key] = {
+            "activations": {kind: record.to_dict() for kind, record in kinds.items()},
+            "output_activations": census_output_activations(text_config, seq_length).to_dict(),
+        }
+    return copy.deepcopy(_CENSUSES[key])
+
+
+def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
+    """Warn that a census asked for cannot run, unless the overrides state its records.
+
+    A census builds its layers from the checkpoint's config; a search hands
+    ND a spec whose overrides state the records its reader measured.
+    """
+    if census_seq_len and not explicit.get("activations"):
+        logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
+
+
 def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
 ) -> Dict[str, Any]:
     """Return canonical cost-model fields for a Trainer ``model`` section.
 
@@ -319,6 +354,14 @@ def resolve_hf_model_spec(
     Args:
         model_raw: The ``model`` section, as a plain mapping.
         visual_seq_len: Optional override for the encoder sequence length.
+        census_seq_len: The tokens to run a census of each layer kind of
+            the language model at, and of its output layer
+            (:mod:`hyper_parallel.auto_parallel._layer_census`), which the
+            spec states as ``"activations"`` and ``"output_activations"``;
+            0 runs none.  The
+            census builds its layers from the checkpoint's config: a spec
+            from ``config_overrides`` alone gets none, and an override of a
+            model field does not reach it.
 
     Returns:
         A dict of canonical model fields, always carrying ``"name"``.
@@ -333,6 +376,7 @@ def resolve_hf_model_spec(
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
+            _no_census(census_seq_len, explicit)
             return _validated(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path "
@@ -348,6 +392,7 @@ def resolve_hf_model_spec(
                 "falling back to model.config_overrides", exc,
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
+            _no_census(census_seq_len, explicit)
             return _validated(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
@@ -368,12 +413,17 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    return _validated(spec)
+    resolved = _validated(spec)
+    if census_seq_len:
+        resolved.update(_census(_text_tower(model_config), resolved["layers"], census_seq_len))
+        resolved = ModelSpec.from_dict(resolved).to_dict()
+    return resolved
 
 
 def resolve_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
 ) -> ModelSpec:
     """Return the typed :class:`ModelSpec` for a Trainer ``model`` section.
 
@@ -383,6 +433,7 @@ def resolve_model_spec(
     Args:
         model_raw: The ``model`` section, as a plain mapping.
         visual_seq_len: Optional override for the encoder sequence length.
+        census_seq_len: As :func:`resolve_hf_model_spec` takes it.
 
     Returns:
         A validated spec.
@@ -392,4 +443,4 @@ def resolve_model_spec(
         ValueError: If neither a pretrained path nor overrides can supply
             the model dimensions.
     """
-    return ModelSpec.from_dict(resolve_hf_model_spec(model_raw, visual_seq_len))
+    return ModelSpec.from_dict(resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len))

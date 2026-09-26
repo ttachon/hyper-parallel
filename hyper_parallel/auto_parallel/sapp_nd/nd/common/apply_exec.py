@@ -40,6 +40,7 @@ CONFIG_FIELDS = {
     "etp": "etp",
     "sequence_parallel": "sequence_parallel",
     "shard_activations": "shard_activations",
+    "loss_parallel": "loss_parallel",
     "micro_batch_size": "b",
     "micro_batch_num": "m",
     "global_batch_size": "gbs",

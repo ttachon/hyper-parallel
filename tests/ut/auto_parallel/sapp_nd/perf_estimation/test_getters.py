@@ -27,7 +27,7 @@ from unittest.mock import patch
 import yaml
 
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
-from hyper_parallel.auto_parallel._model_spec import OpCounts
+from hyper_parallel.auto_parallel._model_spec import KindActivations, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
@@ -37,6 +37,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils imp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_comp
@@ -45,6 +46,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_model_order,
     get_recomp_factor,
     get_table_quantity,
+    selective_shares,
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
@@ -247,21 +249,22 @@ class TestPerformanceAgreesWithMemory(unittest.TestCase):
         Feature: one layer order for every estimator.
         Description: The communication estimate applies each layer's kind
             as it walks the stages one at a time.  Record the kind each
-            layer's DP term sees, in that walk.
+            layer's DP term sees, in that walk: under FSDP, the parts its
+            traffic reads.
         Expectation: Stage 0 holds model layers 0-1 and 4-5, both full
             pairs; stage 1 holds the two linear pairs.
         """
         ccfg = self._stack("1f1b")
         stages = ccfg.generate_partitions_vpp()
         seen = []
-        real = EvalLayerComm.dp_comm_layer
+        real = EvalLayerComm.fsdp_layer_parts
 
-        def spy(cfg: CostModelConfig, ctx: Any) -> float:
-            """The real DP term, recording the kind of the layer it prices."""
+        def spy(cfg: CostModelConfig, ctx: Any) -> tuple:
+            """The real parts, recording the kind of the layer they price."""
             seen.append(cfg.n_softmax)
             return real(cfg, ctx)
 
-        with patch.object(EvalLayerComm, "dp_comm_layer", side_effect=spy):
+        with patch.object(EvalLayerComm, "fsdp_layer_parts", side_effect=spy):
             estimate_comm(ccfg, CustomConfig(), stages, Hard.Device_A2)
         self.assertEqual(seen, [1, 1, 1, 1, 0, 0, 0, 0])
 
@@ -281,6 +284,58 @@ _SWITCHES = {"softmax": 0, "normOp": 1}
 def _factor(rec_op: Any, op_name: str, layer: LayerType = LayerType.SEL_REC_LAYER) -> int:
     """The recompute factor of *op_name* in a layer with these switches."""
     return get_recomp_factor(SimpleNamespace(rec_op=rec_op), layer, op_name)
+
+
+class TestFsdpTraffic(unittest.TestCase):
+    """The bytes FSDP's collectives move, as the time model's DP term."""
+
+    def test_a_ring_moves_n_minus_one_over_n(self):
+        """
+        Feature: EvalLayerComm.fsdp_traffic.
+        Description: A part of 100 parameters over 1 rank, sharded over 4 and
+            held by 16, bf16, gathered twice a micro-batch, its copies
+            all-reducing every other; and one no rank shards, held by 4.
+        Expectation: Each collective over n shards moves (n - 1) / n of the
+            part: two gathers and a reduce-scatter of 3 / 4, and an
+            all-reduce of the shard over its 4 copies, 2 * 3 / 4, halved;
+            the unsharded part only all-reduces.
+        """
+        ccfg = SimpleNamespace(bytes_p=2, bytes_grad=2)
+        self.assertAlmostEqual(EvalLayerComm.fsdp_traffic(ccfg, ((100, 1, 4, 16),), 2, 0.5),
+                               0.75 * 100 * (2 * 2 + 2) + 2 * 0.75 * 25 * 2 * 0.5)
+        self.assertAlmostEqual(EvalLayerComm.fsdp_traffic(ccfg, ((100, 1, 1, 4),), 2, 1),
+                               2 * 0.75 * 100 * 2)
+
+    def test_the_walk_counts_each_micro_batch_s_collectives(self):
+        """
+        Feature: the DP term of the communication walk under FSDP.
+        Description: A HyperParallel stack at DP shard 2, four micro-batches,
+            with its FSDP resharding and keeping the parameters gathered.
+        Expectation: Resharded, each layer is gathered twice a micro-batch
+            and the root once; kept, each once a step.  No copy, so no
+            all-reduce, but the group shards: once a step.
+        """
+        self.assertEqual(self._rounds(True), [(1, 1, 0.25), (3, 2, 0.25)])
+        self.assertEqual(self._rounds(False), [(1, 0.25, 0.25), (3, 0.25, 0.25)])
+
+    def _rounds(self, reshards: bool) -> list:
+        """The parts, gathers and all-reduces the walk passes FSDP's traffic, with *reshards*."""
+        ccfg = _hybrid_config(self.folder, [FULL, LINEAR])
+        ccfg.reshards = reshards
+        calls = []
+        real = EvalLayerComm.fsdp_traffic
+
+        def spy(cfg: CostModelConfig, parts: tuple, gathers: float, reduces: float) -> float:
+            """The real traffic, recording its rounds."""
+            calls.append((len(parts), gathers, reduces))
+            return real(cfg, parts, gathers, reduces)
+
+        with patch.object(EvalLayerComm, "fsdp_traffic", side_effect=spy):
+            estimate_comm(ccfg, CustomConfig(), ccfg.generate_partitions_vpp(), Hard.Device_A2)
+        return sorted(set(calls))
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
 
 
 class TestSelectiveRecompute(unittest.TestCase):
@@ -323,6 +378,27 @@ class TestSelectiveRecompute(unittest.TestCase):
         once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False)
         again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True)
         self.assertEqual(again - once, 10.0, f"without recompute {once}, with recompute {again}")
+
+    def test_a_census_prices_the_matmuls_hyperparallels_policy_runs_again(self):
+        """
+        A selective layer of HyperParallel's policy, whose kind's census
+        states the shares of its attention's and feed-forward's matmul FLOPs
+        the policy runs again, prices that share of each again, beside the
+        ops its switches recompute; a full layer, and a selective one of
+        other switches, have no shares.
+        """
+        census = KindActivations(1.0, 1.0, 1.0, 1.0, 4096, selective_attention_mm=0.25, selective_ffn_mm=0.5)
+        lccfg = SimpleNamespace(n_softmax=1, n_attMM=1, n_ffMM=1, kind_activations=census,
+                                rec_op=Config(dict(HYPER_SELECTIVE_REC_OP)))
+        table = {"n_softmax": 10.0, "n_attMM": 1000.0, "n_ffMM": 100.0}
+        shares = selective_shares(lccfg, LayerType.SEL_REC_LAYER)
+        self.assertEqual(shares, {"attMM": 0.25, "ffMM": 0.5})
+        once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False, shares=shares)
+        again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True, shares=shares)
+        self.assertEqual(again - once, 10.0 + 250.0 + 50.0)
+        self.assertEqual(selective_shares(lccfg, LayerType.FULL_REC_LAYER), {})
+        lccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP, ffAct=1))
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER), {})
 
 
 if __name__ == "__main__":

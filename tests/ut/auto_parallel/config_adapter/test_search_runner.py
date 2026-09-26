@@ -26,6 +26,8 @@ from hyper_parallel.auto_parallel.config_adapter._normalized_config import (
     NormalizedConfig,
 )
 from hyper_parallel.auto_parallel.config_adapter import _search_runner as sr
+from hyper_parallel.auto_parallel.config_adapter import read_hp_yaml_config
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
@@ -571,6 +573,23 @@ class TestTheStatedRun(unittest.TestCase):
         self.assertEqual(data["training"]["global_batch_size"], 128)
         self.assertEqual(_STATED_RUN["fsdp_config"]["dp_shard_size"], 8)
 
+    def test_the_train_yamls_pricing_options_reach_nd(self):
+        """
+        Feature: the train.yaml's context in a search.
+        Description: A train.yaml asking for a census and stating a vision
+            tower's token count, searched on a cluster that states its
+            devices, with a search config that states the token count too.
+        Expectation: The census reaches ND; the search's device count and
+            the search config's token count win over the train.yaml's.
+        """
+        config = _make_full_config(run=dict(_STATED_RUN, context={"census": True, "visual_seq_len": 1024}))
+        config.model_spec["visual_seq_len"] = 2304
+        context = _search_yaml(config)["context"]
+        self.assertIs(context["census"], True)
+        self.assertEqual(context["visual_seq_len"], 2304)
+        self.assertEqual(context["device_num"], _search_yaml(_make_full_config())["context"]["device_num"])
+        self.assertEqual(config.run["context"], {"census": True, "visual_seq_len": 1024})
+
     def test_no_stated_run_changes_nothing(self):
         """A config read from no train.yaml builds the sections it always did."""
         data = _search_yaml(_make_full_config())
@@ -579,6 +598,55 @@ class TestTheStatedRun(unittest.TestCase):
                         "context"},
         )
         self.assertNotIn("torch_dtype", data["model"])
+
+
+class TestCensusInASearch(unittest.TestCase):
+    """A train.yaml's census reaches the estimates of the search it drives."""
+
+    def test_the_spec_carries_the_census_to_nd(self):
+        """
+        Feature: context.census through the search runner.
+        Description: A train.yaml of a two-layer hybrid Qwen3.5-MoE model
+            asking for a census, read as a search reads it, and the yaml the
+            search hands ND, which states the model as overrides only.
+        Expectation: The reader measures each layer kind and the output
+            layer; the overrides carry the records, and ND prices with them
+            without a checkpoint to read, and without a warning.
+        """
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
+            Qwen3_5MoeTextConfig,
+        )
+        text = Qwen3_5MoeTextConfig.from_dict({
+            "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "head_dim": 16, "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
+            "linear_num_value_heads": 4, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
+            "vocab_size": 128, "max_position_embeddings": 256,
+            "layer_types": ["linear_attention", "full_attention"],
+        })
+        train = {
+            "model": {"pretrained_model_name_or_path": "local/qwen3_5_moe", "torch_dtype": "bfloat16"},
+            "training": {"global_batch_size": 4, "micro_batch_size": 1},
+            "dataset": {"data_transform": {"max_seq_len": 64}},
+            "context": {"census": True},
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(train, handle)
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config", return_value=text):
+                config = read_hp_yaml_config(path)
+            self.assertEqual(sorted(config.model_spec["activations"]), ["full_attention", "linear_attention"])
+            data = _search_yaml(config)
+            self.assertNotIn("pretrained_model_name_or_path", data["model"])
+            self.assertIn("output_activations", data["model"]["config_overrides"])
+            search_path = os.path.join(folder, "search.yaml")
+            with open(search_path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(data, handle)
+            with self.assertNoLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING"):
+                ccfg = EvaluatorV2(search_path, framework="hyper_v2", log_level=0).ccfg
+        self.assertEqual(sorted(ccfg.census), ["full_attention", "linear_attention"])
+        self.assertEqual(ccfg.output_census.seq_length, 64)
 
 
 class TestSearchStrategies(unittest.TestCase):

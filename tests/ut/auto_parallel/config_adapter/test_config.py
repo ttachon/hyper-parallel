@@ -724,6 +724,7 @@ class TestHpYamlReader(unittest.TestCase):
         raw["fsdp_config"]["reshard_after_forward"] = False
         raw["accelerator"]["context_parallel_algo"] = "ulysses_cp"
         raw["optimizer"] = {"_target_": "hyper_parallel.optim.AdamW", "fp32_main_params": True}
+        raw["context"] = {"visual_seq_len": 2304, "device_num": 32}
         path = os.path.join(self.tmpdir, "auto_models.yaml")
         _write_yaml(path, raw)
 
@@ -739,6 +740,7 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(run["accelerator"]["context_parallel_algo"], "ulysses_cp")
         self.assertTrue(run["optimizer"]["fp32_main_params"])
         self.assertNotIn("activation_checkpoint", run)
+        self.assertEqual(run["context"], {"visual_seq_len": 2304})
 
     def test_legacy_yaml_states_its_run_under_train(self) -> None:
         """A legacy train.yaml's run comes from its model section and ``train``."""

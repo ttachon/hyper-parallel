@@ -17,6 +17,7 @@
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, apply_layer_kind, layer_groups
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import runs_hyper_selective
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
@@ -59,6 +60,25 @@ def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int
 # The switch an op answers to where it has none of its own: a QK-norm is a norm.
 _SWITCH_OF = {"qknorm": "normOp"}
 
+# The ops whose share of FLOPs a selective layer of HyperParallel's policy
+# runs again a census states, and the fields that state them.
+_CENSUS_SHARES = {"attMM": "selective_attention_mm", "ffMM": "selective_ffn_mm"}
+
+
+def selective_shares(lccfg, layer):
+    """The share of each matmul op's FLOPs a selective layer runs again, as its kind's census measured it.
+
+    Only for a layer of HyperParallel's selective policy, whose switches it
+    has (:func:`runs_hyper_selective`): the policy recomputes every other
+    matmul, which no switch covers.  Empty otherwise, and the switches
+    price every op.
+    """
+    census = getattr(lccfg, "kind_activations", None)
+    if layer != LayerType.SEL_REC_LAYER or census is None or not runs_hyper_selective(lccfg):
+        return {}
+    return {op: getattr(census, name) for op, name in _CENSUS_SHARES.items()
+            if getattr(census, name, None) is not None}
+
 
 def get_recomp_factor(lccfg, layer, op_name):
     """Whether a layer of this type runs the op again in its backward pass.
@@ -80,14 +100,16 @@ def get_recomp_factor(lccfg, layer, op_name):
     return 0
 
 
-def get_table_quantity(lccfg, table, layer, with_recomp):
-    """op compute load from given table"""
+def get_table_quantity(lccfg, table, layer, with_recomp, shares=None):
+    """op compute load from given table; *shares* sets the recompute factor of the ops it names"""
+    shares = shares or {}
     qt_layer = 0
     for op, quantity in table.items():
         op_name = op[2:]
+        factor = shares[op_name] if op_name in shares else get_recomp_factor(lccfg, layer, op_name)
 
         qt_layer += (
-            (1 + with_recomp * get_recomp_factor(lccfg, layer, op_name))
+            (1 + with_recomp * factor)
             * getattr(lccfg, op)
             * quantity
         )

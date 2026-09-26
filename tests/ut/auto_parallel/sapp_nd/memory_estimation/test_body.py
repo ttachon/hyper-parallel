@@ -33,9 +33,12 @@ import unittest
 from unittest.mock import MagicMock, PropertyMock
 
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive_optimizer_sharding
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive_optimizer_sharding
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 
 def _make_ccfg(
@@ -417,6 +420,116 @@ class TestLayerActiv(unittest.TestCase):
         result = EvalBody.layer_activ(ccfg, ctx)
         expected = (10 + 20 + 30) + 200 + 5
         self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestCensusActiv(unittest.TestCase):
+    """Test EvalBody.layer_activ on a layer whose kind has a census record."""
+
+    RECORD = KindActivations(saved=100.0, saved_tp=300.0, working=150.0, working_tp=330.0, seq_length=4096)
+
+    @staticmethod
+    def _ccfg(record, sp=2, cp=1):
+        """A MoE layer at TP 2, micro-batch 2 of 4096 tokens, priced with *record*."""
+        ccfg = _make_ccfg(n_exp=8)
+        ccfg.kind_activations = record
+        ccfg.s, ccfg.b, ccfg.t, ccfg.sp, ccfg.cp = 4096, 2, 2, sp, cp
+        return ccfg
+
+    @staticmethod
+    def _ctx(node=LayerType.NOT_REC_LAYER, working_set=0, on_saved=False):
+        """A layer of *node* at micro factor 3, its formulas 235 bytes."""
+        ctx = MagicMock()
+        ctx.current_node, ctx.micro_factor = node, 3
+        ctx.working_set, ctx.working_on_saved = working_set, on_saved
+        ctx.attn_qkv_activ = ctx.attn_score_activ = ctx.attn_proj_activ = lambda c, x: 10.0
+        ctx.ffn_moe_activ = lambda c, x: 200.0
+        ctx.norm_activ = lambda c, x: 5.0
+        return ctx
+
+    def test_a_layer_keeps_what_its_census_states(self):
+        """
+        Feature: EvalBody.census_activ, between a layer's passes.
+        Description: The layer with sequence parallelism, without it, and
+            at CP 2.
+        Expectation: The census's bytes per token for the micro-batches in
+            flight: TP splits one part, sequence parallelism the other, and
+            CP the tokens.
+        """
+        tokens = 3 * 4096 * 2
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD), self._ctx()), tokens * (50 + 150))
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD, sp=1), self._ctx()), tokens * (100 + 150))
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD, cp=2), self._ctx()), tokens / 2 * (50 + 150))
+
+    def test_a_backward_holds_its_working_set(self):
+        """
+        Feature: EvalBody.census_activ, as a backward's working set.
+        Description: The working set of a layer that recomputed, of one that
+            did not, whose stage counts what it keeps already, and of one
+            whose backward holds less than it keeps.
+        Expectation: The most the backward holds; beyond what the layer
+            keeps where that is counted, and never below it.
+        """
+        tokens = 3 * 4096 * 2
+        ccfg = self._ccfg(self.RECORD)
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(working_set=2)), tokens * (75 + 165))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(working_set=2, on_saved=True)), tokens * 40)
+        small = self._ccfg(KindActivations(100.0, 300.0, 50.0, 100.0, 4096))
+        self.assertEqual(EvalBody.layer_activ(small, self._ctx(working_set=1, on_saved=True)), 0)
+
+    def test_gathered_keys_and_values_stay_whole(self):
+        """
+        Feature: EvalBody.census_activ under context parallelism.
+        Description: The layer at CP 2 under colossalai CP, and under
+            Ulysses CP, with 2 key heads 64 wide.
+        Expectation: A census counts a rank's share of the sequence;
+            colossalai CP keeps the other half's keys and values too, split
+            over TP, and Ulysses CP none.
+        """
+        tokens = 3 * 4096 * 2 / 2
+        record = self.RECORD
+        plain = tokens * (100 / 2 + 300 / 2)
+        for algo, extra in (("colossalai_cp", 2 * 2 * 64 * 2 / 2), ("ulysses_cp", 0)):
+            ccfg = self._ccfg(record, cp=2)
+            ccfg.cp_algo, ccfg.n_linrec, ccfg.n_kv, ccfg.dh, ccfg.bytes_compute = algo, 0, 2, 64, 2
+            self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx()), plain + tokens * extra)
+
+    def test_a_selective_layer_keeps_what_hyperparallels_policy_saves(self):
+        """
+        Feature: EvalBody.census_activ for a selective layer.
+        Description: A selective layer whose kind's record states what it
+            keeps under HyperParallel's selective checkpointing: with that
+            policy's switches, as its backward's working set, at CP 2 under
+            colossalai CP, and with other switches.
+        Expectation: With the policy's switches, the record's selective
+            bytes, split as the rest; its working set beyond them; at CP 2,
+            no gathered keys and values, which it gathers again to
+            recompute; with other switches, its formulas.
+        """
+        record = KindActivations(100.0, 300.0, 150.0, 330.0, 4096, selective=20.0, selective_tp=60.0)
+        tokens = 3 * 4096 * 2
+        selective = LayerType.SEL_REC_LAYER
+        ccfg = self._ccfg(record)
+        ccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), tokens * (10 + 30))
+        held = EvalBody.layer_activ(ccfg, self._ctx(selective, working_set=2, on_saved=True))
+        self.assertEqual(held, tokens * (75 + 165 - 40))
+        ccfg = self._ccfg(record, cp=2)
+        ccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP))
+        ccfg.cp_algo, ccfg.n_linrec, ccfg.n_kv, ccfg.dh, ccfg.bytes_compute = "colossalai_cp", 0, 2, 64, 2
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), tokens / 2 * (10 + 30))
+        ccfg = self._ccfg(record)
+        ccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP, ffAct=1))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), 235)
+
+    def test_the_formulas_price_a_layer_the_census_does_not(self):
+        """
+        Feature: EvalBody.layer_activ's census path.
+        Description: A selective layer of a kind with a record, and a layer
+            of a kind without one.
+        Expectation: Their formulas price both.
+        """
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD), self._ctx(LayerType.SEL_REC_LAYER)), 235)
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(None), self._ctx()), 235)
 
 
 class TestFullrecLayerActiv(unittest.TestCase):

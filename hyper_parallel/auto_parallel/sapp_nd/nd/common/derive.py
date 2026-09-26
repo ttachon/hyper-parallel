@@ -47,6 +47,12 @@ HYPER_SELECTIVE_REC_OP = {
 }
 
 
+def runs_hyper_selective(ccfg: Any) -> bool:
+    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches are its switches."""
+    switches = vars(ccfg.rec_op) if getattr(ccfg, "rec_op", None) is not None else {}
+    return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
+
+
 def derive_sequence_parallel(ccfg: Any) -> None:
     """Set the sequence-parallel factor ``sp``: the TP degree, or 1 without."""
     ccfg.sp = ccfg.t if ccfg.sequence_parallel else 1
@@ -188,13 +194,16 @@ def derive_embedding_sharding(ccfg: Any) -> None:
     The table is split over tensor parallelism unless the vocabulary
     embedding runs data parallel without pipelining, and over data
     parallelism unless the config says it is not.  FSDP, which shards the
-    gradients as the parameters (``grad_shard_as_params``), gathers the
-    table over data parallelism to compute with it, as every parameter.
+    gradients as the parameters (``grad_shard_as_params``), shards the
+    table as every parameter, over :func:`optimizer_ranks`, its FSDP group
+    and not the whole of data parallelism under HSDP, and gathers it over
+    them to compute with it.
     """
     tp = 1 if (ccfg.vocab_emb_dp and ccfg.p == 1) else ccfg.t
-    ccfg.shard_embed = (ccfg.d if ccfg.emb_dp_sharded else 1) * tp
     fsdp = getattr(ccfg, "grad_shard_as_params", False)
-    ccfg.gather_embed = ccfg.d if fsdp and ccfg.emb_dp_sharded else 1
+    ranks = (optimizer_ranks(ccfg) if ccfg.has_op else 1) if fsdp else ccfg.d
+    ccfg.shard_embed = (ranks if ccfg.emb_dp_sharded else 1) * tp
+    ccfg.gather_embed = ranks if fsdp and ccfg.emb_dp_sharded else 1
 
 
 def hyper_rec_op(selective: Union[bool, list]) -> dict[str, int]:
@@ -363,12 +372,16 @@ def derive_activation_sharding(ccfg: Any, run: Mapping[str, Any]) -> None:
     keeps, and ``shard_output_activ`` the output layer's activations.  Both
     are the TP degree when the run shards the activations between layers
     (``shard_activations``), and 1 otherwise; a recomputed layer's input is
-    sliced over TP too when the run's recompute slices it.
+    sliced over TP too when the run's recompute slices it, and the output
+    layer's activations only where the loss runs on logits sharded over the
+    vocabulary (``loss_parallel``, which derive gives as ``shards_logits``):
+    otherwise every rank gathers them whole.
     """
     sharded = _stated(ccfg, "shard_activations", run)
     sliced = sharded or getattr(ccfg, "recompute_slice_activation", False)
+    ccfg.shards_logits = bool(_stated(ccfg, "loss_parallel", run))
     ccfg.shard_recompute_input = ccfg.t if sliced else 1
-    ccfg.shard_output_activ = ccfg.t if sharded else 1
+    ccfg.shard_output_activ = ccfg.t if sharded and ccfg.shards_logits else 1
 
 
 def derive_qk_norm(ccfg: Any) -> None:

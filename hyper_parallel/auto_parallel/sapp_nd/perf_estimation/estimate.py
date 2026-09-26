@@ -40,6 +40,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estim
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_configs_by_position,
     get_table_quantity,
+    selective_shares,
 )
 
 
@@ -140,6 +141,7 @@ def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
         tables[kind][1] if (lcfg.n_exp > 1) else tables[kind][0],
         layer,
         with_recomp,
+        shares=selective_shares(lcfg, layer),
     )
     if ccfg.ttype == PerformanceType.TIME:
         flop = estimate_comp_flop_time(lcfg, flop)

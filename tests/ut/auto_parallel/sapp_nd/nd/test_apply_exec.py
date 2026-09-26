@@ -213,15 +213,20 @@ class TestApplyExec(unittest.TestCase):
         """
         Feature: apply_exec and the family's defaults.
         Description: The Hyper Qwen config states no byte width and no
-            activation sharding.  State two-byte gradients that accumulate
-            without pipelining, and whole activations.
-        Expectation: Before, the family's 4-byte gradients and Qwen's
-            sharded output layer; after, what the spec states.
+            activation sharding, and its loss on logits gathered whole, as
+            HyperParallel's trainer runs it.  State two-byte gradients that
+            accumulate without pipelining, and whole activations; then
+            sharded activations and a loss on sharded logits.
+        Expectation: Before, the family's 4-byte gradients, Qwen's sharded
+            recompute input and the whole output layer; after, what the
+            spec states.
         """
         ccfg = CostModelConfig(os.path.join(_YAMLS, "hyper_qwen3_72b.yaml"), framework="hyper_v2")
-        self.assertEqual((ccfg.bytes_grad, ccfg.shard_output_activ), (4, ccfg.t))
+        self.assertEqual((ccfg.bytes_grad, ccfg.shard_recompute_input, ccfg.shard_output_activ), (4, ccfg.t, 1))
         apply_exec(ccfg, ExecSpec(grad_bytes=2, grad_accumulation=True, shard_activations=False))
-        self.assertEqual((ccfg.bytes_grad, ccfg.shard_output_activ), (2, 1))
+        self.assertEqual((ccfg.bytes_grad, ccfg.shard_recompute_input, ccfg.shard_output_activ), (2, 1, 1))
+        apply_exec(ccfg, ExecSpec(shard_activations=True, loss_parallel=True))
+        self.assertEqual(ccfg.shard_output_activ, ccfg.t)
         self.assertEqual(exec_of(ccfg).grad_bytes, 2)
 
     def test_device_memory_from_a_string(self):

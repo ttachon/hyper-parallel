@@ -168,6 +168,10 @@ class ExecSpec:
         shard_activations: Whether tensor parallelism shards the activations
             between layers, which a fully recomputed layer keeps as its
             input, and the output layer's.
+        loss_parallel: Whether the loss runs on logits sharded over the
+            vocabulary across the tensor-parallel group, each rank's share,
+            rather than on logits every rank gathers whole, as
+            HyperParallel's trainer does unless its ``loss_parallel``.
         micro_batch_size, micro_batch_num, global_batch_size: The batch.
         optimizer_parallel: Whether optimizer states are sharded.
         optimizer_shard: How many data-parallel ranks optimizer sharding
@@ -249,6 +253,7 @@ class ExecSpec:
     etp: Optional[int] = None
     sequence_parallel: Optional[bool] = None
     shard_activations: Optional[bool] = None
+    loss_parallel: Optional[bool] = None
 
     micro_batch_size: Optional[int] = None
     micro_batch_num: Optional[int] = None
@@ -368,7 +373,7 @@ _KINDS: Dict[str, tuple] = {
               "optimizer_states"),
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
              "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
-    "flag": ("sequence_parallel", "shard_activations", "optimizer_parallel", "grad_shard",
+    "flag": ("sequence_parallel", "shard_activations", "loss_parallel", "optimizer_parallel", "grad_shard",
              "grad_shard_as_params", "grad_accumulation", "deferred_grad_accumulation",
              "overlapped_grad_reduce", "reshard_params",
              "mtp_in_offset",
