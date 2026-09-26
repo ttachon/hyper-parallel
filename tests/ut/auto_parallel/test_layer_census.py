@@ -15,8 +15,10 @@
 """Tests for the layer census, the records it states, and their pricing."""
 import functools
 import os
+import sys
 import tempfile
 import unittest
+from typing import Optional
 from unittest.mock import patch
 
 import torch
@@ -38,11 +40,14 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_parameters,
     census_recomputed,
     census_saved_ops,
+    replacement_specs,
     tp_config,
 )
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
 from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory import sac
+from hyper_parallel.models.replacement import module_replacement
 
 _HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
 _CAUSAL_LM = "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained"
@@ -98,7 +103,8 @@ def _qwen35(text):
     return Qwen3_5MoeConfig.from_dict({"text_config": text.to_dict()})
 
 
-def _train_yaml(folder: str, target: str = _CAUSAL_LM, mode: str = "off", pp: int = 1, **context) -> str:
+def _train_yaml(folder: str, target: str = _CAUSAL_LM, mode: str = "off", pp: int = 1,
+                plan_overrides: Optional[list] = None, **context) -> str:
     """A train yaml of the model on two ranks, at DP shard 2 over PP 1 or on two stages."""
     config = {
         "model": {"_target_": target, "pretrained_model_name_or_path": "local/model",
@@ -110,6 +116,8 @@ def _train_yaml(folder: str, target: str = _CAUSAL_LM, mode: str = "off", pp: in
         "dataset": {"data_transform": {"max_seq_len": 4096}},
         "context": dict(context, device_num=2),
     }
+    if plan_overrides:
+        config["plan_overrides"] = plan_overrides
     path = os.path.join(folder, "train.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle)
@@ -400,6 +408,171 @@ class TestKindActivations(unittest.TestCase):
             KindActivations.from_dict([1.0], "output_activations")
         with self.assertRaisesRegex(ValueError, "layer kinds"):
             activations_from_dict([record])
+
+
+# The recipe whose plan_overrides install HyperParallel's fused modules on
+# the Qwen3-MoE Transformers builds.
+_RECIPE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), *[os.pardir] * 3,
+    "hyper_parallel", "models", "qwen3_moe", "recipes", "train.yaml",
+)
+
+
+def _qwen3_moe():
+    """A two-layer Qwen3-MoE config of width 64, 4 experts 32 wide, as the recipe's rules match it."""
+    from transformers import Qwen3MoeConfig  # pylint: disable=C0415
+    return Qwen3MoeConfig(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                          head_dim=16, moe_intermediate_size=32, num_experts=4, num_experts_per_tok=2,
+                          intermediate_size=128, vocab_size=128)
+
+
+def _recipe_specs():
+    """The module replacements the shipped Qwen3-MoE recipe installs."""
+    with open(_RECIPE, encoding="utf-8") as handle:
+        return replacement_specs(yaml.safe_load(handle).get("plan_overrides"))
+
+
+@module_replacement
+def _needs_a_library(*, module, module_fqn, context):
+    """A factory of a module this host cannot build."""
+    del module, module_fqn, context
+    raise ImportError("No module named 'a_native_extension'")
+
+
+class TestModuleReplacements(unittest.TestCase):
+    """The census runs the modules a train.yaml's plan_overrides install."""
+
+    def test_the_entries_that_replace_a_module(self):
+        """
+        Feature: replacement_specs.
+        Description: The shipped Qwen3-MoE recipe, whose plan_overrides state
+            three replacements and two entries that shard alone, under
+            ``when: cp`` and ``when: ep``.
+        Expectation: One rule per replacement, in the order stated, each with
+            its patterns, its factory and the source type it replaces; the
+            sharding entries are left out.
+        """
+        specs = _recipe_specs()
+        self.assertEqual([spec.factory.__name__ for spec in specs],
+                         ["replace_qwen3_moe_rms_norm", "replace_qwen3_moe_flash_attention",
+                          "replace_qwen3_moe_grouped_experts"])
+        self.assertEqual(specs[0].match, ("*.input_layernorm", "*.post_attention_layernorm", "model.norm"))
+        self.assertEqual([spec.module_type.__name__ for spec in specs],
+                         ["Qwen3MoeRMSNorm", "Qwen3MoeAttention", "Qwen3MoeExperts"])
+
+    def test_an_entry_is_checked(self):
+        """
+        Feature: replacement_specs' checks.
+        Description: An entry that replaces a module without stating its
+            type, one naming a module that cannot be imported, and one
+            naming no factory of that name.
+        Expectation: Each raises, naming the entry and what is wrong.
+        """
+        entry = {"match": "*.self_attn", "module_type": "torch.nn.Linear",
+                 "replace_module": {"_target_": "hyper_parallel.models.replacement.module_replacement"}}
+        cases = (
+            ({**entry, "module_type": None}, "without module_type"),
+            ({**entry, "module_type": "no.such.module.Type"}, "cannot import"),
+            ({**entry, "replace_module": {"_target_": "torch.nn.no_such_factory"}}, "cannot import"),
+        )
+        for raw, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                replacement_specs([raw])
+
+    def test_a_fused_layer_keeps_less_than_an_eager_one(self):
+        """
+        Feature: census_layer with replacements.
+        Description: A Qwen3-MoE layer as Transformers builds it, and with
+            the recipe's fused RMSNorm, grouped-query attention and grouped
+            experts installed, at 256 tokens, plain and under HyperParallel's
+            selective policy.
+        Expectation: The fused layer keeps less between its passes and less
+            under the policy, and its backward holds less; it holds the
+            parameters its source held, so the parts count the same.
+        """
+        config, specs = _qwen3_moe(), _recipe_specs()
+        eager = census_layer(config, 0, 256)
+        fused = census_layer(config, 0, 256, replacements=specs)
+        self.assertLess(fused[0], eager[0])
+        self.assertLess(fused[1], eager[1])
+        self.assertLess(census_layer(config, 0, 256, selective=True, replacements=specs)[0],
+                        census_layer(config, 0, 256, selective=True)[0])
+        self.assertEqual(census_parameters(config, 0, replacements=specs), census_parameters(config, 0))
+
+    def test_what_the_fused_kernels_save_is_named_by_op(self):
+        """
+        Feature: census_saved_ops with replacements.
+        Description: The same layer's bytes a token by op, eager and fused.
+        Expectation: The fused layer's norms keep less, since its kernel
+            keeps one reciprocal root mean square a row where the eager norm
+            keeps its upcast input; its attention kernel's saves count toward
+            the batched matmuls and its statistics toward the softmax, and
+            they sum to what the layer keeps.
+        """
+        config, specs = _qwen3_moe(), _recipe_specs()
+        eager = census_saved_ops(config, 0, 256)
+        fused = census_saved_ops(config, 0, 256, replacements=specs)
+        self.assertLess(fused["normOp"], eager["normOp"])
+        self.assertGreater(fused["softmax"], 0)
+        self.assertGreater(fused["attBMM"], 0)
+        self.assertAlmostEqual(sum(fused.values()) * 256, census_layer(config, 0, 256, replacements=specs)[0])
+
+    def test_a_replacement_this_host_cannot_build_is_reported(self):
+        """
+        Feature: census_layer with a replacement whose factory needs a
+            library this host lacks, as DeepSeek-V3.2's attention needs a
+            native extension.
+        Expectation: Every module stays as Transformers built it, the census
+            measures it, and a warning names the factories and the import
+            that failed.
+        """
+        from hyper_parallel.models.replacement import ModuleReplacementSpec  # pylint: disable=C0415
+        from transformers.models.qwen3_moe import modeling_qwen3_moe  # pylint: disable=C0415
+        spec = ModuleReplacementSpec(match=("*.input_layernorm",), factory=_needs_a_library,
+                                     module_type=modeling_qwen3_moe.Qwen3MoeRMSNorm)
+        config = _qwen3_moe()
+        with self.assertLogs("hyper_parallel.auto_parallel._layer_census", "WARNING") as logs:
+            self.assertEqual(census_layer(config, 0, 256, replacements=(spec,)), census_layer(config, 0, 256))
+        self.assertIn("a_native_extension", logs.output[0])
+        self.assertIn("_needs_a_library", logs.output[0])
+
+    def test_the_contracts_stand_in_for_the_kernels(self):
+        """
+        Feature: npu_contracts.
+        Description: The stand-in entered and left, on a host with no
+            ``torch_npu``; then a kernel it has no contract for.
+        Expectation: While it stands in, ``torch_npu`` is the contracts and
+            its fused RMSNorm kernel returns the normalized rows and one
+            statistic a row; after, nothing is bound; a kernel with no
+            contract raises, naming it.
+        """
+        with npu_contracts() as stand_in:
+            self.assertIs(sys.modules["torch_npu"], stand_in)
+            rows = torch.randn(2, 8, dtype=torch.bfloat16)
+            out, rstd = stand_in.npu_rms_norm(rows, torch.ones(8, dtype=torch.bfloat16), 1e-6)
+            self.assertEqual((tuple(out.shape), tuple(rstd.shape), rstd.dtype), ((2, 8), (2, 1), torch.float32))
+            with self.assertRaisesRegex(NotImplementedError, "npu_no_such_kernel"):
+                stand_in.npu_no_such_kernel(rows)
+        self.assertNotIn("torch_npu", sys.modules)
+
+    def test_a_runs_replacements_reach_its_census(self):
+        """
+        Feature: context.census with plan_overrides, through the parser.
+        Description: A train.yaml of the Qwen3-MoE asking for a census, with
+            the recipe's plan_overrides and without them.
+        Expectation: ND prices the run with what the census measured of the
+            modules the run builds, which keep less than Transformers' own.
+        """
+        with open(_RECIPE, encoding="utf-8") as handle:
+            entries = yaml.safe_load(handle)["plan_overrides"]
+        peaks = {}
+        for name, plan in (("eager", None), ("fused", entries)):
+            with patch(_HF_CONFIG, return_value=_qwen3_moe()), tempfile.TemporaryDirectory() as folder:
+                path = _train_yaml(folder, census=True, plan_overrides=plan)
+                ccfg = EvaluatorV2(path, framework="hyper_v2", log_level=0).ccfg
+                peaks[name] = EvaluatorV2(path, framework="hyper_v2", log_level=0).estimate_peak()
+                self.assertIsNotNone(ccfg.census)
+        self.assertLess(peaks["fused"], peaks["eager"])
 
 
 class TestCensusPricing(unittest.TestCase):

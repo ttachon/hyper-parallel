@@ -327,19 +327,21 @@ def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
 _CENSUSES: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
 
-def _census(text_config: Any, layers: Any, seq_length: int) -> Dict[str, Any]:
+def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[Any, ...] = ()) -> Dict[str, Any]:
     """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
     key = (
         text_config.to_json_string(),
         tuple((group["kind"], int(group["count"])) for group in layers),
         int(seq_length),
+        tuple(f"{spec.factory.__module__}.{spec.factory.__qualname__}" for spec in replacements),
     )
     if key not in _CENSUSES:
-        logger.info("census of each layer kind and of the output layer at %d tokens", seq_length)
-        kinds = census_activations(text_config, layers, seq_length)
+        logger.info("census of each layer kind and of the output layer at %d tokens%s", seq_length,
+                    f", {len(replacements)} module replacements installed" if replacements else "")
+        kinds = census_activations(text_config, layers, seq_length, replacements)
         _CENSUSES[key] = {
             "activations": {kind: record.to_dict() for kind, record in kinds.items()},
-            "output_activations": census_output_activations(text_config, seq_length).to_dict(),
+            "output_activations": census_output_activations(text_config, seq_length, replacements).to_dict(),
         }
     return copy.deepcopy(_CENSUSES[key])
 
@@ -379,6 +381,7 @@ def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    replacements: Tuple[Any, ...] = (),
 ) -> Dict[str, Any]:
     """Return canonical cost-model fields for a Trainer ``model`` section.
 
@@ -462,5 +465,5 @@ def resolve_hf_model_spec(
             logger.warning("no census of %s: its first layers are dense, a kind a census does not tell apart",
                            spec["name"])
         else:
-            spec.update(_census(_text_tower(model_config), layers, census_seq_len))
+            spec.update(_census(_text_tower(model_config), layers, census_seq_len, replacements))
     return spec

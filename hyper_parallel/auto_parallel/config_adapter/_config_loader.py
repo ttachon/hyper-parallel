@@ -32,6 +32,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 logger = logging.getLogger(__name__)
@@ -97,8 +98,9 @@ def _get_dict(raw: Dict[str, Any], key: str) -> Dict[str, Any]:
 # the model, not the model; the cost model reads them there.
 _MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype", "softmax_compute_type")
 
-# The root keys of an AutoModels train.yaml that state the run.
-_RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer")
+# The root keys of an AutoModels train.yaml that state the run.  Its
+# plan_overrides state the modules it builds, which a census measures.
+_RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer", "plan_overrides")
 
 # The ``context`` keys of a train.yaml that state how the cost model prices
 # the run: a census of the layers, and a vision tower's token count.  The
@@ -149,13 +151,15 @@ def _load_auto_models_model_spec(
     model_raw: Dict[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    replacements: tuple = (),
 ) -> Dict[str, Any]:
     """Resolve model dimensions through the shared AutoModels path.
 
     Delegates to :func:`resolve_hf_model_spec` so this reader and the
     SAPP-ND parser cannot disagree about field names or fallbacks.
     """
-    return _normalize_model_spec(resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len))
+    return _normalize_model_spec(
+        resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, replacements))
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -456,7 +460,7 @@ def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any
     # this reader resolves: the search hands ND the spec, its records in it.
     census_seq_len = int(seq_len or 4096) if context_raw.get("census") else 0
     model_spec = _load_auto_models_model_spec(
-        model_raw, context_raw.get("visual_seq_len"), census_seq_len,
+        model_raw, context_raw.get("visual_seq_len"), census_seq_len, _census_replacements(raw, census_seq_len),
     )
     if seq_len:
         model_spec["max_position_embeddings"] = seq_len
@@ -494,6 +498,13 @@ def _load_auto_models_parallelism(
     data_parallel_size = int(dp_shard_size or 1)
     pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
     return search_space, data_parallel_size, pp_degree
+
+
+def _census_replacements(raw: Dict[str, Any], census_seq_len: int) -> tuple:
+    """The module replacements a census runs its layers with: the ones the train.yaml's plan_overrides install."""
+    if not census_seq_len:
+        return ()
+    return replacement_specs(raw.get("plan_overrides") or ())
 
 
 def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:

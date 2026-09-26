@@ -66,7 +66,7 @@ and wins over anything read from the checkpoint.
 """
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
@@ -82,7 +82,11 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
-from hyper_parallel.auto_parallel._layer_census import KindActivations, activations_from_dict
+from hyper_parallel.auto_parallel._layer_census import (
+    KindActivations,
+    activations_from_dict,
+    replacement_specs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +247,7 @@ class CostModelParserHyperV2(_CostModelParser):
         (:meth:`_config_census`).
         """
         spec = resolve_hf_model_spec(
-            self._model_section(), self._visual_seq_len_override(), self._census_seq_len()
+            self._model_section(), self._visual_seq_len_override(), self._census_seq_len(), self._replacements()
         )
         if is_auto_models_schema(self.config):
             spec = self._without_mtp(spec)
@@ -273,6 +277,11 @@ class CostModelParserHyperV2(_CostModelParser):
         census, output = spec.get("activations"), spec.get("output_activations")
         self.ccfg.census = activations_from_dict(census) if census else None
         self.ccfg.output_census = KindActivations.from_dict(output, "output_activations") if output else None
+
+    def _replacements(self) -> Tuple[Any, ...]:
+        """The module replacements the run's ``plan_overrides`` install, which a census runs its layers with."""
+        entries = self._config_to_flat_dict(self._get_cfg_attr(self.config, "plan_overrides", None))
+        return replacement_specs(entries if isinstance(entries, list) else ())
 
     def _census_seq_len(self) -> int:
         """The tokens to run a census of each layer kind at, 0 unless ``context.census`` asks for one.
