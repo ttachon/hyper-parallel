@@ -124,9 +124,19 @@ class _CostModVar:
     dh: float = 0
     # An MLA model's value-head width, at which its family prices dh (derive).
     v_head_dim: float = None
+    # An MLA model's non-rotary key-head width, its value heads' unless stated.
+    qk_nope_head_dim: float = None
     dc_kv: float = 0
     dc_q: float = 0
     dhr: float = 0
+    # The biases and norms a model states (its spec's); None where unstated,
+    # which the parameter formulas count their own way.
+    qkv_bias: bool = None
+    o_bias: bool = None
+    mlp_bias: bool = None
+    norm_bias: bool = None
+    layer_norms: int = None
+    shared_expert_gate: bool = None
     k_1st_dense: float = 0
     # Attention flavour of a layer group, and the extra parameters a flavour
     # carries that the q/k/v/o formula does not describe (conv, gates).
@@ -263,6 +273,10 @@ class _CostModVar:
     # None taking its family's; and as derive gives it.
     overlapped_grad_reduce: bool = None
     overlaps_grad_reduce: bool = False
+    # Whether a layer keeps the weight casts the formulas price, as stated,
+    # None where the optimizer does not shard; and as derive gives it.
+    param_casts: bool = None
+    keeps_param_casts: bool = None
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the optimizer keeps per parameter: a layer's, and the embedding

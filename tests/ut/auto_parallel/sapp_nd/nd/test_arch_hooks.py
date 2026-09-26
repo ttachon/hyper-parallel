@@ -151,6 +151,24 @@ def _legacy_state(arch: str, kind: str, has_op: bool, p: int) -> dict:
     return state
 
 
+class TestParamCasts(unittest.TestCase):
+    """A layer keeps a cast beside each matmul as its run says, else where the optimizer does not shard."""
+
+    def test_the_run_decides(self):
+        """
+        Feature: the cast counts applying a family sets.
+        Description: A config whose optimizer does not shard, derive not
+            run; then derive saying its layers keep no cast; then keep them.
+        Expectation: Unsaid, a cast per matmul; said, as said.
+        """
+        got = []
+        for casts in (None, False, True):
+            cfg = _bare("default", has_op=False, keeps_param_casts=casts)
+            check_and_apply_custom_hook(CWrap(cfg))
+            got.append((cfg.n_attParamCast, cfg.n_ffParamCast))
+        self.assertEqual(got, [(4, 3), (0, 0), (4, 3)])
+
+
 class TestDispatchReadsTheArch(unittest.TestCase):
     """The family is chosen by the declared arch, never by the model name."""
 
@@ -428,8 +446,9 @@ class TestStackAsData(unittest.TestCase):
         Feature: linear attention.
         Description: Apply the linear kind of a model with 16 value heads of 64.
         Expectation: The value heads carry the q side, the key heads the kv
-            side, no score ops, one state update, and the convolution and
-            gates as extra parameters.
+            side, no score ops, one state update, and the convolution, the
+            gates' projections, each head's decay and time-step bias and the
+            output norm's weight as extra parameters.
         """
         ccfg = _ccfg("qwen3_5_moe", **_qwen35_model([_L, _F]))
         check_and_apply_custom_hook(ccfg)
@@ -437,7 +456,7 @@ class TestStackAsData(unittest.TestCase):
         self.assertEqual(
             (ccfg.attn_kind, ccfg.a, ccfg.dh, ccfg.n_kv, ccfg.attn_output_gate,
              ccfg.n_softmax, ccfg.n_linrec, ccfg.attn_extra_p),
-            ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16),
+            ("linear", 16, 64, 8.0, True, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16 + 2 * 16 + 64),
         )
 
     def test_only_a_full_layer_normalizes_queries_and_keys(self):

@@ -104,6 +104,8 @@ class CostModelParserMindformers(_CostModelParser):
         self.ccfg.dh = self.ccfg.h / self.ccfg.a  # Per head dimension
         # An MLA model's value-head width, which its family prices dh at.
         self.ccfg.v_head_dim = self.config.model.model_config.v_head_dim or None
+        # Its heads' non-rotary key width, the value heads' unless stated.
+        self.ccfg.qk_nope_head_dim = self.config.model.model_config.qk_nope_head_dim or None
         self.ccfg.dc_kv = (
             self.config.model.model_config.kv_lora_rank
             if self.config.model.model_config.kv_lora_rank

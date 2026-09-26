@@ -26,6 +26,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_flops, verify_parameters
 
 
 def _host_link(cli_parser, cli_args, device):
@@ -414,6 +415,14 @@ if __name__ == "__main__":
         "(hyper_v2 only). Scalar=fixed, list=candidates, 'auto'=ND decides.",
     )
     parser.add_argument(
+        "-V",
+        "--verify",
+        action="store_true",
+        help="Verify mode (hyper_v2 only): set the parameters ND prices of each "
+        "part of the model -y trains beside those of the Transformers layers "
+        "its checkpoint builds, and exit.",
+    )
+    parser.add_argument(
         "-o",
         "--output-dir",
         type=str,
@@ -448,6 +457,17 @@ if __name__ == "__main__":
                      "trainer, which runs no offload")
     if not args.auto_offload and (args.host_link_gibps is not None or args.sustained_tflops is not None):
         parser.error("--host_link_gibps and --sustained_tflops price offload, which needs -ao/--auto_offload")
+    if args.verify:
+        if args.framework != "hyper_v2":
+            parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
+        set_verbose_level(args.verbosity)
+        logger.output("Parameters")
+        for line in report(verify_parameters(args.yaml_config)):
+            logger.output(line)
+        logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
+        for line in report(verify_flops(args.yaml_config)):
+            logger.output(line)
+        sys.exit(0)
 
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)

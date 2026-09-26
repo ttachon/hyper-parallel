@@ -257,6 +257,7 @@ class CostModelParserHyperV2(_CostModelParser):
         head_dim = self._spec_int(spec, "head_dim")
         ccfg.dh = head_dim if head_dim else (ccfg.h / ccfg.a if ccfg.a else 0)
         ccfg.v_head_dim = self._spec_int(spec, "v_head_dim") or None
+        ccfg.qk_nope_head_dim = self._spec_int(spec, "qk_nope_head_dim") or None
         ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
         ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
@@ -264,6 +265,11 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
         # Qwen3 normalizes each head's queries and keys.
         ccfg.qk_norm = bool(spec.get("qk_norm", False))
+        # The biases and norms the spec states; unstated, the parameter
+        # formulas count their own.
+        for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "shared_expert_gate"):
+            setattr(ccfg, name, None if spec.get(name) is None else bool(spec[name]))
+        ccfg.layer_norms = self._spec_int(spec, "layer_norms") or None
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""
@@ -638,6 +644,9 @@ class CostModelParserHyperV2(_CostModelParser):
             # backward runs, and the root's in its backward hook.
             "overlapped_grad_reduce": True,
             "reshard_params": self._reshards_params(),
+            # It gathers the weights in the compute dtype, and a layer keeps
+            # no cast of them, whatever dp_shard.
+            "param_casts": False,
         }
 
     def _reshards_params(self) -> bool:

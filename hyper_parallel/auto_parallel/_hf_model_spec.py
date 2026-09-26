@@ -32,7 +32,13 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from hyper_parallel.auto_parallel._layer_census import census_activations, census_output_activations
 from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
-from hyper_parallel.auto_parallel._op_profiles import infer_arch, infer_qk_norm, resolve_ops
+from hyper_parallel.auto_parallel._op_profiles import (
+    infer_arch,
+    infer_qk_norm,
+    infer_qkv_bias,
+    infer_shared_expert_gate,
+    resolve_ops,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +75,15 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "kv_lora_rank": ("kv_lora_rank",),
     "q_lora_rank": ("q_lora_rank",),
     "qk_rope_head_dim": ("qk_rope_head_dim",),
+    "qk_nope_head_dim": ("qk_nope_head_dim",),
+    "v_head_dim": ("v_head_dim",),
     "attn_output_gate": ("attn_output_gate",),
     "tie_word_embeddings": ("tie_word_embeddings",),
+    # Llama's attention_bias biases all four projections; Qwen2's configs
+    # state none and bias the query, key and value projections alone.
+    "qkv_bias": ("qkv_bias", "attention_bias"),
+    "o_bias": ("o_bias", "attention_bias"),
+    "mlp_bias": ("mlp_bias",),
     # Stated by a few families; Qwen3's config does not state its own.
     "qk_norm": ("qk_norm", "use_qk_norm", "qk_layernorm"),
     # A hybrid stack states its layers; without this every layer is costed
@@ -249,6 +262,12 @@ def _get_hf_config(model_raw: Mapping[str, Any]) -> Any:
     )
 
 
+def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
+    config = _get_hf_config(model_raw)
+    return config, _text_tower(config)
+
+
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the model keys of the ``config_overrides`` fallback."""
     overrides = model_raw.get("config_overrides")
@@ -283,7 +302,10 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
     family was only inferred from the model name and the stack from
     ``layer_types`` or ``first_k_dense_replace``; and so is whether its
     attention normalizes queries and keys, which a Transformers config does
-    not state.  ``layer_types`` is
+    not state, and the biases and norms its layers hold: a Transformers
+    decoder layer holds two RMSNorms, no bias unless its config states one
+    or its family has one, and a shared expert gated where its family
+    gates it.  ``layer_types`` is
     consumed: ``layers`` says the same, checked against the profile.  A
     vision tower states its stack likewise.
     """
@@ -291,6 +313,11 @@ def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
     typed = dataclasses.replace(
         typed, arch=typed.arch or infer_arch(typed.name),
         qk_norm=typed.qk_norm if typed.qk_norm is not None else infer_qk_norm(typed.name),
+        qkv_bias=typed.qkv_bias if typed.qkv_bias is not None else infer_qkv_bias(typed.name),
+        o_bias=bool(typed.o_bias), mlp_bias=bool(typed.mlp_bias), norm_bias=bool(typed.norm_bias),
+        layer_norms=typed.layer_norms or 2,
+        shared_expert_gate=(typed.shared_expert_gate if typed.shared_expert_gate is not None
+                            else infer_shared_expert_gate(typed.name)),
     )
     resolve_ops(typed.arch, typed.ops)
     layers = spec_layer_stack(typed).to_layers()

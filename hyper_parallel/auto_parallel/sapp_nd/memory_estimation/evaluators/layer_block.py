@@ -14,7 +14,7 @@
 # ============================================================================
 """Layer's blocks submodule"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import CPAlgo, _resolve_cp_algo
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -26,30 +26,58 @@ if TYPE_CHECKING:
 mb = EvalUtils.mb
 
 
+def _bias(ccfg: CostModelConfig, stated: str, width: float) -> float:
+    """A projection's bias: *width* where the model states one, none where it states none.
+
+    Where the model states neither, as a parser that reads no bias does,
+    each projection is counted a bias of the hidden width, the formulas'
+    convention.
+    """
+    has_bias = getattr(ccfg, stated, None)
+    if has_bias is None:
+        return ccfg.h
+    return width if has_bias else 0
+
+
+def _mlp_biases(ccfg: CostModelConfig, width: float) -> float:
+    """The biases of one feed-forward of *width*, or one expert's, as :func:`_bias` counts a projection's.
+
+    Stated, each projection into the width has one of it and the last,
+    back to the hidden width, one of that; unstated, each projection one of
+    the width.
+    """
+    has_bias = getattr(ccfg, "mlp_bias", None)
+    if has_bias is None:
+        return ccfg.n_ffMM * width
+    return (ccfg.n_ffMM - 1) * width + ccfg.h if has_bias else 0
+
+
 class EvalAttn:
     """Attention formulas class"""
 
     @staticmethod
     def num_params_mla(ccfg: CostModelConfig, _) -> float:
-        """Parameters count for Multi-Head Latent Attention"""
-        # W_up_q = ccfg.dc_q * ccfg.dh * ccfg.a
-        # W_up_k = ccfg.dc_kv * ccfg.dh * ccfg.n_kv
-        # W_up_v = ccfg.dc_kv * ccfg.dh * ccfg.n_kv
-        # W_down_q = ccfg.dc_q * ccfg.h
-        # W_down_kv = ccfg.dc_kv * ccfg.h
-        # W_q_rope = ccfg.a * ccfg.dhr * ccfg.dc_q
-        # W_k_rope = ccfg.dhr * ccfg.h
-        # Wo = ccfg.h * ccfg.a * ccfg.dh
+        """Parameters count for Multi-Head Latent Attention.
 
-        c_kv_fact = ccfg.dc_kv * (ccfg.n_kv * ccfg.dh + ccfg.h)
-        c_q_fact = ccfg.dc_q * (ccfg.a * ccfg.dh + ccfg.h + ccfg.a * ccfg.dhr)
-        rest_fact = (ccfg.h * ccfg.a * ccfg.dh) + (ccfg.h * ccfg.dhr)
-        res = (
-            0.5 * ccfg.n_attMM * c_kv_fact
-            + 0.25 * ccfg.n_attMM * c_q_fact
-            + 0.25 * ccfg.n_attMM * rest_fact
-        )
-        return res
+        The queries: a down-projection to their latent, its norm and an
+        up-projection to every head's non-rotary and rotary part, or one
+        projection where the model has no query latent.  The keys and
+        values: one down-projection to their shared latent beside the
+        rotary key, its norm, and an up-projection to every head's
+        non-rotary key and value.  The output projection from the values.
+        Each head's non-rotary key is ``qk_nope_head_dim`` wide, ``dh``,
+        its value head's width, unless the model states it.
+        """
+        d_qk = getattr(ccfg, "qk_nope_head_dim", None) or ccfg.dh
+        heads_q = ccfg.a * (d_qk + ccfg.dhr)
+        if ccfg.dc_q:
+            query = ccfg.h * ccfg.dc_q + ccfg.dc_q + ccfg.dc_q * heads_q
+        else:
+            query = ccfg.h * heads_q
+        key_value = (ccfg.h * (ccfg.dc_kv + ccfg.dhr) + ccfg.dc_kv
+                     + ccfg.dc_kv * ccfg.n_kv * (d_qk + ccfg.dh))
+        output = ccfg.a * ccfg.dh * ccfg.h
+        return 0.25 * ccfg.n_attMM * (query + key_value + output)
 
     @staticmethod
     def num_params_attn(ccfg: CostModelConfig, ctx: Context) -> float:
@@ -62,11 +90,11 @@ class EvalAttn:
             d_q = ccfg.a * d_h
             q_fact = 2 if ccfg.attn_output_gate else 1
             return 0.25 * ccfg.n_attMM * (
-                q_fact * ccfg.h * d_q + ccfg.h
+                q_fact * ccfg.h * d_q + _bias(ccfg, "qkv_bias", q_fact * d_q)
             ) + 0.25 * ccfg.n_attMM * (
-                ccfg.h * d_q + ccfg.h
+                ccfg.h * d_q + _bias(ccfg, "o_bias", ccfg.h)
             ) + 0.5 * ccfg.n_attMM * (
-                ccfg.h * ccfg.n_kv * d_h + ccfg.h
+                ccfg.h * ccfg.n_kv * d_h + _bias(ccfg, "qkv_bias", ccfg.n_kv * d_h)
             ) + ccfg.attn_extra_p
         return EvalAttn.num_params_mla(ccfg, ctx)
 
@@ -201,38 +229,47 @@ class EvalFFn:
     @staticmethod
     def num_params_ffn(ccfg: CostModelConfig, _) -> float:
         """Parameters count"""
-        experts_param_size = (
-            (ccfg.n_exp + ccfg.n_shared_exp)
-            * ccfg.n_ffMM
-            * (ccfg.hff * ccfg.h + ccfg.hff)
-        )
-        return experts_param_size
+        return (ccfg.n_exp + ccfg.n_shared_exp) * (
+            ccfg.n_ffMM * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff))
 
     @staticmethod
     def num_params_routed_expert(ccfg: CostModelConfig, _) -> float:
         """Routed expert parameters count (with ETP correction)"""
         hff_sliced = ccfg.hff_exp / max(ccfg.etp, 1)
-        return ccfg.n_exp * ccfg.n_ffMM * (hff_sliced * ccfg.h + hff_sliced)
+        return ccfg.n_exp * (ccfg.n_ffMM * hff_sliced * ccfg.h + _mlp_biases(ccfg, hff_sliced))
+
+    @staticmethod
+    def num_params_router(ccfg: CostModelConfig, _) -> float:
+        """The router's parameters: a weight per routed expert, the hidden width wide, where the layer routes."""
+        return ccfg.h * ccfg.n_exp if ccfg.n_exp > 1 else 0
 
     @staticmethod
     def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
-        """Shared expert parameters count"""
-        return ccfg.n_shared_exp * ccfg.n_ffMM * (ccfg.hff * ccfg.h + ccfg.hff)
+        """Shared expert parameters count, and the weight that gates its output where the model has one.
+
+        Every producer states the shared experts as a count of experts of
+        the routed ones' width, ``hff_exp``: one wide shared expert as that
+        many.
+        """
+        gate = ccfg.h if ccfg.n_shared_exp and getattr(ccfg, "shared_expert_gate", None) else 0
+        width = ccfg.hff_exp
+        return ccfg.n_shared_exp * (ccfg.n_ffMM * width * ccfg.h + _mlp_biases(ccfg, width)) + gate
 
     @staticmethod
-    def ffn_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """ "Activations count"""
+    def ffn_activations(ccfg: CostModelConfig, ctx: Context, width: Optional[float] = None) -> float:
+        """Activations of a feed-forward *width* wide, the model's dense width unless given"""
+        width = ccfg.hff if width is None else width
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         tok_size = ccfg.s * ccfg.b
         n_mm = ccfg.n_ffMM
         if n_mm % 2 == 0:
-            matmul = 0.5 * ccfg.h + 0.5 * ccfg.hff
+            matmul = 0.5 * ccfg.h + 0.5 * width
         else:
-            matmul = 1 / 3 * ccfg.h + 2 / 3 * ccfg.hff
+            matmul = 1 / 3 * ccfg.h + 2 / 3 * width
         matmul *= ccfg.bytes_compute * n_mm
-        activ_fun = ccfg.bytes_compute * ccfg.hff
+        activ_fun = ccfg.bytes_compute * width
         activ_fun *= EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.ffAct)
-        pcast = ccfg.bytes_compute * ccfg.hff * ccfg.n_ffParamCast
+        pcast = ccfg.bytes_compute * width * ccfg.n_ffParamCast
         activ_size = matmul + pcast + activ_fun
         micro_factor = ctx.micro_factor
         return micro_factor * tok_size * activ_size / (ccfg.t * ccfg.cp)
@@ -252,14 +289,14 @@ class EvalFFn:
 
     @staticmethod
     def shared_exp_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Shared expert activations"""
-        return ccfg.n_shared_exp * EvalFFn.ffn_activations(ccfg, ctx)
+        """Shared expert activations, each shared expert of the routed ones' width"""
+        return ccfg.n_shared_exp * EvalFFn.ffn_activations(ccfg, ctx, ccfg.hff_exp)
 
     @staticmethod
     def routed_exp_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """MoE topK activations"""
+        """MoE topK activations, each expert at its width"""
         tok_size = ccfg.s * ccfg.b
-        activ_size = EvalFFn.ffn_activations(ccfg, ctx) / tok_size
+        activ_size = EvalFFn.ffn_activations(ccfg, ctx, ccfg.hff_exp) / tok_size
         avg_num_toks = tok_size * ccfg.n_chosen_exp / ccfg.n_exp
         if not ccfg.gmm:  # Capacity mode
             expert_capacity = avg_num_toks * ccfg.cap_fact * ccfg.n_exp
@@ -289,8 +326,18 @@ class EvalNorm:
 
     @staticmethod
     def num_params_norm(ccfg: CostModelConfig, _) -> float:
-        """Parameters count: the layer's norms, and a QK-norm's query and key weights"""
-        return ccfg.n_normOp * 2 * ccfg.h + getattr(ccfg, "n_qknorm", 0) * 2 * EvalNorm.head_dim(ccfg)
+        """Parameters count: the layer's norms, and a QK-norm's query and key weights.
+
+        A model that states its norms holds a weight in each, and a bias
+        beside it in a LayerNorm; one that does not is counted two vectors
+        per norm op.
+        """
+        layer_norms = getattr(ccfg, "layer_norms", None)
+        if layer_norms is None:
+            vectors = ccfg.n_normOp * 2
+        else:
+            vectors = layer_norms * (2 if getattr(ccfg, "norm_bias", None) else 1)
+        return vectors * ccfg.h + getattr(ccfg, "n_qknorm", 0) * 2 * EvalNorm.head_dim(ccfg)
 
     @staticmethod
     def norm_activations(ccfg: CostModelConfig, ctx: Context) -> float:

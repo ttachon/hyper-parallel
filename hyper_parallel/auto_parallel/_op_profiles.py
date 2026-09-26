@@ -292,6 +292,32 @@ def infer_qk_norm(name: Any) -> bool:
     return any(pattern in lowered for pattern in _QK_NORM_NAMES)
 
 
+# What a lower-cased model name contains when its attention projects queries,
+# keys and values with a bias and its output without, which its Transformers
+# config does not state: the Qwen2 generation.
+_QKV_BIAS_NAMES = ("qwen2",)
+
+# What a lower-cased model name contains when its MoE layer gates its shared
+# expert's output with a weight of its own: Qwen2-MoE, Qwen3.5 and Qwen3-Next.
+_SHARED_EXPERT_GATE_NAMES = ("qwen2_moe", "qwen3_5", "qwen3_next")
+
+
+def infer_qkv_bias(name: Any) -> bool:
+    """Return whether a model named *name* biases its query, key and value projections.
+
+    For a Transformers config that states no ``attention_bias``, as the
+    Qwen2 generation's, whose projections have one.
+    """
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _QKV_BIAS_NAMES)
+
+
+def infer_shared_expert_gate(name: Any) -> bool:
+    """Return whether a model named *name* gates its shared expert's output with a weight of its own."""
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _SHARED_EXPERT_GATE_NAMES)
+
+
 def resolve_ops(arch: str, ops: Optional[Mapping[str, OpCounts]] = None) -> Dict[str, OpCounts]:
     """Return the op counts a model is priced with, per layer kind.
 

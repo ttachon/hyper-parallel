@@ -47,6 +47,9 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
 GENERALIZE_PIPELINE_CALCULATION = False
 MANUAL_P2P_RATIO = 0.002
 BACKWARD_RATIO = 2
+# The chunk the gated delta rule's kernel and Transformers' own
+# implementation run a sequence in.
+GDN_CHUNK = 64
 
 
 def op_table(cfg, attn=None):
@@ -75,18 +78,23 @@ def op_table(cfg, attn=None):
             + 2 * att.n_kv * d_h
         )
     )
-    # Delta-rule state update and readout: linear in the sequence, where an
-    # attention score is quadratic. The entry exists only for a group that
-    # declares the flavour, so no other config needs to carry the count.
-    state = (
-        getattr(att, "lin_n_v", 0)
-        * getattr(att, "lin_d_k", 0)
-        * getattr(att, "lin_d_v", 0)
-    )
-    if state:
-        table["n_linrec"] = 6 * cfg.b * cfg.s * state
+    # The chunked gated delta rule, per value head: within a chunk of
+    # GDN_CHUNK tokens, its keys against its keys and its queries, its
+    # solved weights against its values and its decayed keys, and its
+    # scores against its new values; the state read twice and written once
+    # a chunk.  Linear in the sequence, where an attention score is
+    # quadratic.  The entry exists only for a group that declares the
+    # flavour, so no other config needs to carry the count.
+    n_v, d_k, d_v = (getattr(att, name, 0) for name in ("lin_n_v", "lin_d_k", "lin_d_v"))
+    if n_v * d_k * d_v:
+        table["n_linrec"] = (3 * cfg.b * cfg.s * n_v
+                             * (2 * GDN_CHUNK * (3 * d_k + 2 * d_v) + 6 * d_k * d_v))
     table["n_ffMM"] = 6 * cfg.b * cfg.s * cfg.h * cfg.hff
-    table["n_attBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.h
+    # Every head's queries against every key, as wide as a head's queries
+    # and keys, an MLA head's with its rotary part; then the weights
+    # against the values, as wide as a head's values.
+    d_qk = (getattr(att, "qk_nope_head_dim", None) or d_h) + (getattr(att, "dhr", 0) or 0)
+    table["n_attBMM"] = 3 * cfg.b * cfg.s * cfg.s * att.a * (d_qk + d_h)
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
@@ -100,18 +108,17 @@ def op_table(cfg, attn=None):
     table["n_dropout"] = (
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )
-    if cfg.dc_kv != 0:  # Deepseek
-        table["n_attMM"] = (
-            3
-            / 2
-            * (
-                2 * cfg.dc_kv * cfg.n_kv * cfg.dh
-                + cfg.dc_q * cfg.a * (cfg.dh + cfg.dhr)
-                + cfg.h * (cfg.a * cfg.dh + cfg.dhr)
-            )
-            * cfg.b
-            * cfg.s
-        )
+    if cfg.dc_kv != 0:  # MLA
+        # The queries' latent and its up-projection, or one projection to
+        # every head; the keys' and values' shared down-projection beside
+        # the rotary key; their up-projections, a head's key at its own
+        # width and its value at the value heads'; the output projection.
+        d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
+        heads = cfg.a * (d_nope + cfg.dhr)
+        query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
+        weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+                   + cfg.a * cfg.dh * cfg.h)
+        table["n_attMM"] = 6 * cfg.b * cfg.s * weights / (getattr(cfg, "n_attMM", 0) or 4)
     for op in table:
         table[op] *= cfg.bytes_p / cfg.t / cfg.cp
     # cfg.s *= cfg.cp
@@ -119,11 +126,19 @@ def op_table(cfg, attn=None):
 
 
 def _flavour_tables(cfg, attn=None):
-    """One (dense, expert) table pair for a given attention flavour."""
+    """One (dense, expert) table pair for a given attention flavour.
+
+    A MoE layer's feed-forward entry prices the experts each token runs,
+    the shared experts, as wide as a routed one, and, spread over the
+    layer's feed-forward matmuls, the router and the shared experts' gate.
+    """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
-    scale = cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
-    exp["n_ffMM"] *= scale
+    n_ff = getattr(attn if attn is not None else cfg, "n_ffMM", 0) or 3
+    gate = 1 if cfg.n_shared_exp and getattr(cfg, "shared_expert_gate", None) else 0
+    width = (cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
+             + (cfg.n_exp + gate) / n_ff)
+    exp["n_ffMM"] *= width / cfg.hff
     return base, exp
 
 

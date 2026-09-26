@@ -43,6 +43,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
     LayerTimes,
+    _flavour_tables,
     estimate_comp,
     estimate_layer_times,
     estimate_performance,
@@ -143,6 +144,72 @@ class TestOpTable(unittest.TestCase):
         normed = SimpleNamespace(**vars(_cfg(128)), n_qknorm=1)
         self.assertEqual((op_table(normed)["n_qknorm"], "n_qknorm" in op_table(_cfg(128))),
                          (30 * 128 * (8 + 8) * 64 * 2 / 2, False))
+
+    def test_scores_run_at_the_heads_widths(self):
+        """
+        Feature: the load of the attention scores.
+        Description: 8 heads on width 512, 64 wide as h / a, then 128 wide;
+            then MLA heads whose keys are 64 wide and a rotary 32, values 64.
+        Expectation: Every head's queries against every key, then the
+            weights against the values: 3 b s^2 a (d_qk + d_v), each TP
+            rank its half, in the parameters' bytes.
+        """
+        s = 128
+        for fields, d_qk, d_v in (({}, 64, 64), ({"dh": 128}, 128, 128),
+                                  ({"dh": 64, "qk_nope_head_dim": 64, "dhr": 32}, 96, 64)):
+            cfg = SimpleNamespace(**{**vars(_cfg(s)), **fields})
+            self.assertEqual(op_table(cfg)["n_attBMM"], 3 * s * s * 8 * (d_qk + d_v) * 2 / 2, fields)
+
+    def test_mla_projections_as_the_model_holds_them(self):
+        """
+        Feature: the load of MLA's projections.
+        Description: DeepSeek-V3's attention: width 7168, 128 heads,
+            latents of 1536 and 512, heads 128 and a rotary 64 wide; then the
+            same without a query latent.
+        Expectation: Six multiply-adds a token per weight, forward and
+            backward, over the four attention matmuls: the 187105280
+            weights of the model's projections; without a query latent, one
+            projection to every head in place of the latent's two.
+        """
+        s = 128
+        mla = SimpleNamespace(**{**vars(_cfg(s)), "h": 7168, "a": 128, "n_kv": 128, "dh": 128, "dhr": 64,
+                                 "dc_q": 1536, "dc_kv": 512, "t": 1, "n_attMM": 4})
+        self.assertEqual(op_table(mla)["n_attMM"], 6 * s * 187105280 / 4 * 2)
+        direct = 187105280 - 1536 * (7168 + 128 * 192) + 7168 * 128 * 192
+        mla.dc_q = 0
+        self.assertEqual(op_table(mla)["n_attMM"], 6 * s * direct / 4 * 2)
+
+
+    def test_a_moe_layer_prices_its_whole_feed_forward(self):
+        """
+        Feature: _flavour_tables, a MoE layer's feed-forward.
+        Description: A layer of width 512, its dense layers 1024 wide, with
+            8 experts 64 wide, 2 chosen, a shared expert and its gate, three
+            feed-forward matmuls.
+        Expectation: The feed-forward entry prices each token's two experts
+            and the shared expert, each 64 wide, and, over the three
+            matmuls, the router's 8 weights and the gate's one.
+        """
+        cfg = SimpleNamespace(**{**vars(_cfg(128)), "hff_exp": 64, "n_exp": 8, "n_chosen_exp": 2, "cap_fact": 1,
+                                 "n_shared_exp": 1, "shared_expert_gate": True, "n_ffMM": 3})
+        base, experts = _flavour_tables(cfg)
+        self.assertEqual(experts["n_ffMM"], base["n_ffMM"] / 1024 * (3 * 64 + (8 + 1) / 3))
+
+    def test_the_delta_rule_runs_in_chunks(self):
+        """
+        Feature: the load of the gated delta rule.
+        Description: A linear-attention group of 32 value heads, keys and
+            values 128 wide, on 128 tokens.
+        Expectation: Per token and value head, forward and backward, three
+            times what a chunk of 64 tokens runs over each of its tokens:
+            its keys against its keys and its queries, its solved weights
+            against its values and its decayed keys, its scores against its
+            new values, 2 x 64 x (3 x 128 + 2 x 128), and the state read
+            twice and written once, 6 x 128 x 128.
+        """
+        cfg = SimpleNamespace(**{**vars(_cfg(128)), "lin_n_v": 32, "lin_d_k": 128, "lin_d_v": 128})
+        self.assertEqual(op_table(cfg)["n_linrec"],
+                         3 * 128 * 32 * (2 * 64 * (3 * 128 + 2 * 128) + 6 * 128 * 128) * 2 / 2)
 
 
 _SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")

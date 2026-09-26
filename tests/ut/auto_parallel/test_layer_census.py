@@ -25,13 +25,16 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
+    census_activations,
+    census_final_norm,
+    census_flops,
+    census_layer,
+    census_output_activations,
+    census_parameters,
+    census_recomputed,
     _measure,
     _RecomputedMatmuls,
     _selective_contexts,
-    census_activations,
-    census_layer,
-    census_output_activations,
-    census_recomputed,
     tp_config,
 )
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
@@ -244,6 +247,66 @@ class TestLayerCensus(unittest.TestCase):
             self.assertGreater(record.selective_tp, 0)
             for share in (record.selective_attention_mm, record.selective_ffn_mm):
                 self.assertTrue(0 < share < 1, share)
+
+    def test_a_layers_parameters_by_part(self):
+        """
+        Feature: census_parameters and census_final_norm.
+        Description: Each kind's layer of the model of width 64, with 4
+            routed experts and a shared expert, each 32 wide.
+        Expectation: The router holds a weight per expert; the routed
+            experts three projections each; the shared expert its three and
+            its gate; the norms two RMSNorms of the width, and in the
+            full-attention layer the per-head query and key norms beside
+            them.  The final norm is one RMSNorm.
+        """
+        config = _qwen35_text()
+        for index, norms in ((0, 2 * 64), (1, 2 * 64 + 2 * 16)):
+            parts = census_parameters(config, index)
+            self.assertEqual((parts["router"], parts["routed"], parts["shared"], parts["norm"]),
+                             (64 * 4, 4 * 3 * 64 * 32, 3 * 64 * 32 + 64, norms))
+            self.assertGreater(parts["attention"], 0)
+        self.assertEqual(census_final_norm(config), 64)
+
+    def test_a_layers_forward_flops_by_part(self):
+        """
+        Feature: census_flops.
+        Description: Each kind's layer of the model of width 64 on 32
+            tokens: 4 query heads of 16 behind an output gate and 2 key
+            heads; 4 routed experts 32 wide, 2 chosen, a shared expert 32
+            wide and its gate.
+        Expectation: The full-attention layer's projections; its scores and
+            values at every pair of tokens; each token's two experts' three
+            projections, the shared expert's three and its gate, and the
+            router's.  The linear-attention layer's recurrence is counted
+            apart from its projections, and it has no scores.
+        """
+        config, seq = _qwen35_text(), 32
+        full = census_flops(config, 1, seq)
+        self.assertEqual(full["attention"], 2 * seq * 64 * (2 * 4 * 16 + 2 * 2 * 16 + 4 * 16))
+        self.assertEqual(full["scores"], 2 * 4 * seq * seq * (16 + 16))
+        self.assertEqual((full["routed"], full["shared"], full["router"]),
+                         (2 * seq * 2 * 3 * 64 * 32, 2 * seq * (3 * 64 * 32 + 64), 2 * seq * 64 * 4))
+        linear = census_flops(config, 0, seq)
+        self.assertGreater(linear["linrec"], 0)
+        self.assertNotIn("scores", linear)
+
+    def test_mla_values_keep_their_width(self):
+        """
+        Feature: census_flops and census_layer on MLA.
+        Description: A DeepSeek-V3 layer of width 64 on 32 tokens: 4 heads
+            whose queries and keys are 16 wide, 12 and a rotary 4, and whose
+            values are 8.
+        Expectation: The scores run at the queries' and keys' width and the
+            values at their own, unpadded, as under HyperParallel's sdpa; the
+            layer runs its backward.
+        """
+        from transformers import DeepseekV3Config  # pylint: disable=C0415
+        config = DeepseekV3Config(
+            hidden_size=64, num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=4, q_lora_rank=32,
+            kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=8, intermediate_size=32,
+            first_k_dense_replace=1, vocab_size=128, n_group=1, topk_group=1)
+        self.assertEqual(census_flops(config, 0, 32)["scores"], 2 * 4 * 32 * 32 * (16 + 8))
+        self.assertGreater(census_layer(config, 0, 32)[0], 0)
 
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """

@@ -97,9 +97,14 @@ def apply_op_counts(ccfg: Any, counts: OpCounts) -> None:
     """Set one layer kind's op counts on *ccfg*, each as ``n_<op>``."""
     for name, count in counts.to_dict().items():
         setattr(ccfg, "n_" + name, count)
-    # Parameters are cast when the optimizer does not shard them.
-    ccfg.n_attParamCast = ccfg.n_attMM if not ccfg.has_op else 0
-    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
+    # A layer keeps a cast beside each matmul where the run says it does,
+    # derive's keeps_param_casts; a config derive has not seen, where the
+    # optimizer does not shard.
+    casts = getattr(ccfg, "keeps_param_casts", None)
+    if casts is None:
+        casts = not ccfg.has_op
+    ccfg.n_attParamCast = ccfg.n_attMM if casts else 0
+    ccfg.n_ffParamCast = ccfg.n_ffMM if casts else 0
 
 
 # The fields an attention flavour assigns.  Every kind of a stack whose kinds
@@ -124,8 +129,10 @@ def _linear_attention(snapshot: Any, linear: LinearAttentionDims) -> Dict[str, A
     The flavour maps onto the q/k/v/o formula: the value heads carry the
     q-side width, the key heads the kv-side, and the output gate is a second
     q-wide tensor.  What the formula does not describe is stated apart: the
-    short convolution over the projected stream and the two per-head gates
-    as extra parameters, the recurrent state update as the ``linrec`` op.
+    short convolution over the projected stream, the two per-head gates'
+    projections, each head's decay and time-step bias and the gated output
+    norm's weight as extra parameters, the recurrent state update as the
+    ``linrec`` op.
     """
     n_k, d_k = linear.num_key_heads, linear.key_head_dim
     n_v, d_v = linear.num_value_heads, linear.value_head_dim
@@ -136,7 +143,7 @@ def _linear_attention(snapshot: Any, linear: LinearAttentionDims) -> Dict[str, A
         "dh": d_v,
         "n_kv": n_k * d_k / d_v,
         "attn_output_gate": True,
-        "attn_extra_p": linear.conv_kernel_dim * qkv_width + 2 * snapshot.h * n_v,
+        "attn_extra_p": linear.conv_kernel_dim * qkv_width + 2 * snapshot.h * n_v + 2 * n_v + d_v,
         # The kernel normalizes its queries and keys itself, with no weights.
         "n_qknorm": 0,
         "lin_n_k": n_k,

@@ -29,7 +29,7 @@ Test IDs:
   CM-E07: ep_comm_layer_imbalanced falls back to balanced when n_exp not divisible by ep
   CM-E08: ep_comm_layer_imbalanced falls back to balanced when tokens_per_expert empty
   CM-E09: ep_comm_layer_imbalanced reduces to balanced under uniform distribution
-  CM-T01: tp_comm_exp MoE formula uses hff_exp for routed, hff for shared
+  CM-T01: tp_comm_exp MoE formula uses hff_exp for routed and shared experts
   CM-T02: tp_comm_exp dense formula uses s*b*hff*mb
   CM-C01: Ring CP p=1 comm is 3x p>1 (rec_factor gate by int(ccfg.p == 1))
   CM-C02: Ulysses CP p=1 comm is 2x p>1 (rec_factor gate by int(ccfg.p == 1))
@@ -409,7 +409,7 @@ class TestTpCommExp(unittest.TestCase):
     """Test tp_comm_exp MoE vs dense formula branching."""
 
     def test_moe_formula(self):
-        """CM-T01: MoE TP comm uses hff_exp for routed, hff for shared."""
+        """CM-T01: MoE TP comm uses hff_exp for routed and shared experts."""
         ccfg = _make_ccfg(
             n_exp=8, n_shared_exp=1, ep=2,
             h=4096, hff=14336, hff_exp=2048, bytes_compute=2,
@@ -419,9 +419,9 @@ class TestTpCommExp(unittest.TestCase):
         mb = 1
         result = EvalLayerComm.tp_comm_exp(ccfg, ctx, mb)
         # Routed: n_exp/ep * hff_exp = 4 * 2048 = 8192
-        # Shared: n_shared_exp * hff = 1 * 14336 = 14336
+        # Shared: n_shared_exp * hff_exp = 1 * 2048 = 2048, whatever hff
         routed_comm = 8 / 2 * 2048
-        shared_comm = 1 * 14336
+        shared_comm = 1 * 2048
         inner = 0.25 * 2 * 4096 * 2 * 1 * (routed_comm + shared_comm)
         rec_layer = ctx.current_node == MagicMock()  # False
         rec_factor = int(not rec_layer) | False  # 1

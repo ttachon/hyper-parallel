@@ -152,6 +152,7 @@ class Context:
         self.attn_score_activ, self.attn_proj_activ = None, None
         self.ffn_num_p, self.ffn_activ, self.ffn_moe_activ = None, None, None
         self.ffn_routed_num_p, self.ffn_shared_num_p = None, None
+        self.ffn_router_num_p = None
         self.norm_num_p, self.norm_activ = None, None
         self.pp_micro_eval = {}
         # How many chunks the schedule splits a micro-batch's sequence into,

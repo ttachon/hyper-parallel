@@ -80,11 +80,14 @@ def _make_ccfg(
     ccfg.shard_grad_non_exp = shard_grad_non_exp
     ccfg.shard_grad_exp = shard_grad_exp
     ccfg.shard_grad_exp_partial = shard_grad_exp_partial
+    # No bias or norm stated: the parameter formulas count their own.
+    for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "layer_norms", "shared_expert_gate"):
+        setattr(ccfg, name, None)
     return ccfg
 
 
 def _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, ffn_p=200.0,
-              routed_p=300.0, shared_p=100.0, swap_os=False):
+              routed_p=300.0, shared_p=100.0, swap_os=False, router_p=0.0):
     """Create a mock Context for body tests.
 
     The ctx.eval.num_p(ccfg, ctx) must return the 3-tuple that
@@ -104,6 +107,7 @@ def _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, ffn_p=200.0,
     ctx.ffn_shared_num_p = EvalFFn.num_params_shared_expert if shared_p == "real" else (
         lambda c, x: shared_p
     )
+    ctx.ffn_router_num_p = EvalFFn.num_params_router if router_p == "real" else (lambda c, x: router_p)
 
     # ctx.eval.num_p returns the tuple from EvalBody.num_params_layer
     ctx.eval = MagicMock()
@@ -135,6 +139,15 @@ class TestNumParamsLayer(unittest.TestCase):
         self.assertAlmostEqual(non_exp, 150.0)  # 100 + 50, no dense FFN
         self.assertAlmostEqual(routed, 300.0)
         self.assertAlmostEqual(shared, 100.0)
+
+    def test_a_moe_layers_router_is_a_non_expert_part(self):
+        """BD-N02b: a MoE layer's router, a weight per expert over the hidden width, is among its non-expert parts."""
+        ccfg = _make_ccfg(n_exp=8, n_shared_exp=1, h=4096)
+        ctx = _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, routed_p=300.0, shared_p=100.0, router_p="real")
+        non_exp, routed, shared = EvalBody.num_params_layer(ccfg, ctx)
+        self.assertEqual((non_exp, routed, shared), (150.0 + 4096 * 8, 300.0, 100.0))
+        dense = _make_ccfg(n_exp=1)
+        self.assertEqual(EvalBody.num_params_layer(dense, _make_ctx(dense, router_p="real"))[0], 350.0)
 
     def test_moe_no_shared_expert(self):
         """BD-N03: MoE without shared expert returns shared=0."""
@@ -358,21 +371,18 @@ class TestNumParamsRoutedExpert(unittest.TestCase):
 
 
 class TestNumParamsSharedExpert(unittest.TestCase):
-    """Test EvalFFn.num_params_shared_expert uses hff (not hff_exp)."""
+    """Test EvalFFn.num_params_shared_expert prices each shared expert at the routed width."""
 
-    def test_shared_uses_hff_not_hff_exp(self):
-        """BD-S01: shared expert uses ccfg.hff, NOT ccfg.hff_exp.
+    def test_shared_uses_hff_exp_not_hff(self):
+        """BD-S01: each shared expert is hff_exp wide, whatever the dense layers' hff.
 
-        DeepSeek-V3 has hff_exp=2048 (routed) but hff=18432 (shared).
-        Using hff_exp for shared would severely underestimate.
+        DeepSeek-V3's dense layers are 18432 wide and its one shared expert
+        2048, as wide as a routed one; Qwen2-57B-A14B states its 20480 wide
+        shared expert as eight of 2560.
         """
         ccfg = _make_ccfg(n_exp=256, n_shared_exp=1, h=7168, hff=18432, hff_exp=2048)
         result = EvalFFn.num_params_shared_expert(ccfg, None)
-        # Should use hff=18432, not hff_exp=2048
-        expected_with_hff = 1 * 1 * (18432 * 7168 + 18432)
-        wrong_with_hff_exp = 1 * 1 * (2048 * 7168 + 2048)
-        self.assertAlmostEqual(result, expected_with_hff, places=0)
-        self.assertNotAlmostEqual(result, wrong_with_hff_exp, places=0)
+        self.assertAlmostEqual(result, 1 * 1 * (2048 * 7168 + 2048), places=0)
 
     def test_shared_no_etp(self):
         """BD-S02: shared expert is NOT affected by etp (no TP slicing)."""

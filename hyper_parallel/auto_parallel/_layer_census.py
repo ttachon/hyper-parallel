@@ -36,6 +36,16 @@ Transformers' causal-LM loss, which casts the logits to fp32, as
 HyperParallel's trainer runs them by default, dropping the model's logits
 before the backward as the trainer does; half the vocabulary tells the
 bytes a vocabulary-parallel loss splits.
+
+A layer's parameters are counted by part, as ND prices its parts: the
+attention's, the norms', the dense feed-forward's, the routed experts', the
+shared expert's and the router's (:func:`census_parameters`), for verify
+mode to set beside what ND prices.  So are its forward FLOPs
+(:func:`census_flops`): each matmul's toward the part of the layer that
+runs it, flash attention's toward the scores, at every pair of tokens, as
+the runtime's kernel computes them under an explicit causal mask, and the
+gated delta rule's through Transformers' own chunked implementation, whose
+matmuls the runtime's kernel runs alike.
 """
 from __future__ import annotations
 
@@ -57,8 +67,11 @@ from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
 # The Transformers attention implementation the census registers its flash
-# attention under.
-_FLASH = "nd_census_flash"
+# attention under: a name Transformers does not take for a flash
+# attention's, as it does not take HyperParallel's default, sdpa, so a model
+# runs sdpa's path, and DeepSeek-V3's values are not padded to its queries'
+# width.
+_FLASH = "nd_census_attention"
 
 # The config fields a tensor-parallel rank holds a share of.
 _TP_FIELDS = (
@@ -69,15 +82,19 @@ _TP_FIELDS = (
 # The softmax statistics flash attention keeps per head and token.
 _FLASH_STATS = 8
 
+# The per-head query and key norms an attention holds, which ND prices with
+# the layer's norms.
+_QK_NORMS = ("q_norm", "k_norm")
+
 
 def _flash_outputs(query: torch.Tensor, key: torch.Tensor,
                    value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Flash attention's outputs, shapes only: one of the queries' shape and two fp32 statistics."""
-    del key, value
+    """Flash attention's outputs, shapes only: each head's, as wide as its values, and two fp32 statistics."""
+    del key
     batch, heads, seq, _ = query.shape
     stats = [torch.empty(batch, heads, seq, _FLASH_STATS, dtype=torch.float32, device=query.device)
              for _ in range(2)]
-    return torch.empty_like(query), stats[0], stats[1]
+    return query.new_empty(batch, heads, seq, value.shape[-1]), stats[0], stats[1]
 
 
 # Flash attention as one op, as the runtime's kernel is: HyperParallel's
@@ -390,8 +407,12 @@ def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
 
 
 @contextlib.contextmanager
-def _fake_layer(config: Any, layer_index: int) -> Iterator[Tuple[Any, Any]]:
-    """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels."""
+def _fake_layer(config: Any, layer_index: int, contracts: bool = True) -> Iterator[Tuple[Any, Any]]:
+    """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels.
+
+    The gated delta rule runs HyperParallel's kernel's contract, or, where
+    *contracts* is false, Transformers' own chunked implementation.
+    """
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
     config = copy.deepcopy(config)
@@ -408,9 +429,79 @@ def _fake_layer(config: Any, layer_index: int) -> Iterator[Tuple[Any, Any]]:
             torch.set_default_dtype(default)
         for module in layer.modules():
             if hasattr(module, "chunk_gated_delta_rule"):
-                module.chunk_gated_delta_rule = _gated_delta_rule(modeling)
+                module.chunk_gated_delta_rule = (_gated_delta_rule(modeling) if contracts
+                                                 else modeling.torch_chunk_gated_delta_rule)
         layer.train()
         yield layer, rotary
+
+
+class _PartFlops(TorchDispatchMode):
+    """A layer's forward FLOPs by part: its matmuls' toward the part running them, flash attention's the scores'."""
+
+    def __init__(self, layer: Any) -> None:
+        """Follow which of *layer*'s modules runs, and which tensors are its parameters."""
+        super().__init__()
+        self.flops: Dict[str, int] = {}
+        self.params = {param.untyped_storage()._cdata  # pylint: disable=protected-access
+                       for param in layer.parameters()}
+        self.running: List[str] = []
+        for name, module in layer.named_modules():
+            if name:
+                module.register_forward_pre_hook(functools.partial(self._enter, name))
+                module.register_forward_hook(self._leave)
+
+    def _enter(self, name: str, *_: Any) -> None:
+        """Note that the module at *name* runs."""
+        self.running.append(name)
+
+    def _leave(self, *_: Any) -> None:
+        """Note that the innermost module running has returned."""
+        self.running.pop()
+
+    def _part(self, args: Sequence[Any]) -> str:
+        """The part a matmul on *args* runs for: its module's, or an attention's recurrence where no weight takes part."""
+        part = _parameter_part(f"{self.running[-1]}.weight") if self.running else "ffn"
+        weighted = any(isinstance(arg, torch.Tensor)
+                       and arg.untyped_storage()._cdata in self.params  # pylint: disable=protected-access
+                       for arg in args)
+        return "linrec" if part == "attention" and not weighted else part
+
+    def _add(self, part: str, flops: int) -> None:
+        """Count *flops* toward *part*."""
+        self.flops[part] = self.flops.get(part, 0) + flops
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        out = func(*args, **(kwargs or {}))
+        if func is torch.ops.nd_census.flash_attention.default:
+            query, key, value = args[:3]
+            batch, heads, seq, width = query.shape
+            self._add("scores", 2 * batch * heads * seq * key.shape[2] * (width + value.shape[-1]))
+        elif flops := _matmul_flops(func, args):
+            self._add(self._part(args), flops)
+        return out
+
+
+def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, int]:
+    """The forward FLOPs of layer *layer_index* of *config* on one sequence, by part.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the sequence it runs.
+
+    Returns:
+        The FLOPs of each part that runs a matmul: the attention's
+        projections (``attention``), its scores and values at every pair of
+        tokens (``scores``), a linear attention's recurrence (``linrec``),
+        and the parts of the feed-forward :func:`_parameter_part` names.
+    """
+    with _fake_layer(config, layer_index, contracts=False) as (layer, rotary):
+        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
+        positions = _positions(rotary, hidden, seq_length)
+        counter = _PartFlops(layer)
+        with counter:
+            _run(layer, hidden, positions)
+    return counter.flops
 
 
 def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False) -> Tuple[int, int]:
@@ -467,6 +558,55 @@ def census_recomputed(config: Any, layer_index: int, seq_length: int) -> Tuple[f
                                  context_fn=functools.partial(_selective_contexts, ledger))
         _run(layer, hidden, _positions(rotary, hidden, seq_length), call)
     return ledger.share(attention=True), ledger.share(attention=False)
+
+
+def _parameter_part(name: str) -> str:
+    """The part of a decoder layer the parameter at path *name* belongs to, as ND prices the parts.
+
+    The layer's norms and its attention's per-head query and key norms are
+    its norms; the rest of a child named for attention is its attention.
+    Of the feed-forward, a shared expert's parameters, the routed experts'
+    and the router's are parts of their own, and the rest is the dense
+    feed-forward's.
+    """
+    segments = name.split(".")
+    module = segments[-2] if len(segments) > 1 else ""
+    if "norm" in segments[0] or module in _QK_NORMS:
+        return "norm"
+    if "attn" in segments[0] or "attention" in segments[0]:
+        return "attention"
+    if any("shared" in segment for segment in segments):
+        return "shared"
+    if "experts" in segments:
+        return "routed"
+    if module in ("gate", "router"):
+        return "router"
+    return "ffn"
+
+
+def census_parameters(config: Any, layer_index: int) -> Dict[str, int]:
+    """The parameters of layer *layer_index* of *config*, by part.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+
+    Returns:
+        The parameter count of each part the layer has
+        (:func:`_parameter_part`).
+    """
+    parts: Dict[str, int] = {}
+    with _fake_layer(config, layer_index) as (layer, _):
+        for name, param in layer.named_parameters():
+            part = _parameter_part(name)
+            parts[part] = parts.get(part, 0) + param.numel()
+    return parts
+
+
+def census_final_norm(config: Any) -> int:
+    """The parameters of *config*'s final norm, of the class of a layer's input norm."""
+    with _fake_layer(config, 0) as (layer, _):
+        return sum(param.numel() for param in layer.input_layernorm.parameters())
 
 
 def census_output(config: Any, seq_length: int) -> Tuple[int, int]:

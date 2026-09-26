@@ -46,6 +46,11 @@ from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 
+# The model facts a spec states as true or false.
+_FLAGS = ("attn_output_gate", "tie_word_embeddings", "qk_norm", "qkv_bias", "o_bias", "mlp_bias", "norm_bias",
+          "shared_expert_gate")
+
+
 class ModelSpecError(ValueError):
     """A model spec is missing a required fact or contradicts itself.
 
@@ -371,6 +376,14 @@ class ModelSpec:
             over the head width before the scores, as Qwen3's ``q_norm`` and
             ``k_norm`` do.  A Transformers config does not state it; its
             producer infers it from the model's name.
+        qkv_bias, o_bias, mlp_bias: Whether the query, key and value
+            projections, the output projection and the feed-forward's hold a
+            bias.  Unstated, the parameter formulas count their own.
+        norm_bias, layer_norms: Whether each norm holds a bias beside its
+            weight, as a LayerNorm does, and how many norms a layer holds,
+            its attention's per-head query and key norms apart.
+        shared_expert_gate: Whether a MoE layer gates its shared expert's
+            output with a weight of its own, as Qwen2-MoE's does.
         activations: What a layer of each kind keeps for its backward and
             holds in it, per token, as a census measures them; the memory
             model prices a layer of a kind stated here with them rather
@@ -411,6 +424,12 @@ class ModelSpec:
     attn_output_gate: Optional[bool] = None
     tie_word_embeddings: Optional[bool] = None
     qk_norm: Optional[bool] = None
+    qkv_bias: Optional[bool] = None
+    o_bias: Optional[bool] = None
+    mlp_bias: Optional[bool] = None
+    norm_bias: Optional[bool] = None
+    layer_norms: Optional[int] = None
+    shared_expert_gate: Optional[bool] = None
 
     # Gated DeltaNet linear attention (Qwen3.5), for the layers a linear kind prices.
     linear_num_key_heads: Optional[int] = None
@@ -617,7 +636,7 @@ class ModelSpec:
             return KindActivations.from_dict(value, key)
         if key == "ffn_dim_multiplier":
             return float(value)
-        if key in ("attn_output_gate", "tie_word_embeddings", "qk_norm"):
+        if key in _FLAGS:
             if not isinstance(value, bool):
                 raise ModelSpecError(f"{key} must be true or false, got {value!r}")
             return value
