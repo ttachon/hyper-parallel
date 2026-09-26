@@ -73,6 +73,9 @@ class _Backbone:
             else:
                 raise AttributeError("missing config")
         self.evaluator_instances = None
+        # The submodule a multimodal model's stages are fitted on, by name,
+        # or None for a model of one module (F54).
+        self.main_module = None
         self.ppb = None
         self._overhead_obj = _BackwardOverhead(
             self, self._ccfg, self._ctx, self._inner_dynamic_mem
@@ -426,6 +429,7 @@ class _Backbone:
             stages = self._ccfg.generate_partitions_vpp()
             #     multimodal=self._ccfg.multimodal
             # )
+        self.__name_main_module(self._ccfg)
         if not self._ccfg.multimodal:
             return self.__estimate_stages_backbone(
                 stages, args[1], args[2], spec_stage_id, args[4]
@@ -705,10 +709,49 @@ class _Backbone:
         ccfg, ctx = self._ccfg, self._ctx
         try:
             working, pending = self._overhead_obj.first_layer_working_set(stages, stage_id, record_lay_types)
+            kept += self.__held_before_last_backward(stages, stage_id, sm, record_lay_types)
         finally:
             self._ccfg, self._ctx = ccfg, ctx
         held = max(0, held - pending) if held else 0
         return kept + held + working + sm["root_grad"][stage_id]
+
+    def __name_main_module(self, ccfg) -> None:
+        """Name the submodule a model's stages are fitted on, or none for a model of one module.
+
+        A multimodal model's stages hold its submodules' layers together, and
+        a micro-batch's backward ends on the first of them; the moment the
+        main submodule's own first layer runs its backward is the one a stage
+        has to fit (F54).
+        """
+        if not ccfg.multimodal:
+            self.main_module = None
+            return
+        main = getattr(ccfg, "mm_main", None) or ccfg.mm_order[-1]
+        self.main_module = ccfg.mm_ccfgs[main].model_name
+
+    def __held_before_last_backward(self, stages, stage_id, sm, record_lay_types) -> float:
+        """This micro-batch's activations of the layers whose backward has not run at that moment.
+
+        A stage of one module ends a micro-batch's backward on its first
+        layer, with nothing of that micro-batch left to hold.  A stage that
+        also holds a vision tower ends it on the tower's first layer, but
+        the moment the language model's first layer runs its backward, every
+        activation the tower kept is still held: that is the moment the
+        stage has to fit, so what the tower keeps of this micro-batch counts
+        beside the other micro-batches' (F54).
+        """
+        if self.main_module is None:
+            return 0
+        held = 0
+        for chunk_id, chunk in enumerate(stages[stage_id]):
+            for lay_id, node in enumerate(chunk):
+                if not self.is_regular_layer(node):
+                    continue
+                if record_lay_types[(stage_id, chunk_id, lay_id)][0].model_name == self.main_module:
+                    break
+                micro = sm["micro"][stage_id][chunk_id][lay_id]
+                held += sm["dyn"][stage_id][chunk_id][lay_id] / micro
+        return held
 
     def __postprocess_stages(self, *args):
         """Build memory insights from raw stage evaluation buffers."""
