@@ -22,12 +22,13 @@ from unittest.mock import patch
 
 import yaml
 
-from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters
+from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters, census_saved_ops
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
     census_spec_yaml,
     report,
     report_spec,
+    verify_activations,
     verify_estimate,
     verify_flops,
     verify_parameters,
@@ -230,6 +231,34 @@ class TestVerifyFlops(unittest.TestCase):
                          (sum(row.nd for row in rows[:-1]), sum(row.census for row in rows[:-1])))
 
 
+class TestVerifyActivations(unittest.TestCase):
+    """Verify mode sets what the op records price a layer keeping for each op beside the census's."""
+
+    def test_each_op_beside_its_census(self):
+        """
+        Feature: verify_activations.
+        Description: A Llama of one layer kind, width 64, on 4096 tokens.
+        Expectation: A row per op either prices or measures, in bytes a
+            token of the whole layer: the census's the layer's own, the
+            records' those of its slots, such as the score cast the census
+            never sees; then the layer's whole, the sum of the rows.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        config = _one_kind(LlamaConfig)
+        with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+            rows = verify_activations(_train_yaml(folder))
+        census = census_saved_ops(config, 0, 4096)
+        by = {row.part: row for row in rows}
+        for part, row in by.items():
+            if part != "total":
+                self.assertEqual(row.census, census.get(part, 0.0), part)
+        self.assertLessEqual({op for op, size in census.items() if size}, set(by))
+        self.assertEqual(by["ffAct"].nd, 2 * 128)
+        self.assertEqual((by["total"].nd, by["total"].census),
+                         (sum(row.nd for row in rows[:-1]), sum(census.values())))
+        self.assertEqual({row.where for row in rows}, {"decoder x2"})
+
+
 class TestVerifySpec(unittest.TestCase):
     """Verify mode sets the census's model spec beside the resolver's, and prices the run with each."""
 
@@ -335,6 +364,7 @@ class TestRunNdVerify(unittest.TestCase):
             self.assertTrue(any("Forward FLOPs" in line for line in logs.output))
             self.assertTrue(any("linear_attention x1" in line and "linrec" in line for line in logs.output))
             self.assertTrue(any("fields agree, 0 differ" in line for line in logs.output))
+            self.assertTrue(any("full_attention x1" in line and "attBMM" in line for line in logs.output))
             self.assertTrue(any("peak MB" in line for line in logs.output))
             self.assertTrue(os.path.isfile(os.path.join(folder, "model_spec.yaml")))
             with patch.object(sys, "argv", ["run_nd.py", "-y", path, "-V"]), self.assertRaises(SystemExit) as done:

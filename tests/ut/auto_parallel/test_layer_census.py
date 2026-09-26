@@ -32,6 +32,7 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_output_activations,
     census_parameters,
     census_recomputed,
+    census_saved_ops,
     _measure,
     _RecomputedMatmuls,
     _selective_contexts,
@@ -247,6 +248,34 @@ class TestLayerCensus(unittest.TestCase):
             self.assertGreater(record.selective_tp, 0)
             for share in (record.selective_attention_mm, record.selective_ffn_mm):
                 self.assertTrue(0 < share < 1, share)
+            self.assertAlmostEqual(sum(record.ops.values()), record.saved)
+            self.assertAlmostEqual(sum(record.ops_tp.values()), record.saved_tp)
+        self.assertGreater(got["linear_attention"].ops_tp["linrec"], 0)
+        self.assertGreater(got["full_attention"].ops_tp["attBMM"], 0)
+
+    def test_what_a_layer_saves_for_each_op(self):
+        """
+        Feature: census_saved_ops, the op records the census fills.
+        Description: A Llama layer of width 64, 4 query heads and 2 key
+            heads 16 wide, a gated feed-forward 128 wide, in bf16.
+        Expectation: Per token: the projections' input, the rotary tables
+            and the output projection's input for the attention's
+            projections; the kernel's queries, keys, values and output for
+            its batched matmuls, and its fp32 statistics for the softmax;
+            each RMSNorm's fp32 input, its scale and its bf16 output; the
+            feed-forward's input, its gate and up outputs as its product
+            takes them and that product for its projections, and the gate's
+            output for its activation function.  They sum to what the layer
+            keeps.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        config = LlamaConfig(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                             intermediate_size=128, vocab_size=128)
+        ops = census_saved_ops(config, 0, 64)
+        self.assertEqual(ops, {
+            "attMM": 2 * (64 + 2 * 16 + 64), "attBMM": 2 * (4 * 16 + 2 * 2 * 16 + 4 * 16), "softmax": 4 * 2 * 4 * 8,
+            "normOp": 2 * (4 * 64 + 4 + 2 * 64), "ffMM": 2 * (64 + 3 * 128), "ffAct": 2 * 128})
+        self.assertEqual(sum(ops.values()) * 64, census_layer(config, 0, 64)[0])
 
     def test_a_layers_parameters_by_part(self):
         """
@@ -337,7 +366,8 @@ class TestKindActivations(unittest.TestCase):
         record = {"saved": 2036.25, "saved_tp": 3812.5, "working": 2162.375, "working_tp": 3812.5,
                   "seq_length": 64}
         selective = dict(record, selective=512.0, selective_tp=1024.5, selective_attention_mm=0.25,
-                         selective_ffn_mm=0.625)
+                         selective_ffn_mm=0.625, ops={"attMM": 1000.25, "other": 1036.0},
+                         ops_tp={"attBMM": 3812.5})
         spec = ModelSpec.from_dict(dict(_spec(linear_attention=selective, full_attention=record),
                                          output_activations=record))
         self.assertEqual(spec.activations["linear_attention"].to_dict(), selective)
@@ -349,8 +379,10 @@ class TestKindActivations(unittest.TestCase):
     def test_a_record_is_checked(self):
         """
         Feature: KindActivations.from_dict and ModelSpec.validate.
-        Description: A negative size, a missing field, and a kind no layer of
-            the stack is.
+        Description: A negative size, a missing field, what a layer keeps
+            for each op without the part TP splits, an op the op vector
+            lacks, a negative op's size, and a kind no layer of the stack
+            is.
         Expectation: Each raises, naming what is wrong.
         """
         record = {"saved": 1.0, "saved_tp": 1.0, "working": 1.0, "working_tp": 1.0, "seq_length": 64}
@@ -363,6 +395,12 @@ class TestKindActivations(unittest.TestCase):
         with self.assertRaisesRegex(ModelSpecError, "exceed 1"):
             ModelSpec.from_dict(_spec(linear_attention=dict(record, selective_attention_mm=0.5,
                                                             selective_ffn_mm=1.5)))
+        with self.assertRaisesRegex(ModelSpecError, "without the other"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, ops={"attMM": 1.0})))
+        with self.assertRaisesRegex(ModelSpecError, "must map ops"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, ops={"matmul": 1.0}, ops_tp={})))
+        with self.assertRaisesRegex(ModelSpecError, "negative"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, ops={"attMM": -1.0}, ops_tp={})))
         with self.assertRaisesRegex(ModelSpecError, "decoder"):
             ModelSpec.from_dict(_spec(decoder=record))
         with self.assertRaisesRegex(ModelSpecError, "output_activations must map"):

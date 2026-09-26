@@ -30,6 +30,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
     census_spec_yaml,
     report,
     report_spec,
+    verify_activations,
     verify_estimate,
     verify_flops,
     verify_parameters,
@@ -398,6 +399,9 @@ if __name__ == "__main__":
             logger.output(line)
         logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
         for line in report(verify_flops(args.yaml_config)):
+            logger.output(line)
+        logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
+        for line in report(verify_activations(args.yaml_config)):
             logger.output(line)
         logger.output("Model spec as ND prices it: read from the checkpoint's config, and measured by the census")
         for line in report_spec(verify_spec(args.yaml_config)):
