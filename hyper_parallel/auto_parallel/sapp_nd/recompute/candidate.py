@@ -302,12 +302,11 @@ def _plain(options: Sequence[LayerOption]) -> LayerOption:
 def _working(option: LayerOption, options: Sequence[LayerOption], first: bool = False) -> float:
     """The working set a layer running *option* ends warm-up on, or with *first*, the backward on a stage's first layer.
 
-    What it keeps at one micro-batch and what its backward holds beyond, and
-    for a fully recomputed layer the plain layer's, *options* being its
-    kind's.
+    What it keeps at one micro-batch, the plain layer for full recompute,
+    *options* being its kind's, and what its backward holds beyond.
     """
     run = option if option.recompute is not None else _plain(options)
-    return _kept(run, 1) + (run.first_working_extra if first else run.working_extra)
+    return _kept(run, 1) + (option.first_working_extra if first else option.working_extra)
 
 
 def _charge_working_sets(

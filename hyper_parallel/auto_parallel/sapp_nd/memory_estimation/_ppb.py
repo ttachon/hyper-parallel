@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -185,7 +187,13 @@ class _PPB:
         return max(2, min(getattr(ccfg, "p", 1), getattr(ccfg, "m", 1)))
 
     def _profile(self, ccfg: CostModelConfig, ctx: Context, kind: Optional[LayerKind]) -> None:
-        """Measure the layer plain, with each op alone recomputed and fully recomputed, once per model and kind."""
+        """Measure the layer plain, with each op alone recomputed and fully recomputed, once per model and kind.
+
+        Where a census prices the kind, it prices the plain layer and
+        HyperParallel's selective policy, and the formulas every other
+        setting: the layer selective with every op kept is measured too, as
+        the base the settings add up from, and the policy's setting whole.
+        """
         key = (ccfg.model_name, kind)
         if key in self.profiles:
             return
@@ -193,28 +201,37 @@ class _PPB:
         # The split is exact at one micro-batch in flight and at *many*.
         counts = tuple(count for count in self.profile_counts if 1 < count < many)
         keep = dict.fromkeys(SWITCHES, 1)
+        census = isinstance(getattr(ccfg, "kind_activations", None), KindActivations)
+
+        def _measure(at: Context) -> Tuple[Any, ...]:
+            """The current layer's memory, and the working sets of its backward at both points."""
+            return self._dynamic_mem(many, counts) + self._workings(at)
+
         ctx.current_node = LayerType.NOT_REC_LAYER
-        plain = self._dynamic_mem(many, counts)
+        plain = _measure(ctx)
+        # A fully recomputed layer's backward runs the plain layer, on
+        # activations the stage does not keep; without a census, the working
+        # set is the same either way.
+        full_working = self._working_extra(ctx, 2, on_saved=False) if census else plain[4]
+        base = self._selective(ccfg, ctx, keep, _measure) if census else plain
         alone = {}
         for name in SWITCHES if self.profile_each_switch else ():
             # Only gather acts on the buffers, so any other op recomputed
-            # alone leaves the split charging what it charges the plain layer.
-            measured = self._selective_dynamic_mem(
-                ccfg, ctx, dict(keep, **{name: 0}), many, counts if name == "gather" else ()
-            )
-            alone[name] = measured if name == "gather" else measured[:3] + plain[3:]
+            # alone leaves the split, and the working sets, as the base has them.
+            if name == "gather":
+                alone[name] = self._selective(ccfg, ctx, dict(keep, gather=0), _measure)
+            else:
+                alone[name] = self._selective_dynamic_mem(ccfg, ctx, dict(keep, **{name: 0}), many)[:3] + base[3:]
+        policy = dict(HYPER_SELECTIVE_REC_OP)
+        whole = {frozenset(name for name, state in policy.items() if not state): self._selective(
+            ccfg, ctx, policy, _measure)} if census else {}
         ctx.current_node = LayerType.FULL_REC_LAYER
-        full = self._dynamic_mem(many, counts)
-        workings = []
-        for gathered in (2, 1):
-            ctx.current_node = LayerType.NOT_REC_LAYER
-            workings.append((self._working_extra(ctx, gathered), self._selective(
-                ccfg, ctx, dict(keep, gather=0), lambda at, gathered=gathered: self._working_extra(at, gathered))))
+        full = self._dynamic_mem(many, counts) + (full_working, plain[5])
 
-        def _cost(memory: Tuple[float, float, float, Tuple[float, ...]], backward: float) -> Cost:
+        def _cost(memory: Tuple[Any, ...], backward: float) -> Cost:
             """A measurement as a cost: activations and growing buffers per micro-batch, the rest once."""
-            activation, per_micro_batch, once, excess = memory
-            return Cost(activation + per_micro_batch, once, backward, excess)
+            activation, per_micro_batch, once, excess, working, first_working = memory
+            return Cost(activation + per_micro_batch, once, backward, excess, working, first_working)
 
         forward, backward = self.layer_times(ccfg, kind, LayerType.NOT_REC_LAYER)
         self.profiles[key] = SwitchProfile(
@@ -226,23 +243,40 @@ class _PPB:
             },
             full=_cost(full, self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]),
             counts=counts,
-            working=workings[0],
-            first_working=workings[1],
+            # A selective layer that keeps every op recomputes nothing.
+            selective_base=_cost(base, backward) if census else None,
+            whole={
+                recompute: _cost(memory, self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, policy)[1])
+                for recompute, memory in whole.items()
+            },
         )
 
-    def _working_extra(self, ctx: Context, gathered: int) -> float:
+    def _workings(self, ctx: Context) -> Tuple[float, float]:
+        """What the current layer's backward holds beyond what it keeps at one micro-batch, at both points.
+
+        As warm-up ends, where the stage keeps what the layer keeps for this
+        backward already, and on a stage's first layer as a micro-batch's
+        backward ends, where it keeps none of it.
+        """
+        return self._working_extra(ctx, 2, on_saved=True), self._working_extra(ctx, 1, on_saved=False)
+
+    def _working_extra(self, ctx: Context, gathered: int, on_saved: bool) -> float:
         """What the working set of the current layer's backward holds beyond what it keeps at one micro-batch.
 
         Under FSDP that reshards, the backward holds *gathered* layers'
         parameters: two, its own and the next's, in the working set that
         ends warm-up, and one in the first layer's as the backward ends.
+        *on_saved* says the stage counts what the layer keeps for this
+        backward already, which a census's working set then leaves out.
         """
         kept = sum(self._inner_dynamic_mem(ppb=True))
         ctx.working_set = gathered
+        ctx.working_on_saved = on_saved
         try:
             return sum(self._inner_dynamic_mem(default_micro_factor=1)) - kept
         finally:
             ctx.working_set = 0
+            ctx.working_on_saved = False
 
     def _dynamic_mem(
         self, many: int, counts: Tuple[int, ...] = ()

@@ -57,10 +57,10 @@ class LayerOption:
             at which the two memories charge more than the layer keeps, by
             that many bytes; see :attr:`Cost.excess`.
         working_extra: What the working set of the option's backward holds
-            beyond what it keeps at one micro-batch; see
-            :attr:`SwitchProfile.working`.
+            beyond what it keeps at one micro-batch, the plain layer for full
+            recompute, as warm-up ends; see :attr:`Cost.working`.
         first_working_extra: The same for a stage's first layer's backward,
-            the last it runs; see :attr:`SwitchProfile.first_working`.
+            the last it runs; see :attr:`Cost.first_working`.
     """
 
     recompute: Optional[FrozenSet[str]]
@@ -151,22 +151,20 @@ def price_option(
         backward_time=cost.backward_time,
         names=_names(recompute, configured or {}),
         excess=tuple((count, excess) for count, excess in zip(profile.counts, cost.excess) if excess),
-        working_extra=profile.working[int(recompute is None or "gather" in recompute)],
-        first_working_extra=profile.first_working[int(recompute is None or "gather" in recompute)],
+        working_extra=cost.working,
+        first_working_extra=cost.first_working,
     )
 
 
-def _working(
-    recompute: Optional[FrozenSet[str]], cost: Cost, extras: Tuple[float, float], profile: SwitchProfile
-) -> float:
-    """A working set of the backward of a layer recomputing *recompute*, the plain layer's for full recompute.
+def _workings(recompute: Optional[FrozenSet[str]], cost: Cost, profile: SwitchProfile) -> Tuple[float, float]:
+    """The working sets of the backward of a layer recomputing *recompute*: as warm-up ends, and on a first layer.
 
-    *extras* are what it holds beyond what the layer keeps at one
-    micro-batch, the gathers kept and recomputed.
+    What the layer keeps at one micro-batch, the plain layer for full
+    recompute, and what the backward holds beyond.
     """
-    if recompute is None:
-        return _working(frozenset(), profile.plain, extras, profile)
-    return cost.memory_per_micro_batch + cost.memory_once + extras[int("gather" in recompute)]
+    run = profile.plain if recompute is None else cost
+    kept = run.memory_per_micro_batch + run.memory_once
+    return kept + cost.working, kept + cost.first_working
 
 
 def _compared(
@@ -177,8 +175,7 @@ def _compared(
         count * cost.memory_per_micro_batch + cost.memory_once - excess
         for count, excess in zip(profile.counts, cost.excess)
     )
-    workings = (_working(recompute, cost, extras, profile) for extras in (profile.working, profile.first_working))
-    return cost.values() + tuple(at) + tuple(workings)
+    return cost.values() + tuple(at) + _workings(recompute, cost, profile)
 
 
 def build_front(

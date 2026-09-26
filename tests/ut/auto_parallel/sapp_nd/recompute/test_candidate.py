@@ -18,6 +18,7 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/recompute/test_candidate.py -v
 """
 import copy
+import dataclasses
 import itertools
 import os
 import random
@@ -41,6 +42,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
 from hyper_parallel.auto_parallel.sapp_nd.recompute import candidate as Candidate
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
@@ -549,6 +551,114 @@ class TestWorkingSet(unittest.TestCase):
             )))
             self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(option))
         self.assertGreater(recomputing_gathers, 1)
+
+
+# The resharding dense model with a census of its layers' kind, which states
+# what HyperParallel's selective policy keeps and the shares of the matmuls it
+# recomputes: the census prices the plain layer and the policy, and the
+# formulas every other setting.
+_CENSUS = copy.deepcopy(_RESHARDING)
+_CENSUS["model"]["config_overrides"]["activations"] = {"decoder": {
+    "saved": 30000.0, "saved_tp": 60000.0, "working": 40000.0, "working_tp": 90000.0, "seq_length": 4096,
+    "selective": 8000.0, "selective_tp": 12000.0, "selective_attention_mm": 0.3, "selective_ffn_mm": 0.5}}
+_POLICY = frozenset(name for name, state in HYPER_SELECTIVE_REC_OP.items() if not state)
+
+
+class TestCensus(unittest.TestCase):
+    """The options of a layer kind a census prices."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """The model's profile and fronts, and its first stage with its peaks at both points."""
+        # pylint: disable=protected-access
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_CENSUS, handle)
+            cls.evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        counts = micro_batches_in_flight(cls.evaluator)
+        profiles = layer_profiles(cls.evaluator, Hard.Device_A2, most_in_flight=max(max(row) for row in counts),
+                                  in_flight=[count for row in counts for count in row])
+        cls.kind = next(iter(profiles))
+        cls.profile = profiles[cls.kind]
+        fronts = {key: build_front(profile) for key, profile in profiles.items()}
+        layers, ends = Candidate._body_layers(cls.evaluator, fronts, counts)
+        layers, cls.fronts, _, cls.own = Candidate._charge_working_sets(layers, ends, fronts, None)
+        _, cls.peaks = Candidate._stages(cls.evaluator, layers, cls.fronts, cls.own)
+        cls.stage = layers[0]
+        cls.ending = next(layer for layer in cls.stage if layer.index == ends[0][0].index)
+        cls.plain = {layer.index: Candidate._plain(cls.fronts[layer.key]) for stage in layers for layer in stage}
+        cls.total = sum(len(stage) for stage in layers)
+
+    def test_the_policy_is_measured_whole(self):
+        """
+        Feature: the profile of a kind a census prices.
+        Description: The setting of HyperParallel's selective policy, as
+            measured and as its switches would add up.
+        Expectation: Measured whole: it keeps what the census says, less
+            than the formulas' switches add up to, and its backward is
+            slower, recomputing the matmuls no switch covers. It is on the
+            kind's front.
+        """
+        measured = self.profile.selective(_POLICY)
+        added = dataclasses.replace(self.profile, whole={}).selective(_POLICY)
+        self.assertLess(measured.memory_per_micro_batch, added.memory_per_micro_batch)
+        self.assertGreater(measured.backward_time, added.backward_time)
+        self.assertIn(_POLICY, [option.recompute for option in self.fronts[self.kind]])
+
+    def test_each_option_of_the_layer_that_ends_warm_up_keeps_what_the_config_priced_whole_keeps(self):
+        """
+        Feature: the working set of the layer that ends warm-up, for a kind
+            a census prices.
+        Description: The model at DP shard 2, TP 4 and PP 2, every layer
+            plain but the first stage's last, which runs each option of its
+            kind's front in turn, stated as recompute ranges and the whole
+            config priced with them.
+        Expectation: The first stage keeps what the search says it keeps, to
+            its MB: the plain layer and the policy as the census prices
+            them, the plain layer's working set beyond what the stage keeps
+            for it already, and every other setting as the formulas price
+            it.
+        """
+        # pylint: disable=protected-access
+        kept_plain = self.own.get(self.plain[self.ending.index], self.plain[self.ending.index])
+        index = self.ending.index
+        labels = []
+        for option in self.fronts[self.ending.key]:
+            original = self.own.get(option, option)
+            labels.append(original.recompute)
+            mine = Candidate._stage_memory(self.stage, self.peaks[0], {**self.plain, index: option}, self.fronts,
+                                           self.own)
+            whole = _stage_peaks_of(self.evaluator, SimpleNamespace(ranges=(
+                LayerRange(0, index, None, kept_plain),
+                LayerRange(index, 1, None, original),
+                LayerRange(index + 1, self.total - index - 1, None, kept_plain),
+            )))
+            self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(original))
+        self.assertIn(_POLICY, labels)
+
+    def test_each_option_of_the_first_layer_keeps_what_the_backward_end_priced_whole_keeps(self):
+        """
+        Feature: the working set of the backward a stage runs last, for a
+            kind a census prices.
+        Description: The same model, every layer plain but the first
+            stage's first, which runs each option of its kind's front in
+            turn, stated as recompute ranges and the whole config priced
+            with them.
+        Expectation: As a micro-batch's backward ends, the first stage
+            keeps what the search says it keeps, to its MB.
+        """
+        # pylint: disable=protected-access
+        first = self.stage[0]
+        kept_plain = self.own.get(self.plain[1], self.plain[1])
+        self.assertIsNotNone(self.peaks[0].backward)
+        for option in self.fronts[first.key]:
+            chosen = {**self.plain, first.index: option}
+            mine = self.peaks[0].backward + Candidate._backward_kept(self.stage, chosen, self.fronts, self.own)
+            whole = _stage_points_of(self.evaluator, SimpleNamespace(ranges=(
+                LayerRange(0, 1, None, option), LayerRange(1, self.total - 1, None, kept_plain),
+            )))
+            self.assertLessEqual(abs(mine / MEGABYTE - whole[0]), 1.0, option_label(option))
 
 
 def _kind(per_micro_batch: int, once: int, forward: float) -> Tuple[LayerOption, ...]:

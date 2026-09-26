@@ -115,6 +115,40 @@ class TestSwitchProfile(unittest.TestCase):
         """
         self.assertEqual(_PROFILE.selective([]), _PLAIN)
 
+    def test_a_setting_adds_up_from_the_selective_base_where_it_differs(self):
+        """
+        Feature: SwitchProfile.selective, for a kind a census prices.
+        Description: A profile whose layer selective with every op kept
+            keeps less than its plain layer, as where a census prices the
+            plain layer and the formulas a selective one, and whose gathers
+            recomputed change the working sets; recompute the softmax and
+            the gathers together, and no op.
+        Expectation: The base's cost plus each op's own difference from it,
+            working sets included; the plain layer's for no op.
+        """
+        base = Cost(80.0, 10.0, 50.0, working=5.0, first_working=3.0)
+        alone = dict(_ALONE, gather=Cost(70.0, 20.0, 53.0, working=2.0, first_working=1.0),
+                     softmax=Cost(64.0, 10.0, 50.2, working=5.0, first_working=3.0))
+        profile = SwitchProfile(25.0, _PLAIN, alone, Cost(2.0, 20.0, 80.0), selective_base=base)
+        cost = profile.selective(["gather", "softmax"])
+        self.assertEqual((cost.values(), cost.working, cost.first_working), ((54.0, 20.0, 53.2), 2.0, 1.0))
+        self.assertEqual(profile.selective([]), _PLAIN)
+
+    def test_a_setting_measured_whole_costs_what_was_measured(self):
+        """
+        Feature: SwitchProfile.selective, for a setting measured whole.
+        Description: A profile that measured recomputing the softmax and the
+            activation together, as a census prices HyperParallel's
+            selective policy.
+        Expectation: That setting costs what was measured; any other adds
+            up over its ops.
+        """
+        policy = Cost(30.0, 10.0, 60.0, working=7.0)
+        profile = SwitchProfile(25.0, _PLAIN, _ALONE, Cost(2.0, 20.0, 80.0),
+                                whole={frozenset({"softmax", "ffAct"}): policy})
+        self.assertIs(profile.selective(["ffAct", "softmax"]), policy)
+        self.assertEqual(profile.selective(["gather", "softmax"]).values(), (74.0, 20.0, 53.2))
+
 
 class TestBuildFront(_FrontChecks):
     """The front keeps the options no other option beats."""

@@ -21,9 +21,15 @@ buffers, both on the memory kept and on the volume sent again. So a layer that
 recomputes a set of ops costs the plain layer plus what each of those ops
 costs alone, and a :class:`SwitchProfile`, nine measurements, prices all 128
 settings of the seven switches.
+
+A census of a layer kind (IR phase 5) prices its plain layer, and a layer
+running HyperParallel's selective policy, by what it measured, and every
+other setting by the formulas. The settings then add up from the layer
+selective with every op kept, which the formulas price, and the policy's is
+measured whole.
 """
-from dataclasses import dataclass
-from typing import Iterable, Mapping, Tuple
+from dataclasses import dataclass, field
+from typing import FrozenSet, Iterable, Mapping, Optional, Tuple
 
 # The recompute switches; 1 keeps an op's activation, 0 recomputes the op.
 SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
@@ -45,18 +51,36 @@ class Cost:
             that many micro-batches in flight. The split is exact at one
             micro-batch and at the most any stage keeps, and a buffer that
             does not grow can hide one that does in between.
+        working: What the working set of the layer's backward holds beyond
+            what the layer keeps at one micro-batch, as the memory model
+            charges it to the layer that ends warm-up: under FSDP that
+            reshards, two layers' gathered parameters, its own and the
+            next's, in the buffers the gathers take, and where a census
+            prices the layer, what its backward holds beyond what the stage
+            keeps for it already. For full recompute, beyond what the plain
+            layer keeps: its backward runs the plain layer, on activations
+            the stage does not keep.
+        first_working: The same for the backward a stage runs last, its
+            first layer's, as a micro-batch's backward ends: one layer's
+            gathered parameters, with none left to prefetch, and all a
+            census says the backward holds, as the stage keeps no
+            activations of that micro-batch for it.
     """
 
     memory_per_micro_batch: float
     memory_once: float
     backward_time: float
     excess: Tuple[float, ...] = ()
+    working: float = 0.0
+    first_working: float = 0.0
 
     def __add__(self, other: "Cost") -> "Cost":
         """The sum, cost by cost."""
         return Cost(
             *(mine + theirs for mine, theirs in zip(self.values(), other.values())),
             excess=tuple(mine + theirs for mine, theirs in zip(self.excess, other.excess)),
+            working=self.working + other.working,
+            first_working=self.first_working + other.first_working,
         )
 
     def __sub__(self, other: "Cost") -> "Cost":
@@ -64,6 +88,8 @@ class Cost:
         return Cost(
             *(mine - theirs for mine, theirs in zip(self.values(), other.values())),
             excess=tuple(mine - theirs for mine, theirs in zip(self.excess, other.excess)),
+            working=self.working - other.working,
+            first_working=self.first_working - other.first_working,
         )
 
     def values(self) -> Tuple[float, float, float]:
@@ -82,15 +108,12 @@ class SwitchProfile:
         full: The layer fully recomputed.
         counts: The counts of micro-batches in flight, between one and the
             most any stage keeps, at which each cost states its excess.
-        working: What the working set of the layer's backward, which the
-            memory model charges the layer that ends warm-up, holds beyond
-            what the layer keeps at one micro-batch: ``(gathers kept,
-            gathers recomputed)``. Only ``gather`` acts on it: FSDP that
-            reshards holds two layers' gathered parameters in a backward and
-            none between the layer's passes, in the buffers the gathers take.
-        first_working: The same for the backward a stage runs last, its
-            first layer's, as a micro-batch's backward ends: one layer's
-            gathered parameters, with none left to prefetch.
+        selective_base: The layer selective with every op kept, which the
+            settings add up from where a census prices the plain layer and
+            not a selective one; the plain layer when omitted.
+        whole: The settings measured whole, which do not add up over their
+            switches: HyperParallel's selective policy, where a census
+            prices it.
     """
 
     forward_time: float
@@ -98,14 +121,22 @@ class SwitchProfile:
     alone: Mapping[str, Cost]
     full: Cost
     counts: Tuple[int, ...] = ()
-    working: Tuple[float, float] = (0.0, 0.0)
-    first_working: Tuple[float, float] = (0.0, 0.0)
+    selective_base: Optional[Cost] = None
+    whole: Mapping[FrozenSet[str], Cost] = field(default_factory=dict)
 
     def selective(self, recompute: Iterable[str]) -> Cost:
-        """The cost of recomputing the ops *recompute* names: the plain layer's, plus what each costs alone."""
-        chosen = set(recompute)
-        cost = self.plain
+        """The cost of recomputing the ops *recompute* names.
+
+        The plain layer's for none, a setting's own where it is measured
+        whole, and otherwise the base's, plus what each op costs alone
+        beyond it.
+        """
+        chosen = frozenset(recompute)
+        if chosen in self.whole:
+            return self.whole[chosen]
+        base = self.plain if self.selective_base is None or not chosen else self.selective_base
+        cost = base
         for name in SWITCHES:
             if name in chosen:
-                cost = cost + (self.alone[name] - self.plain)
+                cost = cost + (self.alone[name] - base)
         return cost
