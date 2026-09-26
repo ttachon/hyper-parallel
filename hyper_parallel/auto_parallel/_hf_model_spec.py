@@ -249,6 +249,12 @@ def _get_hf_config(model_raw: Mapping[str, Any]) -> Any:
     )
 
 
+def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
+    config = _get_hf_config(model_raw)
+    return config, _text_tower(config)
+
+
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the model keys of the ``config_overrides`` fallback."""
     overrides = model_raw.get("config_overrides")

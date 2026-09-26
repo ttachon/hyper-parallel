@@ -26,6 +26,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_parameters
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -345,6 +346,14 @@ if __name__ == "__main__":
         "(hyper_v2 only). Scalar=fixed, list=candidates, 'auto'=ND decides.",
     )
     parser.add_argument(
+        "-V",
+        "--verify",
+        action="store_true",
+        help="Verify mode (hyper_v2 only): set the parameters ND prices of each "
+        "part of the model -y trains beside those of the Transformers layers "
+        "its checkpoint builds, and exit.",
+    )
+    parser.add_argument(
         "-o",
         "--output-dir",
         type=str,
@@ -369,6 +378,14 @@ if __name__ == "__main__":
                 "\nProceeding without cache file..."
             )
             args.cache_file = None
+
+    if args.verify:
+        if args.framework != "hyper_v2":
+            parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
+        set_verbose_level(args.verbosity)
+        for line in report(verify_parameters(args.yaml_config)):
+            logger.output(line)
+        sys.exit(0)
 
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)
