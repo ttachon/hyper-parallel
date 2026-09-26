@@ -55,7 +55,8 @@ _OPS = ("attMM", "attBMM", "ffMM", "softmax", "dropout", "normOp", "gather")
 
 # The literal op counts each arch hook assigned before the counts became
 # profiles, in _OPS order, except that mixtral's three expert projections
-# were counted as batched matmuls and now count as the matmuls they are.
+# were counted as batched matmuls and now count as the matmuls they are, and
+# its softmaxes and norms are those its Transformers layers run (F51).
 # headCast and ffAct were pinned to 1 by the estimator for every family.
 _LEGACY_OPS = {
     "default": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
@@ -65,7 +66,7 @@ _LEGACY_OPS = {
     "qwen3_5": {"full_attention": (4, 2, 3, 1, 0, 2, 4)},
     "deepseek": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "cm": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
-    "mixtral": {"decoder": (4, 2, 3, 2, 0, 5, 4)},
+    "mixtral": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "pangualpha": {"decoder": (4, 1, 2, 2, 5, 4, 4)},
     "t5": {"encoder": (4, 1, 2, 2, 5, 2, 4), "decoder": (8, 2, 2, 4, 7, 3, 6)},
     "vision": {"encoder": (4, 2, 2, 1, 0, 2, 4)},

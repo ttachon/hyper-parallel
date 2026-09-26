@@ -45,6 +45,18 @@ HyperParallel's trainer runs them by default, dropping the model's logits
 before the backward as the trainer does; half the vocabulary tells the
 bytes a vocabulary-parallel loss splits.
 
+Where a train.yaml replaces Transformers' modules with HyperParallel's
+fused ones (``plan_overrides`` with ``replace_module``: its RMSNorm, its
+grouped-query attention, its grouped experts), the census runs those
+instead, so what it measures is what the trainer saves
+(:func:`replacement_specs`).  Their kernels are ``torch_npu``'s, which a
+host cannot call, so they run under the kernels' shape contracts
+(:mod:`hyper_parallel.auto_parallel._npu_contracts`).  The FLOP census
+(:func:`census_flops`) and the shares of matmul FLOPs a selective layer
+recomputes (:func:`census_recomputed`) stay on Transformers' own modules:
+both count the arithmetic the time model prices, which fusing a module
+does not change, and a fused kernel runs matmuls no dispatch sees.
+
 A layer's parameters are counted by part, as ND prices its parts: the
 attention's, the norms', the dense feed-forward's, the routed experts', the
 shared expert's and the router's (:func:`census_parameters`), for verify
@@ -62,8 +74,21 @@ import copy
 import functools
 import importlib
 import inspect
+import logging
 import weakref
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forbidden-backend-import
@@ -71,8 +96,11 @@ from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=fo
 from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.auto_parallel._model_spec import KindActivations
+from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
 from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
+
+logger = logging.getLogger(__name__)
 
 # The Transformers attention implementation the census registers its flash
 # attention under: a name Transformers does not take for a flash
@@ -89,6 +117,11 @@ _TP_FIELDS = (
 
 # The softmax statistics flash attention keeps per head and token.
 _FLASH_STATS = 8
+
+# The census's attention kernels, which HyperParallel's selective policy
+# saves as it saves the runtime's: its own flash attention, and the contract
+# of the kernel its fused attention calls.
+_ATTENTION_KERNELS = ("nd_census::flash_attention", "nd_census_npu::fusion_attention")
 
 # The per-head query and key norms an attention holds, which ND prices with
 # the layer's norms.
@@ -364,10 +397,14 @@ class _SavedOps(TorchDispatchMode):
         """The op that saves *tensor*, which the forward saves now."""
         if self.delta_rule:
             return "linrec"
-        if self.func is torch.ops.nd_census.flash_attention.default:
+        if self.func in _attention_ops():
             return "softmax" if tensor.dtype == torch.float32 else "attBMM"
         if self.func is torch.ops.aten.native_dropout.default:
             return "dropout"
+        if self.func is torch.ops.nd_census_npu.rms_norm.default:
+            return "normOp"
+        if self.func is torch.ops.nd_census_npu.swiglu.default:
+            return "ffAct"
         name = self.running[-1] if self.running else ""
         module = self.modules.get(name)
         if name and "norm" in type(module).__name__.lower():
@@ -427,10 +464,11 @@ def _selective_contexts(ledger: Optional[_RecomputedMatmuls] = None) -> Tuple[An
     # census runs.
     checkpointing = importlib.import_module("hyper_parallel.distributed.activation_checkpoint")
     policy = checkpointing._make_selective_checkpoint_policy_fn()  # pylint: disable=protected-access
+    kernels = _attention_ops()
 
     def census_policy(ctx: Any, func: Any, *args: Any, **kwargs: Any) -> CheckpointPolicy:
-        """The trainer's policy, which saves the census's flash attention as it saves the runtime's."""
-        if func is torch.ops.nd_census.flash_attention.default:
+        """The trainer's policy, which saves the census's attention kernels as it saves the runtime's."""
+        if func in kernels:
             decision = CheckpointPolicy.MUST_SAVE
         else:
             decision = policy(ctx, func, *args, **kwargs)
@@ -439,6 +477,119 @@ def _selective_contexts(ledger: Optional[_RecomputedMatmuls] = None) -> Tuple[An
         return decision
 
     return activation_memory.create_selective_checkpoint_contexts(census_policy)
+
+
+@functools.lru_cache(maxsize=None)
+def _attention_ops() -> FrozenSet[Any]:
+    """The census's attention kernels, as ops."""
+    ops = []
+    for name in _ATTENTION_KERNELS:
+        namespace, kernel = name.split("::")
+        ops.append(getattr(getattr(torch.ops, namespace), kernel).default)
+    return frozenset(ops)
+
+
+def _import(path: str, where: str) -> Any:
+    """The object a dotted *path* names.
+
+    Raises:
+        ValueError: If the path names no module or no attribute of one.
+    """
+    module, _, name = str(path).rpartition(".")
+    try:
+        return getattr(importlib.import_module(module), name)
+    except (ImportError, AttributeError, ValueError) as exc:
+        raise ValueError(f"{where}: cannot import {path!r}: {exc}") from exc
+
+
+def replacement_specs(plan_overrides: Any) -> Tuple[Any, ...]:
+    """The module replacements a train.yaml's ``plan_overrides`` install, as replacement rules.
+
+    Args:
+        plan_overrides: The ``plan_overrides`` list, as plain mappings.
+
+    Returns:
+        One :class:`~hyper_parallel.models.replacement.ModuleReplacementSpec`
+        per entry that states ``replace_module``, in the order stated; the
+        entries that state a sharding action alone, or a replacement
+        conditioned on a run the census does not price (``when``), are left
+        out.
+
+    Raises:
+        ValueError: If an entry states ``replace_module`` without
+            ``module_type``, or names a module or factory that cannot be
+            imported.
+    """
+    from hyper_parallel.models.replacement import ModuleReplacementSpec  # pylint: disable=C0415
+
+    specs = []
+    for index, entry in enumerate(plan_overrides or ()):
+        where = f"plan_overrides[{index}]"
+        if not isinstance(entry, Mapping) or entry.get("replace_module") is None or entry.get("when") is not None:
+            continue
+        if entry.get("module_type") is None:
+            raise ValueError(f"{where} states replace_module without module_type")
+        match = entry.get("match")
+        patterns = (match,) if isinstance(match, str) else tuple(match or ())
+        factory = entry["replace_module"]
+        specs.append(ModuleReplacementSpec(
+            match=patterns,
+            factory=_import(factory.get("_target_") if isinstance(factory, Mapping) else factory, where),
+            module_type=_import(entry["module_type"], where),
+            exact_type=bool(entry.get("exact_type", False)),
+        ))
+    return tuple(specs)
+
+
+class _Holder(torch.nn.Module):
+    """A module tree holding one part where a model holds it, so a rule's patterns match its path."""
+
+    def __init__(self, **parts: Any) -> None:
+        """Hold each part of *parts* under ``model``, a layer in a list as a model's stack holds it."""
+        super().__init__()
+        self.model = torch.nn.Module()
+        for name, part in parts.items():
+            setattr(self.model, name, torch.nn.ModuleList([part]) if name == "layers" else part)
+
+
+def _matching(spec: Any, names: Sequence[str]) -> Any:
+    """*spec* with the patterns that match a module of *names*, or ``None`` where none does."""
+    import fnmatch  # pylint: disable=C0415
+
+    import dataclasses  # pylint: disable=C0415
+
+    kept = tuple(pattern for pattern in spec.match
+                 if any(fnmatch.fnmatchcase(name, pattern) for name in names))
+    return None if not kept else dataclasses.replace(spec, match=kept)
+
+
+def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
+    """Install on *holder* the replacements of *specs* whose patterns match one of its modules.
+
+    A rule's other patterns name modules no fake part holds, such as a
+    model's final norm beside a layer, and are left out rather than refused.
+    A factory that needs a library this host lacks, such as an attention
+    built on a native extension, leaves every module as Transformers built
+    it: the census then measures more than the run keeps, and says so.
+    """
+    from hyper_parallel.models.replacement import (  # pylint: disable=C0415
+        apply_module_replacements,
+        compile_module_replacements,
+    )
+
+    names = [name for name, _ in holder.named_modules()]
+    kept = [found for found in (_matching(spec, names) for spec in specs) if found is not None]
+    if not kept:
+        return
+    try:
+        apply_module_replacements(holder, compile_module_replacements(holder, kept),
+                                  weights_mapping=[], context={}, capture_checkpoint_metadata=False)
+    except (ImportError, OSError) as exc:
+        logger.warning(
+            "census on Transformers' own modules: this host cannot build the replacements %s (%s); "
+            "a layer of the run keeps at most what the census measures",
+            [spec.factory.__name__ for spec in kept], exc,
+        )
 
 
 def _modeling(config: Any) -> Any:
@@ -498,11 +649,14 @@ def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
 
 
 @contextlib.contextmanager
-def _fake_layer(config: Any, layer_index: int, contracts: bool = True) -> Iterator[Tuple[Any, Any]]:
+def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
+                replacements: Sequence[Any] = ()) -> Iterator[Tuple[Any, Any]]:
     """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels.
 
     The gated delta rule runs HyperParallel's kernel's contract, or, where
-    *contracts* is false, Transformers' own chunked implementation.
+    *contracts* is false, Transformers' own chunked implementation.  Where
+    *replacements* are given, the modules they name are HyperParallel's fused
+    ones, running under the kernels' contracts for as long as the layer does.
     """
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
@@ -510,7 +664,8 @@ def _fake_layer(config: Any, layer_index: int, contracts: bool = True) -> Iterat
     config._attn_implementation = _FLASH  # pylint: disable=protected-access
     config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
     modeling.ALL_ATTENTION_FUNCTIONS.register(_FLASH, _flash_attention)
-    with FakeTensorMode(allow_non_fake_inputs=True):
+    with npu_contracts() if replacements else contextlib.nullcontext(), \
+            FakeTensorMode(allow_non_fake_inputs=True):
         default = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
         try:
@@ -522,6 +677,10 @@ def _fake_layer(config: Any, layer_index: int, contracts: bool = True) -> Iterat
             if hasattr(module, "chunk_gated_delta_rule"):
                 module.chunk_gated_delta_rule = (_gated_delta_rule(modeling) if contracts
                                                  else modeling.torch_chunk_gated_delta_rule)
+        if replacements:
+            holder = _Holder(layers=layer)
+            _replaced(holder, replacements)
+            layer = holder.model.layers[0]
         layer.train()
         yield layer, rotary
 
@@ -596,7 +755,8 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
 
 
 def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False,
-                 ops: Optional[Dict[str, int]] = None) -> Tuple[int, int]:
+                 ops: Optional[Dict[str, int]] = None,
+                 replacements: Sequence[Any] = ()) -> Tuple[int, int]:
     """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
 
     Args:
@@ -607,6 +767,8 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
             activation checkpointing, as its trainer wraps a layer.
         ops: Where given, and the layer runs without checkpointing, takes
             the bytes it saves by the op saving them (:class:`_SavedOps`).
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
 
     Returns:
         The bytes the forward keeps for the backward, its input included,
@@ -614,9 +776,17 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         most, its own gradients included, less the parameters and those
         gradients.
     """
-    with _fake_layer(config, layer_index) as (layer, rotary):
+    with _fake_layer(config, layer_index, replacements=replacements) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
+        if replacements:
+            # A fused kernel keeps a constant per device, such as the mask
+            # the attention runs its causal sparse mode with, which the
+            # runtime allocates once for every layer and micro-batch: one
+            # forward allocates them before the layer's own bytes are
+            # counted, so they count toward no layer.
+            with torch.no_grad():
+                _run(layer, hidden, _positions(rotary, hidden, seq_length))
         if not selective:
             saved_ops = None if ops is None else _SavedOps(layer)
             measured = _measure(list(layer.parameters()), (hidden,),
@@ -635,20 +805,23 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
                         shared=tree_flatten(positions)[0])
 
 
-def census_saved_ops(config: Any, layer_index: int, seq_length: int) -> Dict[str, float]:
+def census_saved_ops(config: Any, layer_index: int, seq_length: int,
+                     replacements: Sequence[Any] = ()) -> Dict[str, float]:
     """What layer *layer_index* of *config* keeps for its backward for each op, per token, the whole layer.
 
     Args:
         config: The language model's Transformers config.
         layer_index: The layer to build, which settles its kind.
         seq_length: Tokens of the micro-batch of one sequence it runs.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
 
     Returns:
         ``{op: bytes per token}``, by the op saving them
         (:class:`_SavedOps`), which sum to what the layer keeps.
     """
     ops: Dict[str, int] = {}
-    census_layer(config, layer_index, seq_length, ops=ops)
+    census_layer(config, layer_index, seq_length, ops=ops, replacements=replacements)
     return {op: size / seq_length for op, size in ops.items()}
 
 
@@ -699,37 +872,44 @@ def _parameter_part(name: str) -> str:
     return "ffn"
 
 
-def census_parameters(config: Any, layer_index: int) -> Dict[str, int]:
+def census_parameters(config: Any, layer_index: int, replacements: Sequence[Any] = ()) -> Dict[str, int]:
     """The parameters of layer *layer_index* of *config*, by part.
 
     Args:
         config: The language model's Transformers config.
         layer_index: The layer to build, which settles its kind.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).  A replacement holds the
+            parameters its source held, fused or renamed, so it counts the
+            same.
 
     Returns:
         The parameter count of each part the layer has
         (:func:`_parameter_part`).
     """
     parts: Dict[str, int] = {}
-    with _fake_layer(config, layer_index) as (layer, _):
+    with _fake_layer(config, layer_index, replacements=replacements) as (layer, _):
         for name, param in layer.named_parameters():
             part = _parameter_part(name)
             parts[part] = parts.get(part, 0) + param.numel()
     return parts
 
 
-def census_final_norm(config: Any) -> int:
+def census_final_norm(config: Any, replacements: Sequence[Any] = ()) -> int:
     """The parameters of *config*'s final norm, of the class of a layer's input norm."""
-    with _fake_layer(config, 0) as (layer, _):
+    with _fake_layer(config, 0, replacements=replacements) as (layer, _):
         return sum(param.numel() for param in layer.input_layernorm.parameters())
 
 
-def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
+def census_output(config: Any, seq_length: int, replacements: Sequence[Any] = ()) -> Tuple[int, int]:
     """Bytes the output layer of *config* keeps for its backward, and the most its backward holds.
 
     Args:
         config: The language model's Transformers config.
         seq_length: Tokens of the micro-batch of one sequence it runs.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`), of which the final norm's is the
+            one that reaches the output layer.
 
     Returns:
         As :func:`census_layer`: the final norm's input included, the
@@ -738,7 +918,8 @@ def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
     modeling = _modeling(config)
     layer_cls, _ = _classes(modeling)
     loss_function = importlib.import_module("transformers.loss.loss_utils").ForCausalLMLoss
-    with FakeTensorMode(allow_non_fake_inputs=True):
+    with npu_contracts() if replacements else contextlib.nullcontext(), \
+            FakeTensorMode(allow_non_fake_inputs=True):
         default = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
         try:
@@ -747,6 +928,10 @@ def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
             head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         finally:
             torch.set_default_dtype(default)
+        if replacements:
+            holder = _Holder(norm=norm)
+            _replaced(holder, replacements)
+            norm = holder.model.norm
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         labels = torch.randint(0, config.vocab_size, (1, seq_length))
         # The loss alone holds the logits: the trainer drops the model's
@@ -756,12 +941,15 @@ def census_output(config: Any, seq_length: int) -> Tuple[int, int]:
                         lambda loss: loss.backward())
 
 
-def census_output_activations(config: Any, seq_length: int = 4096) -> KindActivations:
+def census_output_activations(config: Any, seq_length: int = 4096,
+                             replacements: Sequence[Any] = ()) -> KindActivations:
     """What the output layer of *config* keeps and holds, per token, with its vocabulary and half of it.
 
     Args:
         config: The language model's Transformers config.
         seq_length: The tokens the census runs the layer at.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
 
     Returns:
         The layer's :class:`KindActivations`, whose TP part is the part a
@@ -769,7 +957,8 @@ def census_output_activations(config: Any, seq_length: int = 4096) -> KindActiva
     """
     half = copy.deepcopy(config)
     half.vocab_size = max(1, config.vocab_size // 2)
-    (saved_1, working_1), (saved_2, working_2) = (census_output(each, seq_length) for each in (config, half))
+    (saved_1, working_1), (saved_2, working_2) = (
+        census_output(each, seq_length, replacements) for each in (config, half))
     return KindActivations(
         saved=max(0.0, 2 * saved_2 - saved_1) / seq_length,
         saved_tp=max(0.0, 2 * (saved_1 - saved_2)) / seq_length,
@@ -779,8 +968,8 @@ def census_output_activations(config: Any, seq_length: int = 4096) -> KindActiva
     )
 
 
-def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
-                       seq_length: int = 4096) -> Dict[str, KindActivations]:
+def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int = 4096,
+                       replacements: Sequence[Any] = ()) -> Dict[str, KindActivations]:
     """What a layer of each kind of *layers* keeps and holds, per token, at TP 1 and TP 2.
 
     Args:
@@ -788,6 +977,8 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
         layers: The model spec's layer stack, groups in model order; MTP
             groups are left out.
         seq_length: The tokens the census runs a layer at.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
 
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
@@ -808,10 +999,11 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]],
         ops_1: Dict[str, int] = {}
         ops_2: Dict[str, int] = {}
         (saved_1, working_1), (saved_2, working_2) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops)
+            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops, replacements=replacements)
             for tp, ops in ((1, ops_1), (2, ops_2)))
         (kept_1, _), (kept_2, _) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True) for tp in (1, 2))
+            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True, replacements=replacements)
+            for tp in (1, 2))
         attention_mm, ffn_mm = census_recomputed(config, layer_index, seq_length)
         out[kind] = KindActivations(
             saved=max(0.0, 2 * saved_2 - saved_1) / seq_length,

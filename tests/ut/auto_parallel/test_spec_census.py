@@ -116,18 +116,14 @@ class TestSpecCensus(unittest.TestCase):
         """
         Feature: census_kind's op counts.
         Description: A Llama layer, and a Mixtral layer of 4 experts.
-        Expectation: The Llama layer's counts are the default profile's; the
-            Mixtral layer runs two norms and one score softmax, where its
-            profile states five and two, and the rest as its profile.
+        Expectation: Each layer's counts are its family's profile's: the
+            Mixtral layer's router runs a softmax of its own, which no
+            score softmax counts.
         """
         from transformers import LlamaConfig, MixtralConfig  # pylint: disable=C0415
         self.assertEqual(census_kind(_one_kind(LlamaConfig), 0).ops, load_op_profile("default").counts("decoder"))
-        mixtral = census_kind(_one_kind(MixtralConfig, num_local_experts=4), 0).ops.to_dict()
-        profile = load_op_profile("mixtral").counts("decoder").to_dict()
-        self.assertEqual((mixtral["normOp"], mixtral["softmax"]), (2, 1))
-        self.assertEqual((profile["normOp"], profile["softmax"]), (5, 2))
-        self.assertEqual({op: count for op, count in mixtral.items() if op not in ("normOp", "softmax")},
-                         {op: count for op, count in profile.items() if op not in ("normOp", "softmax")})
+        self.assertEqual(census_kind(_one_kind(MixtralConfig, num_local_experts=4), 0).ops,
+                         load_op_profile("mixtral").counts("decoder"))
 
     def test_flags_are_read_off_the_layers(self):
         """

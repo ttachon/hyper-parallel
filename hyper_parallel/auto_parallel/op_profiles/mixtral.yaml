@@ -1,5 +1,6 @@
-# Mixtral: gated experts, two softmaxes and five normalisations per layer,
-# and two-byte gradients.
+# Mixtral: gated experts and two-byte gradients.  Its layers run the ops
+# Transformers builds them with, the default decoder's: one score softmax,
+# the router's being the router's own, and two norms.
 run:
   grad_bytes: 2
 kinds:
@@ -8,9 +9,9 @@ kinds:
       attMM: 4
       attBMM: 2
       ffMM: 3
-      softmax: 2
+      softmax: 1
       dropout: 0
-      normOp: 5
+      normOp: 2
       gather: 4
       headCast: 1
       ffAct: 1
