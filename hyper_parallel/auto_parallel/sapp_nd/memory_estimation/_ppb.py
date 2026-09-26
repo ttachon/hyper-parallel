@@ -22,6 +22,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES, Cost, SwitchProfile
 
@@ -197,9 +198,10 @@ class _PPB:
         """Measure the layer plain, with each op alone recomputed and fully recomputed, once per model and kind.
 
         Where a census prices the kind, it prices the plain layer and
-        HyperParallel's selective policy, and the formulas every other
-        setting: the layer selective with every op kept is measured too, as
-        the base the settings add up from, and the policy's setting whole.
+        HyperParallel's selective policy, and its records per op, or else
+        the formulas, every other setting: the layer selective with every
+        op kept is measured too, as the base the settings add up from, and
+        the policy's setting whole.
         """
         key = (ccfg.model_name, kind)
         if key in self.profiles:
@@ -211,8 +213,8 @@ class _PPB:
         census = isinstance(getattr(ccfg, "kind_activations", None), KindActivations)
 
         def _measure(at: Context) -> Tuple[Any, ...]:
-            """The current layer's memory, and the working sets of its backward at both points."""
-            return self._dynamic_mem(many, counts) + self._workings(at)
+            """The current layer's memory, the working sets of its backward at both points, and their census terms."""
+            return self._dynamic_mem(many, counts) + self._workings(at) + (EvalBody.census_working_terms(ccfg, at),)
 
         ctx.current_node = LayerType.NOT_REC_LAYER
         plain = _measure(ctx)
@@ -226,12 +228,20 @@ class _PPB:
         whole = {frozenset(name for name, state in policy.items() if not state): self._selective(
             ccfg, ctx, policy, _measure)} if census else {}
         ctx.current_node = LayerType.FULL_REC_LAYER
-        full = self._dynamic_mem(many, counts) + (full_working, plain[5])
+        full = self._dynamic_mem(many, counts) + (full_working, plain[5], None)
 
         def _cost(memory: Tuple[Any, ...], backward: float) -> Cost:
-            """A measurement as a cost: activations and growing buffers per micro-batch, the rest once."""
-            activation, per_micro_batch, once, excess, working, first_working = memory
-            return Cost(activation + per_micro_batch, once, backward, excess, working, first_working)
+            """A measurement as a cost: activations and growing buffers per micro-batch, the rest once.
+
+            Where a census's records per op price the layer, its working set
+            as warm-up ends before the clamp, and what it keeps of them.
+            """
+            activation, per_micro_batch, once, excess, working, first_working, terms = memory
+            kept = 0.0
+            if terms is not None:
+                kept, held = terms
+                working -= max(0.0, kept - held)
+            return Cost(activation + per_micro_batch, once, backward, excess, working, first_working, kept)
 
         forward, backward = self.layer_times(ccfg, kind, LayerType.NOT_REC_LAYER)
         self.profiles[key] = SwitchProfile(
@@ -245,11 +255,18 @@ class _PPB:
             counts=counts,
             # A selective layer that keeps every op recomputes nothing.
             selective_base=_cost(base, backward) if census else None,
+            census_held=self._census_held(base),
             whole={
                 recompute: _cost(memory, self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, policy)[1])
                 for recompute, memory in whole.items()
             },
         )
+
+    @staticmethod
+    def _census_held(measured: Tuple[Any, ...]) -> Optional[float]:
+        """What the backward of a layer :meth:`_profile` measured holds, where its census's records per op price it."""
+        terms = measured[6]
+        return None if terms is None else terms[1]
 
     def _alone(
         self, ccfg: CostModelConfig, ctx: Context, base: Tuple[Any, ...], measure: Callable, many: int
@@ -257,15 +274,19 @@ class _PPB:
         """The current layer measured with each op alone recomputed, by *measure* as *base* was.
 
         Only gather acts on the buffers, so any other op recomputed alone
-        leaves the split, and the working sets, as the base has them.
+        leaves the split, and the working sets, as the base has them; but
+        where a census prices the layer, what the layer keeps sets its
+        working set as warm-up ends, and each op is measured whole.
         """
         keep = dict.fromkeys(SWITCHES, 1)
+        census = isinstance(getattr(ccfg, "kind_activations", None), KindActivations)
         alone = {}
         for name in SWITCHES:
-            if name == "gather":
-                alone[name] = self._selective(ccfg, ctx, dict(keep, gather=0), measure)
+            switches = dict(keep, **{name: 0})
+            if name == "gather" or census:
+                alone[name] = self._selective(ccfg, ctx, switches, measure)
             else:
-                measured = self._selective(ccfg, ctx, dict(keep, **{name: 0}), lambda _: self._dynamic_mem(many))
+                measured = self._selective(ccfg, ctx, switches, lambda _: self._dynamic_mem(many))
                 alone[name] = measured[:3] + base[3:]
         return alone
 

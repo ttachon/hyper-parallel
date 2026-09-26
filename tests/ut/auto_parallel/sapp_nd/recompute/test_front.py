@@ -149,6 +149,32 @@ class TestSwitchProfile(unittest.TestCase):
         self.assertIs(profile.selective(["ffAct", "softmax"]), policy)
         self.assertEqual(profile.selective(["gather", "softmax"]).values(), (74.0, 20.0, 53.2))
 
+    def test_a_census_working_set_is_clamped_once_it_adds_up(self):
+        """
+        Feature: SwitchProfile.selective, for a kind a census's records per
+            op price.
+        Description: The layer selective with every op kept keeps 40 of
+            what its census states and its backward holds 30, so that its
+            working set as warm-up ends is clamped; the base and each op
+            alone state that working set before the clamp, 100 less twice
+            what they keep, beside what they keep. Recompute the softmax,
+            the softmax and the activation, and the norms too.
+        Expectation: Each setting's working set is what the memory model
+            clamps: before the clamp, plus what the layer keeps beyond what
+            its backward holds, where it still keeps more.
+        """
+        def cost(kept: float) -> Cost:
+            """A setting that keeps *kept* of what the census states, its working set before the clamp."""
+            return Cost(kept, 10.0, 50.0, working=30.0 + 100.0 - 2 * kept, census_kept=kept)
+
+        alone = dict(_ALONE, softmax=cost(36.0), ffAct=cost(32.0), normOp=cost(25.0))
+        profile = SwitchProfile(25.0, _PLAIN, alone, Cost(2.0, 20.0, 80.0), selective_base=cost(40.0),
+                                census_held=30.0)
+        self.assertEqual(profile.selective(["softmax"]).working, 58.0 + 6.0)
+        self.assertEqual(profile.selective(["softmax", "ffAct"]).working, 74.0)
+        self.assertEqual(profile.selective(["softmax", "ffAct", "normOp"]).working, 104.0)
+        self.assertEqual(profile.selective([]), _PLAIN)
+
 
 class TestBuildFront(_FrontChecks):
     """The front keeps the options no other option beats."""

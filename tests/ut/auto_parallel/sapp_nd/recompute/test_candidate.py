@@ -555,10 +555,20 @@ _CENSUS["model"]["config_overrides"]["activations"] = {"decoder": {
     "saved": 30000.0, "saved_tp": 60000.0, "working": 40000.0, "working_tp": 90000.0, "seq_length": 4096,
     "selective": 8000.0, "selective_tp": 12000.0, "selective_attention_mm": 0.3, "selective_ffn_mm": 0.5}}
 _POLICY = frozenset(name for name, state in HYPER_SELECTIVE_REC_OP.items() if not state)
+# The same census stating what the layer keeps for each op, the ops' bytes
+# summing to what it keeps plain, and a backward that holds less than that.
+_CENSUS_BY_OP = copy.deepcopy(_CENSUS)
+_CENSUS_BY_OP["model"]["config_overrides"]["activations"]["decoder"].update({
+    "working": 24000.0, "working_tp": 36000.0,
+    "ops": {"attMM": 6000.0, "ffMM": 12000.0, "normOp": 9000.0, "other": 3000.0},
+    "ops_tp": {"attMM": 12000.0, "attBMM": 16000.0, "softmax": 4000.0, "ffMM": 12000.0, "normOp": 8000.0,
+               "ffAct": 8000.0}})
 
 
 class TestCensus(unittest.TestCase):
     """The options of a layer kind a census prices."""
+
+    CONFIG = _CENSUS
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -567,7 +577,7 @@ class TestCensus(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "train.yaml")
             with open(path, "w", encoding="utf-8") as handle:
-                yaml.safe_dump(_CENSUS, handle)
+                yaml.safe_dump(cls.CONFIG, handle)
             cls.evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
         counts = micro_batches_in_flight(cls.evaluator)
         profiles = layer_profiles(cls.evaluator, Hard.Device_A2, most_in_flight=max(max(row) for row in counts),
@@ -610,8 +620,8 @@ class TestCensus(unittest.TestCase):
         Expectation: The first stage keeps what the search says it keeps, to
             its MB: the plain layer and the policy as the census prices
             them, the plain layer's working set beyond what the stage keeps
-            for it already, and every other setting as the formulas price
-            it.
+            for it already, and every other setting as the census's records
+            per op, or else the formulas, price it.
         """
         # pylint: disable=protected-access
         kept_plain = self.own.get(self.plain[self.ending.index], self.plain[self.ending.index])
@@ -685,6 +695,29 @@ class TestCensus(unittest.TestCase):
         self.assertGreater(sum(choice.stage_savings), sum(full.stage_savings))
         for mine, model in zip(choice.stage_memory, _stage_peaks_of(evaluator, choice)):
             self.assertLessEqual(abs(mine - model), 1.0)
+
+
+class TestCensusByOp(TestCensus):
+    """The options of a layer kind a census prices, its records per op pricing every setting but the policy."""
+
+    CONFIG = _CENSUS_BY_OP
+
+    def test_a_selective_layer_keeping_every_op_keeps_what_the_plain_one_keeps(self):
+        """
+        Feature: the profile of a kind a census's records per op price.
+        Description: The layer selective with every op kept, which the
+            settings add up from, beside the plain layer; and recomputing
+            the norms.
+        Expectation: The two keep the same, where the formulas priced the
+            base below the census's plain layer; the norms free what the
+            census states for them. The profile states what the backward
+            holds, for the working sets to be clamped.
+        """
+        base, plain = self.profile.selective_base, self.profile.plain
+        self.assertEqual(base.values()[:2], plain.values()[:2])
+        freed = base.memory_per_micro_batch - self.profile.selective(["normOp"]).memory_per_micro_batch
+        self.assertGreater(freed, 0)
+        self.assertIsNotNone(self.profile.census_held)
 
 
 class TestRuntimeSelective(unittest.TestCase):

@@ -24,11 +24,15 @@ settings of the seven switches.
 
 A census of a layer kind (IR phase 5) prices its plain layer, and a layer
 running HyperParallel's selective policy, by what it measured, and every
-other setting by the formulas. The settings then add up from the layer
-selective with every op kept, which the formulas price, and the policy's is
-measured whole.
+other setting by what its records per op state for the ops the setting
+keeps, or by the formulas where it states none. The settings then add up
+from the layer selective with every op kept, and the policy's is measured
+whole. Where the census prices them per op, a setting's working set as
+warm-up ends is clamped where the layer keeps more than its backward holds,
+so it adds up before the clamp, which :meth:`SwitchProfile.selective`
+applies to each setting.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import FrozenSet, Iterable, Mapping, Optional, Tuple
 
 # The recompute switches; 1 keeps an op's activation, 0 recomputes the op.
@@ -65,6 +69,9 @@ class Cost:
             gathered parameters, with none left to prefetch, and all a
             census says the backward holds, as the stage keeps no
             activations of that micro-batch for it.
+        census_kept: Where a census's records per op price the layer, what
+            it keeps of them at one micro-batch; *working* is then stated
+            before the clamp (:attr:`SwitchProfile.census_held`).
     """
 
     memory_per_micro_batch: float
@@ -73,6 +80,7 @@ class Cost:
     excess: Tuple[float, ...] = ()
     working: float = 0.0
     first_working: float = 0.0
+    census_kept: float = 0.0
 
     def __add__(self, other: "Cost") -> "Cost":
         """The sum, cost by cost."""
@@ -81,6 +89,7 @@ class Cost:
             excess=tuple(mine + theirs for mine, theirs in zip(self.excess, other.excess)),
             working=self.working + other.working,
             first_working=self.first_working + other.first_working,
+            census_kept=self.census_kept + other.census_kept,
         )
 
     def __sub__(self, other: "Cost") -> "Cost":
@@ -90,6 +99,7 @@ class Cost:
             excess=tuple(mine - theirs for mine, theirs in zip(self.excess, other.excess)),
             working=self.working - other.working,
             first_working=self.first_working - other.first_working,
+            census_kept=self.census_kept - other.census_kept,
         )
 
     def values(self) -> Tuple[float, float, float]:
@@ -114,6 +124,10 @@ class SwitchProfile:
         whole: The settings measured whole, which do not add up over their
             switches: HyperParallel's selective policy, where a census
             prices it.
+        census_held: Where a census's records per op price the selective
+            settings, what the layer's backward holds at one micro-batch:
+            as warm-up ends, it holds that beyond what the layer keeps, and
+            no less than nothing.
     """
 
     forward_time: float
@@ -123,13 +137,15 @@ class SwitchProfile:
     counts: Tuple[int, ...] = ()
     selective_base: Optional[Cost] = None
     whole: Mapping[FrozenSet[str], Cost] = field(default_factory=dict)
+    census_held: Optional[float] = None
 
     def selective(self, recompute: Iterable[str]) -> Cost:
         """The cost of recomputing the ops *recompute* names.
 
         The plain layer's for none, a setting's own where it is measured
         whole, and otherwise the base's, plus what each op costs alone
-        beyond it.
+        beyond it; where a census's records per op price it, its working
+        set as warm-up ends clamped as the memory model clamps it.
         """
         chosen = frozenset(recompute)
         if chosen in self.whole:
@@ -139,4 +155,6 @@ class SwitchProfile:
         for name in SWITCHES:
             if name in chosen:
                 cost = cost + (self.alone[name] - base)
+        if chosen and self.census_held is not None:
+            cost = replace(cost, working=cost.working + max(0.0, cost.census_kept - self.census_held))
         return cost

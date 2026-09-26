@@ -28,6 +28,7 @@ Test IDs:
   BD-G02: stat_grad_layer MoE gradient with EP/partial sharding
   BD-G03: stat_grad_layer shared expert uses shard_grad_exp_partial
 """
+import dataclasses
 import os
 import unittest
 from unittest.mock import MagicMock, PropertyMock
@@ -534,12 +535,86 @@ class TestCensusActiv(unittest.TestCase):
     def test_the_formulas_price_a_layer_the_census_does_not(self):
         """
         Feature: EvalBody.layer_activ's census path.
-        Description: A selective layer of a kind with a record, and a layer
-            of a kind without one.
+        Description: A selective layer of a kind with a record that states
+            nothing per op, and a layer of a kind without one.
         Expectation: Their formulas price both.
         """
         self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD), self._ctx(LayerType.SEL_REC_LAYER)), 235)
         self.assertEqual(EvalBody.layer_activ(self._ccfg(None), self._ctx()), 235)
+
+    # A record per op: the ops' bytes sum to what the plain layer keeps.
+    BY_OP = KindActivations(100.0, 300.0, 150.0, 330.0, 4096, selective=20.0, selective_tp=60.0,
+                            ops={"attMM": 40.0, "normOp": 30.0, "other": 30.0},
+                            ops_tp={"attMM": 100.0, "attBMM": 60.0, "normOp": 80.0, "ffAct": 60.0})
+
+    @staticmethod
+    def _switches(**recompute):
+        """Every switch keeping its op, but those *recompute* sets."""
+        return Config(dict(dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1), **recompute))
+
+    def test_a_selective_layer_keeps_the_ops_its_switches_keep(self):
+        """
+        Feature: EvalBody.census_kept, a census's records per op.
+        Description: A selective layer of a kind whose record states what
+            it keeps for each op: keeping every op, recomputing the norms
+            and the activation, and with HyperParallel's policy's switches;
+            then at CP 2 under colossalai CP, keeping and recomputing the
+            attention's batched matmuls.
+        Expectation: What the record states for the ops the switches keep,
+            split as the plain layer's, the ops no switch names and the
+            census's other always kept: every op, what the plain layer
+            keeps; the policy's, what the census measured under it; the
+            gathered keys and values where the batched matmuls are kept.
+        """
+        tokens = 3 * 4096 * 2
+        selective = LayerType.SEL_REC_LAYER
+        ccfg = self._ccfg(self.BY_OP)
+        ccfg.rec_op = self._switches()
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), tokens * (50 + 150))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx()), tokens * (50 + 150))
+        ccfg.rec_op = self._switches(normOp=0, ffAct=0)
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), tokens * (35 + 80))
+        ccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), tokens * (10 + 30))
+        for attention, kept in ((1, 200 + 2 * 2 * 64 * 2 / 2), (0, 200 - 60 / 2)):
+            ccfg = self._ccfg(self.BY_OP, cp=2)
+            ccfg.cp_algo, ccfg.n_linrec, ccfg.n_kv, ccfg.dh, ccfg.bytes_compute = "colossalai_cp", 0, 2, 64, 2
+            ccfg.rec_op = self._switches(attBMM=attention)
+            self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(selective)), tokens / 2 * kept, attention)
+
+    def test_the_working_set_of_a_layer_priced_per_op(self):
+        """
+        Feature: EvalBody.census_working_terms.
+        Description: A selective layer of a kind whose record states what
+            it keeps for each op, and whose backward holds less than its
+            plain layer keeps: recomputing the norms and the activation,
+            keeping every op, and with HyperParallel's policy's switches;
+            the plain layer; and a kind whose record states nothing per op.
+        Expectation: What the layer keeps and what its backward holds at
+            one micro-batch, the terms of its working set as warm-up ends:
+            what the backward holds beyond what the layer keeps, and
+            nothing where it keeps more; no terms for a layer its census
+            does not price per op.
+        """
+        selective = LayerType.SEL_REC_LAYER
+        tokens = 4096 * 2
+        ccfg = self._ccfg(dataclasses.replace(self.BY_OP, working=60.0, working_tp=200.0))
+
+        def working(ctx: MagicMock) -> MagicMock:
+            """*ctx* as warm-up ends, one micro-batch in flight."""
+            ctx.working_set, ctx.working_on_saved, ctx.micro_factor = 2, True, 1
+            return ctx
+
+        ccfg.rec_op = self._switches(normOp=0, ffAct=0)
+        self.assertEqual(EvalBody.census_working_terms(ccfg, self._ctx(selective)), (tokens * 115, tokens * 130))
+        self.assertEqual(EvalBody.layer_activ(ccfg, working(self._ctx(selective))), tokens * 15)
+        ccfg.rec_op = self._switches()
+        self.assertEqual(EvalBody.census_working_terms(ccfg, self._ctx(selective)), (tokens * 200, tokens * 130))
+        self.assertEqual(EvalBody.layer_activ(ccfg, working(self._ctx(selective))), 0)
+        self.assertIsNone(EvalBody.census_working_terms(ccfg, self._ctx()))
+        ccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP))
+        self.assertIsNone(EvalBody.census_working_terms(ccfg, self._ctx(selective)))
+        self.assertIsNone(EvalBody.census_working_terms(self._ccfg(self.RECORD), self._ctx(selective)))
 
 
 class TestFullrecLayerActiv(unittest.TestCase):
