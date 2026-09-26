@@ -214,8 +214,14 @@ class EvalTail:
 
     @staticmethod
     def num_params_output(ccfg: CostModelConfig, _) -> float:
-        """Parameters count (lmhead)"""
-        return ccfg.h * ccfg.v + ccfg.v
+        """Parameters count: the output table, and the final norm of a model that states its norms.
+
+        One that does not is counted a bias per vocabulary entry instead,
+        the formulas' convention.
+        """
+        if getattr(ccfg, "layer_norms", None) is None:
+            return ccfg.h * ccfg.v + ccfg.v
+        return ccfg.h * ccfg.v + (2 if getattr(ccfg, "norm_bias", None) else 1) * ccfg.h
 
     @staticmethod
     def stat_output_p(ccfg: CostModelConfig, ctx: Context) -> float:

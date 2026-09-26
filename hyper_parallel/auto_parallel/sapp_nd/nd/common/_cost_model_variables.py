@@ -93,6 +93,14 @@ class _CostModVar:
     dc_kv: float = 0
     dc_q: float = 0
     dhr: float = 0
+    # The biases and norms a model states (its spec's); None where unstated,
+    # which the parameter formulas count their own way.
+    qkv_bias: bool = None
+    o_bias: bool = None
+    mlp_bias: bool = None
+    norm_bias: bool = None
+    layer_norms: int = None
+    shared_expert_gate: bool = None
     k_1st_dense: float = 0
     # Attention flavour of a layer group, and the extra parameters a flavour
     # carries that the q/k/v/o formula does not describe (conv, gates).

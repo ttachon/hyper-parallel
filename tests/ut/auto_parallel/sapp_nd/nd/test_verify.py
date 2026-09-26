@@ -40,7 +40,7 @@ def _qwen35_text(tie: bool = False):
         "shared_expert_intermediate_size": 32, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
         "linear_num_value_heads": 4, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
         "vocab_size": 128, "max_position_embeddings": 256, "layer_types": ["linear_attention", "full_attention"],
-        "tie_word_embeddings": tie,
+        "tie_word_embeddings": tie, "attn_output_gate": True,
     })
 
 
@@ -52,6 +52,12 @@ def _deepseek_v3(q_lora_rank=32):
         q_lora_rank=q_lora_rank, kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=8,
         n_routed_experts=4, num_experts_per_tok=2, moe_intermediate_size=16, n_shared_experts=1,
         first_k_dense_replace=1, intermediate_size=32, vocab_size=128, n_group=1, topk_group=1)
+
+
+def _one_kind(config_cls, **fields):
+    """A two-layer config of *config_cls* of width 64, its layers of one kind."""
+    return config_cls(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                      intermediate_size=128, vocab_size=128, **fields)
 
 
 def _train_yaml(folder: str) -> str:
@@ -143,6 +149,20 @@ class TestVerifyParameters(unittest.TestCase):
             rows = {(row.where, row.part): row for row in _verify(_deepseek_v3(q_lora_rank))}
             for kind in ("dense x1", "moe x1"):
                 self.assertEqual(rows[(kind, "attention")].nd, rows[(kind, "attention")].census, kind)
+
+    def test_each_model_is_priced_as_it_is_built(self):
+        """
+        Feature: verify_parameters of whole models.
+        Description: A Llama biasing its projections and feed-forward, a
+            Qwen2 biasing its query, key and value projections, both of one
+            layer kind; the Qwen3.5 hybrid; DeepSeek-V3.
+        Expectation: ND prices every part exactly as Transformers builds it.
+        """
+        from transformers import LlamaConfig, Qwen2Config  # pylint: disable=C0415
+        for config in (_one_kind(LlamaConfig, attention_bias=True, mlp_bias=True), _one_kind(Qwen2Config),
+                       _qwen35_text(), _deepseek_v3()):
+            for row in _verify(config):
+                self.assertEqual(row.nd, row.census, (type(config).__name__, row.where, row.part))
 
     def test_a_train_yaml_without_a_checkpoint_is_refused(self):
         """

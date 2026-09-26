@@ -84,6 +84,9 @@ def _make_ccfg(
     ccfg.shard_grad_non_exp = shard_grad_non_exp
     ccfg.shard_grad_exp = shard_grad_exp
     ccfg.shard_grad_exp_partial = shard_grad_exp_partial
+    # No bias or norm stated: the parameter formulas count their own.
+    for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "layer_norms", "shared_expert_gate"):
+        setattr(ccfg, name, None)
     return ccfg
 
 
