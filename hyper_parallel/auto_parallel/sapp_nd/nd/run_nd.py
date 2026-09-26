@@ -26,7 +26,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
-from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_parameters
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_flops, verify_parameters
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -383,7 +383,11 @@ if __name__ == "__main__":
         if args.framework != "hyper_v2":
             parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
         set_verbose_level(args.verbosity)
+        logger.output("Parameters")
         for line in report(verify_parameters(args.yaml_config)):
+            logger.output(line)
+        logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
+        for line in report(verify_flops(args.yaml_config)):
             logger.output(line)
         sys.exit(0)
 

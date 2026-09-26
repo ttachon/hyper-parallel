@@ -40,7 +40,12 @@ bytes a vocabulary-parallel loss splits.
 A layer's parameters are counted by part, as ND prices its parts: the
 attention's, the norms', the dense feed-forward's, the routed experts', the
 shared expert's and the router's (:func:`census_parameters`), for verify
-mode to set beside what ND prices.
+mode to set beside what ND prices.  So are its forward FLOPs
+(:func:`census_flops`): each matmul's toward the part of the layer that
+runs it, flash attention's toward the scores, at every pair of tokens, as
+the runtime's kernel computes them under an explicit causal mask, and the
+gated delta rule's through Transformers' own chunked implementation, whose
+matmuls the runtime's kernel runs alike.
 """
 from __future__ import annotations
 
@@ -399,8 +404,12 @@ def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
 
 
 @contextlib.contextmanager
-def _fake_layer(config: Any, layer_index: int) -> Iterator[Tuple[Any, Any]]:
-    """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels."""
+def _fake_layer(config: Any, layer_index: int, contracts: bool = True) -> Iterator[Tuple[Any, Any]]:
+    """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels.
+
+    The gated delta rule runs HyperParallel's kernel's contract, or, where
+    *contracts* is false, Transformers' own chunked implementation.
+    """
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
     config = copy.deepcopy(config)
@@ -417,9 +426,79 @@ def _fake_layer(config: Any, layer_index: int) -> Iterator[Tuple[Any, Any]]:
             torch.set_default_dtype(default)
         for module in layer.modules():
             if hasattr(module, "chunk_gated_delta_rule"):
-                module.chunk_gated_delta_rule = _gated_delta_rule(modeling)
+                module.chunk_gated_delta_rule = (_gated_delta_rule(modeling) if contracts
+                                                 else modeling.torch_chunk_gated_delta_rule)
         layer.train()
         yield layer, rotary
+
+
+class _PartFlops(TorchDispatchMode):
+    """A layer's forward FLOPs by part: its matmuls' toward the part running them, flash attention's the scores'."""
+
+    def __init__(self, layer: Any) -> None:
+        """Follow which of *layer*'s modules runs, and which tensors are its parameters."""
+        super().__init__()
+        self.flops: Dict[str, int] = {}
+        self.params = {param.untyped_storage()._cdata  # pylint: disable=protected-access
+                       for param in layer.parameters()}
+        self.running: List[str] = []
+        for name, module in layer.named_modules():
+            if name:
+                module.register_forward_pre_hook(functools.partial(self._enter, name))
+                module.register_forward_hook(self._leave)
+
+    def _enter(self, name: str, *_: Any) -> None:
+        """Note that the module at *name* runs."""
+        self.running.append(name)
+
+    def _leave(self, *_: Any) -> None:
+        """Note that the innermost module running has returned."""
+        self.running.pop()
+
+    def _part(self, args: Sequence[Any]) -> str:
+        """The part a matmul on *args* runs for: its module's, or an attention's recurrence where no weight takes part."""
+        part = _parameter_part(f"{self.running[-1]}.weight") if self.running else "ffn"
+        weighted = any(isinstance(arg, torch.Tensor)
+                       and arg.untyped_storage()._cdata in self.params  # pylint: disable=protected-access
+                       for arg in args)
+        return "linrec" if part == "attention" and not weighted else part
+
+    def _add(self, part: str, flops: int) -> None:
+        """Count *flops* toward *part*."""
+        self.flops[part] = self.flops.get(part, 0) + flops
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        out = func(*args, **(kwargs or {}))
+        if func is torch.ops.nd_census.flash_attention.default:
+            query, key, value = args[:3]
+            batch, heads, seq, width = query.shape
+            self._add("scores", 2 * batch * heads * seq * key.shape[2] * (width + value.shape[-1]))
+        elif flops := _matmul_flops(func, args):
+            self._add(self._part(args), flops)
+        return out
+
+
+def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, int]:
+    """The forward FLOPs of layer *layer_index* of *config* on one sequence, by part.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the sequence it runs.
+
+    Returns:
+        The FLOPs of each part that runs a matmul: the attention's
+        projections (``attention``), its scores and values at every pair of
+        tokens (``scores``), a linear attention's recurrence (``linrec``),
+        and the parts of the feed-forward :func:`_parameter_part` names.
+    """
+    with _fake_layer(config, layer_index, contracts=False) as (layer, rotary):
+        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
+        positions = _positions(rotary, hidden, seq_length)
+        counter = _PartFlops(layer)
+        with counter:
+            _run(layer, hidden, positions)
+    return counter.flops
 
 
 def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False) -> Tuple[int, int]:

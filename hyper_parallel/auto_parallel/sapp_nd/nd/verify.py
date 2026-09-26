@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Verify mode: the parameters ND prices of a model, beside those Transformers builds of it.
+"""Verify mode: the parameters and FLOPs ND prices of a model, beside those of the layers Transformers builds of it.
 
 ``run_nd -f hyper_v2 -y <train.yaml> -V`` builds the first layer of each
 kind of the model the train.yaml trains, on fake tensors, and counts its
@@ -22,22 +22,36 @@ Beside each part it sets what ND's formulas price of it, and the same for
 the embedding and the output layer.  It reports each part's two counts and
 their difference, rather than a pass or a fail: a fact the parser misread
 shows as the part it feeds.
+
+It then counts each kind's forward FLOPs on one sequence of the run's
+length (:func:`~hyper_parallel.auto_parallel._layer_census.census_flops`)
+beside what the time model's op table prices of the same forward: a third
+of each matmul entry, which prices the backward as twice the forward.  The
+table's feed-forward entry covers the whole feed-forward, its experts,
+shared expert and router included.
 """
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple, Tuple
 
 import yaml
 
 from hyper_parallel.auto_parallel._hf_model_spec import checkpoint_configs, is_auto_models_schema
-from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters
+from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_flops, census_parameters
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook, layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import prepare_context
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import BACKWARD_RATIO, _flavour_tables
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_group_configs
+
+# The time model's matmul entries, and the part of a layer each prices.
+_FLOP_PARTS = (("n_attMM", "attention"), ("n_attBMM", "scores"), ("n_linrec", "linrec"), ("n_ffMM", "ffn"))
+
+# The census's parts of a feed-forward, which the time model prices as one.
+_FFN_PARTS = ("ffn", "routed", "shared", "router")
 
 
 class VerifyRow(NamedTuple):
@@ -62,11 +76,55 @@ def nd_parameters(lccfg: Any, ctx: Any) -> Dict[str, float]:
     return parts
 
 
+def nd_flops(ccfg: Any, lccfg: Any) -> Dict[str, float]:
+    """The forward FLOPs the time model prices one sequence of a layer of *lccfg* at, by part.
+
+    A third of each matmul entry of the layer's op table, for one sequence
+    of the whole layer: the table prices the backward as twice the
+    forward, a micro-batch of ``b`` sequences, and one TP and CP rank's
+    share.
+    """
+    base, experts = _flavour_tables(ccfg, lccfg)
+    table = experts if lccfg.n_exp > 1 else base
+    scale = ccfg.b * (1 + BACKWARD_RATIO) * ccfg.bytes_p / ccfg.t / ccfg.cp
+    return {part: getattr(lccfg, op) * table[op] / scale for op, part in _FLOP_PARTS if op in table}
+
+
 def _text_model(ccfg: Any) -> Any:
     """The config of *ccfg*'s language model: the config itself, or a multimodal config's main submodule's."""
     if not getattr(ccfg, "multimodal", False):
         return ccfg
     return ccfg.mm_ccfgs[getattr(ccfg, "mm_main", None) or ccfg.mm_order[-1]]
+
+
+def _priced(yaml_path: str) -> Tuple[Any, Any, Any]:
+    """The Transformers configs a train.yaml trains, its model's and its language model's, and ND's config of it.
+
+    ND's config is its language model's, with the family's op counts and
+    fields applied as the estimates apply them, on a copy.
+
+    Raises:
+        ValueError: The train.yaml names no Transformers checkpoint.
+    """
+    with open(yaml_path, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    if not isinstance(raw, dict) or not is_auto_models_schema(raw) or not isinstance(raw.get("model"), dict):
+        raise ValueError(f"{yaml_path}: verify mode needs an AutoModels train.yaml naming a Transformers checkpoint")
+    config, text = checkpoint_configs(raw["model"])
+    ccfg = copy.deepcopy(_text_model(CostModelConfig(yaml_path, framework="hyper_v2")))
+    check_and_apply_custom_hook(ccfg)
+    return config, text, ccfg
+
+
+def _kinds(ccfg: Any) -> Dict[str, List[Any]]:
+    """Each layer kind of *ccfg*'s stack: its first layer, how many layers it has, and their config."""
+    kinds: Dict[str, List[Any]] = {}
+    first = 0
+    for (kind, count), (lccfg, _) in zip(layer_groups(ccfg), get_layer_group_configs(ccfg)):
+        name = kind.name if kind is not None else "decoder"
+        kinds.setdefault(name, [first, 0, lccfg])[1] += count
+        first += count
+    return kinds
 
 
 def verify_parameters(yaml_path: str) -> List[VerifyRow]:
@@ -85,23 +143,10 @@ def verify_parameters(yaml_path: str) -> List[VerifyRow]:
     Raises:
         ValueError: The train.yaml names no Transformers checkpoint.
     """
-    with open(yaml_path, encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
-    if not isinstance(raw, dict) or not is_auto_models_schema(raw) or not isinstance(raw.get("model"), dict):
-        raise ValueError(f"{yaml_path}: verify mode needs an AutoModels train.yaml naming a Transformers checkpoint")
-    config, text = checkpoint_configs(raw["model"])
-    # The family's op counts and fields, as the estimates apply them, on a copy.
-    ccfg = copy.deepcopy(_text_model(CostModelConfig(yaml_path, framework="hyper_v2")))
-    check_and_apply_custom_hook(ccfg)
+    config, text, ccfg = _priced(yaml_path)
     ctx = prepare_context()
-    kinds: Dict[str, List[Any]] = {}
-    first = 0
-    for (kind, count), (lccfg, _) in zip(layer_groups(ccfg), get_layer_group_configs(ccfg)):
-        name = kind.name if kind is not None else "decoder"
-        kinds.setdefault(name, [first, 0, lccfg])[1] += count
-        first += count
     rows = []
-    for name, (index, count, lccfg) in kinds.items():
+    for name, (index, count, lccfg) in _kinds(ccfg).items():
         nd, census = nd_parameters(lccfg, ctx), census_parameters(text, index)
         rows += [VerifyRow(f"{name} x{count}", part, nd.get(part, 0.0), census.get(part, 0), count)
                  for part in sorted(set(nd) | set(census))]
@@ -112,6 +157,33 @@ def verify_parameters(yaml_path: str) -> List[VerifyRow]:
     rows.append(VerifyRow("output", "table, norm", EvalTail.num_params_output(ccfg, ctx),
                           table + census_final_norm(text)))
     rows.append(VerifyRow("model", "total", sum(row.count * row.nd for row in rows),
+                          sum(row.count * row.census for row in rows)))
+    return rows
+
+
+def verify_flops(yaml_path: str) -> List[VerifyRow]:
+    """The forward FLOPs ND prices of the model a train.yaml trains, part by part, beside the census's.
+
+    Args:
+        yaml_path: An AutoModels train.yaml, whose model names a Transformers
+            checkpoint.
+
+    Returns:
+        A row per part of the first layer of each kind of its language
+        model on one sequence of the run's length, the census's feed-forward
+        parts summed as the time model prices them, then the layers' whole.
+
+    Raises:
+        ValueError: The train.yaml names no Transformers checkpoint.
+    """
+    _, text, ccfg = _priced(yaml_path)
+    rows = []
+    for name, (index, count, lccfg) in _kinds(ccfg).items():
+        nd, census = nd_flops(ccfg, lccfg), census_flops(text, index, int(ccfg.s))
+        census["ffn"] = sum(census.pop(part, 0) for part in _FFN_PARTS)
+        rows += [VerifyRow(f"{name} x{count}", part, nd.get(part, 0.0), census.get(part, 0), count)
+                 for _, part in _FLOP_PARTS if nd.get(part) or census.get(part)]
+    rows.append(VerifyRow("layers", "total", sum(row.count * row.nd for row in rows),
                           sum(row.count * row.census for row in rows)))
     return rows
 

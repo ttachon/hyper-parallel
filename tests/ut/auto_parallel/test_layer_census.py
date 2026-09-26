@@ -25,15 +25,16 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
-    _measure,
-    _RecomputedMatmuls,
-    _selective_contexts,
     census_activations,
     census_final_norm,
+    census_flops,
     census_layer,
     census_output_activations,
     census_parameters,
     census_recomputed,
+    _measure,
+    _RecomputedMatmuls,
+    _selective_contexts,
     tp_config,
 )
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
@@ -265,6 +266,29 @@ class TestLayerCensus(unittest.TestCase):
                              (64 * 4, 4 * 3 * 64 * 32, 3 * 64 * 32 + 64, norms))
             self.assertGreater(parts["attention"], 0)
         self.assertEqual(census_final_norm(config), 64)
+
+    def test_a_layers_forward_flops_by_part(self):
+        """
+        Feature: census_flops.
+        Description: Each kind's layer of the model of width 64 on 32
+            tokens: 4 query heads of 16 behind an output gate and 2 key
+            heads; 4 routed experts 32 wide, 2 chosen, a shared expert 32
+            wide and its gate.
+        Expectation: The full-attention layer's projections; its scores and
+            values at every pair of tokens; each token's two experts' three
+            projections, the shared expert's three and its gate, and the
+            router's.  The linear-attention layer's recurrence is counted
+            apart from its projections, and it has no scores.
+        """
+        config, seq = _qwen35_text(), 32
+        full = census_flops(config, 1, seq)
+        self.assertEqual(full["attention"], 2 * seq * 64 * (2 * 4 * 16 + 2 * 2 * 16 + 4 * 16))
+        self.assertEqual(full["scores"], 2 * 4 * seq * seq * (16 + 16))
+        self.assertEqual((full["routed"], full["shared"], full["router"]),
+                         (2 * seq * 2 * 3 * 64 * 32, 2 * seq * (3 * 64 * 32 + 64), 2 * seq * 64 * 4))
+        linear = census_flops(config, 0, seq)
+        self.assertGreater(linear["linrec"], 0)
+        self.assertNotIn("scores", linear)
 
     def test_the_output_layer_keeps_its_fp32_log_probabilities(self):
         """
