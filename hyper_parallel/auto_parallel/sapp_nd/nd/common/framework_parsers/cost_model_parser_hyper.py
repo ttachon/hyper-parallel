@@ -76,6 +76,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.auto_parallel._layer_stack import LinearAttentionDims, resolve_layers
 from hyper_parallel.auto_parallel._model_spec import (
     KindActivations,
@@ -132,11 +133,13 @@ class CostModelParserHyperV2(_CostModelParser):
         has no MTP layer (:meth:`_without_mtp`), and a vision tower only
         where its model class builds one (:meth:`_builds_vision_tower`).
         ``context.census`` has the resolver run a census of each layer kind
-        (:meth:`_config_census`), and ``context.census_spec`` has it state
-        the census's spec of the model rather than its own.
+        (:meth:`_config_census`), of the modules the run's ``plan_overrides``
+        install (:meth:`_replacements`), and ``context.census_spec`` has it
+        state the census's spec of the model rather than its own.
         """
         spec = resolve_hf_model_spec(
             self._model_section(), self._visual_seq_len_override(), self._census_seq_len(), self._census_spec(),
+            self._replacements(),
         )
         if is_auto_models_schema(self.config):
             spec = self._without_mtp(spec)
@@ -185,6 +188,11 @@ class CostModelParserHyperV2(_CostModelParser):
         """Whether ``context.census_spec`` asks for the census's spec of the model rather than the resolver's."""
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         return bool(self._get_cfg_attr(ctx, "census_spec", False))
+
+    def _replacements(self) -> Tuple[Any, ...]:
+        """The module replacements the run's ``plan_overrides`` install, which a census runs its layers with."""
+        entries = self._config_to_flat_dict(self._get_cfg_attr(self.config, "plan_overrides", None))
+        return replacement_specs(entries if isinstance(entries, list) else ())
 
     # The AutoModels classes that build a vision-language checkpoint's
     # vision tower; every other named class builds the language model alone.
