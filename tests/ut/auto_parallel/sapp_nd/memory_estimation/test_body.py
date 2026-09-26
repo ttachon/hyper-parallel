@@ -375,21 +375,18 @@ class TestNumParamsRoutedExpert(unittest.TestCase):
 
 
 class TestNumParamsSharedExpert(unittest.TestCase):
-    """Test EvalFFn.num_params_shared_expert uses hff (not hff_exp)."""
+    """Test EvalFFn.num_params_shared_expert prices each shared expert at the routed width."""
 
-    def test_shared_uses_hff_not_hff_exp(self):
-        """BD-S01: shared expert uses ccfg.hff, NOT ccfg.hff_exp.
+    def test_shared_uses_hff_exp_not_hff(self):
+        """BD-S01: each shared expert is hff_exp wide, whatever the dense layers' hff.
 
-        DeepSeek-V3 has hff_exp=2048 (routed) but hff=18432 (shared).
-        Using hff_exp for shared would severely underestimate.
+        DeepSeek-V3's dense layers are 18432 wide and its one shared expert
+        2048, as wide as a routed one; Qwen2-57B-A14B states its 20480 wide
+        shared expert as eight of 2560.
         """
         ccfg = _make_ccfg(n_exp=256, n_shared_exp=1, h=7168, hff=18432, hff_exp=2048)
         result = EvalFFn.num_params_shared_expert(ccfg, None)
-        # Should use hff=18432, not hff_exp=2048
-        expected_with_hff = 1 * 1 * (18432 * 7168 + 18432)
-        wrong_with_hff_exp = 1 * 1 * (2048 * 7168 + 2048)
-        self.assertAlmostEqual(result, expected_with_hff, places=0)
-        self.assertNotAlmostEqual(result, wrong_with_hff_exp, places=0)
+        self.assertAlmostEqual(result, 1 * 1 * (2048 * 7168 + 2048), places=0)
 
     def test_shared_no_etp(self):
         """BD-S02: shared expert is NOT affected by etp (no TP slicing)."""
