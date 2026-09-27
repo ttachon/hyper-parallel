@@ -52,7 +52,11 @@ grouped-query attention, its grouped experts), the census runs those
 instead, so what it measures is what the trainer saves
 (:func:`replacement_specs`).  Their kernels are ``torch_npu``'s, which a
 host cannot call, so they run under the kernels' shape contracts
-(:mod:`hyper_parallel.auto_parallel._npu_contracts`).  The FLOP census
+(:mod:`hyper_parallel.auto_parallel._npu_contracts`).  A factory that needs
+a library the host lacks leaves the census with a layer the run does not
+build, which it refuses (:exc:`CensusUnavailable`): Transformers' own
+modules keep other bytes, and under the selective policy a DeepSeek-V3.2
+layer's eager indexer keeps 2.3 times what the layer keeps plain (F53).  The FLOP census
 (:func:`census_flops`) and the shares of matmul FLOPs a selective layer
 recomputes (:func:`census_recomputed`) stay on Transformers' own modules:
 both count the arithmetic the time model prices, which fusing a module
@@ -103,6 +107,10 @@ from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
 logger = logging.getLogger(__name__)
+
+
+class CensusUnavailable(RuntimeError):
+    """A census cannot run here: this host cannot build the modules the run installs."""
 
 
 # The fields a census record states in pairs: what a layer keeps under
@@ -671,9 +679,16 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
 
     A rule's other patterns name modules no fake part holds, such as a
     model's final norm beside a layer, and are left out rather than refused.
-    A factory that needs a library this host lacks, such as an attention
-    built on a native extension, leaves every module as Transformers built
-    it: the census then measures more than the run keeps, and says so.
+
+    Raises:
+        CensusUnavailable: If a factory needs a library this host lacks, such
+            as an attention built on a native extension.  Transformers' own
+            modules are not what the run trains, and measuring them prices a
+            layer nobody runs: a DeepSeek-V3.2 layer whose indexer runs eager
+            keeps, under the selective policy, 1192192 bytes a token against
+            the 516368 it keeps plain, its scores an fp32 tensor of one
+            sequence by another that the policy holds and no backward takes
+            (F53).
     """
     from hyper_parallel.models.replacement import (  # pylint: disable=C0415
         apply_module_replacements,
@@ -688,11 +703,11 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
         apply_module_replacements(holder, compile_module_replacements(holder, kept),
                                   weights_mapping=[], context={}, capture_checkpoint_metadata=False)
     except (ImportError, OSError) as exc:
-        logger.warning(
-            "census on Transformers' own modules: this host cannot build the replacements %s (%s); "
-            "a layer of the run keeps at most what the census measures",
-            [spec.factory.__name__ for spec in kept], exc,
-        )
+        raise CensusUnavailable(
+            f"this host cannot build the modules the run installs "
+            f"({[spec.factory.__name__ for spec in kept]}: {exc}); "
+            f"run the cost model where they build, or drop context.census and let the formulas price them"
+        ) from exc
 
 
 def _modeling(config: Any) -> Any:

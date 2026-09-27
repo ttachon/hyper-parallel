@@ -27,6 +27,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
+    CensusUnavailable,
     KindActivations,
     _measure,
     _RecomputedMatmuls,
@@ -517,24 +518,39 @@ class TestModuleReplacements(unittest.TestCase):
         self.assertGreater(fused["attBMM"], 0)
         self.assertAlmostEqual(sum(fused.values()) * 256, census_layer(config, 0, 256, replacements=specs)[0])
 
-    def test_a_replacement_this_host_cannot_build_is_reported(self):
+    def test_a_replacement_this_host_cannot_build_is_refused(self):
         """
         Feature: census_layer with a replacement whose factory needs a
             library this host lacks, as DeepSeek-V3.2's attention needs a
             native extension.
-        Expectation: Every module stays as Transformers built it, the census
-            measures it, and a warning names the factories and the import
-            that failed.
+        Expectation: The census refuses rather than measure Transformers' own
+            modules, which the run does not train, and names the factory and
+            the import that failed (F53).
         """
         from hyper_parallel.models.replacement import ModuleReplacementSpec  # pylint: disable=C0415
         from transformers.models.qwen3_moe import modeling_qwen3_moe  # pylint: disable=C0415
         spec = ModuleReplacementSpec(match=("*.input_layernorm",), factory=_needs_a_library,
                                      module_type=modeling_qwen3_moe.Qwen3MoeRMSNorm)
-        config = _qwen3_moe()
-        with self.assertLogs("hyper_parallel.auto_parallel._layer_census", "WARNING") as logs:
-            self.assertEqual(census_layer(config, 0, 256, replacements=(spec,)), census_layer(config, 0, 256))
-        self.assertIn("a_native_extension", logs.output[0])
-        self.assertIn("_needs_a_library", logs.output[0])
+        with self.assertRaises(CensusUnavailable) as refusal:
+            census_layer(_qwen3_moe(), 0, 256, replacements=(spec,))
+        self.assertIn("a_native_extension", str(refusal.exception))
+        self.assertIn("_needs_a_library", str(refusal.exception))
+
+    def test_a_run_whose_modules_do_not_build_is_priced_by_the_formulas(self):
+        """
+        Feature: context.census with a plan_overrides entry this host cannot
+            build, through the parser.
+        Expectation: The run is priced without a census, as a run that asks
+            for none, and a warning says why (F53).
+        """
+        plan = [{"match": "*.input_layernorm",
+                 "module_type": "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm",
+                 "replace_module": {"_target_": f"{__name__}._needs_a_library"}}]
+        with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING") as logs:
+            priced = _evaluator(_qwen35_text(), census=True, plan_overrides=plan)
+        self.assertIsNone(priced.ccfg.census)
+        self.assertEqual(priced.estimate_peak(), _evaluator(_qwen35_text()).estimate_peak())
+        self.assertIn("a_native_extension", "".join(logs.output))
 
     def test_the_contracts_stand_in_for_the_kernels(self):
         """
