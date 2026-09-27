@@ -38,6 +38,12 @@ state it.
   output.
 
 Any other kernel raises when called, naming it.
+
+A fused module may cache a constant the first time it runs, as the attention
+caches the compressed causal mask its sparse mode takes, one per device.
+Under the census's fake tensors that constant is a fake tensor, which a real
+call would then take from the cache, so leaving the contracts drops what the
+census left (:func:`_drop_fake_caches`, F55).
 """
 from __future__ import annotations
 
@@ -49,6 +55,7 @@ import types
 from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
+from torch._subclasses.fake_tensor import FakeTensor  # pylint: disable=forbidden-backend-import
 
 # The softmax statistics the fused attention keeps per head and token.
 _STATS = 8
@@ -292,6 +299,26 @@ def _stand_in() -> types.ModuleType:
 TORCH_NPU = _stand_in()
 
 
+def _drop_fake_caches() -> None:
+    """Drop the fake tensors what ran under the contracts left in the runtime's caches.
+
+    HyperParallel's fused modules cache a constant per device in a module of
+    their own, such as the compressed causal mask the NPU attention's sparse
+    mode takes (``models/qwen3*/adapter/attention.py``).  A census fills those
+    caches with fake tensors, which a real call in the same process would take
+    from them, so every fake tensor a model module holds in a cache keyed by
+    anything is dropped, leaving the caches as the census found them (F55).
+    """
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("hyper_parallel.models") or module is None:
+            continue
+        for value in list(vars(module).values()):
+            if not isinstance(value, dict):
+                continue
+            for key in [key for key, held in value.items() if isinstance(held, FakeTensor)]:
+                del value[key]
+
+
 @contextlib.contextmanager
 def npu_contracts() -> Iterator[types.ModuleType]:
     """``torch_npu`` as the contracts, for what runs inside.
@@ -310,6 +337,7 @@ def npu_contracts() -> Iterator[types.ModuleType]:
     try:
         yield TORCH_NPU
     finally:
+        _drop_fake_caches()
         if previous is _ABSENT:
             sys.modules.pop("torch_npu", None)
         else:

@@ -17,10 +17,13 @@
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+import torch
 from torch import Tensor, nn
 
 
+from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
+from hyper_parallel.distributed import activation_checkpoint
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
@@ -171,6 +174,35 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         """Activation checkpointing should fail instead of guessing a container."""
         with self.assertRaisesRegex(ValueError, "gradient_checkpointing"):
             _apply_activation_checkpointing(_UnmarkedDiscoveryModel(), "selective")
+
+
+class TestSelectiveCheckpointPolicy(unittest.TestCase):
+    """The operators HyperParallel's selective activation checkpointing saves."""
+
+    def test_the_fused_attention_the_models_call_is_saved(self):
+        """
+        Feature: _SELECTIVE_AC_MUST_SAVE_OPS and the eager policy.
+        Description: The operator ``torch_npu.npu_fusion_attention``
+            dispatches to, which every fused attention of this repository
+            calls and the shard registry names; stood in for by a library of
+            this test where torch_npu is absent.
+        Expectation: The policy saves its output, as it saves sdpa's, rather
+            than recompute the attention kernel (F52).
+        """
+        existing = getattr(getattr(torch.ops, "npu", None), "npu_fusion_attention", None)
+        if existing is None:
+            library = torch.library.Library("npu", "FRAGMENT")  # pylint: disable=not-callable
+            self.addCleanup(library._destroy)  # pylint: disable=protected-access
+            library.define("npu_fusion_attention(Tensor query) -> Tensor")
+            library.impl("npu_fusion_attention", lambda query: query.clone(), "CompositeExplicitAutograd")
+            existing = torch.ops.npu.npu_fusion_attention
+        operator = existing.default
+        # pylint: disable=protected-access
+        with patch.object(activation_checkpoint, "_SELECTIVE_AC_MUST_SAVE_OPS",
+                          activation_checkpoint._build_selective_ac_must_save_ops()):
+            self.assertIn(operator, activation_checkpoint._SELECTIVE_AC_MUST_SAVE_OPS)
+            policy = activation_checkpoint._make_selective_checkpoint_policy_fn()
+            self.assertEqual(policy(MagicMock(is_recompute=False), operator), CheckpointPolicy.MUST_SAVE)
 
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):

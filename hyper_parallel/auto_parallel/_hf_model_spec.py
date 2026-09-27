@@ -29,7 +29,11 @@ import dataclasses
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from hyper_parallel.auto_parallel._layer_census import census_activations, census_output_activations
+from hyper_parallel.auto_parallel._layer_census import (
+    CensusUnavailable,
+    census_activations,
+    census_output_activations,
+)
 from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
 from hyper_parallel.auto_parallel._model_spec import ModelSpec
 from hyper_parallel.auto_parallel._op_profiles import (
@@ -344,11 +348,18 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
     if key not in _CENSUSES:
         logger.info("census of each layer kind and of the output layer at %d tokens%s", seq_length,
                     f", {len(replacements)} module replacements installed" if replacements else "")
-        kinds = census_activations(text_config, layers, seq_length, replacements)
-        _CENSUSES[key] = {
-            "activations": {kind: record.to_dict() for kind, record in kinds.items()},
-            "output_activations": census_output_activations(text_config, seq_length, replacements).to_dict(),
-        }
+        try:
+            kinds = census_activations(text_config, layers, seq_length, replacements)
+            _CENSUSES[key] = {
+                "activations": {kind: record.to_dict() for kind, record in kinds.items()},
+                "output_activations": census_output_activations(text_config, seq_length, replacements).to_dict(),
+            }
+        except CensusUnavailable as exc:
+            # The formulas price the layers, as they do without a census: a
+            # census of Transformers' own modules would price a layer the run
+            # does not build (F53).
+            logger.warning("no census of the layers: %s", exc)
+            _CENSUSES[key] = {}
     return copy.deepcopy(_CENSUSES[key])
 
 
