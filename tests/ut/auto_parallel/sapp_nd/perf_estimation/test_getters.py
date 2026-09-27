@@ -46,6 +46,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_model_order,
     get_recomp_factor,
     get_table_quantity,
+    mla_weights,
     selective_shares,
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
@@ -399,6 +400,48 @@ class TestSelectiveRecompute(unittest.TestCase):
         self.assertEqual(selective_shares(lccfg, LayerType.FULL_REC_LAYER), {})
         lccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP, ffAct=1))
         self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER), {})
+
+    def test_an_mla_layer_recomputing_its_up_projections_runs_their_share_again(self):
+        """
+        A selective MLA layer whose attUp switch is 0, its config's or its
+        own, prices its up-projections' share of its projections' FLOPs
+        again: the queries' from their latent and the keys' and values' from
+        theirs.  Kept, in a full layer, or in a layer that compresses
+        nothing, it prices none.
+        """
+        lccfg = SimpleNamespace(dh=128, dhr=64, qk_nope_head_dim=128, a=128, n_kv=128, h=7168, dc_q=1536,
+                                dc_kv=512, n_attMM=1, rec_op=Config({"attUp": 0}), kind_activations=None)
+        heads = 128 * (128 + 64)
+        up = 1536 * heads + 512 * 128 * (128 + 128)
+        weights = 1536 * (7168 + heads) + 7168 * (512 + 64) + 512 * 128 * (128 + 128) + 128 * 128 * 7168
+        self.assertEqual(mla_weights(lccfg), (weights, up))
+        shares = selective_shares(lccfg, LayerType.SEL_REC_LAYER)
+        self.assertEqual(shares, {"attMM": up / weights})
+        table = {"n_attMM": 1000.0}
+        once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False, shares=shares)
+        again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True, shares=shares)
+        self.assertAlmostEqual(again - once, 1000.0 * up / weights, places=9)
+        self.assertEqual(selective_shares(lccfg, LayerType.FULL_REC_LAYER), {})
+        lccfg.rec_op = Config({"attUp": 1})
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER), {})
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER, {"attUp": 0}), {"attMM": up / weights})
+        lccfg.dc_q = 0
+        self.assertEqual(mla_weights(lccfg)[1], 512 * 128 * (128 + 128))
+        lccfg.dc_kv = 0
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER, {"attUp": 0}), {})
+
+    def test_a_switch_a_setting_leaves_out_keeps_its_op(self):
+        """
+        A setting stated before attUp existed, in a config's rec_op, whose
+        Config answers 0 for a switch it lacks, or in a mapping: memory
+        keeps the op and time runs it once, as for a switch at 1.
+        """
+        for rec_op in (Config(_SWITCHES), dict(_SWITCHES)):
+            ccfg = SimpleNamespace(rec_op=rec_op)
+            self.assertEqual(EvalUtils.switch(ccfg, SimpleNamespace(switches=None), "attUp"), 1, rec_op)
+            self.assertEqual(EvalUtils.switch(ccfg, SimpleNamespace(switches=None), "softmax"), 0, rec_op)
+        self.assertEqual(EvalUtils.switch(SimpleNamespace(rec_op=None), SimpleNamespace(switches={}), "attUp"), 1)
+        self.assertEqual(_factor(Config(_SWITCHES), "attUp"), 0)
 
 
 if __name__ == "__main__":

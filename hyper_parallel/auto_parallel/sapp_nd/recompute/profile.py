@@ -20,7 +20,8 @@ the recompute estimate, and only ``gather`` acts on the communication
 buffers, both on the memory kept and on the volume sent again. So a layer that
 recomputes a set of ops costs the plain layer plus what each of those ops
 costs alone, and a :class:`SwitchProfile`, nine measurements, prices all 128
-settings of the seven switches.
+settings of the seven switches; an MLA layer's, a tenth, all 256 with the
+switch of its up-projections.
 
 A census of a layer kind (IR phase 5) prices its plain layer, and a layer
 running HyperParallel's selective policy, by what it measured, and every
@@ -36,7 +37,11 @@ from dataclasses import dataclass, field, replace
 from typing import FrozenSet, Iterable, Mapping, Optional, Tuple
 
 # The recompute switches; 1 keeps an op's activation, 0 recomputes the op.
-SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
+SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct", "attUp")
+# The switches a layer kind may keep nothing under, an MLA layer's
+# up-projections: a front weighs them only where they change what the kind
+# costs, so that every other kind's settings stay the seven switches'.
+OPTIONAL = ("attUp",)
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,12 @@ class SwitchProfile:
     selective_base: Optional[Cost] = None
     whole: Mapping[FrozenSet[str], Cost] = field(default_factory=dict)
     census_held: Optional[float] = None
+
+    def acting(self) -> Tuple[str, ...]:
+        """The switches a setting is made of: every one but an optional one that changes nothing."""
+        base = self.plain if self.selective_base is None else self.selective_base
+        return tuple(name for name in SWITCHES
+                     if name not in OPTIONAL or (name in self.alone and self.alone[name] != base))
 
     def selective(self, recompute: Iterable[str]) -> Cost:
         """The cost of recomputing the ops *recompute* names.

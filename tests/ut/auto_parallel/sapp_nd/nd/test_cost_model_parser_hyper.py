@@ -551,11 +551,13 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Feature: HYPER_SELECTIVE_REC_OP.
         Description: The switches of HyperParallel's selective checkpointing.
         Expectation: Attention kernels are kept; the elementwise ops and the
-            all-gather around them are recomputed; all seven switches are set.
+            all-gather around them are recomputed; an MLA layer's
+            up-projections, matmuls, are kept; every switch is set.
         """
         self.assertEqual(
             HYPER_SELECTIVE_REC_OP,
-            {"attBMM": 1, "headCast": 0, "dropout": 0, "softmax": 0, "normOp": 0, "gather": 0, "ffAct": 0},
+            {"attBMM": 1, "headCast": 0, "dropout": 0, "softmax": 0, "normOp": 0, "gather": 0, "ffAct": 0,
+             "attUp": 1},
         )
 
     # ---- L0: Feature flags -----------------------------------------------

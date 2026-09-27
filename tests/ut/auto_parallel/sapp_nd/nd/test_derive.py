@@ -28,6 +28,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (
     derive_flash_attention_factor,
     derive_layer_fields,
     derive_recompute_switches,
+    runs_hyper_selective,
 )
 
 
@@ -88,17 +89,34 @@ class TestDerive(unittest.TestCase):
             sequence parallelism, then its communication recompute alone.
         Expectation: The head cast, norm and activation are recomputed and the
             attention kernels kept; the all-gather is recomputed only by
-            select_comm_recompute.
+            select_comm_recompute; an MLA layer's up-projections, which
+            MindFormers' rule leaves out, are kept.
         """
         ccfg = _config(sel_rec_rule="mindformers", sel_rec=True, sp=2)
         derive_recompute_switches(ccfg)
-        expected = {"attBMM": 1, "headCast": 0, "dropout": 1, "softmax": 1, "normOp": 0, "gather": 1, "ffAct": 0}
+        expected = {"attBMM": 1, "headCast": 0, "dropout": 1, "softmax": 1, "normOp": 0, "gather": 1, "ffAct": 0,
+                    "attUp": 1}
         self.assertEqual(vars(ccfg.rec_op), expected, f"rec_op={vars(ccfg.rec_op)}")
 
         ccfg = _config(sel_rec_rule="mindformers", sel_comm_rec=[1, 0], sp=2)
         derive_recompute_switches(ccfg)
         expected = {**dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1), "gather": 0}
         self.assertEqual(vars(ccfg.rec_op), expected, f"rec_op={vars(ccfg.rec_op)}")
+
+    def test_a_policy_that_recomputes_the_up_projections_is_not_hyperparallels(self):
+        """
+        Feature: runs_hyper_selective.
+        Description: HyperParallel's switches as the policy states them, as
+            a setting stated before attUp existed states them, and with
+            attUp at 0.
+        Expectation: The first two are its policy, a switch left out keeping
+            its op; the third is not, so a census does not price it as the
+            policy.
+        """
+        seven = {name: state for name, state in HYPER_SELECTIVE_REC_OP.items() if name != "attUp"}
+        self.assertTrue(runs_hyper_selective(None, dict(HYPER_SELECTIVE_REC_OP)))
+        self.assertTrue(runs_hyper_selective(None, seven))
+        self.assertFalse(runs_hyper_selective(None, dict(seven, attUp=0)))
 
     def test_unknown_recompute_rule_is_refused(self):
         """

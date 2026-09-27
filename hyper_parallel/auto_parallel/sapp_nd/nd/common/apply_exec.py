@@ -148,7 +148,9 @@ def recompute_of(ccfg: Any) -> Optional[Tuple[RecomputeRange, ...]]:
         _OPTIONS.get(stages[stage_id][chunk_id][lay_id], "none")
         for stage_id, chunk_id, lay_id in get_model_order(ccfg, stages)
     ]
-    ops = {op: "keep" if getattr(ccfg.rec_op, op, 1) else "recompute" for op in RECOMPUTE_OPS}
+    # From vars: a Config answers 0, recompute, for a switch it lacks.
+    stated = vars(ccfg.rec_op) if ccfg.rec_op is not None else {}
+    ops = {op: "keep" if stated.get(op, 1) else "recompute" for op in RECOMPUTE_OPS}
     return _ranges(options, ops)
 
 

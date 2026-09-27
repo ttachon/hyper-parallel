@@ -7,6 +7,10 @@
 # whose outputs recomputing it takes; comm marks an op that is
 # communication rather than compute.
 #
+# parts: what of an op's saves a switch of its own drops, apart from the op,
+# which keeps the rest: part_of names the op.  What a part keeps counts
+# toward its op wherever an op is priced alone.
+#
 # slots: the memory model's activation formulas.  A slot's formula prices
 # what a layer keeps in it, one rank's share of a micro-batch, in bytes,
 # over total: the elements its ops keep, each op's as its expression
@@ -48,9 +52,21 @@ ops:
     needs: [ffMM]
   linrec:
     needs: [attMM]
+parts:
+  # The query heads and the key and value heads an MLA layer's
+  # up-projections build from the latents it keeps: recomputing the
+  # up-projections builds them again.  The queries' only where they have a
+  # latent of their own; without one, a projection builds them from the
+  # layer's input.
+  attUp:
+    part_of: attMM
+    switch: attUp
+    needs: [attMM]
 slots:
   # The projections' inputs, and the keys and values an attention keeps: an
-  # MLA layer's latents and heads where it compresses them.
+  # MLA layer's latents, and its heads, which its up-projections build.
+  # Every term counts elements, so the two entries sum to what one
+  # expression summed, to the bit.
   qkv:
     part: attention
     formula: micro_factor * (s * b * bytes_compute * total) / (t * cp)
@@ -59,9 +75,13 @@ slots:
         0.25 * (n_attMM + n_attParamCast) * h
         + 0.5 * (n_attMM + n_attParamCast) * dh * n_kv * cp / kv_shards
         if dc_kv == 0 else
-        0.25 * (n_attMM + n_attParamCast) * (dc_q + 2 * a * (dh + dhr))
-        + (0.25 * (n_attMM + n_attParamCast) * (dhr + n_kv * (2 * dh + dhr))
+        0.25 * (n_attMM + n_attParamCast) * (dc_q + (0 if dc_q else 2 * a * (dh + dhr)))
+        + (0.25 * (n_attMM + n_attParamCast) * dhr
            + 0.25 * (n_attMM + n_attParamCast) * (n_kv * dh + dc_kv)) * cp / kv_shards
+      attUp: >-
+        0 if dc_kv == 0 else
+        0.25 * (n_attMM + n_attParamCast) * (2 * a * (dh + dhr) if dc_q else 0)
+        + 0.25 * (n_attMM + n_attParamCast) * n_kv * (2 * dh + dhr) * cp / kv_shards
       attBMM: n_attBMM * dh
   # The scores' softmax, its dropout mask and the scores' cast, per head.
   score:

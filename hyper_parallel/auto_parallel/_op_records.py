@@ -16,9 +16,10 @@
 
 ``op_records.yaml`` states, for every op of the op vector, the recompute
 switch that drops it, if any, the ops whose outputs recomputing it takes,
-and whether it is communication; and, for each of the memory model's
-activation formulas, a *slot*, the formula and the elements each of its ops
-keeps.  The memory model prices a layer's activations from the slots, so
+and whether it is communication; the *parts* of an op's saves that a switch
+of their own drops, each named for the op it is part of; and, for each of the
+memory model's activation formulas, a *slot*, the formula and the elements
+each of its ops and parts keeps.  The memory model prices a layer's activations from the slots, so
 the records are the one source of what a layer keeps, op by op: a caller
 prices any setting of the switches from them without setting the switches
 on a config.
@@ -32,7 +33,7 @@ names the caller binds.
 import ast
 import functools
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Tuple
 
@@ -46,7 +47,9 @@ RECORDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "op_reco
 PARTS = ("attention", "ffn", "norm")
 
 # The recompute switches: a selective layer drops what the ops they name keep.
-SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
+# attUp drops the query, key and value heads an MLA layer's up-projections
+# build from the latents it keeps, a part of attMM's saves.
+SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct", "attUp")
 
 _NODES = (
     ast.Expression, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp, ast.Call, ast.Name,
@@ -124,17 +127,20 @@ class OpRecord:
     """What the records state of one op, beside what it keeps in each slot.
 
     Attributes:
-        name: The op, one of the op vector's.
+        name: The op, one of the op vector's, or a part of one's saves.
         switch: The recompute switch that drops what it keeps, or ``None``
             for an op every selective layer keeps.
         needs: The ops whose outputs recomputing it takes.
         comm: Whether it is communication rather than compute.
+        part_of: For a part, the op of the op vector whose saves it is part
+            of; ``None`` for an op.
     """
 
     name: str
     switch: Optional[str]
     needs: Tuple[str, ...]
     comm: bool
+    part_of: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -170,17 +176,36 @@ class OpRecords:
         ops: The record of each op of the op vector, by name.
         slots: The slots, by name.
         defaults: The value of a field a layer config may not hold.
+        parts: The record of each part of an op's saves, by name.
     """
 
     ops: Mapping[str, OpRecord]
     slots: Mapping[str, Slot]
     defaults: Mapping[str, float]
+    parts: Mapping[str, OpRecord] = field(default_factory=lambda: MappingProxyType({}))
+
+    def record(self, name: str) -> OpRecord:
+        """The record of an op or of a part."""
+        return self.ops[name] if name in self.ops else self.parts[name]
+
+    def _counts_toward(self, name: str, op: str) -> bool:
+        """Whether what *name* keeps counts toward *op*: it is the op, or a part of its saves."""
+        return name == op or (name in self.parts and self.parts[name].part_of == op)
 
     def keeps(self, op: str) -> Dict[str, Expression]:
-        """The elements *op* keeps in each slot it keeps anything in, by slot, whichever layers they hold in."""
-        if op not in self.ops:
-            raise ModelSpecError(f"no op {op!r}; the ops are {sorted(self.ops)}")
-        return {slot.name: elements for slot in self.slots.values() for name, elements in slot.ops if name == op}
+        """The slots *op* keeps anything in, its parts' among them, each with the elements it keeps there.
+
+        For an op of the op vector, the elements of the first of its
+        entries in each slot, itself or a part; for a part, its own.
+        """
+        if op not in self.ops and op not in self.parts:
+            raise ModelSpecError(f"no op {op!r}; the ops are {sorted(self.ops)}, the parts {sorted(self.parts)}")
+        found: Dict[str, Expression] = {}
+        for slot in self.slots.values():
+            for name, elements in slot.ops:
+                if self._counts_toward(name, op):
+                    found.setdefault(slot.name, elements)
+        return found
 
     def evaluate(self, slot: str, value: Callable[[str], Any], keep: Callable[[str], Any],
                  only: Optional[str] = None) -> float:
@@ -189,10 +214,11 @@ class OpRecords:
         Args:
             slot: The slot.
             value: The value of each name the slot reads.
-            keep: For each op, 1 where the layer keeps what it keeps, 0
-                where it drops it.
+            keep: For each op and part, 1 where the layer keeps what it
+                keeps, 0 where it drops it.
             only: An op to price alone: the slot's formula over its
-                elements, whatever *keep* says.
+                elements and its parts', whatever *keep* says; or a part,
+                over its own.
 
         Returns:
             The bytes, one rank's share of a micro-batch.
@@ -201,7 +227,7 @@ class OpRecords:
         names = _Names(value)
         total = 0
         for op, elements in record.ops:
-            kept = int(op == only) if only is not None else keep(op)
+            kept = int(self._counts_toward(op, only)) if only is not None else keep(op)
             if kept:
                 total += kept * elements(names)
         names["total"] = total
@@ -213,14 +239,15 @@ def _op_names() -> Tuple[str, ...]:
     return tuple(field.name for field in fields(OpCounts))
 
 
-def _op_record(name: str, data: Any) -> OpRecord:
-    """Build one op's record from its ``{switch, needs, comm}`` mapping."""
-    where = f"op_records.ops.{name}"
+def _op_record(name: str, data: Any, where: str = "", part: bool = False) -> OpRecord:
+    """Build one op's record from its ``{switch, needs, comm}`` mapping, a part's with its ``part_of``."""
+    where = where or f"op_records.ops.{name}"
+    keys = {"switch", "needs", "comm"} | ({"part_of"} if part else set())
     if not isinstance(data, Mapping):
-        raise ModelSpecError(f"{where} must map switch, needs and comm, got {data!r}")
-    unknown = sorted(set(data) - {"switch", "needs", "comm"})
+        raise ModelSpecError(f"{where} must map {', '.join(sorted(keys))}, got {data!r}")
+    unknown = sorted(set(data) - keys)
     if unknown:
-        raise ModelSpecError(f"{where} has unknown keys {unknown}; a record has switch, needs and comm")
+        raise ModelSpecError(f"{where} has unknown keys {unknown}; a record has {', '.join(sorted(keys))}")
     switch = data.get("switch")
     if switch is not None and switch not in SWITCHES:
         raise ModelSpecError(f"{where}.switch must be one of {list(SWITCHES)}, got {switch!r}")
@@ -231,10 +258,25 @@ def _op_record(name: str, data: Any) -> OpRecord:
     comm = data.get("comm", False)
     if not isinstance(comm, bool):
         raise ModelSpecError(f"{where}.comm must be true or false, got {comm!r}")
-    return OpRecord(str(name), switch, tuple(needs), comm)
+    part_of = data.get("part_of") if part else None
+    if part and (part_of not in ops or switch is None):
+        raise ModelSpecError(f"{where} must name the op of {ops} it is part of, and the switch that drops it")
+    return OpRecord(str(name), switch, tuple(needs), comm, part_of)
 
 
-def _slot(name: str, data: Any, ops: Mapping[str, OpRecord]) -> Slot:
+def _parts(data: Any) -> Mapping[str, OpRecord]:
+    """The records of the parts of ops' saves that a switch of their own drops."""
+    parts = data or {}
+    if not isinstance(parts, Mapping):
+        raise ModelSpecError(f"op records' parts must map names to records, got {parts!r}")
+    clash = sorted(set(parts) & set(_op_names()))
+    if clash:
+        raise ModelSpecError(f"op records' parts {clash} are named as ops")
+    return MappingProxyType({str(name): _op_record(name, record, f"op_records.parts.{name}", part=True)
+                             for name, record in parts.items()})
+
+
+def _slot(name: str, data: Any, ops: Mapping[str, OpRecord]) -> Slot:  # ops: the ops and the parts
     """Build one slot from its ``{part, formula, ops}`` mapping."""
     where = f"op_records.slots.{name}"
     if not isinstance(data, Mapping):
@@ -282,7 +324,7 @@ def load_op_records(path: str = RECORDS_PATH) -> OpRecords:
     """
     with open(path, encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
-    unknown = sorted(set(data) - {"defaults", "ops", "slots"})
+    unknown = sorted(set(data) - {"defaults", "ops", "parts", "slots"})
     if unknown:
         raise ModelSpecError(f"op records have unknown keys {unknown}")
     stated = data.get("ops") or {}
@@ -292,5 +334,6 @@ def load_op_records(path: str = RECORDS_PATH) -> OpRecords:
     if missing or extra:
         raise ModelSpecError(f"op records must state every op of {list(names)}: missing {missing}, unknown {extra}")
     ops = {name: _op_record(name, stated[name]) for name in names}
-    slots = {str(name): _slot(name, slot, ops) for name, slot in (data.get("slots") or {}).items()}
-    return OpRecords(MappingProxyType(ops), MappingProxyType(slots), _defaults(data.get("defaults")))
+    parts = _parts(data.get("parts"))
+    slots = {str(name): _slot(name, slot, {**ops, **parts}) for name, slot in (data.get("slots") or {}).items()}
+    return OpRecords(MappingProxyType(ops), MappingProxyType(slots), _defaults(data.get("defaults")), parts)

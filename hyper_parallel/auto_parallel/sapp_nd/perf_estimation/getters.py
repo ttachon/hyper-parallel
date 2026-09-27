@@ -78,19 +78,51 @@ _SWITCH_OF = {"qknorm": "normOp"}
 _CENSUS_SHARES = {"attMM": "selective_attention_mm", "ffMM": "selective_ffn_mm"}
 
 
-def selective_shares(lccfg, layer, switches=None):
-    """The share of each matmul op's FLOPs a selective layer runs again, as its kind's census measured it.
+def mla_weights(cfg: Any) -> Tuple[Any, Any]:
+    """An MLA layer's projection weights, all of them and its up-projections', as the time model prices them.
 
-    Only for a layer of HyperParallel's selective policy, whose switches it
-    has (:func:`runs_hyper_selective`), *switches* where the layer has its
-    own: the policy recomputes every other matmul, which no switch covers.
-    Empty otherwise, and the switches price every op.
+    The queries' latent and its up-projection, or one projection to every
+    head; the keys' and values' shared down-projection beside the rotary
+    key; their up-projections, a head's key at its own width and its value
+    at the value heads'; the output projection.  The up-projections build
+    the queries' heads from their latent, where they have one, and the
+    keys' and values' from theirs.
+
+    Returns:
+        ``(weights, up)``.
     """
-    census = getattr(lccfg, "kind_activations", None)
-    if layer != LayerType.SEL_REC_LAYER or census is None or not runs_hyper_selective(lccfg, switches):
+    d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
+    heads = cfg.a * (d_nope + cfg.dhr)
+    query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
+    weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+               + cfg.a * cfg.dh * cfg.h)
+    up = (cfg.dc_q * heads if cfg.dc_q else 0) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+    return weights, up
+
+
+def selective_shares(lccfg, layer, switches=None):
+    """The share of each matmul op's FLOPs a selective layer runs again, where no switch prices it.
+
+    A layer of HyperParallel's selective policy, whose switches it has
+    (:func:`runs_hyper_selective`), *switches* where the layer has its own,
+    runs again the shares its kind's census measured: the policy recomputes
+    every other matmul, which no switch covers.  An MLA layer whose
+    ``attUp`` switch is 0 runs its up-projections again, their share of its
+    projections' FLOPs.  Empty otherwise, and the switches price every op.
+    """
+    if layer != LayerType.SEL_REC_LAYER:
         return {}
-    return {op: getattr(census, name) for op, name in _CENSUS_SHARES.items()
-            if getattr(census, name, None) is not None}
+    census = getattr(lccfg, "kind_activations", None)
+    if census is not None and runs_hyper_selective(lccfg, switches):
+        return {op: getattr(census, name) for op, name in _CENSUS_SHARES.items()
+                if getattr(census, name, None) is not None}
+    if not getattr(lccfg, "dc_kv", 0):
+        return {}
+    stated = switches if switches is not None else vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
+    if stated.get("attUp", 1):
+        return {}
+    weights, up = mla_weights(lccfg)
+    return {"attMM": up / weights}
 
 
 def get_recomp_factor(lccfg, layer, op_name, switches=None):

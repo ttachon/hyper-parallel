@@ -24,6 +24,7 @@ import logging
 import math
 from typing import Any, Callable, Dict, Mapping, Union
 
+from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS
 from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, family_profile
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import stated_recompute
@@ -35,7 +36,8 @@ logger = logging.getLogger(__name__)
 # matmul and attention kernels and of reduce-scatter, all-to-all and all-reduce,
 # and recomputes everything else, all-gathers included. A switch at 1 keeps the
 # op's activation and 0 recomputes it. The policy also recomputes every other
-# projection matmul, which has no switch, so that part is not priced.
+# projection matmul, which has no switch, so that part is not priced; an MLA
+# layer's up-projections, matmuls too, are kept.
 HYPER_SELECTIVE_REC_OP = {
     "attBMM": 1,
     "headCast": 0,
@@ -44,14 +46,18 @@ HYPER_SELECTIVE_REC_OP = {
     "normOp": 0,
     "gather": 0,
     "ffAct": 0,
+    "attUp": 1,
 }
 
 
 def runs_hyper_selective(ccfg: Any, switches: Any = None) -> bool:
-    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches, or *switches*, are its switches."""
+    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches, or *switches*, are its switches.
+
+    A switch they leave out keeps its op.
+    """
     stated = getattr(ccfg, "rec_op", None) if switches is None else switches
     values = stated if isinstance(stated, Mapping) else vars(stated) if stated is not None else {}
-    return all(values.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
+    return all(values.get(name, 1) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
 def derive_sequence_parallel(ccfg: Any) -> None:
@@ -308,6 +314,8 @@ def derive_recompute_switches(ccfg: Any) -> None:
         switches = mindformers_rec_op(ccfg, run_selective)
     else:
         raise ValueError(f"Unknown selective recompute rule {ccfg.sel_rec_rule!r}")
+    # Every switch, as a range's own state them: one the rule leaves out keeps its op.
+    switches = {op: switches.get(op, 1) for op in RECOMPUTE_OPS}
     settings = {tuple(sorted((item.switches() or switches).items())) for item in selective}
     ccfg.layer_switches = None
     if len(settings) > 1:

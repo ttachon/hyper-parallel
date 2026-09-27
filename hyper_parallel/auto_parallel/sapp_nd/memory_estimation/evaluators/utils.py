@@ -101,8 +101,17 @@ class EvalUtils:
     @staticmethod
     def switch(ccfg: CostModelConfig, ctx: Context, name: str) -> Any:
         """One recompute switch of the layer *ctx* evaluates, 1 to keep the op's activation and 0 to recompute it."""
-        stated = EvalUtils.switches(ccfg, ctx)
-        return stated[name] if isinstance(stated, Mapping) else getattr(stated, name)
+        return EvalUtils.state(EvalUtils.switches(ccfg, ctx), name)
+
+    @staticmethod
+    def state(stated: Any, name: str) -> Any:
+        """Switch *name* in *stated*, a mapping or a config's ``rec_op``: a switch it leaves out keeps its op.
+
+        Read from ``vars``, since a ``Config`` answers 0, recompute, for any
+        attribute it lacks.
+        """
+        values = stated if isinstance(stated, Mapping) else vars(stated) if stated is not None else {}
+        return values.get(name, 1)
 
     @classmethod
     def eval_expr_insight(cls, **kwargs):

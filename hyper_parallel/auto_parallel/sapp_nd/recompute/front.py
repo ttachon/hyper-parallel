@@ -14,9 +14,10 @@
 # ============================================================================
 """The recompute front of a layer kind: the options no other option beats.
 
-An option runs a layer one way: plain, recomputing some of the seven ops the
+An option runs a layer one way: plain, recomputing some of the ops the
 recompute switches name, or fully recomputed. Of the 128 settings of the
-switches and full recompute, the front keeps those that no other option beats
+seven switches, 256 on an MLA layer, which may recompute its up-projections,
+and full recompute, the front keeps those that no other option beats
 on memory per micro-batch, memory held once, memory at each count of
 micro-batches in flight a stage keeps, the working set of its backward, and
 backward time together. The plain layer and full recompute are always on it.
@@ -105,9 +106,14 @@ class KindFront:
 
 
 def _candidates(profile: SwitchProfile) -> Iterator[Tuple[Optional[FrozenSet[str]], Cost]]:
-    """Every option and its cost, those that recompute fewer ops first and full recompute last."""
-    for size in range(len(SWITCHES) + 1):
-        for names in itertools.combinations(SWITCHES, size):
+    """Every option and its cost, those that recompute fewer ops first and full recompute last.
+
+    The settings are of the switches that act on the kind
+    (:meth:`SwitchProfile.acting`).
+    """
+    switches = profile.acting()
+    for size in range(len(switches) + 1):
+        for names in itertools.combinations(switches, size):
             yield frozenset(names), profile.selective(names)
     yield None, profile.full
 

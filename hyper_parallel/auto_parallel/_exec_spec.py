@@ -43,8 +43,10 @@ SELECTIVE_RULES = ("hyperparallel", "mindformers")
 RECOMPUTE_OPTIONS = ("none", "full", "selective")
 # The ops a selective range decides for, the cost model's recompute switches,
 # and the state it gives each: the op's output is kept for backward, or
-# recomputed.  Offload will add a third state.
-RECOMPUTE_OPS = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
+# recomputed.  Offload will add a third state.  attUp is an MLA layer's
+# up-projections, which build its query, key and value heads from their
+# latents.
+RECOMPUTE_OPS = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct", "attUp")
 OP_STATES = ("keep", "recompute")
 
 

@@ -262,18 +262,18 @@ class EvalRecords:
                 activations and 0 to drop them; where omitted, those the
                 context carries, else the config's own.
             overrides: Values that stand for the config's fields.
-            only: An op to price alone, whatever the switches say.
+            only: An op to price alone, its parts with it, or a part, whatever
+                the switches say.
         """
         records = load_op_records()
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         stated = EvalUtils.switches(ccfg, ctx) if switches is None else switches
 
         def keep(op: str) -> Any:
-            switch = records.ops[op].switch
+            switch = records.record(op).switch
             if switch is None:
                 return 1
-            state = stated[switch] if isinstance(stated, Mapping) else getattr(stated, switch)
-            return EvalUtils.rec_coeff(rec_layer, state)
+            return EvalUtils.rec_coeff(rec_layer, EvalUtils.state(stated, switch))
 
         return records.evaluate(slot, EvalRecords.values(ccfg, ctx, overrides), keep, only)
 

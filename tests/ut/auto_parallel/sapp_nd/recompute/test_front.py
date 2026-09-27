@@ -37,7 +37,13 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils imp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_layer_times
-from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption, build_front, layer_fronts
+from hyper_parallel.auto_parallel.sapp_nd.recompute.front import (
+    LayerOption,
+    build_front,
+    layer_fronts,
+    layer_profiles,
+    price_option,
+)
 from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES, Cost, SwitchProfile
 
 DEEPSEEK_YAML = os.path.join(
@@ -61,9 +67,10 @@ _PROFILE = SwitchProfile(forward_time=25.0, plain=_PLAIN, alone=_ALONE, full=Cos
 
 
 def _every_option(profile: SwitchProfile) -> Iterator[Tuple[Optional[frozenset], Cost]]:
-    """Every setting of the switches with its cost, then full recompute."""
-    for size in range(len(SWITCHES) + 1):
-        for names in itertools.combinations(SWITCHES, size):
+    """Every setting of the switches that act on the kind with its cost, then full recompute."""
+    switches = profile.acting()
+    for size in range(len(switches) + 1):
+        for names in itertools.combinations(switches, size):
             yield frozenset(names), profile.selective(names)
     yield None, profile.full
 
@@ -323,6 +330,35 @@ class TestLayerFronts(_FrontChecks):
             self.assertLessEqual(abs(moe["memory_select_rec"] - EvalUtils.mb(option.memory_per_micro_batch)), 1,
                                  option.recompute)
 
+    def test_an_mla_kind_offers_its_up_projections(self):
+        """
+        Feature: layer_fronts on an MLA model.
+        Description: DeepSeek's kinds build their query, key and value heads
+            from latents; price recomputing the up-projections alone, and
+            evaluate it in full, its backward time alone and its memory in
+            the pipeline balancer's description of a config that sets it.
+        Expectation: Each kind weighs attUp: recomputing it keeps less per
+            micro-batch than the plain layer and takes longer in backward,
+            by what a full evaluation of the setting charges; and each front
+            has an option recomputing it.
+        """
+        profiles = layer_profiles(self.evaluator, Hard.Device_A2)
+        for index, ((_, kind), profile) in enumerate(profiles.items()):
+            self.assertIn("attUp", profile.acting(), kind)
+            option = price_option(profile, frozenset({"attUp"}))
+            self.assertLess(option.memory_per_micro_batch, profile.plain.memory_per_micro_batch, kind)
+            self.assertGreater(option.backward_time, profile.plain.backward_time, kind)
+            backward = estimate_layer_times(copy.deepcopy(self.evaluator.ccfg), kind, LayerType.SEL_REC_LAYER,
+                                            Hard.Device_A2, switches=option.switches)[1]
+            self.assertAlmostEqual(backward / option.backward_time, 1.0, places=12, msg=kind)
+            evaluator = EvaluatorV2(DEEPSEEK_YAML, framework="mindformers", log_level=0)
+            evaluator.ccfg.rec_op = Config(option.switches)
+            description = evaluator.estimate_layer_memory()["layers_description"]
+            body = [desc for desc in description if desc["type"] == "BODY"][index]
+            self.assertLessEqual(abs(body["memory_select_rec"] - EvalUtils.mb(option.memory_per_micro_batch)), 1,
+                                 kind)
+            self.assertTrue(any(item.recompute and "attUp" in item.recompute for item in self.fronts[index].options))
+
     def test_asking_twice_gives_the_same_fronts_and_leaves_the_config_alone(self):
         """
         Feature: layer_fronts.
@@ -381,6 +417,21 @@ class TestOtherModels(_FrontChecks):
         self.assertEqual([front.kind for front in fronts], [None])
         self.assert_front(fronts[0].options)
         self.assertTrue(any(option.recompute and "gather" in option.recompute for option in fronts[0].options))
+
+    def test_a_model_without_latents_weighs_the_seven_switches(self):
+        """
+        Feature: layer_profiles and build_front.
+        Description: A dense model, which compresses nothing into latents.
+        Expectation: attUp keeps nothing there: its profile weighs the other
+            seven switches alone, and no option recomputes it.
+        """
+        evaluator = EvaluatorV2(copy.deepcopy(_DENSE), framework="hyper_v2", log_level=0)
+        profiles = layer_profiles(evaluator, Hard.Device_A2)
+        for profile in profiles.values():
+            self.assertEqual(profile.acting(), tuple(name for name in SWITCHES if name != "attUp"))
+            self.assertEqual(profile.alone["attUp"], profile.plain)
+        fronts = layer_fronts(evaluator, Hard.Device_A2)
+        self.assertFalse(any(option.recompute and "attUp" in option.recompute for option in fronts[0].options))
 
     def test_a_hybrid_model_gets_a_front_per_attention_flavour(self):
         """

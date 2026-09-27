@@ -24,7 +24,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
-from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES, Cost, SwitchProfile
+from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import OPTIONAL, SWITCHES, Cost, SwitchProfile
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel._op_profiles import LayerKind
@@ -247,10 +247,7 @@ class _PPB:
         self.profiles[key] = SwitchProfile(
             forward_time=forward,
             plain=_cost(plain, backward),
-            alone={
-                name: _cost(memory, self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, dict(keep, **{name: 0}))[1])
-                for name, memory in alone.items()
-            },
+            alone=self._alone_costs(ccfg, kind, alone, _cost, _cost(base, backward)),
             full=_cost(full, self.layer_times(ccfg, kind, LayerType.FULL_REC_LAYER)[1]),
             counts=counts,
             # A selective layer that keeps every op recomputes nothing.
@@ -261,6 +258,20 @@ class _PPB:
                 for recompute, memory in whole.items()
             },
         )
+
+    def _alone_costs(
+        self, ccfg: CostModelConfig, kind: Optional[LayerKind], alone: Dict[str, Tuple[Any, ...]],
+        cost: Callable, base: Cost,
+    ) -> Dict[str, Cost]:
+        """Each switch's cost, its op alone recomputed; an optional one the layer keeps nothing under costs *base*."""
+        keep = dict.fromkeys(SWITCHES, 1)
+        costs = {
+            name: cost(memory, self.layer_times(ccfg, kind, LayerType.SEL_REC_LAYER, dict(keep, **{name: 0}))[1])
+            for name, memory in alone.items()
+        }
+        if self.profile_each_switch:
+            costs.update({name: base for name in OPTIONAL if name not in costs})
+        return costs
 
     @staticmethod
     def _census_held(measured: Tuple[Any, ...]) -> Optional[float]:
@@ -282,6 +293,8 @@ class _PPB:
         census = isinstance(getattr(ccfg, "kind_activations", None), KindActivations)
         alone = {}
         for name in SWITCHES:
+            if name in OPTIONAL and not self._drops_any(ccfg, name):
+                continue
             switches = dict(keep, **{name: 0})
             if name == "gather" or census:
                 alone[name] = self._selective(ccfg, ctx, switches, measure)
@@ -289,6 +302,16 @@ class _PPB:
                 measured = self._selective(ccfg, ctx, switches, lambda _: self._dynamic_mem(many))
                 alone[name] = measured[:3] + base[3:]
         return alone
+
+    @staticmethod
+    def _drops_any(ccfg: CostModelConfig, switch: str) -> bool:
+        """Whether the current layer keeps anything an optional *switch* drops.
+
+        attUp, the one optional switch, drops the heads an MLA layer's
+        up-projections build, as the records' part of it states: a layer
+        that compresses its keys and values has them.
+        """
+        return switch != "attUp" or bool(getattr(ccfg, "dc_kv", 0))
 
     def _workings(self, ctx: Context) -> Tuple[float, float]:
         """What the current layer's backward holds beyond what it keeps at one micro-batch, at both points.
