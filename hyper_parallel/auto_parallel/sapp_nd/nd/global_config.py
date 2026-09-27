@@ -27,10 +27,14 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.balancing_adapter as BA
 class GlobalConfig:
     """Union of cost model & parallel config"""
 
-    def __init__(self, config, dimensions=None, mppb=False):
+    def __init__(self, config, dimensions=None, mppb=False, parent=None):
 
         self.wrap = CWrap(config)
         self.ccfg = self.wrap.ccfg
+        # The other submodules of a multimodal model, which run on the same
+        # stages as the one the search drives: each takes the candidate's
+        # degrees, with its own layers placed and its own recompute adapted.
+        self.siblings = self._pipeline_siblings(config, parent, mppb)
 
         if dimensions is not None:
             logger.debug("dimensions = %s", str(dimensions))
@@ -226,6 +230,7 @@ class GlobalConfig:
             kwargs[dim.name.lower()] = value
 
         self.ccfg.set_strategy(**kwargs)
+        self.siblings_take(kwargs)
         if not self.ccfg.multimodal:
             if not self.ccfg.hooks_dict:
                 logger.info(
@@ -239,6 +244,47 @@ class GlobalConfig:
                 hook(self.wrap)
 
         return ok
+
+    @staticmethod
+    def _pipeline_siblings(config, parent, mppb):
+        """Every other config of *config*'s pipeline: a multimodal parent's other submodules, and the parent.
+
+        Each submodule comes with the balancing of its own layers, which
+        adapts its recompute to a candidate's pipeline; the parent has no
+        layers of its own and takes the degrees alone.
+        """
+        if parent is None or not parent.multimodal:
+            return []
+        siblings = []
+        for name in parent.mm_order:
+            sub = parent.mm_ccfgs[name]
+            if sub is not config:
+                siblings.append((sub, BA.BalancingAdapter(
+                    sub.n_lay + sub.n_mtp,
+                    copy.deepcopy(sub.offset),
+                    copy.deepcopy(sub.full_rec),
+                    mppb,
+                )))
+        return siblings + [(parent, None)]
+
+    def siblings_take(self, kwargs):
+        """Give every other config of a shared pipeline the degrees of *kwargs*.
+
+        A vision tower is trained on the same devices as the language model
+        the search drives, so it takes the candidate's degrees; its layers
+        stay on the first stages, where the parser places them, and its
+        recompute is adapted to the candidate's pipeline rather than the
+        language model's, which counts other layers.  The parent, which
+        holds the strategy its submodules share and combines their
+        partitions, takes the degrees and no layer of its own.
+        """
+        degrees = {key: value for key, value in kwargs.items() if key not in ("offset", "full_rec")}
+        for sibling, balancing in self.siblings:
+            pipeline = (degrees.get("pp", sibling.p), degrees.get("vpp", sibling.vp))
+            stated = {"offset": BA.front_loaded_offset(balancing.layers if balancing else 0, *pipeline)}
+            if balancing is not None:
+                stated["full_rec"] = balancing.treat_recompute(*pipeline)
+            sibling.set_shared_strategy(**degrees, **stated)
 
     def space(self, dim, divide, reverse=False):
         """Generate the space for a given dimension"""

@@ -280,6 +280,17 @@ class CostModelConfig(PartitionGenerator):
             f"{self.model_name}:  model_name is required (multimodal)"
         )
 
+    def set_shared_strategy(self, **kwargs: Any) -> None:
+        """Apply a strategy to this config itself, a multimodal parent included.
+
+        :meth:`set_strategy` targets a submodule of a multimodal config,
+        never the parent; but the parent holds the strategy its submodules
+        share, and the partitions it combines are of that pipeline, so a
+        caller that gives every config of one pipeline its own placement
+        writes each of them through this.
+        """
+        apply_exec(self, strategy_exec(self, kwargs))
+
     def set_strategy(self, **kwargs: Any) -> None:
         """Apply a keyword strategy: the ExecSpec it states, and what follows.
 

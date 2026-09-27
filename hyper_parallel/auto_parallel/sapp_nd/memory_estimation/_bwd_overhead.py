@@ -71,16 +71,39 @@ class _BackwardOverhead:
             self._ctx.working_set = 0
             self._ctx.working_on_saved = False
 
+    def _last_backward_lay_ids(self, stages: list, stage_id: int, record_lay_types: dict) -> list:
+        """The stage's regular layers from the one whose backward a micro-batch's ends on, in stage order.
+
+        A stage runs its layers' backward in reverse, so the last is its
+        first layer.  Where a vision tower shares the stage with the
+        language model the search drives, the tower's layers come first and
+        run last, and their working set is the smaller of the two; but the
+        moment the language model's own first layer runs its backward, every
+        activation of the tower is still held, and that is the moment the
+        stage has to fit (F2, F54).  A stage of one module, or one holding
+        no layer of the main module, keeps its own first layers.
+        """
+        regular = [lay_id for lay_id, node in enumerate(stages[stage_id][0])
+                   if self.backbone.is_regular_layer(node)]
+        main = getattr(self.backbone, "main_module", None)
+        if main is None:
+            return regular
+        of_main = [lay_id for lay_id in regular
+                   if record_lay_types[(stage_id, 0, lay_id)][0].model_name == main]
+        return of_main or regular
+
     def first_layer_working_set(self, stages: list, stage_id: int, record_lay_types: dict) -> Tuple[float, float]:
-        """The working set of the backward of the stage's first layer, the last it runs, unlogged.
+        """The working set of the backward a micro-batch's ends on, the stage's first layer's, unlogged.
 
         It holds its own gathered parameters, with no layer left to prefetch.
         FSDP that reduces a layer's gradients while the next layer's backward
         runs holds its whole gradients, and the second layer's, whose
-        reduction is still in flight.  Also returns the first layer's
-        reduce-scatter output, which does not exist yet.
+        reduction is still in flight.  Also returns that layer's
+        reduce-scatter output, which does not exist yet.  Where submodules
+        share the stage, it is the main module's first layer
+        (:meth:`_last_backward_lay_ids`).
         """
-        lay_ids = [lay_id for lay_id, node in enumerate(stages[stage_id][0]) if self.backbone.is_regular_layer(node)]
+        lay_ids = self._last_backward_lay_ids(stages, stage_id, record_lay_types)
         working, pending = 0, 0
         for rank, lay_id in enumerate(lay_ids[:2]):
             node = self._fetch_node_and_switch_env(stages, record_lay_types, stage_id, 0, lay_id)

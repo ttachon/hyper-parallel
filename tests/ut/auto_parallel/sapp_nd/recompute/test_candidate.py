@@ -1224,34 +1224,39 @@ class TestAutoRecomputeSearch(unittest.TestCase):
         self.assertIsNone(per_layer.mode)
         self.assertLessEqual(score, scored[0][2] * (1 + 1e-12))
 
-    def test_a_multimodal_search_chooses_for_the_model_it_prices(self):
+    def test_a_multimodal_search_prices_the_whole_model(self):
         """
         Feature: ParallelizeMultiModal auto_recompute.
-        Description: A vision-language model, whose search prices its text
-            model (IR finding F2).
-        Expectation: Every candidate gets options for the text model's
-            layers.
+        Description: A vision-language model, whose candidates are priced on
+            the tower and the text model together (IR F2), searched with and
+            without auto_recompute.
+        Expectation: No candidate gets a choice: the options would be built
+            for the text model's layers, and their budgets would leave the
+            tower out. Both searches score the same candidates alike, as
+            the whole model prices them.
         """
         set_verbose_level(1)
-        for dim in Dim.ALL_DIMS:
-            dim.reset_bound()
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "vl.yaml")
-            with open(path, "w", encoding="utf-8") as handle:
-                yaml.safe_dump(_VL_TRAINING, handle)
-            with patch.object(_hf_model_spec, "_get_hf_config", return_value=_VL), \
-                    patch.dict(os.environ, {"MPLCONFIGDIR": folder}):
-                runner = Par.Parallelize("hyper_v2", path, Hard.Machine(8, "A2"), global_batch_size=16,
-                                         dimensions=[Dim.DP], auto_recompute=True).instance
-                self.assertIsInstance(runner, Par.ParallelizeMultiModal)
-                results, _ = runner.device_loops(({}, 0), None)
-                space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
-                scored, _ = runner.order_search_space(space, None, None)
-        self.assertTrue(scored)
-        text_layers = len(layer_kinds(runner.config.ccfg))
-        for config, _, _, _ in scored:
-            ranges = runner.recompute_choices[config].ranges
-            self.assertEqual(sum(item.count for item in ranges), text_layers)
+        scored = {}
+        for auto in (True, False):
+            for dim in Dim.ALL_DIMS:
+                dim.reset_bound()
+            with tempfile.TemporaryDirectory() as folder:
+                path = os.path.join(folder, "vl.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(_VL_TRAINING, handle)
+                with patch.object(_hf_model_spec, "_get_hf_config", return_value=_VL), \
+                        patch.dict(os.environ, {"MPLCONFIGDIR": folder}):
+                    runner = Par.Parallelize("hyper_v2", path, Hard.Machine(8, "A2"), global_batch_size=16,
+                                             dimensions=[Dim.DP], auto_recompute=auto).instance
+                    self.assertIsInstance(runner, Par.ParallelizeMultiModal)
+                    results, _ = runner.device_loops(({}, 0), None)
+                    space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+                    ordered, _ = runner.order_search_space(space, None, None)
+                    scored[auto] = [(str(config), mem, score) for config, mem, score, _ in ordered]
+                    self.assertEqual(runner.recompute_choices, {})
+                    self.assertEqual(runner.recompute_per_layer(ordered[0][0]), (None, None))
+        self.assertTrue(scored[True])
+        self.assertEqual(scored[True], scored[False])
 
 
 if __name__ == "__main__":

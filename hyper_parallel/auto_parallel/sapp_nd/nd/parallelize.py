@@ -95,8 +95,10 @@ class ParallelizeLayer:
 
         self.mem_eval = evaluator
         # Choose every layer's recompute option for each candidate, rather
-        # than score it fully recomputed. The choice prices the model the
-        # search prices: a multimodal model by its main submodule.
+        # than score it fully recomputed. A multimodal model gets none: its
+        # candidates are priced on every submodule (F2), and the options are
+        # built for one submodule's layers, whose budgets would leave the
+        # others out.
         self.auto_recompute = bool(auto_recompute)
         # The options chosen for each configuration the ordering scored.
         self.recompute_choices = {}
@@ -124,6 +126,7 @@ class ParallelizeLayer:
                     self.mem_eval._ccfg.mm_ccfgs[sub_model],
                     dimensions,
                     mppb=manual_ppb,
+                    parent=self.mem_eval._ccfg,
                 )
             else:
                 self.config = GlobalConfig(
@@ -267,11 +270,25 @@ class ParallelizeLayer:
             return False
         return True
 
+    def priced(self) -> Any:
+        """The config a candidate is priced on: the whole model, every submodule of it.
+
+        The search drives one submodule's strategy (:class:`GlobalConfig`
+        gives the others the same degrees), and a candidate is priced on the
+        model the run trains: a vision tower's parameters, activations and
+        compute count toward the stage that holds them (F2).
+        """
+        return self.mem_eval.ccfg
+
+    def _priced_on_submodules(self) -> bool:
+        """Whether a candidate is priced on several submodules, the one the search drives among them."""
+        return bool(getattr(self.priced(), "multimodal", False))
+
     def memory_estim(self, debugger: Any = None) -> Any:
         """Whether the config fits memory"""
         logger.debug("estimate_peak")
         verbose = logger.level < logging.INFO
-        self.mem_eval.set_config(self.config.ccfg)  # = self.config.ccfg
+        self.mem_eval.set_config(self.priced())
         # self.mem_eval = EvaluatorV2(self.config)
         logger.debug("ccfg = %s", str(self.config.ccfg))
         peak = self.mem_eval.estimate_peak(
@@ -415,7 +432,7 @@ class ParallelizeLayer:
                 logger.debug("before apply_async")
                 peak = pool.apply_async(
                     pool_estimate_memory,
-                    args=(copy.deepcopy(self.config.ccfg),),
+                    args=(copy.deepcopy(self.priced()),),
                     # args=(evaluator,),
                     # self.memory_estim,
                 )
@@ -450,7 +467,7 @@ class ParallelizeLayer:
                     score = pool.apply_async(
                         pool_estimate_performance,
                         args=(
-                            copy.deepcopy(self.config.ccfg),
+                            copy.deepcopy(self.priced()),
                             self.machine.device,
                             mem,
                             cache_file,
@@ -465,7 +482,7 @@ class ParallelizeLayer:
                             enable=self.enable_debug,
                         )
                         score = estimate_performance(
-                            self.config.ccfg,
+                            self.priced(),
                             debugger=debugger,
                             device_type=self.machine.device,
                             memory=mem,
@@ -479,7 +496,7 @@ class ParallelizeLayer:
                         del debug_parts[-2:]
                     else:
                         score = estimate_performance(
-                            self.config.ccfg,
+                            self.priced(),
                             device_type=self.machine.device,
                             memory=mem,
                             stage_savings=savings,
@@ -513,10 +530,11 @@ class ParallelizeLayer:
             parallel_config: The configuration the config was just set to.
 
         Returns:
-            The choice; ``None`` without auto_recompute, or when there is
-            none to make and the configuration keeps its own recompute.
+            The choice; ``None`` without auto_recompute, for a multimodal
+            model, or when there is none to make and the configuration keeps
+            its own recompute.
         """
-        if not self.auto_recompute:
+        if not self.auto_recompute or self._priced_on_submodules():
             return None
         self.mem_eval.set_config(self.config.ccfg)
         choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
@@ -536,8 +554,10 @@ class ParallelizeLayer:
 
         Returns:
             ``(choice, score)``, or ``(None, None)`` when there is no choice
-            to make.
+            to make, a multimodal model's among them.
         """
+        if self._priced_on_submodules():
+            return None, None
         self.config.set_parallel_config(parallel_config)
         self.mem_eval.set_config(self.config.ccfg)
         choice = choose_recompute(self.mem_eval, self.machine.device, link=self.offload_link)
@@ -562,7 +582,7 @@ class ParallelizeLayer:
             self.config.set_parallel_config(config)
             peak_mem = self.memory_estim()
             score = estimate_performance(
-                self.config.ccfg,
+                self.priced(),
                 debugger=debugger,
                 device_type=self.machine.device,
                 stage_focused=0,
@@ -592,7 +612,7 @@ class ParallelizeLayer:
             logger.debug(self.mem_eval.get_strategy())
             peak_mem = self.memory_estim()
             score = estimate_performance(
-                self.config.ccfg,
+                self.priced(),
                 debugger=debugger,
                 device_type=self.machine.device,
             )  # , memory = mem)
