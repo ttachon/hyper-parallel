@@ -123,6 +123,13 @@ _SELECTIVE_AC_COMPUTE_OP_NAMES = (
     "aten._scaled_dot_product_flash_attention_for_cpu",
     "aten._scaled_dot_product_fused_attention_overrideable",
     "aten.scaled_dot_product_attention",
+    # Every fused attention of this repository calls
+    # ``torch_npu.npu_fusion_attention``, the operator the shard registry
+    # names as well (``core/shard/ops/yaml/torch_flash_attention_score.yaml``).
+    # A torch_npu whose entry point dispatches to a later interface registers
+    # that operator instead, so both are named and whichever the install has
+    # resolves; the other is dropped by ``_existing_ops``.
+    "npu.npu_fusion_attention",
     "npu.npu_fusion_attention_v3",
     "aten._flex_attention",
     "aten.topk",

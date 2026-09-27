@@ -14,6 +14,7 @@
 # ============================================================================
 """Tests for the layer census, the activations it states in the model spec, and their pricing."""
 import functools
+import importlib
 import os
 import sys
 import tempfile
@@ -40,6 +41,7 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     _RecomputedMatmuls,
     _selective_contexts,
     tp_config,
+    _ATTENTION_KERNELS,
 )
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
@@ -540,6 +542,23 @@ class TestModuleReplacements(unittest.TestCase):
             self.assertEqual(census_layer(config, 0, 256, replacements=(spec,)), census_layer(config, 0, 256))
         self.assertIn("a_native_extension", logs.output[0])
         self.assertIn("_needs_a_library", logs.output[0])
+
+    def test_the_policy_saves_the_kernel_the_contract_stands_for(self):
+        """
+        Feature: the runtime operators HyperParallel's selective policy saves,
+            beside the census's contracts for them.
+        Description: The census saves what its attention kernels return
+            because the trainer's policy saves the runtime's; this holds the
+            two lists together (F52).
+        Expectation: The policy's compute operators name the fused attention
+            every adapter calls, ``npu.npu_fusion_attention``, and the sdpa
+            the census's flash attention stands in for.
+        """
+        checkpointing = importlib.import_module("hyper_parallel.distributed.activation_checkpoint")
+        names = checkpointing._SELECTIVE_AC_COMPUTE_OP_NAMES  # pylint: disable=protected-access
+        self.assertIn("npu.npu_fusion_attention", names)
+        self.assertIn("aten.scaled_dot_product_attention", names)
+        self.assertEqual(len(_ATTENTION_KERNELS), 2)
 
     def test_the_contracts_stand_in_for_the_kernels(self):
         """
