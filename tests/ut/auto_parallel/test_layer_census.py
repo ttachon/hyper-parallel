@@ -15,7 +15,6 @@
 """Tests for the layer census, the activations it states in the model spec, and their pricing."""
 import functools
 import importlib
-import importlib
 import os
 import sys
 import tempfile
