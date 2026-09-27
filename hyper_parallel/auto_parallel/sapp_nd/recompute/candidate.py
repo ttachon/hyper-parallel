@@ -32,7 +32,11 @@ knapsack weighs it with them.
 
 A runtime that runs every layer one way, such as HyperParallel's trainer with
 its ``activation_checkpoint.mode``, gets the fastest of its modes that fits
-instead, from the same budgets: see :data:`MODES`.
+instead, from the same budgets: see :data:`MODES`. A model priced on several
+submodules, a vision tower beside a language model, gets no choice per layer,
+whose budgets would be built from one submodule's layers; its runtime's mode
+is stated on every submodule, and the whole model priced under each
+(:func:`mode_ranges`, :func:`whole_modes`).
 
 With a host link, a choice per layer may also offload: a stage's first layers
 run plain and move what they keep per micro-batch to the host after their
@@ -61,6 +65,8 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
 
+from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS, RecomputeRange
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import HostLink
@@ -130,12 +136,17 @@ class RecomputeChoice:
             units.
         mode: The mode every layer runs, one of :data:`MODES`, when one mode
             was chosen for all of them; ``None`` for a choice per layer.
+        score: The candidate's score under the choice, where the whole model
+            was priced with it, a model priced on several submodules; ``None``
+            where the search takes *stage_savings* off the score of the
+            config's own recompute.
     """
 
     ranges: Tuple[LayerRange, ...]
     stage_memory: Tuple[float, ...]
     stage_savings: Tuple[float, ...]
     mode: Optional[str] = None
+    score: Optional[float] = None
 
     @property
     def memory(self) -> float:
@@ -227,6 +238,53 @@ def mode_recompute(mode: str, configured: Mapping[str, Any]) -> Optional[FrozenS
     if mode == "selective":
         return frozenset(name for name in SWITCHES if not int(bool(configured.get(name, 1))))
     raise ValueError(f"unknown recompute mode {mode!r}; expected one of {', '.join(MODES)}")
+
+
+def mode_ranges(mode: str, configured: Mapping[str, Any]) -> Tuple[RecomputeRange, ...]:
+    """Every layer of a model running *mode*, as the recompute ranges an ExecSpec states.
+
+    Args:
+        mode: One of :data:`MODES`.
+        configured: The switches the selective mode sets, 1 to keep an op and
+            0 to recompute it.
+
+    Returns:
+        No range for a model that recomputes nothing, else one range over
+        every layer: full, or selective with each op's state.
+    """
+    recompute = mode_recompute(mode, configured)
+    if recompute is None:
+        return (RecomputeRange(option="full"),)
+    if not recompute:
+        return ()
+    return (RecomputeRange(option="selective",
+                           ops={op: "recompute" if op in recompute else "keep" for op in RECOMPUTE_OPS}),)
+
+
+def census_prices(ccfg: Any) -> bool:
+    """Whether a census prices every layer kind of *ccfg*, HyperParallel's selective policy among what it measures."""
+    kinds = layer_kinds(ccfg)
+    if not kinds:
+        return False
+    if any(kind is None for kind in kinds):
+        return isinstance(getattr(ccfg, "kind_activations", None), KindActivations)
+    census = getattr(ccfg, "census", None)
+    census = census if isinstance(census, Mapping) else {}
+    return all(isinstance(census.get(kind.name), KindActivations) for kind in kinds)
+
+
+def whole_modes(
+    configs: Sequence[Any], modes: Sequence[str], selective: Optional[Mapping[str, int]]
+) -> Tuple[str, ...]:
+    """*modes*, less a runtime's own selective mode unless a census prices every kind of every one of *configs*.
+
+    The modes a model priced whole is offered, as :func:`choose_recompute`
+    offers them a model priced layer by layer: the formulas do not price the
+    matmuls HyperParallel's policy recomputes.
+    """
+    if selective is None or "selective" not in modes or all(census_prices(ccfg) for ccfg in configs):
+        return tuple(modes)
+    return tuple(mode for mode in modes if mode != "selective")
 
 
 def _own(node: LayerType, options: Sequence[LayerOption]) -> Optional[LayerOption]:

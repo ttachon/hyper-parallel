@@ -36,7 +36,8 @@ import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pyl
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel import _hf_model_spec
-from hyper_parallel.auto_parallel._exec_spec import ExecSpec, RecomputeRange
+from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS, ExecSpec, RecomputeRange
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
@@ -52,9 +53,11 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     choose_recompute,
     describe,
     micro_batches_in_flight,
+    mode_ranges,
     mode_recompute,
     option_label,
     to_records,
+    whole_modes,
 )
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption, build_front, layer_profiles
 from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import MEGABYTE, Stage
@@ -1062,6 +1065,49 @@ class TestOneMode(unittest.TestCase):
         with self.assertRaises(ValueError):
             mode_recompute("sometimes", configured)
 
+    def test_a_mode_reads_as_the_ranges_a_config_states(self):
+        """
+        Feature: mode_ranges.
+        Description: Each mode, with the switches a config sets.
+        Expectation: Off states no range, full one full range over every
+            layer, and selective one selective range stating each op's
+            state, the ops the switches set to 0 recomputed.
+        """
+        configured = {"attBMM": 1, "normOp": 0, "ffAct": 0}
+        self.assertEqual(mode_ranges("off", configured), ())
+        self.assertEqual(mode_ranges("full", configured), (RecomputeRange(option="full"),))
+        (selective,) = mode_ranges("selective", configured)
+        self.assertEqual(selective.option, "selective")
+        self.assertEqual(selective.switches(), {op: int(op not in ("normOp", "ffAct")) for op in RECOMPUTE_OPS})
+
+    def test_a_model_priced_whole_runs_the_runtimes_selective_mode_only_where_a_census_prices_it(self):
+        """
+        Feature: whole_modes.
+        Description: A tower and a language model, each of two kinds, and
+            a census that prices both kinds of both, one kind of the tower,
+            or none; with the trainer's own selective switches, and with the
+            configs' own.
+        Expectation: The trainer's selective mode is offered only where the
+            census prices every kind of both; a selective mode of the
+            configs' own switches always.
+        """
+        kinds = [SimpleNamespace(name="dense"), SimpleNamespace(name="moe")]
+        record = KindActivations(1.0, 0.0, 1.0, 0.0, 4096)
+
+        def configs(tower_kinds: Sequence[str]) -> List[SimpleNamespace]:
+            """A tower whose census prices *tower_kinds*, and a language model whose census prices both kinds."""
+            tower = SimpleNamespace(kinds=kinds, census={name: record for name in tower_kinds})
+            text = SimpleNamespace(kinds=kinds, census={"dense": record, "moe": record})
+            return [tower, text]
+
+        modes = ("off", "selective", "full")
+        policy = dict(HYPER_SELECTIVE_REC_OP)
+        with patch.object(Candidate, "layer_kinds", side_effect=lambda ccfg: ccfg.kinds):
+            self.assertEqual(whole_modes(configs(("dense", "moe")), modes, policy), modes)
+            self.assertEqual(whole_modes(configs(("dense",)), modes, policy), ("off", "full"))
+            self.assertEqual(whole_modes(configs(()), modes, policy), ("off", "full"))
+            self.assertEqual(whole_modes(configs(()), modes, None), modes)
+
 
 class TestNoChoice(unittest.TestCase):
     """What the choice does not cover."""
@@ -1230,13 +1276,14 @@ class TestAutoRecomputeSearch(unittest.TestCase):
         Description: A vision-language model, whose candidates are priced on
             the tower and the text model together (IR F2), searched with and
             without auto_recompute.
-        Expectation: No candidate gets a choice: the options would be built
-            for the text model's layers, and their budgets would leave the
-            tower out. Both searches score the same candidates alike, as
-            the whole model prices them.
+        Expectation: No candidate gets a choice per layer: the options would
+            be built for the text model's layers, and their budgets would
+            leave the tower out. Each gets one mode for every layer instead,
+            the fastest that fits priced whole, and scores no worse than
+            fully recomputed.
         """
         set_verbose_level(1)
-        scored = {}
+        scored, choices = {}, {}
         for auto in (True, False):
             for dim in Dim.ALL_DIMS:
                 dim.reset_bound()
@@ -1252,11 +1299,71 @@ class TestAutoRecomputeSearch(unittest.TestCase):
                     results, _ = runner.device_loops(({}, 0), None)
                     space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
                     ordered, _ = runner.order_search_space(space, None, None)
-                    scored[auto] = [(str(config), mem, score) for config, mem, score, _ in ordered]
-                    self.assertEqual(runner.recompute_choices, {})
+                    scored[auto] = {str(config): score for config, _, score, _ in ordered}
+                    choices[auto] = dict(runner.recompute_choices)
                     self.assertEqual(runner.recompute_per_layer(ordered[0][0]), (None, None))
-        self.assertTrue(scored[True])
-        self.assertEqual(scored[True], scored[False])
+        self.assertEqual(choices[False], {})
+        self.assertEqual(len(choices[True]), len(scored[True]))
+        for choice in choices[True].values():
+            self.assertIn(choice.mode, MODES)
+            self.assertEqual(choice.ranges, ())
+        self.assertEqual(set(scored[True]), set(scored[False]))
+        for config, score in scored[True].items():
+            self.assertLessEqual(score, scored[False][config])
+
+    @staticmethod
+    def _vl_search(folder: str, **extra: Any):
+        """The vision-language model's search over DP on eight devices, and its runner."""
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        path = os.path.join(folder, "vl.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(_VL_TRAINING, handle)
+        runner = Par.Parallelize("hyper_v2", path, Hard.Machine(8, "A2"), global_batch_size=16,
+                                 dimensions=[Dim.DP], **extra).instance
+        results, _ = runner.device_loops(({}, 0), None)
+        space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+        ordered, _ = runner.order_search_space(space, None, None)
+        return ordered, runner
+
+    def test_a_multimodal_search_runs_the_trainers_mode_priced_whole(self):
+        """
+        Feature: ParallelizeMultiModal recompute_modes.
+        Description: The vision-language model searched without auto
+            recompute, with the trainer's full mode alone, and with off or
+            full; each candidate's mode then stated on the tower and the text
+            model and the whole model priced.
+        Expectation: Every candidate gets a mode, and keeps the memory and
+            the score the whole model has under it: full recomputes every
+            layer as the config states, so the full mode scores each
+            candidate as the search without auto recompute does, and off,
+            where it fits, is faster.
+        """
+        set_verbose_level(1)
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(_hf_model_spec, "_get_hf_config", return_value=_VL), \
+                    patch.dict(os.environ, {"MPLCONFIGDIR": folder}):
+                own, _ = self._vl_search(folder)
+                full, _ = self._vl_search(folder, auto_recompute=True, recompute_modes=("full",))
+                either, runner = self._vl_search(folder, auto_recompute=True, recompute_modes=("off", "full"))
+                self.assertIsInstance(runner, Par.ParallelizeMultiModal)
+                whole = runner.priced()
+                for config, memory, score, _ in either:
+                    choice = runner.recompute_choices[config]
+                    runner.config.set_parallel_config(config)
+                    priced = copy.deepcopy(runner.priced())
+                    for name in priced.mm_order:
+                        apply_exec(priced.mm_ccfgs[name], ExecSpec(recompute=mode_ranges(choice.mode, {})))
+                    runner.mem_eval.set_config(priced)
+                    peaks = [insight["Static"] + insight["Dynamic"]
+                             for insight in runner.mem_eval.estimate_peak_insight()]
+                    runner.mem_eval.set_config(whole)
+                    self.assertEqual(memory, int(round(max(peaks))))
+                    self.assertEqual(score, Par.estimate_performance(priced, device_type=runner.machine.device,
+                                                                     memory=memory))
+        self.assertEqual([(str(c), m, s) for c, m, s, _ in full], [(str(c), m, s) for c, m, s, _ in own])
+        self.assertTrue(either)
+        self.assertLess(either[0][2], own[0][2])
 
 
 if __name__ == "__main__":

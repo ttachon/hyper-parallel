@@ -21,8 +21,9 @@ import multiprocessing as proc
 import json
 import os
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
@@ -30,6 +31,8 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     RecomputeChoice,
     choose_recompute,
     describe,
+    mode_ranges,
+    whole_modes,
 )
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
@@ -38,6 +41,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     CostModelConfig,
     arm_strategy_guard,
@@ -66,40 +70,9 @@ class ParallelizeLayer:
             manual_ppb = extra_config.pop("mppb")
         else:
             manual_ppb = False
-        auto_recompute = extra_config.pop("auto_recompute", False)
-        if auto_recompute and manual_ppb:
-            raise ValueError(
-                "auto_recompute chooses every layer's recompute, so it cannot also take it from the config (mppb)"
-            )
-        # With auto_recompute, the modes a runtime that runs every layer one
-        # way offers, of recompute.candidate.MODES; without them, each layer
-        # gets its own option.
-        self.recompute_modes = extra_config.pop("recompute_modes", None)
-        unknown = sorted(set(self.recompute_modes or ()) - set(MODES))
-        if unknown:
-            raise ValueError(f"unknown recompute modes {unknown}; expected some of {', '.join(MODES)}")
-        # The switches such a runtime's selective mode sets, where they are
-        # not the config's; see recompute.candidate.choose_recompute.
-        self.recompute_selective = extra_config.pop("recompute_selective", None)
-        # With auto_offload, a choice per layer may offload each stage's first
-        # layers over the host link: host_link, else the device's own.
-        auto_offload = extra_config.pop("auto_offload", False)
-        host_link = extra_config.pop("host_link", None)
-        self.offload_link = None
-        if auto_offload:
-            if not auto_recompute:
-                raise ValueError("auto_offload offloads in the choice per layer that auto_recompute makes")
-            self.offload_link = host_link or machine.device.host_link
-            if self.offload_link is None:
-                raise ValueError(f"device {machine.device} states no host link to offload over; give host_link")
+        self._take_recompute_options(extra_config, manual_ppb)
 
         self.mem_eval = evaluator
-        # Choose every layer's recompute option for each candidate, rather
-        # than score it fully recomputed. A multimodal model gets none: its
-        # candidates are priced on every submodule (F2), and the options are
-        # built for one submodule's layers, whose budgets would leave the
-        # others out.
-        self.auto_recompute = bool(auto_recompute)
         # The options chosen for each configuration the ordering scored.
         self.recompute_choices = {}
 
@@ -152,6 +125,42 @@ class ParallelizeLayer:
         # From here on the configs this search owns take a strategy only
         # through set_strategy; an estimator's copy of one starts unarmed.
         arm_strategy_guard(self.mem_eval.ccfg)
+
+    def _take_recompute_options(self, extra_config: Dict[str, Any], manual_ppb: bool) -> None:
+        """Take the recompute and offload options out of *extra_config*, refusing those that do not go together."""
+        auto_recompute = extra_config.pop("auto_recompute", False)
+        if auto_recompute and manual_ppb:
+            raise ValueError(
+                "auto_recompute chooses every layer's recompute, so it cannot also take it from the config (mppb)"
+            )
+        # Choose every layer's recompute option for each candidate, rather
+        # than score it fully recomputed. A multimodal model, whose
+        # candidates are priced on every submodule (F2), gets one mode for
+        # every layer, priced whole, and no option per layer: the options are
+        # built for one submodule's layers, whose budgets would leave the
+        # others out.
+        self.auto_recompute = bool(auto_recompute)
+        # With auto_recompute, the modes a runtime that runs every layer one
+        # way offers, of recompute.candidate.MODES; without them, each layer
+        # gets its own option.
+        self.recompute_modes = extra_config.pop("recompute_modes", None)
+        unknown = sorted(set(self.recompute_modes or ()) - set(MODES))
+        if unknown:
+            raise ValueError(f"unknown recompute modes {unknown}; expected some of {', '.join(MODES)}")
+        # The switches such a runtime's selective mode sets, where they are
+        # not the config's; see recompute.candidate.choose_recompute.
+        self.recompute_selective = extra_config.pop("recompute_selective", None)
+        # With auto_offload, a choice per layer may offload each stage's first
+        # layers over the host link: host_link, else the device's own.
+        auto_offload = extra_config.pop("auto_offload", False)
+        host_link = extra_config.pop("host_link", None)
+        self.offload_link = None
+        if auto_offload:
+            if not auto_recompute:
+                raise ValueError("auto_offload offloads in the choice per layer that auto_recompute makes")
+            self.offload_link = host_link or self.machine.device.host_link
+            if self.offload_link is None:
+                raise ValueError(f"device {self.machine.device} states no host link to offload over; give host_link")
 
     def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""
@@ -461,13 +470,17 @@ class ParallelizeLayer:
                 values = []
                 mem, savings = peak, None
                 choice = self.choose_recompute(config)
+                priced = self.priced()
                 if choice is not None:
                     mem, savings = int(round(choice.memory)), choice.stage_savings
+                    if choice.score is not None:
+                        # The whole model, with every submodule running the mode.
+                        priced, savings = self.priced_with_mode(choice.mode), None
                 if multiproc:
                     score = pool.apply_async(
                         pool_estimate_performance,
                         args=(
-                            copy.deepcopy(self.priced()),
+                            copy.deepcopy(priced),
                             self.machine.device,
                             mem,
                             cache_file,
@@ -482,7 +495,7 @@ class ParallelizeLayer:
                             enable=self.enable_debug,
                         )
                         score = estimate_performance(
-                            self.priced(),
+                            priced,
                             debugger=debugger,
                             device_type=self.machine.device,
                             memory=mem,
@@ -496,7 +509,7 @@ class ParallelizeLayer:
                         del debug_parts[-2:]
                     else:
                         score = estimate_performance(
-                            self.priced(),
+                            priced,
                             device_type=self.machine.device,
                             memory=mem,
                             stage_savings=savings,
@@ -530,18 +543,74 @@ class ParallelizeLayer:
             parallel_config: The configuration the config was just set to.
 
         Returns:
-            The choice; ``None`` without auto_recompute, for a multimodal
-            model, or when there is none to make and the configuration keeps
-            its own recompute.
+            The choice; ``None`` without auto_recompute, or when there is
+            none to make and the configuration keeps its own recompute.
         """
-        if not self.auto_recompute or self._priced_on_submodules():
+        if not self.auto_recompute:
             return None
-        self.mem_eval.set_config(self.config.ccfg)
-        choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
-                                  link=self.offload_link, selective=self.recompute_selective)
+        if self._priced_on_submodules():
+            choice = self._one_mode_whole()
+        else:
+            self.mem_eval.set_config(self.config.ccfg)
+            choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
+                                      link=self.offload_link, selective=self.recompute_selective)
         if choice is not None:
             self.recompute_choices[parallel_config] = choice
         return choice
+
+    def _one_mode_whole(self) -> Optional[RecomputeChoice]:
+        """The fastest mode that fits, for every layer, each mode priced on the whole model.
+
+        A model priced on several submodules runs its runtime's mode on every
+        submodule's layers, a vision tower's as well as its language
+        model's, and a choice per layer, whose budgets are built for one
+        submodule's layers, would leave the others out. So each mode is
+        stated on every submodule's config, and the whole model priced under
+        it: its stages' memory by the memory model, its score by the
+        performance estimate. Without a runtime's modes, every one of
+        :data:`MODES` is weighed, selective with each submodule's switches.
+
+        Returns:
+            The fastest mode that fits, with the stage memory and the score
+            the whole model has under it; ``None`` when none fits.
+        """
+        whole = self.priced()
+        modes = whole_modes([whole.mm_ccfgs[name] for name in whole.mm_order], self.recompute_modes or MODES,
+                            self.recompute_selective)
+        best = None
+        try:
+            for mode in modes:
+                # Each mode on a copy of the whole model, which the evaluator holds between them.
+                self.mem_eval.set_config(whole)
+                priced = self.priced_with_mode(mode)
+                self.mem_eval.set_config(priced)
+                stage_memory = tuple(insight["Static"] + insight["Dynamic"]
+                                     for insight in self.mem_eval.estimate_peak_insight())
+                if not self.mem_eval.mem_fit(max(stage_memory)):
+                    continue
+                score = estimate_performance(priced, device_type=self.machine.device,
+                                             memory=int(round(max(stage_memory))))
+                if best is None or score < best.score:
+                    best = RecomputeChoice((), stage_memory, (), mode=mode, score=score)
+        finally:
+            self.mem_eval.set_config(whole)
+        return best
+
+    def priced_with_mode(self, mode: str) -> Any:
+        """A copy of the config a candidate is priced on, every submodule's layers running *mode*.
+
+        Args:
+            mode: One of the runtime's modes; its selective mode sets the
+                runtime's own switches, where it states them, else each
+                submodule's.
+        """
+        priced = copy.deepcopy(self.priced())
+        for name in priced.mm_order:
+            config = priced.mm_ccfgs[name]
+            rec_op = getattr(config, "rec_op", None)
+            switches = self.recompute_selective or (vars(rec_op) if rec_op is not None else {})
+            apply_exec(config, ExecSpec(recompute=mode_ranges(mode, switches)))
+        return priced
 
     def recompute_per_layer(self, parallel_config: Any) -> Tuple[Optional[RecomputeChoice], Optional[float]]:
         """Each layer's own fastest option for one configuration, and the score it gives.
