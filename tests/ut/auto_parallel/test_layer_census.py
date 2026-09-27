@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 import torch
 import yaml
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
@@ -519,6 +519,20 @@ class TestModuleReplacements(unittest.TestCase):
         self.assertGreater(fused["softmax"], 0)
         self.assertGreater(fused["attBMM"], 0)
         self.assertAlmostEqual(sum(fused.values()) * 256, census_layer(config, 0, 256, replacements=specs)[0])
+
+    def test_a_census_leaves_the_runtimes_caches_as_it_found_them(self):
+        """
+        Feature: the caches HyperParallel's fused modules fill, after a census.
+        Description: The Qwen3-MoE attention caches the compressed causal mask
+            its sparse mode takes, one per device, the first time it runs.
+        Expectation: A census of the fused layer leaves no fake tensor in that
+            cache, so a real call in the same process builds its own mask
+            (F55).
+        """
+        from hyper_parallel.models.qwen3_moe.adapter import attention  # pylint: disable=C0415
+        census_layer(_qwen3_moe(), 0, 256, replacements=_recipe_specs())
+        cached = attention._COMPRESSED_CAUSAL_MASKS  # pylint: disable=protected-access
+        self.assertEqual([mask for mask in cached.values() if isinstance(mask, FakeTensor)], [])
 
     def test_a_replacement_this_host_cannot_build_is_refused(self):
         """
