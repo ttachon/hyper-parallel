@@ -326,14 +326,21 @@ does.
 A sweep can also let ND choose what to run. `--nd-top N` runs ND's search at
 the sweep's shape and profiles the N strategies it ranks best among those this
 model and trainer can run, which tests the part of its ranking a search relies
-on. Naming an axis as well adds that grid beside them, which is how to measure
-ND's picks against a strategy already known to be good:
+on. The named degrees keep their meaning. A degree named with one value holds
+for ND's picks as for the grid, so `--op 16` runs every strategy at OP 16, and
+ND's best there; naming axes also adds their grid beside the picks, so this
+runs ND's best at OP 16 and EP 4 to 64 at OP 16:
 
 ```bash
-python examples/training_demo/sweep_qwen3_5_moe.py --nd-top 5 --ep 16 \
+python examples/training_demo/sweep_qwen3_5_moe.py --nd-top 5 --ep 4,8,16,32,64 --op 16 \
     --python /home/tt/envs/hp2/bin/python3.11
 python examples/training_demo/sweep_qwen3_5_moe.py --nd-top 5 --only rank   # preview only
 ```
+
+An axis named with a list only adds its grid: ND's picks keep their own value
+on it. To measure ND's picks against a strategy already known to be good, name
+that strategy's axis with its value and another, `--ep 1,16`, rather than
+`--ep 16`, which would hold ND's picks to EP 16.
 
 The `rank` stage writes ND's whole order to `nd_ranking.csv`, through
 `run_nd --ranking_csv`, and the shape it was made for beside it. A later stage
@@ -341,14 +348,16 @@ refuses a ranking made for another shape rather than read it as this one's. The
 search covers ND's whole space, TP and PP included, and the choice among its
 configurations follows three rules:
 
-- A configuration this model or trainer cannot run is passed over and listed
-  with the reason, so a preference of ND's that cannot be tested is visible.
+- A configuration this model or trainer cannot run, or one away from a degree
+  the sweep fixes, is passed over and listed with the reason, so a preference of
+  ND's that is not tested is visible.
 - Configurations that are one strategy to the trainer are run once: SP on and
   off at TP 1 run identically.
 - A tie is one prediction, so it is run once. At any EP, ND gives every OP
   above 1 the same time, since its estimate depends on whether FSDP shards and
   not on how widely; the tie is run at its widest OP, the FSDP default and the
-  one holding the least memory, and the other widths are printed with it.
+  one holding the least memory, or at the OP the sweep fixes, and the other
+  widths are printed with it.
 
 At PP 1, ND's search keeps the micro-batch count at 1 and grows the
 micro-batch size instead, so a CP 2 strategy runs two sequences per

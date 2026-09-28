@@ -32,11 +32,13 @@ compares four strategies:
 
 Or let ND choose. This runs ND's search at the sweep's shape and profiles the
 five strategies it ranks best among those this model and trainer can run,
-which tests its ranking where a search relies on it. Naming an axis as well
-adds that grid, a known strategy to measure ND's picks against:
+which tests its ranking where a search relies on it. A degree named with one
+value holds for ND's picks as for the grid, and naming axes adds their grid
+beside the picks, so the second line runs ND's best at OP 16 and EP 4 to 64
+at OP 16:
 
     ... --nd-top 5
-    ... --nd-top 5 --ep 16
+    ... --nd-top 5 --ep 4,8,16,32,64 --op 16
 
 Stages run in order and each can be run alone with ``--only``, so a failed
 sweep can be classified without re-running, and a changed cost model can be
@@ -206,6 +208,31 @@ def named_axes(args: argparse.Namespace) -> bool:
     return any(getattr(args, name) for name in ("ep", "cp", "op", "tp", "pp"))
 
 
+def fixed_degrees(args: argparse.Namespace) -> Dict[str, int]:
+    """The degrees named with one value, which every strategy the sweep runs takes.
+
+    A list sweeps its axis and ND's picks keep their own value on it; a single
+    value fixes the axis, for ND's picks as for the grid.
+    """
+    fixed = {}
+    for name in ("ep", "cp", "op", "tp", "pp"):
+        values = _split_ints(getattr(args, name) or "")
+        if len(values) == 1:
+            fixed[name] = values[0]
+    return fixed
+
+
+def _off_fixed(point: Point, fixed: Dict[str, int]) -> Optional[str]:
+    """Say which fixed degree a strategy departs from, or None.
+
+    OP is left to the tie the strategy belongs to, which may hold the fixed width.
+    """
+    for name, value in fixed.items():
+        if name != "op" and getattr(point, name) != value:
+            return f"the sweep fixes {name.upper()} at {value}"
+    return None
+
+
 def expand(args: argparse.Namespace, world: int) -> List[Point]:
     """Return the cartesian product of the requested degrees, validated.
 
@@ -267,18 +294,24 @@ def pick_nd_top(rows: Sequence[Dict[str, str]], args: argparse.Namespace, world:
     prediction, so it is run once, at its widest OP: the FSDP default, and the
     one holding the least memory. The other widths are reported with it.
 
+    A degree the sweep fixes (``fixed_degrees``) holds here too: a strategy at
+    another EP, CP, TP or PP is passed over, and a tie runs at the fixed OP, or
+    is passed over when ND ranks none of its widths there.
+
     Returns:
         ``(picks, passed)``: the picks in ND's order, and ``(rank, point,
         reason)`` for every strategy ND ranked above the last pick that this
-        model or trainer cannot run.
+        model or trainer cannot run, or that departs from a fixed degree; for
+        every such strategy ND ranks when it has fewer than ``count`` picks.
     """
     gbs = args.global_batch_size or world
+    fixed = fixed_degrees(args)
     groups: Dict[Any, Dict[str, Any]] = {}
     passed: List[Tuple[int, Point, str]] = []
     refused = set()
     for row in rows:
         point = _row_point(row, args, gbs)
-        reason = _unrunnable(point, args, world)
+        reason = _unrunnable(point, args, world) or _off_fixed(point, fixed)
         if reason:
             if point not in refused:
                 refused.add(point)
@@ -291,13 +324,20 @@ def pick_nd_top(rows: Sequence[Dict[str, str]], args: argparse.Namespace, world:
                                         "widths": {}})
         group["widths"].setdefault(point.op, (point, float(row["memory_mb"])))
     picks = []
-    for group in list(groups.values())[:count]:
-        widest = max(group["widths"])
-        point, memory_mb = group["widths"][widest]
+    for group in groups.values():
+        if len(picks) == count:
+            break
+        width = fixed.get("op", max(group["widths"]))
+        if width not in group["widths"]:
+            passed.append((group["rank"], group["widths"][max(group["widths"])][0],
+                           f"the sweep fixes OP at {width}"))
+            continue
+        point, memory_mb = group["widths"][width]
         picks.append(Pick(rank=group["rank"], score=group["score"], memory_mb=memory_mb,
-                          point=point, tied_ops=sorted(set(group["widths"]) - {widest})))
-    last = picks[-1].rank if picks else 0
-    return picks, [entry for entry in passed if entry[0] < last]
+                          point=point, tied_ops=sorted(set(group["widths"]) - {width})))
+    last = picks[-1].rank if len(picks) == count else float("inf")
+    return picks, sorted((entry for entry in passed if entry[0] < last),
+                         key=lambda entry: entry[0])
 
 
 @dataclass
@@ -828,9 +868,11 @@ def load_ranking(sweep: Sweep) -> Tuple[List[Dict[str, str]], str]:
 
 
 def _print_picks(picks: Sequence[Pick], passed: Sequence[Tuple[int, Point, str]],
-                 wanted: int, kept: int) -> None:
-    """Say which of ND's strategies the sweep runs, and which it cannot."""
-    print(f"\nND's {len(picks)} best strategies this model can run, "
+                 wanted: int, kept: int, fixed: Dict[str, int]) -> None:
+    """Say which of ND's strategies the sweep runs, and which it leaves out."""
+    where = "".join(f", {name.upper()} {value}" for name, value in fixed.items())
+    where = f" at {where[2:]}" if where else ""
+    print(f"\nND's {len(picks)} best strategies this model can run{where}, "
           f"of the {kept} configurations its search keeps:", flush=True)
     for pick in picks:
         ties = (f"   tied with OP {', '.join(map(str, pick.tied_ops))}"
@@ -838,11 +880,12 @@ def _print_picks(picks: Sequence[Pick], passed: Sequence[Tuple[int, Point, str]]
         print(f"  #{pick.rank:<5d} {pick.point.tag:28s} score {pick.score:.4e}  "
               f"{pick.memory_mb / 1024:6.1f} GiB{ties}", flush=True)
     if len(picks) < wanted:
-        print(f"  asked for {wanted}: ND keeps no other strategy this model can run",
+        print(f"  asked for {wanted}: ND keeps no other strategy this model can run{where}",
               flush=True)
     if passed:
-        print(f"ND ranks {len(passed)} strategy(ies) above its last pick that "
-              "cannot run here:", flush=True)
+        which = "above its last pick" if len(picks) == wanted else "in all"
+        print(f"ND ranks {len(passed)} strategy(ies) {which} that this sweep "
+              "leaves out:", flush=True)
         by_reason: Dict[str, List[Tuple[int, Point, str]]] = {}
         for entry in passed:
             by_reason.setdefault(entry[2], []).append(entry)
@@ -859,7 +902,7 @@ def choose_points(sweep: Sweep) -> List[Point]:
         if not rows:
             raise SystemExit(why)
         picks, passed = pick_nd_top(rows, sweep.args, sweep.world, sweep.args.nd_top)
-        _print_picks(picks, passed, sweep.args.nd_top, len(rows))
+        _print_picks(picks, passed, sweep.args.nd_top, len(rows), fixed_degrees(sweep.args))
         points = [pick.point for pick in picks]
     if not sweep.args.nd_top or named_axes(sweep.args):
         points += [point for point in expand(sweep.args, sweep.world) if point not in points]
@@ -1021,8 +1064,9 @@ def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
     """Add the swept parallel degrees and the batch shape."""
     parser.add_argument("--nd-top", type=int, default=0,
                         help="run the N strategies ND ranks best at this shape, of "
-                             "those this model and trainer can run; a named axis "
-                             "adds its grid beside them")
+                             "those this model and trainer can run; a degree named "
+                             "with one value holds for them too, and named axes "
+                             "add their grid beside them")
     parser.add_argument("--ep", default=None,
                         help="expert-parallel degrees; every axis defaults to 1, "
                              "so a sweep varies only what it names")
