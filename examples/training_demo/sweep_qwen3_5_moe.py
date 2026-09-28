@@ -40,6 +40,12 @@ at OP 16:
     ... --nd-top 5
     ... --nd-top 5 --ep 4,8,16,32,64 --op 16
 
+To start on nodes that are healthy now, name a pool to pick from. The sweep
+first runs the kit's ``select --auto --census`` over it under its own cluster
+config, and writes the nodes that pass into that config:
+
+    ... --pool /home/tt/cluster_all.env
+
 Stages run in order and each can be run alone with ``--only``, so a failed
 sweep can be classified without re-running, and a changed cost model can be
 re-scored without re-profiling.
@@ -74,7 +80,7 @@ PEAK_PATTERN = re.compile(
     r"memory/device_max_reserved_gb=([0-9.]+)"
 )
 REMOTE_PROFILES = "output/sweep_profiles"
-STAGES = ("rank", "mirror", "data", "run", "fetch", "classify", "compare", "plot")
+STAGES = ("select", "rank", "mirror", "data", "run", "fetch", "classify", "compare", "plot")
 # The degrees a strategy is named by, as ND's ranking and the classified CSV
 # both spell them. SP and VPP are left out: SP only acts with TP and VPP only
 # with PP, and neither of those runs on this model.
@@ -97,6 +103,18 @@ def _run(command: Sequence[str], *, capture: bool = False, check: bool = True) -
     if check and result.returncode != 0:
         raise SystemExit(f"command failed with {result.returncode}")
     return result.stdout or ""
+
+
+def _run_tee(command: Sequence[str]) -> Tuple[int, str]:
+    """Run a command, echoing it and streaming its output, and return (code, output)."""
+    print("+ " + " ".join(shlex.quote(part) for part in command), flush=True)
+    lines = []
+    with subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT) as process:
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            lines.append(line)
+    return process.returncode, "".join(lines)
 
 
 def read_cluster_env(env_path: Path) -> Dict[str, Any]:
@@ -132,6 +150,80 @@ def read_cluster_env(env_path: Path) -> Dict[str, Any]:
         # The kit's own default when the config leaves it out.
         "log_dir": (values[4] or f"{repo_dir}/scripts/cluster/logs").rstrip("/"),
     }
+
+
+def with_nodes(text: str, nodes: Sequence[str]) -> str:
+    """Return a kit config with its NODES block replaced by *nodes*.
+
+    A ``)`` inside a comment does not end the block: ``cluster select`` writes
+    each node's state, parentheses included, as a comment on its line. The
+    four-line header ``cluster select -o`` puts on a config is dropped, so a
+    config selected again does not gather one header per selection.
+    """
+    lines = text.splitlines(keepends=True)
+    if lines and lines[0].startswith("# Standalone cluster.env:"):
+        lines = lines[4:]
+    block = "NODES=(\n" + "".join(f"  {host}\n" for host in nodes) + ")\n"
+    out, skip, found = [], False, False
+    for line in lines:
+        code = line.split("#", 1)[0]
+        if skip:
+            skip = ")" not in code
+            continue
+        if not found and re.match(r"\s*NODES=\(", code):
+            out.append(block)
+            skip = ")" not in code.split("(", 1)[1]
+            found = True
+            continue
+        out.append(line)
+    if not found:
+        raise SystemExit("the cluster config has no NODES=( block to replace")
+    return "".join(out)
+
+
+def select_nodes(args: argparse.Namespace) -> None:
+    """Pick nodes of ``--pool`` that pass the kit's census into ``--cluster-env``.
+
+    The kit selects from ``--cluster-env`` with the pool's nodes, so the census
+    tests this sweep's repo directory, interpreter and HCCL settings on every
+    die, and the config ``select -o`` writes is ``--cluster-env`` with the
+    picks. It is written beside the sweep and copied over ``--cluster-env``
+    only once it loads, since the kit deletes a target it cannot load.
+    """
+    usual = read_cluster_env(args.cluster_env)
+    pool = read_cluster_env(args.pool)["nodes"]
+    count = args.nodes or len(usual["nodes"])
+    if not 1 <= count <= len(pool):
+        raise SystemExit(f"--nodes {count}: {args.pool} lists {len(pool)} node(s)")
+    pool_env = args.out / "select_pool.env"
+    pool_env.write_text(with_nodes(args.cluster_env.read_text(encoding="utf-8"), pool),
+                        encoding="utf-8")
+    # The census runs inside the repo directory, which a node that never ran
+    # this sweep lacks; mirror fills it on the nodes picked. Only where its
+    # parent exists: a missing /home/tt would land on the root filesystem.
+    repo = shlex.quote(usual["repo_dir"])
+    _run([args.cluster, "-c", str(pool_env), "exec", "-E",
+          f'd={repo}; [ -d "$d" ] || [ ! -d "${{d%/*}}" ] || mkdir "$d"'], check=False)
+    picked = args.out / "select_picked.env"
+    select = [args.cluster, "-c", str(pool_env), "select", "--auto", str(count),
+              "--census", "-o", str(picked)]
+    code, output = _run_tee(select)
+    if code and "select: only " in output:
+        # Too few passed, and the reasons are printed above: wait for enough.
+        code, _ = _run_tee(select + ["-w"])
+    if code:
+        raise SystemExit(f"cluster select failed with {code}")
+    chosen = read_cluster_env(picked)
+    if len(chosen["nodes"]) != count:
+        raise SystemExit(f"{picked} lists {len(chosen['nodes'])} node(s), not {count}")
+    backup = args.out / f"{args.cluster_env.name}.before_select"
+    backup.write_bytes(args.cluster_env.read_bytes())
+    staged = args.cluster_env.with_name(args.cluster_env.name + ".tmp")
+    staged.write_bytes(picked.read_bytes())
+    staged.replace(args.cluster_env)
+    print(f"{args.cluster_env} now runs on {' '.join(chosen['nodes'])}, "
+          f"{len(chosen['nodes']) * chosen['nproc']} devices; the one it replaced "
+          f"is {backup}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -1223,6 +1315,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the sweep arguments."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cluster-env", type=Path, default=DEFAULT_ENV)
+    parser.add_argument("--pool", type=Path, default=None,
+                        help="a kit config listing the nodes to pick from: the sweep "
+                             "then starts by selecting --nodes of them that pass the "
+                             "kit's census, and writes them into --cluster-env")
+    parser.add_argument("--nodes", type=int, default=0,
+                        help="nodes the select stage picks; default is as many as "
+                             "--cluster-env lists")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "output" / "sweep")
     parser.add_argument("--cluster", default="cluster",
@@ -1254,9 +1353,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Sweep the requested strategies and score ND against the result."""
     args = parse_args(argv)
-    sweep = Sweep(args=args, env=read_cluster_env(args.cluster_env))
-    sweep.out.mkdir(parents=True, exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
     stages = set(args.only or STAGES)
+    if "select" in stages and args.pool:
+        select_nodes(args)
+    elif args.only and "select" in args.only:
+        raise SystemExit("the select stage needs --pool, the nodes to pick from")
+    if stages == {"select"}:
+        return
+    sweep = Sweep(args=args, env=read_cluster_env(args.cluster_env))
     # A grid sweep ranks only when the stage is named: the search needs the
     # analysis interpreter, which a sweep that only runs and fetches does not.
     if "rank" in stages and (args.nd_top or args.only):

@@ -210,6 +210,8 @@ separates them.
 
 | flag | sets | default |
 |---|---|---|
+| `--pool` | starts by picking the nodes, see below | off |
+| `--nodes` | how many nodes `--pool` picks | as many as `--cluster-env` lists |
 | `--nd-top` | runs ND's N best runnable strategies, see below | off |
 | `--ep` | `accelerator.ep_size` | `1` |
 | `--cp` | `accelerator.cp_size` | `1` |
@@ -265,6 +267,7 @@ python examples/training_demo/sweep_qwen3_5_moe.py --only classify --only compar
 
 | stage | what it does |
 |---|---|
+| `select` | with `--pool` only: picks the nodes that pass the kit's census and writes them into `--cluster-env` |
 | `rank` | ND's search at the sweep's shape into `nd_ranking.csv`; runs by default only with `--nd-top` |
 | `mirror` | makes every node's tree identical, excluding `output/` |
 | `data` | rebuilds the Indexed Dataset on every node at `--seq-len` |
@@ -273,6 +276,28 @@ python examples/training_demo/sweep_qwen3_5_moe.py --only classify --only compar
 | `classify` | `nd.trace_classify` per run, merged into one CSV |
 | `compare` | `run_nd --real_csv`, printing measured against estimated shares, then ND's rank of each strategy when a ranking exists |
 | `plot` | `sweep.pdf`/`.png`: the step split and the peak memory across the sweep; `memory.pdf`/`.png`: the measured peak against ND's estimate |
+
+On a shared pool, an idle NPU is not a working one: a node can have a link
+down, memory held by a process `npu-smi` does not list, an environment that
+fails to set up, or a die that fails its first op. `--pool` makes the sweep
+start from nodes that pass all of that now:
+
+```bash
+python examples/training_demo/sweep_qwen3_5_moe.py --pool /home/tt/cluster_all.env ...
+```
+
+The `select` stage runs the kit's `cluster select --auto N --census` over the
+pool's nodes, `N` from `--nodes` or as many as `--cluster-env` lists. It runs
+it under `--cluster-env` with the pool's nodes swapped in, not under the pool's
+own config, so the census tests this sweep's repository directory, interpreter
+and HCCL settings, and the config it writes is `--cluster-env` with the nodes
+that passed. That file then replaces `--cluster-env`, so every later stage, and
+every later `--only` run, uses them; the one it replaced is kept in `--out` as
+`<name>.before_select`. When too few pass, the kit prints why for each node and
+the sweep waits, re-probing every five minutes, until enough do. The census
+runs inside the repository directory, so the stage first creates it, empty, on
+every pool node that lacks it; `mirror` then fills it on the nodes picked. The
+kit's `select` must have `--census`.
 
 A strategy that dies is not waited out. One dead rank ends the job, but it
 does not end the other ranks: they wait in the collective it never joins until
