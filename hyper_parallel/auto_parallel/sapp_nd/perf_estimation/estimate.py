@@ -583,15 +583,17 @@ def estimate_performance(*args, **kwargs):
     logger.info(stages)
     logger.info(ccfg)
 
+    # Only the plain walks record parts. A stage's time takes what the
+    # recompute walks add as RECOMPUTE alone; recorded as communication too,
+    # it made the parts outgrow the time, and the bubble, their difference,
+    # went negative.
     compute_perfs = estimate_comp(
         cfg, ccfg, stages, with_recomp=False, debugger=debugger
     )
     recompute_perfs = (
         [0] * cfg.p
         if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(
-            cfg, ccfg, stages, with_recomp=True, debugger=debugger
-        )
+        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
     )
     comm_perfs = estimate_comm(
         cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
@@ -600,9 +602,7 @@ def estimate_performance(*args, **kwargs):
     recomm_perfs = (
         [0] * cfg.p
         if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(
-            cfg, ccfg, stages, device_type, with_recomp=True, debugger=debugger
-        )
+        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
     )
 
     stage_perfs = estimate_stage(
