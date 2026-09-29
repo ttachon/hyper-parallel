@@ -26,6 +26,8 @@ import unittest
 import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
+from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     apply_layer_kind,
     check_and_apply_custom_hook,
@@ -142,6 +144,31 @@ class TestRecomputePricing(unittest.TestCase):
         compute_only = estimate_performance(
             ccfg, ccfg=CustomConfig(retype=RecType.COMPUTE_ONLY), device_type=Hard.Device_A2)
         self.assertGreater(default, compute_only)
+
+    def test_resent_communication_is_recompute_not_a_communication_part(self):
+        """
+        Feature: estimate_performance's parts.
+        Description: DeepSeek, fully recomputed at TP 4 and EP 8 on one
+            pipeline stage, priced with a debugger under the default options
+            and with compute only.
+        Expectation: Both record the plain walk's communication parts; the
+            communication the default sends again is in its RECOMPUTE, and
+            its parts add up to its score with no bubble.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        ccfg.set_strategy(pp=1, offset=0)
+        priced = {}
+        for retype in (RecType.WITH, RecType.COMPUTE_ONLY):
+            debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, ccfg.d)], all_dims=[Dim.DP]), Debug.PerfParts)
+            score = estimate_performance(
+                ccfg, ccfg=CustomConfig(retype=retype), debugger=debugger, device_type=Hard.Device_A2)
+            priced[retype] = (score, debugger.info)
+        (score, parts), (_, compute_only) = priced[RecType.WITH], priced[RecType.COMPUTE_ONLY]
+        comm = (Debug.PerfParts.DP_COMM, Debug.PerfParts.MP_COMM, Debug.PerfParts.EP_COMM, Debug.PerfParts.CP_COMM)
+        self.assertGreater(parts[Debug.PerfParts.EP_COMM], 0)
+        self.assertEqual([parts[part] for part in comm], [compute_only[part] for part in comm])
+        self.assertGreater(parts[Debug.PerfParts.RECOMPUTE], compute_only[Debug.PerfParts.RECOMPUTE])
+        self.assertAlmostEqual(parts[Debug.PerfParts.BUBBLE] / score, 0.0, places=12)
 
 
 if __name__ == "__main__":
