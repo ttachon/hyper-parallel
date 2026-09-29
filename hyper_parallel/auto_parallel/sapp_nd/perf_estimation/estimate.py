@@ -560,15 +560,17 @@ def _finalize_perf(perf, cache_file, debugger, memory):
 
 def _stage_parts(cfg, ccfg, stages, device_type, debugger):
     """One config's per-stage compute, recompute, communication and recomputed communication."""
+    # Only the plain walks record parts. A stage's time takes what the
+    # recompute walks add as RECOMPUTE alone; recorded as communication too,
+    # it made the parts outgrow the time, and the bubble, their difference,
+    # went negative.
     compute_perfs = estimate_comp(
         cfg, ccfg, stages, with_recomp=False, debugger=debugger
     )
     recompute_perfs = (
         [0] * cfg.p
         if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(
-            cfg, ccfg, stages, with_recomp=True, debugger=debugger
-        )
+        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
     )
     comm_perfs = estimate_comm(
         cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
@@ -576,9 +578,7 @@ def _stage_parts(cfg, ccfg, stages, device_type, debugger):
     recomm_perfs = (
         [0] * cfg.p
         if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(
-            cfg, ccfg, stages, device_type, with_recomp=True, debugger=debugger
-        )
+        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
     )
     return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
 
