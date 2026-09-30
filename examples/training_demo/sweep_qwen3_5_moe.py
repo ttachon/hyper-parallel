@@ -904,6 +904,9 @@ def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
     The launch also sets each strategy's ``edp_shard_size`` to world / EP,
     its whole expert data-parallel group, which no single value in this file
     states for every strategy ND searches: ``context.expert_shard`` says it.
+    ND prices each layer kind's activations from a census of a fake layer
+    (``context.census``): at the training shape the output layer's logits set
+    the peak, and the formulas alone put it far below the trainer's.
     """
     import yaml  # pylint: disable=import-outside-toplevel
 
@@ -917,7 +920,8 @@ def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
                                         mode=sweep.args.activation_checkpoint)
     raw["training"] = dict(raw.get("training") or {}, global_batch_size=sweep.gbs,
                            micro_batch_size=sweep.args.micro_batch_size)
-    raw["context"] = dict(raw.get("context") or {}, device_num=sweep.world, expert_shard="group")
+    raw["context"] = dict(raw.get("context") or {}, device_num=sweep.world, expert_shard="group",
+                          census=True)
     nd_yaml.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
