@@ -835,6 +835,11 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertFalse(gc_ok.ep_constraints_valid(pc_ok))
         gc_ok.ccfg.expert_shard = 1
         self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+        # A run that shards over each strategy's whole group fits any group.
+        gc_ok.ccfg.expert_shard = 2
+        gc_ok.ccfg.expert_shard_group = True
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+        gc_ok.ccfg.expert_shard_group = False
 
         # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
         gc_c1 = _make_gc(n_exp=8, ep=3, hff_exp=14336, etp=0, tp=2)

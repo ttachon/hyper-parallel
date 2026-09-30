@@ -107,9 +107,13 @@ class _CostModelParser(ABC):
         TP, the group of ranks that hold the same experts.  Without expert
         parallelism its FSDP shards the experts with the other parameters, over
         the optimizer's *ranks*.  Stated by no one, the optimizer shards them over
-        the whole group.
+        the whole group.  A run that shards each strategy's experts over its
+        whole group (``expert_shard_group``) does so under expert parallelism
+        whatever shard it states, since the group changes with the strategy.
         """
         stated = getattr(ccfg, "expert_shard", None)
+        if getattr(ccfg, "expert_shard_group", False) and ccfg.ep > 1:
+            return max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep)
         if not stated:
             return (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
         if ccfg.ep > 1:

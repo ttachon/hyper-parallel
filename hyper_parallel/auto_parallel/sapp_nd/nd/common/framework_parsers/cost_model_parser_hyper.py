@@ -60,6 +60,8 @@ search config).  Give them only to cost one fixed strategy::
       device_num: 64
       census: true                   # price each layer kind's activations
                                      # from a census of a fake layer of it
+      expert_shard: group            # shard each strategy's routed experts
+                                     # over its whole expert DP group
 
 ``model.config_overrides`` stays supported for standalone search configs,
 and wins over anything read from the checkpoint.
@@ -775,9 +777,18 @@ class CostModelParserHyperV2(_CostModelParser):
         default: a run that states none keeps each of its experts whole on
         every rank holding it.  The legacy schema states nothing, and the
         family's rule applies.
+
+        One ``edp_shard_size`` cannot state what a launcher does that sets it,
+        strategy by strategy, to the whole expert data-parallel group, since
+        that group changes with EP; ``context.expert_shard: group`` states it.
         """
         if is_auto_models_schema(self.config):
             self.ccfg.expert_shard = max(1, int(self._get_cfg_attr(fsdp, "edp_shard_size", 1) or 1))
+            ctx = self._get_cfg_attr(self.config, "context", Config({}))
+            rule = self._get_cfg_attr(ctx, "expert_shard", None)
+            if rule not in (None, "group"):
+                raise ValueError(f"context.expert_shard takes 'group' or nothing, not {rule!r}")
+            self.ccfg.expert_shard_group = rule == "group"
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
         """Populate optimizer and gradient sharding settings.

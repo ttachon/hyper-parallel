@@ -797,7 +797,26 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ccfg.has_grad_shard = has_grad_shard
         ccfg.os_max_shard = os_max_shard
         ccfg.expert_shard = None
+        ccfg.expert_shard_group = False
         return ccfg
+
+    def test_a_run_that_shards_experts_over_their_whole_group(self):
+        """BD-H06: a launcher that sets each strategy's expert shard to its whole group.
+
+        At DP 8 and an optimizer shard of 2, whatever shard the run states:
+        over the whole expert data-parallel group under expert parallelism,
+        4 ranks at EP 2 and 2 at EP 4; without EP, over the optimizer's 2
+        ranks, as a stated shard is.
+        """
+        got = {}
+        for ep, d_exp in ((1, 8), (2, 4), (4, 2)):
+            for shard in (1, 2):
+                ccfg = self._make_parser_ccfg(d=8, t=1, d_exp=d_exp, ep=ep, t_exp=1, os_max_shard=2)
+                ccfg.expert_shard = shard
+                ccfg.expert_shard_group = True
+                _CostModelParser.config_optimizer_shard(None, ccfg)
+                got[ep, shard] = ccfg.shard_p_os_exp
+        self.assertEqual(got, {(1, 1): 2, (1, 2): 2, (2, 1): 4, (2, 2): 4, (4, 1): 2, (4, 2): 2})
 
     def test_a_stated_expert_shard(self):
         """BD-H05: a run that states its expert shard shards routed experts as HyperParallel's FSDP does.

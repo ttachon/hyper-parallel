@@ -67,6 +67,10 @@ class _CostModVar:
     # expert over under expert parallelism, as the run states it; None for
     # the optimizer's whole group.
     expert_shard: int = None
+    # Whether the run shards each strategy's routed experts over that
+    # strategy's whole expert data-parallel group, as a launcher that sets
+    # edp_shard_size to the group does: the shard then follows the strategy.
+    expert_shard_group: bool = False
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None

@@ -1709,6 +1709,24 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertEqual(got[1][1], 1)
         self.assertEqual(got[2][1], 2)
 
+    def test_a_launcher_shards_each_strategys_experts_over_its_group(self):
+        """
+        Feature: _parse_expert_sharding.
+        Description: A MoE run at DP 4, TP 2 and EP 4 in the AutoModels schema
+            stating edp_shard_size 1, without and with context.expert_shard
+            group, and with a rule it does not know.
+        Expectation: The stated shard keeps each expert whole; the group rule
+            shards it over the 2-rank expert group whatever the run states;
+            an unknown rule is refused.
+        """
+        got = []
+        for context in ({}, {"expert_shard": "group"}):
+            ccfg = _make_ccfg(_moe_overrides(fsdp_config={"edp_shard_size": 1}, context=context))
+            got.append((ccfg.expert_shard_group, ccfg.shard_p_os_exp))
+        self.assertEqual(got, [(False, 1), (True, 2)])
+        with self.assertRaises(ValueError):
+            _make_ccfg(_moe_overrides(fsdp_config={}, context={"expert_shard": "all"}))
+
     def test_the_run_accumulates_without_a_pipeline(self):
         """
         Feature: accumulates_grads.
