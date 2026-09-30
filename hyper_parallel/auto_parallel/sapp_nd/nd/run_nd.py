@@ -26,6 +26,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+import hyper_parallel.auto_parallel.sapp_nd.nd.ratios as Ratios
 from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
     report,
     verify_activations,
@@ -94,6 +95,12 @@ def _compare_with_real_csv(runner, cli_args):
     )
     logger.output("%s", Debug.format_classified_comparison(configs_estimated))
     Debug.print_correlations_classified([metrics])
+    if cli_args.write_ratios is not None:
+        ratios = Ratios.fit_ratios(configs_estimated)
+        Ratios.write_ratios(cli_args.write_ratios, ratios, configs_estimated, cli_args.real_csv)
+        for text in Ratios.report(configs_estimated, ratios):
+            logger.output("%s", text)
+        logger.output("Ratios written to %s; run_nd -c reads them", cli_args.write_ratios)
 
 
 def _priced_train_yaml(search_config: str) -> str:
@@ -400,10 +407,21 @@ if __name__ == "__main__":
         help="Also write every configuration the search keeps, in ND's order, "
         "to this CSV: rank, degrees, memory in MB, score and its parts.",
     )
+    parser.add_argument(
+        "--write_ratios",
+        type=str,
+        default=None,
+        help="With --real_csv, fit a ratio per part, measured over ND's estimate, "
+        "on the configurations the CSV measured, write them to this JSON file "
+        "(the file -c reads) and print how well they predict each configuration "
+        "when fitted on the others.",
+    )
 
     args = parser.parse_args()
     if args.real_csv is not None and not os.path.isfile(args.real_csv):
         parser.error(f"real_csv not found: {args.real_csv}")
+    if args.write_ratios is not None and args.real_csv is None:
+        parser.error("--write_ratios fits the ratios on a comparison: it needs --real_csv")
 
     max_mem = (
         Memory.from_string(args.max_mem.strip())
