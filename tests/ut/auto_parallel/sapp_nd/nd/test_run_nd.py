@@ -205,7 +205,9 @@ class _FakeParallelize:
         """Return one measured configuration and its metrics without estimating."""
         self.compare_args = (csv_f, output_path, plot_idle)
         real = {"comp": 6.0, "dp_wait": 4.0}
-        configs = [(Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP]), 1, 10.0, 10.0, [1.0] * 9, real)]
+        # One value per part a score splits into: every PerfParts but TOTAL and MEMORY.
+        parts = [1.0] * (len(Debug.PerfParts) - 2)
+        configs = [(Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP]), 1, 10.0, 10.0, parts, real)]
         return configs, Debug.correlation_with_classified_comms(configs)
 
     def last_run_kwargs(self) -> dict:
@@ -1353,8 +1355,9 @@ class TestSappNDRunND(unittest.TestCase):
             and TOTAL keeps one distance per configuration.
         """
         dims = Dim.Dimensions([(Dim.DP, 4), (Dim.OP, 4)], all_dims=[Dim.DP, Dim.OP])
-        # FW, BW, RECOMPUTE, DP, MP, EP, CP, PP, BUBBLE: ND compute 6, DP 2, EP 1, PP + bubble 1.
-        estimations = [2.0, 3.0, 1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+        # FW, BW, RECOMPUTE, DP, DP_REDUCE, MP, EP, CP, PP, BUBBLE: ND compute 6, DP 2 of
+        # which 0.5 all-reduced, EP 1, PP + bubble 1.
+        estimations = [2.0, 3.0, 1.0, 1.5, 0.5, 0.0, 1.0, 0.0, 0.0, 1.0]
         real = {"comp": 5.0, "dp_wait": 2.0, "mp_wait": 0.0, "ep_wait": 1.0, "cp_wait": 0.0,
                 "pp_wait": 1.0, "op_wait": 1.0, "sp_wait": 0.0}
         doubled = {part: 2 * value for part, value in real.items()}
@@ -1737,6 +1740,35 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.custom_llama2(fp32)
         self.assertEqual(fp32.bytes_grad, 4)
         self.assertTrue(fp32.accumulates_grads)
+
+    def test_the_pipeline_takes_the_all_reduce_out_of_dp(self) -> None:
+        """
+        Feature: estimate_pipeline, PerfParts.DP_REDUCE.
+        Description: Two stages whose DP times of 8 and 10 hold all-reduces of
+            2 and 5, priced without and with the all-reduce recorded.
+        Expectation: The same time and bubble either way; the all-reduce is the
+            straggler stage's times the two micro-batches, and it and the split
+            run's DP_COMM add up to the plain run's DP_COMM.
+        """
+        cfg = _make_perf_cfg(p=2, vp=1, m=2)
+        runs = []
+        for reduces in (None, [2.0, 5.0]):
+            debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, 2)], all_dims=[Dim.DP]), Debug.PerfParts)
+            for part in (Debug.PerfParts.FW_COMPUTE, Debug.PerfParts.BW_COMPUTE, Debug.PerfParts.RECOMPUTE,
+                         Debug.PerfParts.MP_COMM, Debug.PerfParts.EP_COMM, Debug.PerfParts.CP_COMM):
+                debugger.info[part] = [1.0, 2.0]
+            debugger.info[Debug.PerfParts.DP_COMM] = [8.0, 10.0]
+            if reduces is not None:
+                debugger.info[Debug.PerfParts.DP_REDUCE] = reduces
+            time = PerfEstimate.estimate_pipeline(cfg, [12.0, 18.0], debugger=debugger)
+            runs.append((time, dict(debugger.info)))
+        (plain_time, plain), (split_time, split) = runs
+        self.assertEqual(split_time, plain_time)
+        self.assertEqual(split[Debug.PerfParts.BUBBLE], plain[Debug.PerfParts.BUBBLE])
+        self.assertEqual(plain[Debug.PerfParts.DP_REDUCE], 0)
+        self.assertEqual(split[Debug.PerfParts.DP_REDUCE], 10.0)
+        self.assertEqual(split[Debug.PerfParts.DP_COMM] + split[Debug.PerfParts.DP_REDUCE],
+                         plain[Debug.PerfParts.DP_COMM])
 
     def test_performance_formula_helpers(self) -> None:
         """

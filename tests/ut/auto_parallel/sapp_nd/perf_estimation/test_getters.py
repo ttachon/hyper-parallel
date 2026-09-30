@@ -305,6 +305,20 @@ class TestFsdpTraffic(unittest.TestCase):
         self.assertAlmostEqual(EvalLayerComm.fsdp_traffic(ccfg, ((100, 1, 1, 4),), 2, 1),
                                2 * 0.75 * 100 * 2)
 
+    def test_the_all_reduce_is_its_own_share_of_the_traffic(self):
+        """
+        Feature: EvalLayerComm.fsdp_reduce_traffic.
+        Description: The two parts of the test above.
+        Expectation: The sharded part's all-reduce is its copies' 2 * 3 / 4 of
+            a quarter, halved, the rest its gathers and reduce-scatter; the
+            unsharded part's traffic is all all-reduce.
+        """
+        ccfg = SimpleNamespace(bytes_p=2, bytes_grad=2)
+        self.assertAlmostEqual(EvalLayerComm.fsdp_reduce_traffic(ccfg, ((100, 1, 4, 16),), 0.5),
+                               2 * 0.75 * 25 * 2 * 0.5)
+        self.assertAlmostEqual(EvalLayerComm.fsdp_reduce_traffic(ccfg, ((100, 1, 1, 4),), 1),
+                               EvalLayerComm.fsdp_traffic(ccfg, ((100, 1, 1, 4),), 2, 1))
+
     def test_the_walk_counts_each_micro_batch_s_collectives(self):
         """
         Feature: the DP term of the communication walk under FSDP.

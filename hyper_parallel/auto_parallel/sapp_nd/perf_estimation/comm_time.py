@@ -573,8 +573,14 @@ def _accumulate_stage_comm(param, stage, stage_id):
     it, whichever layer the walk reached last.  Under FSDP (grads_as_params),
     a layer's DP volume, and the root's, is the traffic its collectives
     move a micro-batch (:meth:`EvalLayerComm.fsdp_traffic`).
+
+    Returns:
+        ``(comm, reduced)``: the volumes by dimension, and the part of the DP
+        volume the copies of a shard all-reduce
+        (:meth:`EvalLayerComm.fsdp_reduce_traffic`).
     """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
+    reduced = 0.0
     fsdp = bool(getattr(param["cfg"], "grads_as_params", False))
     layer_gathers, root_gathers, reduces = _fsdp_rounds(param["cfg"]) if fsdp else (0, 0, 0)
     for chunk_id, chunk in enumerate(stage):
@@ -593,10 +599,13 @@ def _accumulate_stage_comm(param, stage, stage_id):
                 if fsdp:
                     parts = EvalLayerComm.fsdp_layer_parts(cfg, param["ctx"])
                     comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, parts, layer_gathers, reduces)
+                    reduced += EvalLayerComm.fsdp_reduce_traffic(cfg, parts, reduces)
                 else:
                     comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
             elif fsdp and not is_body:
-                comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, fsdp_root_parts(cfg, layer), root_gathers, reduces)
+                parts = fsdp_root_parts(cfg, layer)
+                comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, parts, root_gathers, reduces)
+                reduced += EvalLayerComm.fsdp_reduce_traffic(cfg, parts, reduces)
 
             comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
                 cfg, param["ctx"], 1
@@ -616,7 +625,7 @@ def _accumulate_stage_comm(param, stage, stage_id):
                 comm[Dim.TP] += tp_again
                 comm[Dim.EP] += ep_again
                 comm[Dim.CP] += cp_again
-    return comm
+    return comm, reduced
 
 
 def estimate_from_mem_comm(*args, **kwargs):
@@ -646,8 +655,12 @@ def estimate_from_mem_comm(*args, **kwargs):
     )
     param["hooks"] = dict(zip(get_model_order(param["cfg"], param["stages"]), flatten))
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
+    # Each stage's all-reduce, the share of its DP time the copies of a shard
+    # spend reducing it: estimate_pipeline takes it out of DP_COMM.
+    reduces = []
     for stage_id, stage in enumerate(param["stages"]):
-        comm = _accumulate_stage_comm(param, stage, stage_id)
+        comm, reduced = _accumulate_stage_comm(param, stage, stage_id)
+        reduce_share = reduced / comm[Dim.DP] if comm[Dim.DP] else 0.0
 
         if param["ccfg"].ttype == PerformanceType.TIME:
             for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
@@ -689,6 +702,7 @@ def estimate_from_mem_comm(*args, **kwargs):
         comms[Dim.TP].append(comm[Dim.TP])
         comms[Dim.EP].append(comm[Dim.EP])
         comms[Dim.CP].append(comm[Dim.CP])
+        reduces.append(comm[Dim.DP] * reduce_share)
 
     if param["debugger"] and param["debugger"].is_enabled():
         logger.info("DP_COMM = %s", comms[Dim.DP])
@@ -696,6 +710,7 @@ def estimate_from_mem_comm(*args, **kwargs):
         logger.info("EP_COMM = %s", comms[Dim.EP])
         logger.info("CP_COMM = %s", comms[Dim.CP])
         param["debugger"].info[PerfParts.DP_COMM] = comms[Dim.DP]
+        param["debugger"].info[PerfParts.DP_REDUCE] = reduces
         param["debugger"].info[PerfParts.MP_COMM] = comms[Dim.TP]
         param["debugger"].info[PerfParts.EP_COMM] = comms[Dim.EP]
         param["debugger"].info[PerfParts.CP_COMM] = comms[Dim.CP]
