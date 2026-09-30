@@ -900,6 +900,10 @@ def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
     launch uses. The degrees are left as the config states them, since ND
     takes them from the measured CSV or searches them, and the world size is
     stated so that ND derives the data-parallel width the trainer does.
+
+    The launch also sets each strategy's ``edp_shard_size`` to world / EP,
+    its whole expert data-parallel group, which no single value in this file
+    states for every strategy ND searches: ``context.expert_shard`` says it.
     """
     import yaml  # pylint: disable=import-outside-toplevel
 
@@ -913,7 +917,7 @@ def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
                                         mode=sweep.args.activation_checkpoint)
     raw["training"] = dict(raw.get("training") or {}, global_batch_size=sweep.gbs,
                            micro_batch_size=sweep.args.micro_batch_size)
-    raw["context"] = dict(raw.get("context") or {}, device_num=sweep.world)
+    raw["context"] = dict(raw.get("context") or {}, device_num=sweep.world, expert_shard="group")
     nd_yaml.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
