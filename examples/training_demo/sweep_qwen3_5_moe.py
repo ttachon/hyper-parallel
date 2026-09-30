@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import re
@@ -488,13 +489,21 @@ class Sweep:
         Stored beside ND's ranking, so a ranking made for another shape is
         refused rather than read as this one's: the output directory is shared
         by default, and a stale ranking would otherwise look like a fresh one.
+        The ratios the ranking was scored with count too, by their content.
         """
         return {"world": self.world, "layers": self.args.layers,
                 "seq_len": self.args.seq_len,
                 "activation_checkpoint": self.args.activation_checkpoint,
                 "global_batch_size": self.gbs,
                 "micro_batch_size": self.args.micro_batch_size,
-                "config": self.args.config.name, "arch": self.args.arch}
+                "config": self.args.config.name, "arch": self.args.arch,
+                "ratios": (hashlib.md5(self.args.ratios.read_bytes()).hexdigest()[:12]
+                           if self.args.ratios else None)}
+
+    @property
+    def ratios_json(self) -> Path:
+        """Where compare writes the ratios this sweep's measurements fit."""
+        return self.out / "nd_ratios.json"
 
     @property
     def python(self) -> str:
@@ -937,20 +946,22 @@ def stage_rank(sweep: Sweep) -> None:
     what this model can run: a strategy ND prefers that the trainer cannot run
     is worth seeing, so the choice among the runnable ones is left to
     ``pick_nd_top``. Any ranking already in the directory is removed first, so
-    a search that fails cannot leave an older one looking current.
+    a search that fails cannot leave an older one looking current. With
+    ``--ratios``, every score is ND's corrected estimate in milliseconds.
     """
     require_importable(sweep)
     nd_yaml = sweep.out / "nd_model.yaml"
     write_nd_config(sweep, nd_yaml)
     for stale in (sweep.ranking_csv, _shape_file(sweep)):
         stale.unlink(missing_ok=True)
+    ratios = ["-c", str(sweep.args.ratios)] if sweep.args.ratios else []
     _run([
         sweep.python, "-m", RUN_ND,
         "-y", str(nd_yaml), "-f", sweep.args.framework,
         "-d", str(sweep.world), "-A", sweep.args.arch, "-b", str(sweep.gbs),
         "-t", str(max(20, 2 * sweep.args.nd_top)),
         "--ranking_csv", str(sweep.ranking_csv), "-o", str(sweep.out / "nd_rank"),
-    ])
+    ] + ratios)
     _shape_file(sweep).write_text(json.dumps(sweep.shape, indent=2), encoding="utf-8")
 
 
@@ -1141,18 +1152,27 @@ def stage_compare(sweep: Sweep) -> None:
     ``--framework`` must select the AutoModels-aware parser: run_nd defaults to
     ``mindformers``, which reads a different schema, and the deprecated
     ``hyperparallel`` wants a TorchTitan TOML plus a source path.
+
+    The comparison also fits the ratios of the next round, measured over ND's
+    estimate part by part, into ``nd_ratios.json``: ``--ratios`` passes them to
+    that round's rank stage.
     """
     require_importable(sweep)
     if not sweep.merged_csv.is_file():
         raise SystemExit(f"nothing to compare: {sweep.merged_csv} does not exist")
     nd_yaml = sweep.out / "nd_model.yaml"
     write_nd_config(sweep, nd_yaml)
+    sweep.ratios_json.unlink(missing_ok=True)
     _run([
         sweep.python, "-m", RUN_ND,
         "-y", str(nd_yaml), "-f", sweep.args.framework,
         "-d", str(sweep.world), "-A", sweep.args.arch,
         "--real_csv", str(sweep.merged_csv), "-o", str(sweep.nd_dir),
+        "--write_ratios", str(sweep.ratios_json),
     ], check=False)
+    if sweep.ratios_json.is_file():
+        print(f"\nRatios for the next round in {sweep.ratios_json}: rank it with "
+              f"--ratios {sweep.ratios_json}", flush=True)
     ranking, why = load_ranking(sweep)
     if ranking:
         report_ranking(sweep, ranking)
@@ -1341,6 +1361,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                              "environment's python, not necessarily this one")
     parser.add_argument("--framework", default="hyper_v2",
                         help="run_nd parser; hyper_v2 reads the AutoModels schema")
+    parser.add_argument("--ratios", type=Path, default=None,
+                        help="the ratios a compared round wrote (its nd_ratios.json): "
+                             "the rank stage scores every strategy with them (run_nd -c)")
     parser.add_argument("--profile-memory", choices=("none", "separate", "same"),
                         default="separate",
                         help="'separate' repeats the sweep with the allocator "
