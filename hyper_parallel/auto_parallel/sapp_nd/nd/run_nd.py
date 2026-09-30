@@ -18,12 +18,20 @@ import argparse
 import os
 import sys
 
+import yaml
+
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
-import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    report,
+    verify_activations,
+    verify_flops,
+    verify_parameters,
+)
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -33,6 +41,10 @@ def _apply_cli_overrides(search_cfg, cli_args):
         search_cfg: The search config read from ``-s/--search-config``.
         cli_args: The parsed CLI namespace.
     """
+    if cli_args.device_type is not None:
+        # -A sets the device the search prices, as it does on the CLI path;
+        # only the search config's device_type reached the search before.
+        search_cfg.cluster_spec["device_type"] = cli_args.device_type
     if cli_args.global_batch_size is not None:
         search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
     if cli_args.max_mem is not None:
@@ -84,6 +96,41 @@ def _compare_with_real_csv(runner, cli_args):
     Debug.print_correlations_classified([metrics])
 
 
+def _priced_train_yaml(search_config: str) -> str:
+    """The train.yaml a search config names, which its search prices.
+
+    Args:
+        search_config: The search config's path.
+
+    Returns:
+        Its ``train_yaml``, or an empty string where it names none, as a
+        standalone search config does.
+    """
+    with open(search_config, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    named = raw.get("train_yaml") if isinstance(raw, dict) else None
+    return named if isinstance(named, str) else ""
+
+
+def _check_train_yaml(cli_parser: argparse.ArgumentParser, cli_args: argparse.Namespace) -> None:
+    """Refuse a -y that is not the train.yaml the search config prices.
+
+    The search prices the train.yaml its config names, and -y is the one
+    the resolved strategy is written over: two files would put one run's
+    strategy over another's run.
+
+    Args:
+        cli_parser: The parser, whose ``error()`` exits.
+        cli_args: The parsed CLI namespace, both files found.
+    """
+    priced = _priced_train_yaml(cli_args.search_config)
+    if priced and os.path.isfile(priced) and not os.path.samefile(priced, cli_args.yaml_config):
+        cli_parser.error(
+            f"-y names {cli_args.yaml_config}, but the search config prices its train_yaml, {priced}: "
+            "pass the same file"
+        )
+
+
 def _run_hyper_v2_search(cli_parser, cli_args):
     """Run the HyperParallel V2 strategy search via ``config_adapter``.
 
@@ -113,6 +160,7 @@ def _run_hyper_v2_search(cli_parser, cli_args):
         cli_parser.error(f"search-config not found: {cli_args.search_config}")
     if not os.path.isfile(cli_args.yaml_config):
         cli_parser.error(f"yaml-config not found: {cli_args.yaml_config}")
+    _check_train_yaml(cli_parser, cli_args)
 
     set_verbose_level(cli_args.verbosity)
     Debug.set_output_dir(cli_args.output_dir)
@@ -244,8 +292,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-A",
         "--device_type",
-        default="A2",
-        help="choose device type between A2 or A3",
+        default=None,
+        help="choose device type between A2 or A3: A2 unless given, or a search config states one",
     )
     parser.add_argument(
         "-swap_os",
@@ -322,6 +370,14 @@ if __name__ == "__main__":
         "(hyper_v2 only). Scalar=fixed, list=candidates, 'auto'=ND decides.",
     )
     parser.add_argument(
+        "-V",
+        "--verify",
+        action="store_true",
+        help="Verify mode (hyper_v2 only): set the parameters ND prices of each "
+        "part of the model -y trains beside those of the Transformers layers "
+        "its checkpoint builds, and exit.",
+    )
+    parser.add_argument(
         "-o",
         "--output-dir",
         type=str,
@@ -364,6 +420,21 @@ if __name__ == "__main__":
             )
             args.cache_file = None
 
+    if args.verify:
+        if args.framework != "hyper_v2":
+            parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
+        set_verbose_level(args.verbosity)
+        logger.output("Parameters")
+        for line in report(verify_parameters(args.yaml_config)):
+            logger.output(line)
+        logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
+        for line in report(verify_flops(args.yaml_config)):
+            logger.output(line)
+        logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
+        for line in report(verify_activations(args.yaml_config)):
+            logger.output(line)
+        sys.exit(0)
+
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)
         sys.exit(0)
@@ -383,7 +454,7 @@ if __name__ == "__main__":
     Debug.set_output_dir(args.output_dir)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
-    machine = Hard.Machine(args.devices, args.device_type)
+    machine = Hard.Machine(args.devices, args.device_type or "A2")
 
     if args.framework == "hyperparallel2":
         if args.yaml_config is None or args.train_yaml is None or args.accelerate_yaml is None:

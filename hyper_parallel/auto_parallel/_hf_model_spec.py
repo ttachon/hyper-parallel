@@ -24,8 +24,15 @@ function-local because ``transformers`` is not a hard dependency of
 ``hyper_parallel`` (``requirements.txt`` only pins numpy) and the non-Hyper
 cost-model backends must keep working without it.
 """
+import copy
 import logging
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from hyper_parallel.auto_parallel._layer_census import (
+    CensusUnavailable,
+    census_activations,
+    census_output_activations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +74,15 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "kv_lora_rank": ("kv_lora_rank",),
     "q_lora_rank": ("q_lora_rank",),
     "qk_rope_head_dim": ("qk_rope_head_dim",),
+    "qk_nope_head_dim": ("qk_nope_head_dim",),
+    "v_head_dim": ("v_head_dim",),
     "attn_output_gate": ("attn_output_gate",),
     "tie_word_embeddings": ("tie_word_embeddings",),
+    # Llama's attention_bias biases all four projections; Qwen2's configs
+    # state none and bias the query, key and value projections alone.
+    "qkv_bias": ("qkv_bias", "attention_bias"),
+    "o_bias": ("o_bias", "attention_bias"),
+    "mlp_bias": ("mlp_bias",),
     # Stated by a few families; Qwen3's config does not state its own.
     "qk_norm": ("qk_norm", "use_qk_norm", "qk_layernorm"),
     # A hybrid stack states its layers; without this every layer is costed
@@ -114,10 +128,50 @@ def infer_qk_norm(name: Any) -> bool:
     return any(pattern in lowered for pattern in _QK_NORM_NAMES)
 
 
-def _settle_qk_norm(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Settle whether the language model normalizes queries and keys, from its name if nothing states it."""
+# What a lower-cased model name contains when its attention projects queries,
+# keys and values with a bias and its output without, which its Transformers
+# config does not state: the Qwen2 generation.
+_QKV_BIAS_NAMES = ("qwen2",)
+
+# What a lower-cased model name contains when its MoE layer gates its shared
+# expert's output with a weight of its own: Qwen2-MoE, Qwen3.5 and Qwen3-Next.
+_SHARED_EXPERT_GATE_NAMES = ("qwen2_moe", "qwen3_5", "qwen3_next")
+
+
+def infer_qkv_bias(name: Any) -> bool:
+    """Return whether a model named *name* biases its query, key and value projections.
+
+    For a Transformers config that states no ``attention_bias``, as the
+    Qwen2 generation's, whose projections have one.
+    """
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _QKV_BIAS_NAMES)
+
+
+def infer_shared_expert_gate(name: Any) -> bool:
+    """Return whether a model named *name* gates its shared expert's output with a weight of its own."""
+    lowered = str(name).lower()
+    return any(pattern in lowered for pattern in _SHARED_EXPERT_GATE_NAMES)
+
+
+def _settle_facts(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Settle what the language model's config does not state, from its name where nothing states it.
+
+    Whether its attention normalizes queries and keys, and the biases and
+    norms its layers hold: a Transformers decoder layer holds two RMSNorms,
+    no bias unless its config states one or its family has one, and a
+    shared expert gated where its family gates it.
+    """
+    name = spec.get("name")
     if spec.get("qk_norm") is None:
-        spec["qk_norm"] = infer_qk_norm(spec.get("name"))
+        spec["qk_norm"] = infer_qk_norm(name)
+    if spec.get("qkv_bias") is None:
+        spec["qkv_bias"] = infer_qkv_bias(name)
+    for fact in ("o_bias", "mlp_bias", "norm_bias"):
+        spec[fact] = bool(spec.get(fact))
+    spec["layer_norms"] = spec.get("layer_norms") or 2
+    if spec.get("shared_expert_gate") is None:
+        spec["shared_expert_gate"] = infer_shared_expert_gate(name)
     return spec
 
 
@@ -274,6 +328,12 @@ def _model_path(model_raw: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
+    config = _get_hf_config(model_raw)
+    return config, _text_tower(config)
+
+
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the fields the model section states itself, as a plain dict.
 
@@ -292,9 +352,73 @@ def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     return explicit
 
 
+# The censuses this process has run, by config, layer stack and length: a
+# harness pricing several runs of one model runs one.
+_CENSUSES: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+
+def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[Any, ...] = ()) -> Dict[str, Any]:
+    """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
+    key = (
+        text_config.to_json_string(),
+        tuple((group["kind"], int(group["count"])) for group in layers),
+        int(seq_length),
+        tuple(f"{spec.factory.__module__}.{spec.factory.__qualname__}" for spec in replacements),
+    )
+    if key not in _CENSUSES:
+        logger.info("census of each layer kind and of the output layer at %d tokens%s", seq_length,
+                    f", {len(replacements)} module replacements installed" if replacements else "")
+        try:
+            kinds = census_activations(text_config, layers, seq_length, replacements)
+            _CENSUSES[key] = {
+                "activations": {kind: record.to_dict() for kind, record in kinds.items()},
+                "output_activations": census_output_activations(text_config, seq_length, replacements).to_dict(),
+            }
+        except CensusUnavailable as exc:
+            # The formulas price the layers, as they do without a census: a
+            # census of Transformers' own modules would price a layer the run
+            # does not build (F53).
+            logger.warning("no census of the layers: %s", exc)
+            _CENSUSES[key] = {}
+    return copy.deepcopy(_CENSUSES[key])
+
+
+def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
+    """Warn that a census asked for cannot run, unless the overrides state its records.
+
+    A census builds its layers from the checkpoint's config; a search hands
+    ND a spec whose overrides state the records its reader measured.
+    """
+    if census_seq_len and not explicit.get("activations"):
+        logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
+
+
+def _census_layers(spec: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """The groups of body layers a census tells apart, in model order, or None.
+
+    The Hyper parser prices a hybrid model's layers by the attention flavour
+    its ``layer_types`` states, and any other model's as one kind; None
+    where the first layers are dense (``first_k_dense_replace``), a kind
+    the parser prices through the model's family.
+    """
+    if spec.get("first_k_dense_replace"):
+        return None
+    count = int(spec.get("num_hidden_layers") or 0)
+    kinds = [str(kind) for kind in (spec.get("layer_types") or [])[:count]] or ["decoder"] * count
+    groups: List[Dict[str, Any]] = []
+    for kind in kinds:
+        if groups and groups[-1]["kind"] == kind:
+            groups[-1]["count"] += 1
+        else:
+            groups.append({"kind": kind, "count": 1})
+    return groups
+
+
 def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
+    replacements: Tuple[Any, ...] = (),
 ) -> Dict[str, Any]:
     """Return canonical cost-model fields for a Trainer ``model`` section.
 
@@ -313,6 +437,13 @@ def resolve_hf_model_spec(
     Args:
         model_raw: The ``model`` section, as a plain mapping.
         visual_seq_len: Optional override for the encoder sequence length.
+        census_seq_len: The tokens to run a census of each layer kind of
+            the language model at, and of its output layer
+            (:mod:`hyper_parallel.auto_parallel._layer_census`), which the
+            spec states as ``"activations"`` and ``"output_activations"``;
+            0 runs none.  The census builds its layers from the checkpoint's
+            config: a spec from ``config_overrides`` alone gets none, and an
+            override of a model field does not reach it.
 
     Returns:
         A dict of canonical model fields, always carrying ``"name"``.
@@ -327,7 +458,8 @@ def resolve_hf_model_spec(
     if not model_path:
         if explicit:
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            return _settle_qk_norm(explicit)
+            _no_census(census_seq_len, explicit)
+            return _settle_facts(explicit)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path, "
             "model.config_path or model.config_overrides for Auto Parallel search"
@@ -342,7 +474,8 @@ def resolve_hf_model_spec(
                 "falling back to model.config_overrides", exc,
             )
             explicit.setdefault("name", model_raw.get("name", "custom"))
-            return _settle_qk_norm(explicit)
+            _no_census(census_seq_len, explicit)
+            return _settle_facts(explicit)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "
@@ -362,4 +495,12 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    return _settle_qk_norm(spec)
+    spec = _settle_facts(spec)
+    if census_seq_len:
+        layers = _census_layers(spec)
+        if layers is None:
+            logger.warning("no census of %s: its first layers are dense, a kind a census does not tell apart",
+                           spec["name"])
+        else:
+            spec.update(_census(_text_tower(model_config), layers, census_seq_len, replacements))
+    return spec

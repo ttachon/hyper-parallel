@@ -21,6 +21,7 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import NodeEval, Context
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
@@ -160,6 +161,32 @@ def _ring_cp_volumes(ccfg, rec_factor, kv_dim):
     return _CPVolumes(kv_vol_step, total_kv, comm_vol, int(cp - 1), 2)
 
 
+def cp_traffic(ccfg: CostModelConfig, cp_algo: CPAlgo) -> float:
+    """The bytes a rank moves a micro-batch for one layer's context parallelism.
+
+    Attention exchanges its keys and values, the MLP nothing.  colossalai
+    and hybrid CP all-gather K and V over the sequence in the forward and
+    reduce-scatter their gradients in the backward, as HyperParallel runs
+    them (a ring passes the same chunks), each moving (cp - 1) / cp of the
+    sequence a rank.  Ulysses all-to-alls the local query, key, value and
+    output between sequence and heads, forward and backward.  A
+    linear-attention layer passes its recurrent state to the next rank,
+    and its gradient back, unless it all-to-alls as Ulysses does.
+    """
+    cp, t = ccfg.cp, max(1, ccfg.t)
+    ring = (cp - 1) / cp
+    head = ccfg.dh or ccfg.h / max(1, ccfg.a)
+    kv_width = compute_kv_dim(ccfg)
+    if cp_algo == CPAlgo.ULYSSES_CP:
+        rope = ccfg.dhr if detect_attention_type(ccfg) == AttentionType.MLA else 0
+        widths = ccfg.a * (head + rope) / t + 2 * kv_width + ccfg.a * head / t
+        return 2 * ring * ccfg.s / cp * ccfg.b * widths * ccfg.bytes_compute
+    if ccfg.n_linrec:
+        state_bytes = 4
+        return 2 * ccfg.a / t * head * head * state_bytes
+    return 2 * ring * ccfg.s * ccfg.b * 2 * kv_width * ccfg.bytes_compute
+
+
 def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPCommunicationCost:
     """Estimate CP communication cost with detailed breakdown.
 
@@ -192,6 +219,7 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
         volumes = _ulysses_cp_volumes(ccfg, rec_factor)
     else:
         volumes = _ring_cp_volumes(ccfg, rec_factor, kv_dim)
+    volumes = volumes._replace(comm_volume=cp_traffic(ccfg, cp_algo))
     return _cp_comm_cost_common(
         ccfg, volumes, attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
@@ -458,6 +486,7 @@ def prepare_context():
     # A MoE layer's experts, counted as the memory path's eval config counts them.
     ctx.ffn_routed_num_p = EvalFFn.num_params_routed_expert
     ctx.ffn_shared_num_p = EvalFFn.num_params_shared_expert
+    ctx.ffn_router_num_p = EvalFFn.num_params_router
     ctx.norm_num_p = EvalNorm.num_params_norm
 
     ctx.node_eval[LayerType.EMBEDDING_LAYER] = NodeEval(
@@ -479,14 +508,17 @@ def _recomputed_comm(cfg, ctx, layer):
     It is the communication whose buffers the layer's memory no longer keeps:
     all of it for a fully recomputed layer, and for a selective one what its
     switches drop, which the memory model's own terms give as the plain
-    volume less the selective one. Parameter traffic is not recomputed.
+    volume less the selective one. Parameter traffic is not recomputed. Of
+    CP's traffic, a recompute runs the forward's exchange again, the half
+    the gather switch keeps in a selective layer.
     """
     def _volumes(node):
         ctx.current_node = node
+        kept = EvalUtils.rec_coeff(node == LayerType.SEL_REC_LAYER, cfg.rec_op.gather)
         return (
             EvalLayerComm.tp_comm_layer(cfg, ctx, 1),
             EvalLayerComm.ep_comm_layer(cfg, ctx, 1),
-            cp_comm_layer_detailed(cfg, ctx).comm_volume,
+            cp_comm_layer_detailed(cfg, ctx).comm_volume / 2 * kept,
         )
 
     kept = ctx.current_node
@@ -500,6 +532,35 @@ def _recomputed_comm(cfg, ctx, layer):
         ctx.current_node = kept
 
 
+def fsdp_root_parts(cfg, layer) -> tuple:
+    """The root's table, the embedding's or the output layer's, as FSDP holds it.
+
+    The parts are as :meth:`EvalLayerComm.fsdp_layer_parts` gives a layer's;
+    a table the output layer shares is its.
+    """
+    if layer == LayerType.EMBEDDING_LAYER:
+        if EvalHead.shares_output_table(cfg):
+            return ()
+        tp = cfg.shard_embed / max(1, cfg.gather_embed or 1)
+        return ((EvalHead.num_params_embed(cfg, None), tp, cfg.shard_embed, cfg.d * tp),)
+    return ((EvalTail.num_params_output(cfg, None), cfg.t, cfg.shard_p_os_non_exp_partial, cfg.d * cfg.cp * cfg.t),)
+
+
+def _fsdp_rounds(cfg) -> tuple:
+    """How many times a micro-batch FSDP gathers a layer's and the root's parameters, and all-reduces.
+
+    Resharded after its forward and its backward, a layer is gathered for
+    both, and the root, kept through its backward, once; kept gathered, each
+    is gathered once a step.  The copies of a shard all-reduce once a step,
+    after the reduce-scatters, where an FSDP group shards the parameters,
+    and every micro-batch where none does.
+    """
+    micro = max(1, cfg.m)
+    reshards = bool(getattr(cfg, "reshards", False))
+    shards = cfg.shard_p_os_non_exp_partial > cfg.t * cfg.cp
+    return (2 if reshards else 1 / micro), (1 if reshards else 1 / micro), (1 / micro if shards else 1)
+
+
 def _accumulate_stage_comm(param, stage, stage_id):
     """Sum the per-layer DP, TP, EP and CP communication volumes of one stage.
 
@@ -509,9 +570,13 @@ def _accumulate_stage_comm(param, stage, stage_id):
 
     A body layer is priced on the walk's config, after its group's hook; the
     embedding and the output layer on the model's config, as its family left
-    it, whichever layer the walk reached last.
+    it, whichever layer the walk reached last.  Under FSDP (grads_as_params),
+    a layer's DP volume, and the root's, is the traffic its collectives
+    move a micro-batch (:meth:`EvalLayerComm.fsdp_traffic`).
     """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
+    fsdp = bool(getattr(param["cfg"], "grads_as_params", False))
+    layer_gathers, root_gathers, reduces = _fsdp_rounds(param["cfg"]) if fsdp else (0, 0, 0)
     for chunk_id, chunk in enumerate(stage):
         for lay_id, layer in enumerate(chunk):
             param["ctx"].current_node = layer
@@ -525,7 +590,13 @@ def _accumulate_stage_comm(param, stage, stage_id):
                 logger.info("is layer moe ? %s", cfg.n_exp > 1)
                 param["ctx"].current_node = LayerType.NOT_REC_LAYER
                 logger.info("param ctx %s", param["ctx"])
-                comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
+                if fsdp:
+                    parts = EvalLayerComm.fsdp_layer_parts(cfg, param["ctx"])
+                    comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, parts, layer_gathers, reduces)
+                else:
+                    comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
+            elif fsdp and not is_body:
+                comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, fsdp_root_parts(cfg, layer), root_gathers, reduces)
 
             comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
                 cfg, param["ctx"], 1
@@ -533,9 +604,10 @@ def _accumulate_stage_comm(param, stage, stage_id):
             comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
                 cfg, param["ctx"], 1
             )  # * param["cfg"].ep
-            comm[Dim.CP] += cp_comm_layer_detailed(
-                cfg, param["ctx"]
-            ).comm_volume
+            if is_body:
+                comm[Dim.CP] += cp_comm_layer_detailed(
+                    cfg, param["ctx"]
+                ).comm_volume
             # min(device_type.level_bound_number[0], param["cfg"].ep)
             # comm_cp += EvalLayerComm.cp_comm_layer
             # (param["cfg"], param["ctx"])

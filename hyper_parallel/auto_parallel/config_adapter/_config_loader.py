@@ -18,9 +18,10 @@ Reads Search Config (``search.yaml``) and HyperParallel training config
 (``train.yaml``) files, producing :class:`NormalizedConfig` instances.
 """
 
+import copy
 import logging
 import os
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import yaml  # type: ignore[import-untyped]  # pylint: disable=C0415
@@ -31,6 +32,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 logger = logging.getLogger(__name__)
@@ -92,16 +94,72 @@ def _get_dict(raw: Dict[str, Any], key: str) -> Dict[str, Any]:
     return val if isinstance(val, dict) else {}
 
 
+# The model section's keys that state how the run builds, loads and computes
+# the model, not the model; the cost model reads them there.
+_MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype", "softmax_compute_type")
+
+# The root keys of an AutoModels train.yaml that state the run.  Its
+# plan_overrides state the modules it builds, which a census measures.
+_RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer", "plan_overrides")
+
+# The ``context`` keys of a train.yaml that state how the cost model prices
+# the run: a census of the layers, and a vision tower's token count.  The
+# device count and the memory budget are a search's own.
+_RUN_CONTEXT_KEYS = ("census", "visual_seq_len")
+
+# The keys of a legacy train.yaml's ``train`` section that are not its
+# training settings: recompute, the search's, and precision, which the cost
+# model reads from the model section.
+_LEGACY_TRAIN_SECTIONS = ("accelerator", "optimizer", "gradient_checkpointing", "mixed_precision")
+
+
+def _model_run(model_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the dtypes a model section states for the run."""
+    return {key: model_raw[key] for key in _MODEL_RUN_KEYS if model_raw.get(key) is not None}
+
+
+def _stated_run(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the run a train.yaml states, in the AutoModels sections' names.
+
+    The model's dtypes, FSDP's precision and resharding, the optimizer,
+    gradient clipping and the accelerator's settings are the run's, and the
+    model spec carries none of them.  The strategy the same sections state
+    stays in: the search runner writes the one it searches over it.  A legacy
+    train.yaml states them under ``train``.  The context's pricing options,
+    :data:`_RUN_CONTEXT_KEYS`, ride along.
+    """
+    run: Dict[str, Any] = {"model": _model_run(_get_dict(raw, "model"))}
+    context = {key: value for key, value in _get_dict(raw, "context").items() if key in _RUN_CONTEXT_KEYS}
+    if context:
+        run["context"] = copy.deepcopy(context)
+    if is_auto_models_schema(raw):
+        for key in _RUN_SECTIONS:
+            if raw.get(key) is not None:
+                run[key] = copy.deepcopy(raw[key])
+        return run
+    train_raw = _get_dict(raw, "train")
+    run["training"] = {
+        key: copy.deepcopy(value) for key, value in train_raw.items() if key not in _LEGACY_TRAIN_SECTIONS
+    }
+    for key in ("accelerator", "optimizer"):
+        if isinstance(train_raw.get(key), dict):
+            run[key] = copy.deepcopy(train_raw[key])
+    return run
+
+
 def _load_auto_models_model_spec(
     model_raw: Dict[str, Any],
     visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
+    replacements: tuple = (),
 ) -> Dict[str, Any]:
     """Resolve model dimensions through the shared AutoModels path.
 
     Delegates to :func:`resolve_hf_model_spec` so this reader and the
     SAPP-ND parser cannot disagree about field names or fallbacks.
     """
-    return _normalize_model_spec(resolve_hf_model_spec(model_raw, visual_seq_len))
+    return _normalize_model_spec(
+        resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, replacements))
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -142,7 +200,7 @@ def _load_yaml(path: str) -> Dict[str, Any]:
 
 def _parse_unified_parallelism(
     para_raw: Dict[str, Any],
-) -> Tuple[Dict[str, List[int]], Dict[str, Any]]:
+) -> Tuple[Dict[str, List[int]], Dict[str, Any], Set[str]]:
     """Convert the unified parallelism declaration into search_space + constraint.
 
     Rules:
@@ -160,7 +218,7 @@ def _parse_unified_parallelism(
     """
     search_space: Dict[str, List[int]] = {}
     constraint: Dict[str, Any] = {}
-    auto: set = set()
+    auto: Set[str] = set()
 
     for short_key, canonical_key in _UNIFIED_DIM_MAP.items():
         if short_key not in para_raw:
@@ -241,15 +299,19 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         base_config = _build_config_from_hp_yaml(base_raw)
 
     model_spec: Dict[str, Any]
+    run: Dict[str, Any]
     if base_config:
         model_spec = dict(base_config.model_spec)
+        run = copy.deepcopy(base_config.run)
     else:
         model_spec = {}
+        run = {}
 
     # Override or supply model section from search.yaml
     search_model = _get_dict(raw, "model")
     if search_model:
         model_spec.update(search_model)
+        run.setdefault("model", {}).update(_model_run(search_model))
 
     model_spec.setdefault("max_position_embeddings", 4096)
     model_spec.setdefault("local_batch_size", 1)
@@ -314,6 +376,7 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         parallelism_summary=summary,
         estimator=estimator,
         pp_config=pp_config,
+        run=run,
     )
 
 
@@ -382,23 +445,23 @@ _AUTO_MODELS_ACCEL_TO_SEARCH = {
 }
 
 
-def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
-    """Construct a normalized config from the current AutoModels schema."""
+def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Load model dimensions and training attributes from AutoModels YAML."""
     model_raw = _get_dict(raw, "model")
     training_raw = _get_dict(raw, "training")
-    accelerator_raw = _get_dict(raw, "accelerator")
-    fsdp_raw = _get_dict(raw, "fsdp_config")
-    activation_raw = _get_dict(raw, "activation_checkpoint")
     dataset_raw = _get_dict(raw, "dataset")
     data_transform_raw = _get_dict(dataset_raw, "data_transform")
-
     context_raw = _get_dict(raw, "context")
-    model_spec = _load_auto_models_model_spec(
-        model_raw, context_raw.get("visual_seq_len"),
-    )
+
     # Both spellings the SAPP-ND parser accepts, so the two halves of the
     # cost model agree on where the training sequence length comes from.
     seq_len = data_transform_raw.get("max_seq_len") or _get_dict(raw, "data").get("max_seq_len")
+    # A census builds its layers from the checkpoint's config, which only
+    # this reader resolves: the search hands ND the spec, its records in it.
+    census_seq_len = int(seq_len or 4096) if context_raw.get("census") else 0
+    model_spec = _load_auto_models_model_spec(
+        model_raw, context_raw.get("visual_seq_len"), census_seq_len, _census_replacements(raw, census_seq_len),
+    )
     if seq_len:
         model_spec["max_position_embeddings"] = seq_len
     else:
@@ -413,8 +476,17 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
         model_spec["device_num"] = int(context_raw["device_num"])
     model_spec["local_batch_size"] = training_raw.get("micro_batch_size", 1)
     model_spec["compute_dtype"] = model_raw.get("torch_dtype", "bfloat16")
+    return model_spec
 
+
+def _load_auto_models_parallelism(
+    raw: Dict[str, Any],
+) -> Tuple[Dict[str, List[int]], int, int]:
+    """Load fixed parallelism degrees from AutoModels YAML."""
+    accelerator_raw = _get_dict(raw, "accelerator")
+    fsdp_raw = _get_dict(raw, "fsdp_config")
     search_space: Dict[str, List[int]] = {}
+
     dp_shard_size = fsdp_raw.get("dp_shard_size")
     if dp_shard_size is not None:
         search_space["data_parallel_shard_degree"] = [int(dp_shard_size)]
@@ -423,16 +495,33 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
         if value is not None:
             search_space[search_name] = [int(value)]
 
+    data_parallel_size = int(dp_shard_size or 1)
+    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
+    return search_space, data_parallel_size, pp_degree
+
+
+def _census_replacements(raw: Dict[str, Any], census_seq_len: int) -> tuple:
+    """The module replacements a census runs its layers with: the ones the train.yaml's plan_overrides install."""
+    if not census_seq_len:
+        return ()
+    return replacement_specs(raw.get("plan_overrides") or ())
+
+
+def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
+    """Construct a normalized config from the current AutoModels schema."""
+    model_spec = _load_auto_models_model_spec_from_yaml(raw)
+    search_space, data_parallel_size, pp_degree = _load_auto_models_parallelism(raw)
+    training_raw = _get_dict(raw, "training")
+    activation_raw = _get_dict(raw, "activation_checkpoint")
+
     global_batch_size = int(training_raw.get("global_batch_size", 0) or 0)
     local_batch_size = int(model_spec["local_batch_size"] or 1)
-    data_parallel_size = int(dp_shard_size or 1)
     micro_batch_num = (
         global_batch_size // (local_batch_size * data_parallel_size)
         if global_batch_size
         and global_batch_size % (local_batch_size * data_parallel_size) == 0
         else 1
     )
-    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
 
     mode = str(activation_raw.get("mode", "off"))
     recompute_map = {
@@ -458,6 +547,7 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
             "stage_partition_mode": "uniform",
             "micro_batch_num": max(1, micro_batch_num),
         },
+        run=_stated_run(raw),
     )
 
 
@@ -542,6 +632,7 @@ def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         constraint=constraint,
         estimator=estimator,
         pp_config=pp_config,
+        run=_stated_run(raw),
     )
 
 

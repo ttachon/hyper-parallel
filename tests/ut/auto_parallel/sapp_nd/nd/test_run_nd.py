@@ -734,6 +734,7 @@ class TestSappNDRunND(unittest.TestCase):
         global_config.ccfg = fake_ccfg
         global_config.dimensions = Dim.ALL_DIMS.copy()
         global_config.balancing = _FakeBalancing()
+        global_config.siblings = []
         parallel_config = global_config.make_parallel_config(
             (2, 2, 2, 1),
             (4, 2),
@@ -741,6 +742,14 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(global_config.dim_val(Dim.DP, parallel_config), 2)
         self.assertEqual(global_config.global_batch_size(parallel_config), 16)
+        no_pipeline = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(no_pipeline), 8)
+        self.assertFalse(no_pipeline.is_valid())
+        fake_ccfg.accumulates_grads = True
+        accumulating = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(accumulating), 16)
+        self.assertTrue(accumulating.is_valid())
+        fake_ccfg.accumulates_grads = False
         self.assertEqual(global_config.layer_num_for_offset(), 4)
         self.assertEqual(global_config.total_layer_num(), 5)
         self.assertEqual(global_config.adapt_config(2, 1), ([0, 0], [0, 0]))
@@ -803,6 +812,7 @@ class TestSappNDRunND(unittest.TestCase):
             gc.ccfg = ccfg
             gc.dimensions = Dim.ALL_DIMS.copy()
             gc.balancing = _FakeBalancing()
+            gc.siblings = []
             return gc
 
         # Dense model (n_exp=1) — fast-path, always True regardless of ep.
@@ -817,6 +827,13 @@ class TestSappNDRunND(unittest.TestCase):
         pc_ok = gc_ok.make_parallel_config(
             (2, 2, 1, 1), (4, 1), (4, 1, 2, False)
         )
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+
+        # C4: DP 2 x TP 2 over EP 4 leaves one rank per expert group, which
+        # an expert shard of 2 cannot divide; a shard of 1 always does.
+        gc_ok.ccfg.expert_shard = 2
+        self.assertFalse(gc_ok.ep_constraints_valid(pc_ok))
+        gc_ok.ccfg.expert_shard = 1
         self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
 
         # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
@@ -1042,6 +1059,47 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(fake_config.resolved_strategy, fake_result)
             self.assertEqual(len(_FakeParallelize.instances), 0)
 
+    def test_run_nd_cli_hyper_v2_refuses_another_train_yaml(self) -> None:
+        """
+        Feature: run_nd's -y against the search config's train_yaml.
+        Description: A search config naming one train.yaml, run with -y
+            naming another, and with -y naming the same file by another
+            path.
+        Expectation: Two files are refused before the search reads its
+            config, since the resolved yaml would state one run's strategy
+            over another's run; one file under two spellings runs.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            other_yaml = os.path.join(tmp_dir, "other.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            for path in (train_yaml, other_yaml):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write(f"train_yaml: {train_yaml}\nparallelism:\n  dp: [1, 2]\n")
+            fake_result = {
+                "dp": 2, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                "micro_batch_num": 1, "memory_estimate_mb": 100.0, "score": 1.0,
+            }
+            codes = []
+            for given in (other_yaml, os.path.join(tmp_dir, ".", "train.yaml")):
+                with patch(
+                    "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                    return_value=SimpleNamespace(resolved_strategy=None),
+                ) as mock_read, \
+                        patch("hyper_parallel.auto_parallel.config_adapter.validate", return_value=[]), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                              return_value=fake_result), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml"):
+                    argv = ["run_nd.py", "-f", "hyper_v2", "-y", given, "-s", search_yaml, "-o", tmp_dir, "-v", "0"]
+                    with patch.object(sys, "argv", argv):
+                        with self.assertRaises(SystemExit) as exc_info:
+                            runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                codes.append((exc_info.exception.code, mock_read.called))
+        self.assertEqual(codes, [(2, False), (0, True)])
+
     def test_run_nd_cli_hyper_v2_search_config_validation_error(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1216,8 +1274,17 @@ class TestSappNDRunND(unittest.TestCase):
                             run_name="__main__",
                         )
                 self.assertEqual(exc_info.exception.code, 0)
+                self.assertEqual(cluster_spec["device_type"], "A2")
+                with patch.object(sys, "argv", argv + ["-A", "A3"]):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
             self.assertEqual(cluster_spec["num_nodes"], 8)
-            mock_search.assert_called_once()
+            self.assertEqual(cluster_spec["device_type"], "A3")
+            self.assertEqual(mock_search.call_count, 2)
 
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
@@ -1312,6 +1379,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.enable_debug = False
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
+        runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
         runner.memory_estim = lambda: 32
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
@@ -1414,6 +1482,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.global_batch_size = 8
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
+        runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
         runner.memory_estim = lambda: 2048
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
@@ -1463,6 +1532,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.enable_debug = False
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=set_parallel_config)
+        runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
         runner.memory_estim = lambda: 32
         with tempfile.TemporaryDirectory() as tmp_dir:
             csv_path = os.path.join(tmp_dir, "real.csv")
@@ -1597,6 +1667,7 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.custom_mixtral(cfg)
         self.assertEqual(cfg.hff, cfg.hff_exp)
         self.assertEqual((cfg.n_ffMM, cfg.n_ffBMM, cfg.n_ffParamCast), (3, 0, 3))
+        self.assertEqual((cfg.n_softmax, cfg.n_normOp), (1, 2))
         ArchHooks.custom_pangualpha(cfg)
         self.assertEqual(cfg.n_normOp, 4)
         ArchHooks.custom_qwen(cfg)
@@ -1660,6 +1731,7 @@ class TestSappNDRunND(unittest.TestCase):
         fp32 = _make_arch_cfg(p=1, bytes_p=4, grads_as_params=True)
         ArchHooks.custom_llama2(fp32)
         self.assertEqual(fp32.bytes_grad, 4)
+        self.assertTrue(fp32.accumulates_grads)
 
     def test_performance_formula_helpers(self) -> None:
         """
@@ -2379,6 +2451,7 @@ class TestSappNDRunND(unittest.TestCase):
             write=lambda folder, config: writes.append((folder, config)),
         )
         runner.config = config_state
+        runner.priced = lambda: config_state.ccfg
         runner.machine = SimpleNamespace(number=16, device=Hard.Device_A2)
         runner.global_batch_size = 8
         runner.model_name = "unit"
@@ -2474,6 +2547,7 @@ class TestSappNDRunND(unittest.TestCase):
             set_parallel_config=lambda config: True,
         )
         runner.mem_eval = SimpleNamespace(get_strategy=lambda: {"dp": 2})
+        runner.priced = lambda: runner.config.ccfg
         runner.memory_estim = lambda: 32
 
         class _FakeDebug:

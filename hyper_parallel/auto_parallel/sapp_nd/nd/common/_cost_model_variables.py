@@ -43,6 +43,13 @@ class _CostModVar:
     mm_ccfgs: any = None
     mm_order: list = None
     layer_custom_config: list = None
+    # What a layer of each kind keeps and holds per token, as a census states
+    # it (an auto_parallel KindActivations per layer type), the record of the
+    # kind of the layer priced, which the Hyper parser binds, and the output
+    # layer's; with none, the formulas price them.
+    census: dict = None
+    kind_activations: any = None
+    output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
 
@@ -56,6 +63,10 @@ class _CostModVar:
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
+    # How many ranks of its expert data-parallel group FSDP shards a routed
+    # expert over under expert parallelism, as the run states it; None for
+    # the optimizer's whole group.
+    expert_shard: int = None
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
@@ -75,9 +86,21 @@ class _CostModVar:
     n_lay: float = 0
     n_kv: float = 0
     dh: float = 0
+    # An MLA model's value-head width, at which its family prices dh, and its
+    # non-rotary key-head width, the value heads' unless stated.
+    v_head_dim: float = None
+    qk_nope_head_dim: float = None
     dc_kv: float = 0
     dc_q: float = 0
     dhr: float = 0
+    # The biases and norms a model states (its spec's); None where unstated,
+    # which the parameter formulas count their own way.
+    qkv_bias: bool = None
+    o_bias: bool = None
+    mlp_bias: bool = None
+    norm_bias: bool = None
+    layer_norms: int = None
+    shared_expert_gate: bool = None
     k_1st_dense: float = 0
     # Attention flavour of a layer group, and the extra parameters a flavour
     # carries that the q/k/v/o formula does not describe (conv, gates).
@@ -174,7 +197,14 @@ class _CostModVar:
 
     # shard
     shard_embed: float = 0
+    # Over how many of the ranks that shard the embedding table its layer
+    # gathers it to compute with it.
+    gather_embed: float = 1
     shard_output_activ: float = 0
+    # Whether the loss runs on logits sharded over the vocabulary, as the
+    # run states it, None taking its family's; and as the families read it.
+    loss_parallel: bool = None
+    shards_logits: bool = True
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
 
@@ -185,6 +215,10 @@ class _CostModVar:
     # Whether each gradient is held as its parameter is: in its width and
     # sharding, at any pipeline degree, as FSDP holds it.
     grads_as_params: bool = False
+    # Whether the run accumulates gradients over micro-batches without
+    # pipeline parallelism, holding them between micro-batches: a search
+    # then gives PP 1 several micro-batches.
+    accumulates_grads: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
     # What the run's optimizer keeps, None taking the family's: a state's
@@ -205,6 +239,13 @@ class _CostModVar:
     # backward ends, adding it to the accumulated gradient only then, as
     # HyperParallel's does; PyTorch's FSDP2 adds it as soon as it is reduced.
     defers_grads: bool = False
+    # Whether FSDP holds a layer's whole gradients while the next layer's
+    # backward runs, and the root's until the backward ends.
+    overlaps_grad_reduce: bool = False
+    # Whether a layer keeps the weight casts the formulas price beside its
+    # matmuls; None where no parser says, then where the optimizer does not
+    # shard.
+    keeps_param_casts: bool = None
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:

@@ -36,12 +36,16 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estim
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_configs_by_position,
     get_table_quantity,
+    selective_shares,
 )
 
 
 GENERALIZE_PIPELINE_CALCULATION = False
 MANUAL_P2P_RATIO = 0.002
 BACKWARD_RATIO = 2
+# The chunk the gated delta rule's kernel and Transformers' own
+# implementation run a sequence in.
+GDN_CHUNK = 64
 
 
 def op_table(cfg, attn=None):
@@ -70,18 +74,23 @@ def op_table(cfg, attn=None):
             + 2 * att.n_kv * d_h
         )
     )
-    # Delta-rule state update and readout: linear in the sequence, where an
-    # attention score is quadratic. The entry exists only for a group that
-    # declares the flavour, so no other config needs to carry the count.
-    state = (
-        getattr(att, "lin_n_v", 0)
-        * getattr(att, "lin_d_k", 0)
-        * getattr(att, "lin_d_v", 0)
-    )
-    if state:
-        table["n_linrec"] = 6 * cfg.b * cfg.s * state
+    # The chunked gated delta rule, per value head: within a chunk of
+    # GDN_CHUNK tokens, its keys against its keys and its queries, its
+    # solved weights against its values and its decayed keys, and its
+    # scores against its new values; the state read twice and written once
+    # a chunk.  Linear in the sequence, where an attention score is
+    # quadratic.  The entry exists only for a group that declares the
+    # flavour, so no other config needs to carry the count.
+    n_v, d_k, d_v = (getattr(att, name, 0) for name in ("lin_n_v", "lin_d_k", "lin_d_v"))
+    if n_v * d_k * d_v:
+        table["n_linrec"] = (3 * cfg.b * cfg.s * n_v
+                             * (2 * GDN_CHUNK * (3 * d_k + 2 * d_v) + 6 * d_k * d_v))
     table["n_ffMM"] = 6 * cfg.b * cfg.s * cfg.h * cfg.hff
-    table["n_attBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.h
+    # Every head's queries against every key, as wide as a head's queries
+    # and keys, an MLA head's with its rotary part; then the weights
+    # against the values, as wide as a head's values.
+    d_qk = (getattr(att, "qk_nope_head_dim", None) or d_h) + (getattr(att, "dhr", 0) or 0)
+    table["n_attBMM"] = 3 * cfg.b * cfg.s * cfg.s * att.a * (d_qk + d_h)
     table["n_ffBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.hff
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
@@ -96,18 +105,17 @@ def op_table(cfg, attn=None):
     table["n_dropout"] = (
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )
-    if cfg.dc_kv != 0:  # Deepseek
-        table["n_attMM"] = (
-            3
-            / 2
-            * (
-                2 * cfg.dc_kv * cfg.n_kv * cfg.dh
-                + cfg.dc_q * cfg.a * (cfg.dh + cfg.dhr)
-                + cfg.h * (cfg.a * cfg.dh + cfg.dhr)
-            )
-            * cfg.b
-            * cfg.s
-        )
+    if cfg.dc_kv != 0:  # MLA
+        # The queries' latent and its up-projection, or one projection to
+        # every head; the keys' and values' shared down-projection beside
+        # the rotary key; their up-projections, a head's key at its own
+        # width and its value at the value heads'; the output projection.
+        d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
+        heads = cfg.a * (d_nope + cfg.dhr)
+        query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
+        weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+                   + cfg.a * cfg.dh * cfg.h)
+        table["n_attMM"] = 6 * cfg.b * cfg.s * weights / (getattr(cfg, "n_attMM", 0) or 4)
     for op in table:
         table[op] *= cfg.bytes_p / cfg.t / cfg.cp
     # cfg.s *= cfg.cp
@@ -115,12 +123,24 @@ def op_table(cfg, attn=None):
 
 
 def _flavour_tables(cfg, attn=None):
-    """One (dense, expert) table pair for a given attention flavour."""
+    """One (dense, expert) table pair for a given attention flavour.
+
+    A MoE layer's feed-forward entry prices the experts each token runs,
+    the shared experts, as wide as a routed one, and, spread over the
+    layer's feed-forward matmuls, the router and the shared experts' gate;
+    its activation function's entry the same experts, which run it at
+    their width, where a dense layer's runs it at the dense width.
+    """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
-    scale = cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
-    exp["n_ffMM"] *= scale
-    exp["n_ffBMM"] *= scale
+    group = attn if attn is not None else cfg
+    n_ff = max(getattr(group, "n_ffMM", 0) or 0, getattr(group, "n_ffBMM", 0) or 0) or 3
+    gate = 1 if cfg.n_shared_exp and getattr(cfg, "shared_expert_gate", None) else 0
+    experts = cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
+    width = experts + (cfg.n_exp + gate) / n_ff
+    exp["n_ffMM"] *= width / cfg.hff
+    exp["n_ffBMM"] *= width / cfg.hff
+    exp["n_ffAct"] *= experts / cfg.hff
     return base, exp
 
 
@@ -138,6 +158,7 @@ def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
         tables[kind][1] if (lcfg.n_exp > 1) else tables[kind][0],
         layer,
         with_recomp,
+        shares=selective_shares(lcfg, layer),
     )
     if ccfg.ttype == PerformanceType.TIME:
         flop = estimate_comp_flop_time(lcfg, flop)
@@ -537,6 +558,53 @@ def _finalize_perf(perf, cache_file, debugger, memory):
     return perf
 
 
+def _stage_parts(cfg, ccfg, stages, device_type, debugger):
+    """One config's per-stage compute, recompute, communication and recomputed communication."""
+    # Only the plain walks record parts. A stage's time takes what the
+    # recompute walks add as RECOMPUTE alone; recorded as communication too,
+    # it made the parts outgrow the time, and the bubble, their difference,
+    # went negative.
+    compute_perfs = estimate_comp(
+        cfg, ccfg, stages, with_recomp=False, debugger=debugger
+    )
+    recompute_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
+        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
+    )
+    comm_perfs = estimate_comm(
+        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
+    )
+    recomm_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
+        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
+    )
+    return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
+
+
+def _submodule_parts(cfg, ccfg, device_type, debugger):
+    """A multimodal model's per-stage parts, every submodule's summed (F2).
+
+    The submodules of a vision-language model run on one pipeline, so a
+    stage's time is the work of the layers on it, whichever submodule they
+    belong to, as the memory model sums what they keep there
+    (``combine_partition_multimodal``).  Each is priced on its own
+    partitions and under its own family, on a copy, so no submodule leaves
+    state for the next.
+    """
+    partitions = cfg.generate_partitions_vpp()
+    totals = None
+    for name in cfg.mm_order:
+        sub = deepcopy(cfg.mm_ccfgs[name])
+        check_and_apply_custom_hook(sub)
+        parts = _stage_parts(sub, ccfg, partitions[name], device_type, debugger)
+        totals = parts if totals is None else tuple(
+            [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
+        )
+    return totals
+
+
 # performance estimation
 def estimate_performance(*args, **kwargs):
     """main estimation"""
@@ -583,30 +651,21 @@ def estimate_performance(*args, **kwargs):
     logger.info(stages)
     logger.info(ccfg)
 
-    # Only the plain walks record parts. A stage's time takes what the
-    # recompute walks add as RECOMPUTE alone; recorded as communication too,
-    # it made the parts outgrow the time, and the bubble, their difference,
-    # went negative.
-    compute_perfs = estimate_comp(
-        cfg, ccfg, stages, with_recomp=False, debugger=debugger
-    )
-    recompute_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
-    )
-    comm_perfs = estimate_comm(
-        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
-    )
+    if getattr(cfg, "multimodal", False):
+        compute_perfs, recompute_perfs, comm_perfs, recomm_perfs = _submodule_parts(
+            cfg, ccfg, device_type, debugger
+        )
+        timed = cfg.mm_ccfgs[getattr(cfg, "mm_main", None) or cfg.mm_order[-1]]
+        timed.n = cfg.n
+    else:
+        compute_perfs, recompute_perfs, comm_perfs, recomm_perfs = _stage_parts(
+            cfg, ccfg, stages, device_type, debugger
+        )
+        timed = cfg
     logger.info("PerfEst: comm_perfs %s", comm_perfs)
-    recomm_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
-    )
 
     stage_perfs = estimate_stage(
-        cfg,
+        timed,
         ccfg,
         compute_perfs,
         comm_perfs,
@@ -618,9 +677,9 @@ def estimate_performance(*args, **kwargs):
 
     stage_focused = kwargs.get("stage_focused", None)
     perf = estimate_perf(
-        cfg, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
+        timed, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
     )
-    perf += estimate_p2p(cfg, ccfg, stage_perfs, debugger=debugger)
+    perf += estimate_p2p(timed, ccfg, stage_perfs, debugger=debugger)
     logger.info("PerfEst: perf %s", perf)
 
     cache_file = kwargs.get("cache_file")

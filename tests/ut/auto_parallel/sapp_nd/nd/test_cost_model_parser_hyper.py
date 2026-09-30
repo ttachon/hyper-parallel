@@ -26,10 +26,15 @@ from unittest.mock import patch
 
 import yaml
 
+from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import _optimizer_bytes
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    _optimizer_bytes,
+    custom_default_transformer,
+    keeps_param_casts,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
@@ -185,6 +190,13 @@ def _mla_overrides(**kw: Any) -> Dict[str, Any]:
     return base
 
 
+def _image_text_config(**kw: Any) -> Dict[str, Any]:
+    """An AutoModels configuration whose model class builds a vision tower too."""
+    config = _auto_models_config(**kw)
+    config["model"]["_target_"] = "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained"
+    return config
+
+
 def _auto_models_config(**kw: Any) -> Dict[str, Any]:
     """Return a minimal current AutoModels Trainer configuration."""
     base = {
@@ -293,6 +305,18 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         # When num_key_value_heads=0, fallback sets n_kv = a = 64
         self.assertEqual(ccfg.n_kv, 64)
         self.assertEqual(ccfg.dh, 5120 / 64)
+
+    def test_an_offset_places_every_layer(self):
+        """
+        Feature: _balanced_offset.
+        Description: Seven layers at PP 4, and eight.
+        Expectation: With seven, the first three stages run one more layer
+            each, so every layer has a stage; with eight, none does.
+        """
+        seven = _make_ccfg(_dense_overrides(model={"config_overrides": {"num_hidden_layers": 7}}))
+        eight = _make_ccfg(_dense_overrides(model={"config_overrides": {"num_hidden_layers": 8}}))
+        self.assertEqual(list(seven.offset), [1, 1, 1, 0])
+        self.assertEqual(list(eight.offset), [0, 0, 0, 0])
 
     def test_overrides_mtp_depth(self):
         """
@@ -427,6 +451,24 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         ccfg2 = _make_ccfg(cfg2)
         self.assertFalse(ccfg2.has_op)
         self.assertEqual(ccfg2.os_max_shard, ccfg2.d)
+
+    def test_layers_keep_no_weight_cast(self):
+        """
+        Feature: the run facts of HyperParallel's FSDP.
+        Description: A run whose optimizer does not shard; then a config no
+            parser has seen, with and without optimizer sharding.
+        Expectation: HyperParallel's layers keep no cast of their weights,
+            which its FSDP gathers in the compute dtype, so no cast is
+            counted beside the matmuls, as at any dp_shard; unsaid, a layer
+            keeps them exactly where the optimizer does not shard.
+        """
+        cfg = _dense_overrides(train={"accelerator": {"enable_parallel_optimizer": False}})
+        ccfg = _make_ccfg(cfg)
+        custom_default_transformer(ccfg)
+        self.assertFalse(ccfg.has_op)
+        self.assertEqual((ccfg.keeps_param_casts, ccfg.n_attParamCast, ccfg.n_ffParamCast), (False, 0, 0))
+        self.assertEqual([keeps_param_casts(SimpleNamespace(has_op=has_op)) for has_op in (False, True)],
+                         [True, False])
 
     def test_parallelism_grad_accum_shard(self):
         """
@@ -936,12 +978,13 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         """
         Feature: MTP depth resolution.
         Description: Transformers spells MTP depth num_nextn_predict_layers.
-        Expectation: n_mtp picks up the alias and enters offset balancing.
+        Expectation: The model spec picks up the alias: the checkpoint has
+            the layer, which the AutoModels trainer does not build.
         """
         mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
-        ccfg = _make_ccfg(_auto_models_config())
-        self.assertEqual(ccfg.n_mtp, 1)
-        self.assertTrue(ccfg.is_mtp_in_offset)
+        spec = resolve_hf_model_spec(_auto_models_config()["model"])
+        self.assertEqual(spec["mtp_depth"], 1)
+        self.assertEqual(_make_ccfg(_auto_models_config()).n_mtp, 0)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_mtp_depth_prefers_internal_name(self, mock_hf):
@@ -951,8 +994,57 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Expectation: The internal mtp_depth wins.
         """
         mock_hf.return_value = self._hf_config(mtp_depth=3, num_nextn_predict_layers=1)
+        spec = resolve_hf_model_spec(_auto_models_config()["model"])
+        self.assertEqual(spec["mtp_depth"], 3)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_a_causal_lm_builds_no_vision_tower(self, mock_hf):
+        """
+        Feature: _builds_vision_tower.
+        Description: A vision-language checkpoint trained as a causal LM,
+            with no model class named, and as image-text-to-text.
+        Expectation: The causal LM prices the language model alone; the
+            image-text class and a yaml that names none price the tower.
+        """
+        mock_hf.return_value = SimpleNamespace(
+            model_type="qwen3_vl_moe",
+            text_config=self._hf_config(),
+            vision_config=SimpleNamespace(
+                hidden_size=1152, depth=6, num_heads=16, intermediate_size=4304, out_hidden_size=4096,
+                patch_size=16, spatial_merge_size=2, num_position_embeddings=2304,
+            ),
+        )
+        got = []
+        for target in ("hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained", None,
+                       "hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained"):
+            config = _auto_models_config()
+            if target:
+                config["model"]["_target_"] = target
+            else:
+                config["model"].pop("_target_", None)
+            got.append(bool(_make_ccfg(config).multimodal))
+        self.assertEqual(got, [False, True, True])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_the_trainer_builds_no_mtp_layer(self, mock_hf):
+        """
+        Feature: _without_mtp.
+        Description: A checkpoint with an MTP layer, under the AutoModels
+            trainer and under the legacy schema.
+        Expectation: The AutoModels trainer builds the Transformers model,
+            which has none: no MTP layer is priced, none enters offset
+            balancing and the stack holds the body alone.  The legacy
+            schema keeps its MTP layer.
+        """
+        mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
         ccfg = _make_ccfg(_auto_models_config())
-        self.assertEqual(ccfg.n_mtp, 3)
+        self.assertEqual(ccfg.n_mtp, 0)
+        self.assertFalse(ccfg.is_mtp_in_offset)
+        self.assertEqual(sum(count for count, _ in ccfg.layer_custom_config), ccfg.n_lay)
+        legacy = _make_ccfg(_dense_overrides(
+            model={"config_overrides": {"num_hidden_layers": 8, "mtp_depth": 1}},
+        ))
+        self.assertEqual(legacy.n_mtp, 1)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_missing_field_falls_back_to_overrides(self, mock_hf):
@@ -1024,7 +1116,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             submodule alongside it instead of raising AttributeError.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
 
         self.assertTrue(ccfg.multimodal)
         self.assertEqual(ccfg.mm_order, ["vision", "text"])
@@ -1057,7 +1149,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             caches unchanged.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         text = ccfg.mm_ccfgs["text"]
         vision = ccfg.mm_ccfgs["vision"]
 
@@ -1078,7 +1170,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         Expectation: The vision submodule adopts the override.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config(context={"visual_seq_len": 2304}))
+        ccfg = _make_ccfg(_image_text_config(context={"visual_seq_len": 2304}))
         self.assertEqual(ccfg.mm_ccfgs["vision"].s, 2304)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
@@ -1091,7 +1183,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             placed entirely on the first stage.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
         self.assertEqual(vision.p, text.p)
         self.assertEqual(vision.vp, text.vp)
@@ -1111,7 +1203,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             through one submodule reaches neither the sibling nor the parent.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config())
+        ccfg = _make_ccfg(_image_text_config())
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
 
         self.assertIsNot(text.overwrite_eval_functions,
@@ -1213,7 +1305,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             vision tower still lands on the first stage of the first chunk.
         """
         mock_hf.return_value = self._vl_config()
-        ccfg = _make_ccfg(_auto_models_config(
+        ccfg = _make_ccfg(_image_text_config(
             accelerator={"pp_size": 4, "pp_interleave_num": 2},
         ))
         vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
@@ -1452,11 +1544,12 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertAlmostEqual(freed[1][0], 2 * layer, delta=1)
 
     @staticmethod
-    def _dynamic(micro_batches: int, **run: Any) -> float:
-        """Stage 0's dynamic memory, in MB, of a dense model at DP shard 4 and PP 1, fully recomputed."""
+    def _insight(micro_batches: int, devices: int = 4, **run: Any) -> Dict[str, Any]:
+        """Stage 0's insight, in MB, of a dense model at DP shard 4 over *devices* and PP 1, fully recomputed."""
         config = _auto_models_config(
             accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1}, fsdp_config={"dp_shard_size": 4},
-            training={"global_batch_size": 4 * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            training={"global_batch_size": devices * micro_batches, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            context={"device_num": devices},
         )
         with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
             mock_hf.return_value = SimpleNamespace(
@@ -1470,9 +1563,103 @@ class TestFsdpResharding(unittest.TestCase):
                 evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
         for name, value in run.items():
             setattr(evaluator.ccfg, name, value)
-        stage = evaluator.estimate_peak_insight()[0]
+        return evaluator.estimate_peak_insight()[0]
+
+    @classmethod
+    def _dynamic(cls, micro_batches: int, **run: Any) -> float:
+        """Stage 0's dynamic memory, in MB, and its layers' gradients, as :meth:`_insight`."""
+        stage = cls._insight(micro_batches, **run)
         grads = sum(value.get("accu_grad", 0) for key, value in stage["Node Log"].items() if isinstance(key[2], int))
         return stage["Dynamic"], grads
+
+    def test_the_output_layers_backward_gathers_no_table_again(self):
+        """
+        Feature: the root's gathered tables in a working set.
+        Description: The working set of the output layer's backward, which
+            ends warm-up on a single stage, under FSDP that reshards, and
+            with reshard_after_forward off.
+        Expectation: Resharding, FSDP's root keeps its tables gathered from
+            the forward on: the output layer keeps its table, and its
+            backward's working set gathers none again.  Kept gathered, as
+            before, the working set counts it.
+        """
+        log = self._insight(1)["Node Log"]
+        self.assertGreater(log[(0, 0, "", "O")]["ag_comm"], 0)
+        self.assertEqual(log[(0, 0, "G_", "O")].get("ag_comm", 0), 0)
+        kept = self._insight(1, reshards=False)["Node Log"]
+        self.assertEqual(kept[(0, 0, "G_", "O")]["ag_comm"], kept[(0, 0, "", "O")]["ag_comm"])
+
+    def test_the_loss_runs_on_the_logits_the_trainer_gathers(self):
+        """
+        Feature: loss_parallel, stated by the Hyper parser and read by the
+            Qwen family's hook.
+        Description: A Qwen model at TP 2 with sequence parallelism, as
+            HyperParallel's trainer runs it by default, and with
+            accelerator.loss_parallel.
+        Expectation: By default every TP rank holds the logits whole: the
+            output layer's activations are not split; with loss_parallel
+            they are, over TP.
+        """
+        got = []
+        for accelerator in ({}, {"loss_parallel": True}):
+            config = _auto_models_config(accelerator=dict(
+                {"tp_size": 2, "ep_size": 1, "pp_size": 1, "sequence_parallel": True}, **accelerator))
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config") as mock_hf:
+                mock_hf.return_value = SimpleNamespace(
+                    model_type="qwen3", hidden_size=1024, num_hidden_layers=4, num_attention_heads=8,
+                    num_key_value_heads=8, intermediate_size=2816, vocab_size=32000,
+                    max_position_embeddings=4096,
+                )
+                with tempfile.TemporaryDirectory() as folder:
+                    path = os.path.join(folder, "train.yaml")
+                    with open(path, "w", encoding="utf-8") as handle:
+                        yaml.safe_dump(config, handle)
+                    ccfg = EvaluatorV2(path, framework="hyper_v2", log_level=0).ccfg
+            got.append((ccfg.loss_parallel, ccfg.shard_output_activ))
+        self.assertEqual(got, [(False, 1), (True, 2)])
+
+    def test_the_root_gathers_both_tables(self):
+        """
+        Feature: gather_embed, the embedding table FSDP gathers.
+        Description: The root of a model whose embedding and output tables
+            are two, each sharded over the DP shard.
+        Expectation: FSDP gathers the embedding table whole to compute with
+            it, as the output table: their buffers weigh the same.
+        """
+        log = self._insight(1)["Node Log"]
+        self.assertEqual(log[(0, 0, "", "E")]["ag_comm"], log[(0, 0, "", "O")]["ag_comm"])
+
+    def test_hsdp_shards_both_tables_alike(self):
+        """
+        Feature: the embedding table under HSDP.
+        Description: DP 16 over 16 devices, its FSDP group 4 ranks, the
+            others replicas.
+        Expectation: The embedding table is sharded over the FSDP group, as
+            the output table: they weigh the same.
+        """
+        log = self._insight(1, devices=16)["Node Log"]
+        embedding, output = log[(0, 0, "", "E")], log[(0, 0, "", "O")]
+        self.assertEqual(embedding["model_param"], output["model_param"])
+        self.assertEqual(embedding["ag_comm"], output["ag_comm"])
+
+    def test_the_backward_ends_holding_whole_gradients(self):
+        """
+        Feature: the end of the backward, under FSDP that overlaps each
+            layer's gradient reduction with the next layer's backward.
+        Description: The same stage, two micro-batches per step, with the
+            reductions overlapped, as HyperParallel's are, and without.
+        Expectation: Overlapped, the backward ends holding the first two
+            layers' gradients whole, the second's reduction in flight and
+            the first's not started, and the output table's until the root's
+            hook: four sharded gradients each over the DP shard of 4, less
+            the first layer's output, which is not there yet.
+        """
+        self.assertTrue(_make_ccfg(_dense_overrides()).overlaps_grad_reduce)
+        overlapped = self._insight(2)
+        plain = self._insight(2, overlaps_grad_reduce=False)
+        log = overlapped["Node Log"]
+        layer, output = log[(0, 0, 0, "F")]["accu_grad"], log[(0, 0, "", "O")]["accu_grad"]
+        self.assertAlmostEqual(overlapped["Dynamic"] - plain["Dynamic"], 4 * (2 * layer + output) - layer, delta=3)
 
     def test_reduce_scatter_outputs_wait_for_the_backward_end(self):
         """
@@ -1504,6 +1691,33 @@ class TestFsdpResharding(unittest.TestCase):
             ccfg = _make_ccfg(_dense_overrides(fsdp_config=fsdp))
             got.append(ccfg.reshards)
         self.assertEqual(got, [True, False, False])
+
+    def test_the_run_states_how_fsdp_shards_its_experts(self):
+        """
+        Feature: _parse_expert_sharding.
+        Description: A MoE run at EP 4 in the legacy schema, and in the
+            AutoModels one without and with edp_shard_size 2.
+        Expectation: The legacy schema states nothing; HyperParallel's keeps
+            each expert whole by default, and shards it over the ranks the
+            run states.
+        """
+        got = []
+        for extra in ({}, {"fsdp_config": {}}, {"fsdp_config": {"edp_shard_size": 2}}):
+            ccfg = _make_ccfg(_moe_overrides(**extra))
+            got.append((ccfg.expert_shard, ccfg.shard_p_os_exp))
+        self.assertEqual([shard or None for shard, _ in got], [None, 1, 2])
+        self.assertEqual(got[1][1], 1)
+        self.assertEqual(got[2][1], 2)
+
+    def test_the_run_accumulates_without_a_pipeline(self):
+        """
+        Feature: accumulates_grads.
+        Description: A HyperParallel run at PP 1.
+        Expectation: Its FSDP holds each gradient between micro-batches, so
+            it accumulates them without a pipeline, and a search gives PP 1
+            several micro-batches.
+        """
+        self.assertTrue(_make_ccfg(_dense_overrides()).accumulates_grads)
 
 
 class TestHybridLayerStack(unittest.TestCase):
@@ -1553,8 +1767,9 @@ class TestHybridLayerStack(unittest.TestCase):
         evaluator.estimate_peak()
 
         full = ("full", 8, 128, 2, 1, 0, 0, 1)
-        # Conv over q, k and v, plus two gates per value head.
-        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16, 0)
+        # Conv over q, k and v, two gates per value head, each head's decay
+        # and time-step bias, and the output norm's weight.
+        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16 + 2 * 16 + 64, 0)
         self.assertEqual([seen[lay_id] for lay_id in sorted(seen)],
                          [linear, linear, full, linear, full])
 

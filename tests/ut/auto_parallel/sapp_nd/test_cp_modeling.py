@@ -2126,19 +2126,23 @@ class TestCPRingPeakCorrection(unittest.TestCase):
         """
         Feature: Linear activations (qkv, proj, ffn, norm) scale with s not s²
         Description: Since linear activations only scale with s (not s²),
-                     Ring and Ulysses should produce identical values for
-                     qkv, proj, ffn, norm — both just divide by cp.
-        Expectation: Ring qkv/proj/ffn/norm == Ulysses qkv/proj/ffn/norm
+                     Ring and Ulysses produce identical values for ffn and
+                     norm, both divided by cp; Ring keeps the keys and values
+                     it all-gathers whole.
+        Expectation: Ring ffn/norm == Ulysses ffn/norm; Ring qkv exceeds
+                     Ulysses qkv by the keys and values of the other three
+                     quarters of the sequence.
         """
         ccfg_ring = _make_ccfg(cp=4, cp_algo="colossalai_cp", t=1)
         ccfg_ulysses = _make_ccfg(cp=4, cp_algo="ulysses_cp", t=1)
         ctx = Context()
         ctx.micro_factor = 1
 
+        kv = ccfg_ring.s * ccfg_ring.b * ccfg_ring.bytes_compute * 2 * ccfg_ring.dh * ccfg_ring.n_kv
         self.assertAlmostEqual(
-            EvalAttn.attn_qkv_activations(ccfg_ring, ctx),
-            EvalAttn.attn_qkv_activations(ccfg_ulysses, ctx), places=4,
-            msg="qkv should be same for Ring and Ulysses (linear /cp)")
+            EvalAttn.attn_qkv_activations(ccfg_ring, ctx) - EvalAttn.attn_qkv_activations(ccfg_ulysses, ctx),
+            kv * 3 / 4, places=1,
+            msg="Ring keeps the whole sequence's keys and values")
         self.assertAlmostEqual(
             EvalFFn.ffn_activations(ccfg_ring, ctx),
             EvalFFn.ffn_activations(ccfg_ulysses, ctx), places=4,
@@ -2160,11 +2164,11 @@ class TestCPRecFactor(unittest.TestCase):
         """
         Feature: attn_qkv_activations /cp
         Description: QKV linear activations scale with s, so /cp is correct
-                     for both Ring and Ulysses
+                     under Ulysses CP, which splits the heads
         Expectation: cp=4 → qkv activations = 1/4 of cp=1
         """
-        ccfg_1 = _make_ccfg(cp=1, t=1)
-        ccfg_4 = _make_ccfg(cp=4, t=1)
+        ccfg_1 = _make_ccfg(cp=1, t=1, cp_algo="ulysses_cp")
+        ccfg_4 = _make_ccfg(cp=4, t=1, cp_algo="ulysses_cp")
         ctx = Context()
         ctx.micro_factor = 1
 
@@ -2369,23 +2373,24 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         plat_marks=["cpu_linux"], level_mark="level0",
         card_mark="onecard", essential_mark="unessential",
     )
-    def test_comm_volume_equals_old_cp_comm_layer(self):
+    def test_comm_volume_is_the_keys_and_values_exchanged(self):
         """
-        Feature: CP comm_volume backward compatibility
-        Description: comm_volume should exactly equal the legacy
-                     EvalLayerComm.cp_comm_layer output, since it replaced
-                     that value in the comm[Dim.CP] accumulation.
-        Expectation: comm_volume == old cp_comm_layer (Ring cp=4)
+        Feature: CP comm_volume, the traffic the time model prices.
+        Description: GQA at cp=4 (8 KV heads of 128, bf16, 131072 tokens):
+                     colossalai CP, Ulysses, and a linear-attention layer.
+        Expectation: colossalai gathers K and V forward and reduce-scatters
+                     their gradients backward, 3/4 of the sequence a rank
+                     each; Ulysses all-to-alls its local query, key, value
+                     and output both ways, 3/4 of each; the linear layer
+                     passes its fp32 recurrent state and its gradient.
         """
-        ccfg = _make_ccfg(cp=4, p=1)
-        ctx = Context()
-        ctx.current_node = LayerType.NOT_REC_LAYER
-
-        new_result = cp_comm_layer_detailed(ccfg, ctx)
-        old_result = EvalLayerComm.cp_comm_layer(ccfg, ctx)
-        self.assertAlmostEqual(new_result.comm_volume, old_result, places=6,
-                               msg=f"comm_volume ({new_result.comm_volume}) should equal "
-                                   f"old cp_comm_layer ({old_result})")
+        ring = cp_comm_layer_detailed(_make_ccfg(cp=4, p=1), Context())
+        self.assertAlmostEqual(ring.comm_volume, 2 * 0.75 * 131072 * 2 * 1024 * 2)
+        self.assertAlmostEqual(ring.comm_volume, ring.total_kv_volume)
+        ulysses = cp_comm_layer_detailed(_make_ccfg(cp=4, p=1, cp_algo="ulysses_cp"), Context())
+        self.assertAlmostEqual(ulysses.comm_volume, 2 * 0.75 * 131072 / 4 * (8192 + 2 * 1024 + 8192) * 2)
+        linear = cp_comm_layer_detailed(_make_ccfg(cp=4, p=1, n_linrec=1), Context())
+        self.assertAlmostEqual(linear.comm_volume, 2 * 64 * 128 * 128 * 4)
 
 
 class TestCPCommBufferInPeak(unittest.TestCase):
@@ -3169,6 +3174,24 @@ class TestDimensionsValidationBranches(unittest.TestCase):
         """PP=1 & MBN>1 → _check_mbn_pp returns False."""
         result = Dim.Dimensions._check_mbn_pp({Dim.MBN: 2, Dim.PP: 1}, [Dim.PP])
         self.assertFalse(result)
+
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="unessential",
+    )
+    def test_accumulating_run_takes_micro_batches_without_pipeline(self):
+        """PP=1 & MBN>1 → valid in a run that accumulates gradients, its accumulation steps."""
+        dims = [(Dim.MBN, 2), (Dim.PP, 1)]
+        self.assertTrue(Dim.Dimensions(dims, accumulates=True).is_valid())
+        self.assertFalse(Dim.Dimensions(dims).is_valid())
+
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="unessential",
+    )
+    def test_accumulating_run_keeps_a_micro_batch_per_stage(self):
+        """MBN < PP stays invalid whether the run accumulates or not."""
+        self.assertFalse(Dim.Dimensions([(Dim.MBN, 1), (Dim.PP, 2)], accumulates=True).is_valid())
 
     @arg_mark(
         plat_marks=["cpu_linux"], level_mark="level0",

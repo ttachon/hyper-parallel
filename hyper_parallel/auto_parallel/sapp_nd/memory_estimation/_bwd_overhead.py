@@ -14,7 +14,10 @@
 # ============================================================================
 """Backward overhead module"""
 
+from typing import Tuple
+
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 
 
 class _BackwardOverhead:
@@ -51,30 +54,72 @@ class _BackwardOverhead:
         # print("here11",id(self.backbone._ccfg))
         return stages[stage_id][chunk_id][lay_id]
 
-    def _working_set(self) -> float:
-        """The dynamic memory of the node set up, as the working set of its backward."""
-        self._ctx.working_set = True
+    def _working_set(self, gathered: int = 2, on_saved: bool = False) -> float:
+        """The dynamic memory of the node set up, as the working set of its backward.
+
+        Under FSDP that reshards, a layer's backward holds *gathered* layers'
+        parameters: its own and the next layer's, prefetched.  *on_saved*
+        says the stage's dynamic memory counts what the node keeps for this
+        backward already, as it does where the node does not recompute.
+        """
+        self._ctx.working_set = gathered
+        self._ctx.working_on_saved = on_saved
         try:
             return sum(self._inner_dynamic_mem(default_micro_factor=1))
         finally:
-            self._ctx.working_set = False
+            self._ctx.working_set = 0
+            self._ctx.working_on_saved = False
 
-    def first_layer_working_set(self, stages: list, stage_id: int, record_lay_types: dict) -> float:
-        """The working set of the backward of the stage's first layer, the last it runs, unlogged."""
-        for lay_id, node in enumerate(stages[stage_id][0]):
-            if self.backbone.is_regular_layer(node):
-                break
-        else:
-            return 0
-        self._fetch_node_and_switch_env(stages, record_lay_types, stage_id, 0, lay_id)
-        ctx = self._ctx
-        saved = (ctx.current_node, ctx.current_lay_id, ctx.enable_node_log, dict(ctx.accu_mem_type))
-        ctx.current_node = LayerType.NOT_REC_LAYER if node == LayerType.FULL_REC_LAYER else node
-        ctx.enable_node_log = False
-        try:
-            return self._working_set()
-        finally:
-            ctx.current_node, ctx.current_lay_id, ctx.enable_node_log, ctx.accu_mem_type = saved
+    def _last_backward_lay_ids(self, stages: list, stage_id: int, record_lay_types: dict) -> list:
+        """The stage's regular layers from the one whose backward a micro-batch's ends on, in stage order.
+
+        A stage runs its layers' backward in reverse, so the last is its
+        first layer.  Where a vision tower shares the stage with the
+        language model the search drives, the tower's layers come first and
+        run last, and their working set is the smaller of the two; but the
+        moment the language model's own first layer runs its backward, every
+        activation of the tower is still held, and that is the moment the
+        stage has to fit (F2, F54).  A stage of one module, or one holding
+        no layer of the main module, keeps its own first layers.
+        """
+        regular = [lay_id for lay_id, node in enumerate(stages[stage_id][0])
+                   if self.backbone.is_regular_layer(node)]
+        main = getattr(self.backbone, "main_module", None)
+        if main is None:
+            return regular
+        of_main = [lay_id for lay_id in regular
+                   if record_lay_types[(stage_id, 0, lay_id)][0].model_name == main]
+        return of_main or regular
+
+    def first_layer_working_set(self, stages: list, stage_id: int, record_lay_types: dict) -> Tuple[float, float]:
+        """The working set of the backward a micro-batch's ends on, the stage's first layer's, unlogged.
+
+        It holds its own gathered parameters, with no layer left to prefetch.
+        FSDP that reduces a layer's gradients while the next layer's backward
+        runs holds its whole gradients, and the second layer's, whose
+        reduction is still in flight.  Also returns that layer's
+        reduce-scatter output, which does not exist yet.  Where submodules
+        share the stage, it is the main module's first layer
+        (:meth:`_last_backward_lay_ids`).
+        """
+        lay_ids = self._last_backward_lay_ids(stages, stage_id, record_lay_types)
+        working, pending = 0, 0
+        for rank, lay_id in enumerate(lay_ids[:2]):
+            node = self._fetch_node_and_switch_env(stages, record_lay_types, stage_id, 0, lay_id)
+            ctx = self._ctx
+            saved = (ctx.current_node, ctx.current_lay_id, ctx.enable_node_log, dict(ctx.accu_mem_type))
+            ctx.current_node = LayerType.NOT_REC_LAYER if node == LayerType.FULL_REC_LAYER else node
+            ctx.enable_node_log = False
+            try:
+                if rank == 0:
+                    working += self._working_set(gathered=1)
+                if self._ccfg.overlaps_grad_reduce:
+                    whole, sharded = EvalBody.reduced_grad_layer(self._ccfg, ctx)
+                    working += whole
+                    pending = pending if rank else sharded
+            finally:
+                ctx.current_node, ctx.current_lay_id, ctx.enable_node_log, ctx.accu_mem_type = saved
+        return working, pending
 
     def estimate(
         self, stages: list, stage_id: int, record_lay_types: dict
@@ -157,7 +202,7 @@ class _BackwardOverhead:
             else:
                 self._ctx.current_node = last_node
                 self._ctx.current_lay_id = f"G_{self._ctx.current_lay_id}"
-                res = self._working_set()
+                res = self._working_set(on_saved=True)
                 if (
                     last_node == LayerType.OUTPUT_LAYER
                     and self._ccfg.n_mtp > 0
@@ -175,7 +220,7 @@ class _BackwardOverhead:
                             f"G_{self._ctx.current_lay_id}"
                         )
                         self._ctx.current_node = last_mtp
-                    res += self._working_set()
+                    res += self._working_set(on_saved=last_mtp != LayerType.FULL_REC_LAYER)
         return res
 
     def __stage_bwd_overhead_zbv(

@@ -58,6 +58,11 @@ class NormalizedConfig:
             ``cp_algo`` (``"colossalai_cp"`` | ``"ulysses_cp"`` | ``"hybrid_cp"``,
             default ``"colossalai_cp"``).
         pp_config: Pipeline-parallel specific configuration.
+        run: What the train.yaml states about the run, in its own sections
+            and names: the model's dtypes, FSDP's precision and resharding,
+            the optimizer, gradient clipping and the accelerator's settings.
+            The search runner lays the strategy it searches over it, so the
+            rest reaches the cost model as the train.yaml states it.
         parallelism_summary: One line naming what every parallelism
             dimension resolved to, so a dimension that was silently pinned
             or silently freed is visible.
@@ -70,6 +75,7 @@ class NormalizedConfig:
     constraint: Dict[str, Any] = field(default_factory=dict)
     estimator: Dict[str, Any] = field(default_factory=dict)
     pp_config: Dict[str, Any] = field(default_factory=dict)
+    run: Dict[str, Any] = field(default_factory=dict)
     parallelism_summary: str = ""
     resolved_strategy: Optional[Dict[str, Any]] = None
 
@@ -82,6 +88,7 @@ class NormalizedConfig:
             "constraint": dict(self.constraint),
             "estimator": dict(self.estimator),
             "pp_config": dict(self.pp_config),
+            "run": dict(self.run),
         }
         if self.resolved_strategy is not None:
             result["resolved_strategy"] = dict(self.resolved_strategy)
