@@ -103,9 +103,10 @@ _MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype"
 _RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer", "plan_overrides")
 
 # The ``context`` keys of a train.yaml that state how the cost model prices
-# the run: a census of the layers, and a vision tower's token count.  The
-# device count and the memory budget are a search's own.
-_RUN_CONTEXT_KEYS = ("census", "visual_seq_len")
+# the run: a census of the layers, a vision tower's token count, and a
+# launcher that shards each strategy's experts over its whole expert group.
+# The device count and the memory budget are a search's own.
+_RUN_CONTEXT_KEYS = ("census", "visual_seq_len", "expert_shard")
 
 # The keys of a legacy train.yaml's ``train`` section that are not its
 # training settings: recompute, the search's, and precision, which the cost
