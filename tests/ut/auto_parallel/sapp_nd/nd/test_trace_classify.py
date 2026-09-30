@@ -191,7 +191,8 @@ class TestTraceClassify(unittest.TestCase):
         total = str(Debug.PerfParts.TOTAL)
         nd_names = [str(part) for part in Debug.PerfParts]
         self.assertEqual(names[:names.index(total) + 1], nd_names[:nd_names.index(total) + 1])
-        self.assertAlmostEqual(parts[str(Debug.PerfParts.DP_COMM)], 0.136, places=9)
+        dp_parts = parts[str(Debug.PerfParts.DP_COMM)] + parts[str(Debug.PerfParts.DP_REDUCE)]
+        self.assertAlmostEqual(dp_parts, 0.136, places=9)
         self.assertAlmostEqual(sum(value for name, value in parts.items() if name != total), parts[total], places=9)
 
     def test_parse_dims_validates_names_and_values(self):

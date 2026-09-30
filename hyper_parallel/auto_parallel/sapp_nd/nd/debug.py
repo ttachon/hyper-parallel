@@ -60,7 +60,11 @@ class PerfParts(Enum):
     FW_COMPUTE = auto()
     BW_COMPUTE = auto()
     RECOMPUTE = auto()
+    # FSDP's gathers and reduce-scatters, and a run's other DP traffic.
     DP_COMM = auto()
+    # The all-reduce among the copies of an FSDP shard: HSDP's once a step,
+    # every gradient's where FSDP shards nothing.
+    DP_REDUCE = auto()
     MP_COMM = auto()
     EP_COMM = auto()
     CP_COMM = auto()
@@ -83,6 +87,8 @@ class PerfParts(Enum):
             name = "Rec"
         elif self == self.DP_COMM:
             name = "DP"
+        elif self == self.DP_REDUCE:
+            name = "AR"
         elif self == self.MP_COMM:
             name = "MP"
         elif self == self.EP_COMM:
@@ -230,6 +236,7 @@ def gen_colors(categories):
         str(PerfParts.BW_COMPUTE): pastel(compute_color, -0.1),
         str(PerfParts.RECOMPUTE): pastel(compute_color),
         str(PerfParts.DP_COMM): pastel(dim_color(Dim.DP)),
+        str(PerfParts.DP_REDUCE): pastel(dim_color(Dim.DP), -0.15),
         str(PerfParts.MP_COMM): pastel(dim_color(Dim.TP), -0.1),
         str(PerfParts.EP_COMM): pastel(dim_color(Dim.EP)),
         str(PerfParts.CP_COMM): pastel(dim_color(Dim.CP)),
@@ -695,6 +702,7 @@ def estimation_in_real_parts(
     )
     estimations_in_real_components[RealParts.DP_WAIT].append(
         estimations[PerfParts.DP_COMM.value - 1]
+        + estimations[PerfParts.DP_REDUCE.value - 1]
     )
     estimations_in_real_components[RealParts.MP_WAIT].append(
         estimations[PerfParts.MP_COMM.value - 1]

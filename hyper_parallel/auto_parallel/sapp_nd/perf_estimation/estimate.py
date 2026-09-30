@@ -244,6 +244,20 @@ def get_dynamic_ratio(cfg):
     return 3 / 2 * (cfg.hff_exp + cfg.s) * (8192 / (cfg.h + cfg.s))
 
 
+def _weigh_comm_parts(debugger, comm_w):
+    """Weigh each stage's recorded communication parts as the stage time weighs them.
+
+    DP_REDUCE, the all-reduce's share of DP_COMM, is weighed where the
+    communication walk recorded it (``estimate_from_mem_comm``).
+    """
+    for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM]:
+        debugger.info[p] = [
+            comm_w * c for c in debugger.info[p]
+        ]
+    if isinstance(debugger.info[PerfParts.DP_REDUCE], list):
+        debugger.info[PerfParts.DP_REDUCE] = [comm_w * c for c in debugger.info[PerfParts.DP_REDUCE]]
+
+
 def estimate_stage(*args, **kwargs):
     """stage level estimation"""
     cfg = args[0]
@@ -281,10 +295,7 @@ def estimate_stage(*args, **kwargs):
     ]
 
     if debugger and debugger.is_enabled():
-        for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM]:
-            debugger.info[p] = [
-                comm_w * c for c in debugger.info[p]
-            ]
+        _weigh_comm_parts(debugger, comm_w)
         debugger.info[PerfParts.FW_COMPUTE] = [
             comp_w * comp / (1 + BACKWARD_RATIO) for comp in compute_perfs
         ]
@@ -394,6 +405,12 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
             time_sum,
         )
         debugger.info[PerfParts.BUBBLE] = bubble
+        # DP_COMM timed the stage's whole DP traffic, the time and the bubble
+        # above with it; its all-reduce is DP_REDUCE's, the rest FSDP's.
+        reduced = debugger.info[PerfParts.DP_REDUCE]
+        if isinstance(reduced, list):
+            debugger.info[PerfParts.DP_REDUCE] = reduced[last_straggler_idx] * cfg.m
+            debugger.info[PerfParts.DP_COMM] -= debugger.info[PerfParts.DP_REDUCE]
     return pipeline_perf
 
 
@@ -463,6 +480,9 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
             ratio = compute_ratio
         else:
             ratio = coeffs.get(part.name)
+            if ratio is None and part == PerfParts.DP_REDUCE:
+                # A file fitted before the all-reduce had a part of its own.
+                ratio = coeffs.get(PerfParts.DP_COMM.name)
         new_val = 0.0 if raw == 0.0 else raw * ratio
         debugger.info[part] = new_val
 

@@ -599,8 +599,11 @@ def perf_parts(mean: Dict[str, float]) -> Dict[str, float]:
     """The measured step in the columns of ND's estimate (``debug.csv``).
 
     Real data cannot split the pipeline bubble from P2P time, so all of ``pp_wait``
-    goes to ``PP_COMM``. The columns after ``TOTAL`` hold what ND does not model,
-    plus the device compute an Ascend run cannot attribute to a pass.
+    goes to ``PP_COMM``. FSDP's waits, ``op_wait``, go to ``DP_COMM`` and the
+    all-reduces, ``dp_wait``, to ``DP_REDUCE``, as an Ascend profile splits them;
+    a Chrome trace counts FSDP's reduce-scatters among the all-reduces. The
+    columns after ``TOTAL`` hold what ND does not model, plus the device compute
+    an Ascend run cannot attribute to a pass.
 
     Args:
         mean: Output of ``mean_parts``.
@@ -613,7 +616,8 @@ def perf_parts(mean: Dict[str, float]) -> Dict[str, float]:
         str(parts.FW_COMPUTE): mean["comp_fw"],
         str(parts.BW_COMPUTE): mean["comp_bw"],
         str(parts.RECOMPUTE): mean["comp_rec"],
-        str(parts.DP_COMM): mean[DP_WAIT] + mean[OP_WAIT],
+        str(parts.DP_COMM): mean[OP_WAIT],
+        str(parts.DP_REDUCE): mean[DP_WAIT],
         str(parts.MP_COMM): mean[MP_WAIT] + mean[SP_WAIT],
         str(parts.EP_COMM): mean[EP_WAIT],
         str(parts.CP_COMM): mean[CP_WAIT],

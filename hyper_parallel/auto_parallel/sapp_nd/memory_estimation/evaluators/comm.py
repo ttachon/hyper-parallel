@@ -106,6 +106,22 @@ class EvalLayerComm:
         return total
 
     @staticmethod
+    def fsdp_reduce_traffic(ccfg: CostModelConfig, parts: tuple, reduces: float) -> float:
+        """The all-reduce in :meth:`fsdp_traffic`: the bytes the copies of a shard move reducing it.
+
+        HSDP's replicas all-reduce each gradient shard once a step, and a run
+        whose FSDP shards nothing all-reduces every gradient; the rest of
+        :meth:`fsdp_traffic` is FSDP's own gathers and reduce-scatters.
+        """
+        total = 0.0
+        for size, computed, kept, group in parts:
+            whole = size / max(1, computed)
+            shards = max(1.0, kept / max(1, computed))
+            copies = max(1.0, group / max(1, kept))
+            total += 2 * (copies - 1) / copies * whole / shards * ccfg.bytes_grad * reduces
+        return total
+
+    @staticmethod
     def tp_comm_non_exp(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """TP comm for non-expert parameters"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
