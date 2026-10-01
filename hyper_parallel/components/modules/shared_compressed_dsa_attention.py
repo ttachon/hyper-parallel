@@ -248,7 +248,10 @@ class SharedCompressedPackedSequence:
         """
         device = torch.device(device)
         # Torch exposes tensor mutation tracking only through its version counter.
-        version = None if self.cu_seq_lens.is_inference() else self.cu_seq_lens._version  # pylint: disable=protected-access
+        version = (
+            None if self.cu_seq_lens.is_inference()
+            else self.cu_seq_lens._version  # pylint: disable=protected-access
+        )
         if version is not None and self._snapshot.get("version") == version:
             prepared: SharedCompressedPackedSequence = self if self._snapshot.get("owned") else self._snapshot["value"]
         else:
@@ -451,6 +454,52 @@ def _try_fused_compressed_topk(
     return fused_compressed_topk(query, key, merge_weight, compress_ratio, top_k, query_segments)
 
 
+def _try_accelerated_compressed_topk(
+        query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor, *,
+        top_k: int, compress_ratio: int, sequence_length: int, compressed_length: int,
+        sparse_count: int, query_offset: int,
+        reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+        minimum_key_indices: torch.Tensor | None,
+        query_segments: tuple[tuple[int, int, int, int, int], ...] | None,
+        use_fused: bool, use_provider: bool,
+) -> torch.Tensor | None:
+    """Return the first accelerated selection offered, or None for the reference.
+
+    The order is the native LI V2 operators, which ``use_fused`` demands and
+    which raise where unsupported, then a registered selection provider, then
+    the CANN adapter.
+    """
+    if use_fused:
+        selected = _try_fused_compressed_topk(
+            query, key, merge_weight, top_k, compress_ratio, query_offset,
+            reduce_sum, minimum_key_indices, query_segments,
+        )
+        if selected is None:
+            raise RuntimeError(
+                "V4.1 fused Indexer is required but this call is unsupported: "
+                f"device={query.device}, dtype={query.dtype}, Q={tuple(query.shape)}, K={tuple(key.shape)}, "
+                f"topk={top_k}, ratio={compress_ratio}, TP={reduce_sum is not None}. "
+                "Check the LI V2 extension, input shapes and ordinary causal geometry; no reference fallback was run."
+            )
+        return selected
+    if use_provider and _FUSED_SELECTION_PROVIDER is not None:
+        selected = _FUSED_SELECTION_PROVIDER.causal_topk(
+            query, key, merge_weight, compress_ratio=compress_ratio,
+            sparse_count=sparse_count, query_offset=query_offset,
+            reduce_sum=reduce_sum, minimum_key_indices=minimum_key_indices)
+        if selected is not None:
+            return selected
+    if (compress_ratio <= 128 and reduce_sum is None
+            and (minimum_key_indices is None or query_segments is not None)
+            and cann_indexer_available(query, key, top_k)):
+        if query_segments is None:
+            raw_end = query_offset + sequence_length
+            query_segments = ((0, sequence_length, 0, min(raw_end // compress_ratio, compressed_length),
+                               raw_end % compress_ratio),)
+        return cann_compressed_topk(query, key, merge_weight, compress_ratio, top_k, query_segments)
+    return None
+
+
 _FUSED_SELECTION_PROVIDER = None
 
 
@@ -527,36 +576,15 @@ def compressed_causal_topk(
             device=query.device,
         )
 
-    if use_fused:
-        selected = _try_fused_compressed_topk(
-            query, key, merge_weight, top_k, compress_ratio, query_offset,
-            reduce_sum, minimum_key_indices, query_segments,
-        )
-        if selected is None:
-            raise RuntimeError(
-                "V4.1 fused Indexer is required but this call is unsupported: "
-                f"device={query.device}, dtype={query.dtype}, Q={tuple(query.shape)}, K={tuple(key.shape)}, "
-                f"topk={top_k}, ratio={compress_ratio}, TP={reduce_sum is not None}. "
-                "Check the LI V2 extension, input shapes and ordinary causal geometry; no reference fallback was run."
-            )
+    selected = _try_accelerated_compressed_topk(
+        query, key, merge_weight, top_k=top_k, compress_ratio=compress_ratio,
+        sequence_length=sequence_length, compressed_length=compressed_length,
+        sparse_count=sparse_count, query_offset=query_offset, reduce_sum=reduce_sum,
+        minimum_key_indices=minimum_key_indices, query_segments=query_segments,
+        use_fused=use_fused, use_provider=use_provider,
+    )
+    if selected is not None:
         return selected
-
-    if use_provider and _FUSED_SELECTION_PROVIDER is not None:
-        selected = _FUSED_SELECTION_PROVIDER.causal_topk(
-            query, key, merge_weight, compress_ratio=compress_ratio,
-            sparse_count=sparse_count, query_offset=query_offset,
-            reduce_sum=reduce_sum, minimum_key_indices=minimum_key_indices)
-        if selected is not None:
-            return selected
-
-    if (compress_ratio <= 128 and reduce_sum is None
-            and (minimum_key_indices is None or query_segments is not None)
-            and cann_indexer_available(query, key, top_k)):
-        if query_segments is None:
-            raw_end = query_offset + sequence_length
-            query_segments = ((0, sequence_length, 0, min(raw_end // compress_ratio, compressed_length),
-                               raw_end % compress_ratio),)
-        return cann_compressed_topk(query, key, merge_weight, compress_ratio, top_k, query_segments)
 
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
