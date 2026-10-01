@@ -1,0 +1,180 @@
+# Cropped Qwen3.5-35B-A3B-Base (MoE) from_config run: FSDP + EP.
+# Offline Indexed Dataset input; nothing in this config reaches the network.
+#
+# Defaults target ONE node of 16 dies. The rule when scaling out is:
+#   ep_size            divides num_experts (256) and world_size
+#   dp_shard_size      = world_size
+#   edp_shard_size     = world_size / ep_size   (must divide it; 1 leaves expert
+#                                                optimizer state unsharded)
+#   global_batch_size  a multiple of micro_batch_size x dp_world_size, which is
+#                      world_size here, so it must grow with the device count
+# 4 nodes of 16 dies, keeping ep_size 8:
+#   --fsdp_config.dp_shard_size=64 --fsdp_config.edp_shard_size=8 \
+#   --training.global_batch_size=64
+#
+# Needs the qwen3_5_moe adapter: without it the planner leaves the Gated DeltaNet
+# projections and every shared_expert_gate unclassified and refuses any ep_size > 1.
+
+model:
+  _target_: examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe
+  config_path: /home/tt/models/Qwen3.5-35B-A3B-Base
+  # Keep a multiple of 4: Qwen3.5 repeats 3 linear_attention + 1 full_attention.
+  num_hidden_layers: 8
+  # Unset keeps all 256 routed experts (7.75B cropped). Set it lower, as a
+  # multiple of ep_size, for a cheaper first pass.
+  num_experts: null
+  # Transformers defaults experts to grouped_mm (torch._grouped_mm). Drop this
+  # line once that is confirmed working on this CANN build.
+  experts_implementation: eager
+  local_files_only: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  validate_placement: false
+
+training:
+  train_iters: 10
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  # TP breaks the Gated DeltaNet grouped convolution (conv1d is sharded while
+  # groups and conv_dim stay global), so leave tp_size at 1.
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+  # The Trainer has no pipeline schedule: pp_size > 1 does not raise and does
+  # not pipeline, it trains one full replica per stage group.
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 16
+  edp_shard_size: 2
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  # Qwen3.5-MoE's block is routed + sigmoid(shared_expert_gate(x)) * shared_expert(x),
+  # which is the qwen2moe archetype exactly. Do NOT substitute qwen3moe_ep_compute_fn:
+  # it passes the same interface check but returns the routed branch only, silently
+  # dropping the shared expert.
+  # use_grouped_gemm picks npu_grouped_swiglu over the per-expert loop, whose cost
+  # grows as num_experts / ep_size. Set it false to fall back to the loop.
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
+      use_grouped_gemm: true
+  # Only active at cp_size > 1. The p2p algorithm has no divisibility requirement;
+  # qwen3_5_gdn_ulysses_cp_wrapper is the alternative when cp divides 16 and 32.
+  # CP and TP cannot be combined on this model.
+  - match: "*.linear_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /home/tt/models/Qwen3.5-35B-A3B-Base
+      local_files_only: true
+      tokenizer_type: pretokenized
+      vocab_size: 248320
+      eod_token_id: 248044
+
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: ./output/training_demo/data/parallel_offline_text_document
+  data_config:
+    seq_length: 128
+    split: "1, 0, 0"
+    mock_data: false
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    data_lazy_load: true
+    skip_data_check: true
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: indexed
+    attention_mode: dense
+    cp_algorithm: ulysses
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-5
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: null

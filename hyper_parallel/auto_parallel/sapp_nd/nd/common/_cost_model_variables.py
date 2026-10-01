@@ -43,6 +43,13 @@ class _CostModVar:
     mm_ccfgs: any = None
     mm_order: list = None
     layer_custom_config: list = None
+    # What a layer of each kind keeps and holds per token, as a census states
+    # it (an auto_parallel KindActivations per layer type), the record of the
+    # kind of the layer priced, which the Hyper parser binds, and the output
+    # layer's; with none, the formulas price them.
+    census: dict = None
+    kind_activations: any = None
+    output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
 
@@ -56,6 +63,14 @@ class _CostModVar:
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
+    # How many ranks of its expert data-parallel group FSDP shards a routed
+    # expert over under expert parallelism, as the run states it; None for
+    # the optimizer's whole group.
+    expert_shard: int = None
+    # Whether the run shards each strategy's routed experts over that
+    # strategy's whole expert data-parallel group, as a launcher that sets
+    # edp_shard_size to the group does: the shard then follows the strategy.
+    expert_shard_group: bool = False
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
@@ -75,10 +90,40 @@ class _CostModVar:
     n_lay: float = 0
     n_kv: float = 0
     dh: float = 0
+    # An MLA model's value-head width, at which its family prices dh, and its
+    # non-rotary key-head width, the value heads' unless stated.
+    v_head_dim: float = None
+    qk_nope_head_dim: float = None
     dc_kv: float = 0
     dc_q: float = 0
     dhr: float = 0
+    # The biases and norms a model states (its spec's); None where unstated,
+    # which the parameter formulas count their own way.
+    qkv_bias: bool = None
+    o_bias: bool = None
+    mlp_bias: bool = None
+    norm_bias: bool = None
+    layer_norms: int = None
+    shared_expert_gate: bool = None
     k_1st_dense: float = 0
+    # Attention flavour of a layer group, and the extra parameters a flavour
+    # carries that the q/k/v/o formula does not describe (conv, gates).
+    attn_kind: str = "full"
+    attn_extra_p: float = 0
+    lin_n_k: float = 0
+    lin_d_k: float = 0
+    lin_n_v: float = 0
+    lin_d_v: float = 0
+    lin_conv: float = 0
+    # Recurrent-state update and readout, the linear-attention op the
+    # arch hooks have no counterpart for. Zero for every other flavour.
+    n_linrec: float = 0
+    # The QK-norm a layer runs: 1 where the model normalizes each head's
+    # queries and keys (qk_norm), 0 on a linear-attention layer.
+    n_qknorm: float = 0
+    # The attention fields a linear group displaced, kept so a later full
+    # group can put them back when hooks run in place, layer after layer.
+    full_attn: dict = None
     n_mtp: float = 0
     is_mtp_in_offset: bool = True
     multiple_of: float = 0
@@ -98,7 +143,6 @@ class _CostModVar:
     tokens_per_expert: list = None
 
     # CP modeling
-    kv_lora_rank: float = 0
     attention_type: str = None
     device_per_node: float = 8
     bw_intra: float = 400.0
@@ -140,6 +184,9 @@ class _CostModVar:
     has_grad_shard: bool = False
     freeze: bool = False
     has_fa: bool = False
+    attn_output_gate: bool = False
+    # Whether attention normalizes each head's queries and keys (Qwen3).
+    qk_norm: bool = False
     # vp_less_mem: bool = False
     has_clip: bool = False
     gmm: bool = False
@@ -154,7 +201,14 @@ class _CostModVar:
 
     # shard
     shard_embed: float = 0
+    # Over how many of the ranks that shard the embedding table its layer
+    # gathers it to compute with it.
+    gather_embed: float = 1
     shard_output_activ: float = 0
+    # Whether the loss runs on logits sharded over the vocabulary, as the
+    # run states it, None taking its family's; and as the families read it.
+    loss_parallel: bool = None
+    shards_logits: bool = True
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
 
@@ -162,8 +216,40 @@ class _CostModVar:
     bytes_p: float = 0
     bytes_compute: float = 0
     bytes_softmax: float = 0
+    # Whether each gradient is held as its parameter is: in its width and
+    # sharding, at any pipeline degree, as FSDP holds it.
+    grads_as_params: bool = False
+    # Whether the run accumulates gradients over micro-batches without
+    # pipeline parallelism, holding them between micro-batches: a search
+    # then gives PP 1 several micro-batches.
+    accumulates_grads: bool = False
     bytes_grad: float = 0
     bytes_os: float = 0
+    # What the run's optimizer keeps, None taking the family's: a state's
+    # width, its states per layer parameter (2 for AdamW, 1 for Muon) and
+    # the width of its copy of the parameters; and, from them, its bytes
+    # per parameter of a layer and of the embedding and output tables,
+    # which the family hooks set.
+    optimizer_state_bytes: float = None
+    optimizer_states: float = None
+    main_param_bytes: float = None
+    bytes_optim: float = 0
+    bytes_optim_table: float = 0
+    # Whether FSDP frees a layer's gathered parameters once it has run, and
+    # gathers them again when it runs next; MindSpore's optimizer
+    # parallelism keeps its gathered weights.
+    reshards: bool = False
+    # Whether FSDP holds each layer's reduce-scatter output until the
+    # backward ends, adding it to the accumulated gradient only then, as
+    # HyperParallel's does; PyTorch's FSDP2 adds it as soon as it is reduced.
+    defers_grads: bool = False
+    # Whether FSDP holds a layer's whole gradients while the next layer's
+    # backward runs, and the root's until the backward ends.
+    overlaps_grad_reduce: bool = False
+    # Whether a layer keeps the weight casts the formulas price beside its
+    # matmuls; None where no parser says, then where the optimizer does not
+    # shard.
+    keeps_param_casts: bool = None
     bytes_norm: float = 0
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
@@ -240,28 +326,26 @@ class _CostModVar:
         """process input config"""
         self.hooks_dict = None if not hook_cls else hook_cls.get_hooks()
         self.source_code = source_code
-        if isinstance(input_config, str):
-            self.config = Config(input_config)
-            # get parser
-            if framework:
-                logger.debug("Find parser module based on input framework name")
-                parser_cls = self.get_framework_parser(framework.lower())
-            else:
-                logger.debug("Naive way to find parser module")
-                parser_cls = self.get_framework_parser_naive(input_config)
-            if parser_cls:
-                self.parser = parser_cls(self)
-                logger.debug("Parser module: %s", self.parser.__class__)
-                self.parser.parse()
-            return
-        if isinstance(input_config, dict):
+        if isinstance(input_config, (str, dict)):
             self.config = Config(input_config)
         elif isinstance(input_config, Config):
             self.config = input_config
         else:
             raise TypeError(
-                f"Expecting path string or Config object for {input_config}"
+                f"Expecting path string, dict or Config object for {input_config}"
             )
-        #MindFormers format by default
-        self.parser = self.get_framework_parser_naive("yaml")(self)
-        self.parser.parse()
+        # An in-memory config names its framework the same way a file does:
+        # the framework selects the parser whatever form the config takes.
+        if framework:
+            logger.debug("Find parser module based on input framework name")
+            parser_cls = self.get_framework_parser(framework.lower())
+        elif isinstance(input_config, str):
+            logger.debug("Naive way to find parser module")
+            parser_cls = self.get_framework_parser_naive(input_config)
+        else:
+            # MindFormers format by default
+            parser_cls = self.get_framework_parser_naive("yaml")
+        if parser_cls:
+            self.parser = parser_cls(self)
+            logger.debug("Parser module: %s", self.parser.__class__)
+            self.parser.parse()

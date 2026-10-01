@@ -38,12 +38,14 @@ class CostModelParserMindspeed(_CostModelParser):
         self.ccfg.b = self.config.tmp.mbs
         self.ccfg.d = self.config.tmp.dp  # DP
         self.ccfg.t = self.config.tmp.tp  # TP
-        self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+        self.ccfg.os_max_shard = self.ccfg.d
         self.ccfg.cp = self.config.tmp.cp  # CP
         self.ccfg.vp = self.config.tmp.vpp  # VPP
         self.ccfg.ep = self.config.tmp.ep  # EP
         ccfgs = self.__search_and_parse_mods_ccfg(self.ccfg.config)
         self.ccfg.multimodal = len(ccfgs) > 1
+        if len(ccfgs) == 1:
+            self.__adopt_module(next(iter(ccfgs.values())))
         if self.ccfg.multimodal:
             if not self.ccfg.hooks_dict:
                 raise TypeError(
@@ -84,6 +86,29 @@ class CostModelParserMindspeed(_CostModelParser):
                 else:
                     self.__complete_unimodal_pp_plan(m, cc, num_layer_per_stage)
         self.ccfg.overwrite_eval_functions = {}
+
+    # What a config keeps of its own when it takes its one module's parse.
+    _KEPT_FROM_CONFIG = ("config", "config_path", "parser", "hooks_dict", "device_capacity",
+                         "multimodal", "mm_ccfgs", "mm_order")
+
+    def __adopt_module(self, module):
+        """Make a config of one module that module: its model, run and derived fields."""
+        for key, value in vars(module).items():
+            if key not in self._KEPT_FROM_CONFIG:
+                object.__setattr__(self.ccfg, key, value)
+
+    @staticmethod
+    def __recompute_count(full_rec):
+        """The layers a module recomputes on each of its stages, as its parse states them."""
+        while isinstance(full_rec, list):
+            full_rec = next((count for count in full_rec if count), 0)
+        return int(full_rec or 0)
+
+    def __completed_recompute(self, cc):
+        """The module's own recompute, on the stages its completed plan puts it on."""
+        own = self.__recompute_count(cc.full_rec)
+        per_stage = [[min(own, count) for count in chunk] for chunk in cc.pp_partition]
+        return per_stage if cc.vp > 1 else per_stage[0]
 
     def __complete_unimodal_pp_plan(self, m, cc, num_layer_per_stage):
         """Try to follow previous pp plan"""
@@ -127,9 +152,7 @@ class CostModelParserMindspeed(_CostModelParser):
             for v_idx in range(self.ccfg.vp)
         ]
         cc.p, cc.vp = self.ccfg.p, self.ccfg.vp
-        cc.full_rec = (
-            self.ccfg.mm_ccfgs[self.ccfg.mm_order[previous_mod_idx]].full_rec is True
-        )
+        cc.full_rec = self.__completed_recompute(cc)
         cc.sel_rec = False
 
     def __search_and_parse_mods_ccfg(self, field):
@@ -147,11 +170,11 @@ class CostModelParserMindspeed(_CostModelParser):
 
     def __config_parse_json_parallelism(self, cc, mod):
         """MindSpeed format for parallelism"""
-        cc.t = max(cc.tensor_model_parallel_size, self.config.tmp.tp)
-        cc.p = max(cc.pipeline_model_parallel_size, self.config.tmp.pp)
+        cc.t = max(mod.tensor_model_parallel_size, self.config.tmp.tp)
+        cc.p = max(mod.pipeline_model_parallel_size, self.config.tmp.pp)
         cc.cp = self.config.tmp.cp
         cc.d = self.config.tmp.dp
-        cc.ep = max(cc.expert_model_parallel_size, self.config.tmp.ep)
+        cc.ep = max(mod.expert_model_parallel_size, self.config.tmp.ep)
         cc.sp = cc.t if mod.sequence_parallel else 1
         if cc.cp > 1 and cc.sp > 1:
             logger.warning(
@@ -184,6 +207,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.dc_kv = mod.k_lora_rank  # KV compression dimension #NOT SURE
         cc.dc_q = mod.q_lora_rank  # Q compression dimension
         cc.dhr = mod.qk_rope_head_dim  # decoupled QK per head dimension
+        self.state_qk_norm(cc, mod.qk_layernorm)  # Megatron's --qk-layernorm
 
     def __config_parse_json_moe(self, cc, mod):
         """MindSpeed format for MoE infos"""
@@ -198,6 +222,10 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.k_1st_dense = mod.first_k_dense_replace
         # temporary
         cc.etp = self.config.tmp.etp  # ETP
+
+    def config_shard_emb(self, ccfg):
+        """Set how the embedding table is sharded, on *ccfg*: over TP and DP."""
+        ccfg.shard_embed = ccfg.t * ccfg.d
 
     def __config_parse_json_op_recompute(self, cc):
         """MindSpeed format for select recompute"""
@@ -265,11 +293,11 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.bytes_norm = 4
 
         # Optimizer parallel factors
-        cc.os_max_shard = cc.d * cc.t
+        cc.os_max_shard = cc.d
         self.config_optimizer_shard(cc)
 
         # Other factors
-        cc.shard_embed = cc.t * cc.d
+        self.config_shard_emb(cc)
         cc.shard_output_activ = 1
         cc.shard_recompute_input = 1
         cc.s_fa = (
@@ -296,7 +324,9 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation
         self.__config_parse_json_op_recompute(cc)
-        cc.layer_custom_config = [(cc.n_lay, None)]
+        # One group of every layer, the MTP layers included, as under the
+        # other parsers: a partition that places an MTP layer prices it.
+        cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
         # By default, 100% of layers use a unique custom config (if specified)
         cc.overwrite_eval_functions = {}
         return cc  # mod_hook

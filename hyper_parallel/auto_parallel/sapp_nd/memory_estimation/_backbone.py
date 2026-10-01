@@ -31,6 +31,8 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._bwd_overhead import _BackwardOverhead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
@@ -71,6 +73,9 @@ class _Backbone:
             else:
                 raise AttributeError("missing config")
         self.evaluator_instances = None
+        # The submodule a multimodal model's stages are fitted on, by name,
+        # or None for a model of one module (F54).
+        self.main_module = None
         self.ppb = None
         self._overhead_obj = _BackwardOverhead(
             self, self._ccfg, self._ctx, self._inner_dynamic_mem
@@ -124,23 +129,26 @@ class _Backbone:
             self._ccfg.update_config(new_config, self.hook_cls, self.framework, self.source_code)
         else:
             self._ccfg = CostModelConfig(new_config, self.hook_cls, self.framework, self.source_code)
-        if isinstance(new_config, str):
-            if not self.config_path:
-                logger.info(
-                    "%s Process config file: %s",
-                    "=" * 30,
-                    new_config.split("/")[-1],
-                )
-            self.config_path = new_config
+        if isinstance(new_config, str) and not self.config_path:
+            logger.info(
+                "%s Process config file: %s",
+                "=" * 30,
+                new_config.split("/")[-1],
+            )
+        # Kept whatever its form, so reset_config() can parse a config handed
+        # over in memory again rather than read one from a path.
+        self.config_path = new_config
         self.evaluator_instances = None
         self.ppb = None
 
     def _inner_static_mem(self) -> float:
         """static memory evaluation for backbone estimation"""
+        self._ctx.node_grad = 0
         if self._ctx.current_node in self._ctx.node_eval:
             p = self._ctx.eval.stat.p(self._ccfg, self._ctx)
             ost = self._ctx.eval.stat.os(self._ccfg, self._ctx)
             grad = self._ctx.eval.stat.grad(self._ccfg, self._ctx)
+            self._ctx.node_grad = grad
             res = p + ost + grad
             self._ctx.save2log("_param", res)
             # Log routed/shared expert param breakdown for MoE layers
@@ -166,6 +174,7 @@ class _Backbone:
     ) -> tuple[float, float]:
         """dynamic memory evaluation for backbone estimation"""
         if self._ctx.current_node in self._ctx.node_eval:
+            self._ctx.seq_chunks = 1
             if ppb:
                 micro_factor = 1
             elif default_micro_factor:
@@ -176,9 +185,17 @@ class _Backbone:
                     self._ccfg, self._ctx
                 )
             self._ctx.micro_factor = max(1, micro_factor)
-            activation = self._ctx.eval.dyn.activation(self._ccfg, self._ctx)
-            self._ctx.save2log("_activ", activation)
-            comm = self._inner_comm_mem(micro_factor)
+            # A schedule that splits the sequence evaluates the node at one
+            # chunk's length, and leaves the config's as it found it.
+            full_s = self._ccfg.s
+            if self._ctx.seq_chunks > 1:
+                self._ccfg.s = full_s / self._ctx.seq_chunks
+            try:
+                activation = self._ctx.eval.dyn.activation(self._ccfg, self._ctx)
+                self._ctx.save2log("_activ", activation)
+                comm = self._inner_comm_mem(micro_factor)
+            finally:
+                self._ccfg.s = full_s
             return activation, comm
         return 0, 0
 
@@ -209,6 +226,17 @@ class _Backbone:
                 else:
                     comm = fun(self._ccfg, self._ctx)
                 comm_mem[k] = comm
+            # FSDP that reshards frees a layer's gathered parameters once it
+            # has run: a layer keeps none between its passes, and its
+            # backward holds its own and the next layer's, prefetched, as
+            # its working set counts them.  The root's, the embedding and
+            # output tables, stay gathered from the forward on: their
+            # nodes keep them, and a working set holds no second copy.
+            if "dp" in comm_mem and self._ccfg.reshards:
+                if self.is_regular_layer(self._ctx.current_node):
+                    comm_mem["dp"] *= self._ctx.working_set
+                elif self._ctx.working_set:
+                    comm_mem["dp"] = 0
             res = EvalUtils.eval_expr_insight(
                 expr=self._ctx.comm_expr,
                 ctx=self._ctx,
@@ -401,6 +429,7 @@ class _Backbone:
             stages = self._ccfg.generate_partitions_vpp()
             #     multimodal=self._ccfg.multimodal
             # )
+        self.__name_main_module(self._ccfg)
         if not self._ccfg.multimodal:
             return self.__estimate_stages_backbone(
                 stages, args[1], args[2], spec_stage_id, args[4]
@@ -466,6 +495,23 @@ class _Backbone:
         self._ccfg = original_ccfg
         return res
 
+    @staticmethod
+    def _stage_buffers(stages: list, pipeline: int) -> Dict:
+        """What the layer loop fills, per stage, chunk and layer, and per stage."""
+        def per_layer(value):
+            """One *value* per layer of every chunk of every stage."""
+            return [[[value for _ in c] for c in s] for s in stages]
+
+        return {
+            "stat": per_layer(0),
+            "dyn": per_layer(0),
+            "comm": per_layer(0),
+            "micro": per_layer(1),
+            "grad_out": [0 for _ in stages],
+            "root_grad": [0 for _ in stages],
+            "logs": [Config({}) for _ in range(pipeline)],
+        }
+
     def __estimate_stages_backbone(self, *args) -> Tuple[list, Dict]:
         """Evaluator's main function for stage estimation"""
         stages = args[0]
@@ -487,11 +533,7 @@ class _Backbone:
                 ),
             )
 
-        stage_misc = {
-            "stat": [[[0 for _ in c] for c in s] for s in stages],
-            "dyn": [[[0 for _ in c] for c in s] for s in stages],
-            "logs": [Config({}) for _ in range(self._ccfg.p)],
-        }
+        stage_misc = self._stage_buffers(stages, self._ccfg.p)
         # tmp_ppb_lay_desc = []  # PPB purpose
         ppb_lay_desc = []
         record_lay_types = {}
@@ -610,10 +652,16 @@ class _Backbone:
                     self._ctx.current_chunk_id = chunk_id
                     self._ctx.current_lay_id = lay_id
                     self._ctx.current_node = node
-                    sm["stat"][stage_id][chunk_id][lay_id] = self._inner_static_mem()
-                    sm["dyn"][stage_id][chunk_id][lay_id] = sum(
-                        self._inner_dynamic_mem()
-                    )
+                    static_mem = self._inner_static_mem()
+                    sm["stat"][stage_id][chunk_id][lay_id] = static_mem
+                    activation, comm = self._inner_dynamic_mem()
+                    sm["dyn"][stage_id][chunk_id][lay_id] = activation + comm
+                    sm["comm"][stage_id][chunk_id][lay_id] = comm
+                    sm["micro"][stage_id][chunk_id][lay_id] = self._ctx.micro_factor or 1
+                    if self.is_regular_layer(node):
+                        sm["grad_out"][stage_id] += self._ctx.node_grad
+                    elif node == LayerType.OUTPUT_LAYER and self._ccfg.overlaps_grad_reduce:
+                        sm["root_grad"][stage_id] += EvalTailSingle.reduced_grad_out_single(self._ccfg, self._ctx)[0]
                     if verbose:
                         logger.info("pp micro factor for dynamic: %s",self._ctx.micro_factor)
                     # PPB Purpose
@@ -633,6 +681,78 @@ class _Backbone:
                         self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
                 self.__update_stage_logs(sm["logs"], stage_id)
 
+    def __backward_end(self, stages, stage_id, sm, record_lay_types) -> float:
+        """The stage's dynamic memory as a micro-batch's backward ends, or 0.
+
+        FSDP that holds each layer's reduce-scatter output until the backward
+        ends, and accumulates gradients over several micro-batches, then
+        holds the outputs of the stage's layers beside the gradients it
+        accumulated; FSDP that reduces a layer's gradients while the next
+        layer's backward runs holds whole gradients meanwhile, and the
+        root's, the output table's, until the backward ends.  Either's peak
+        can come as the backward ends, when that micro-batch keeps nothing
+        but the other micro-batches in flight still do.  The root's gathered
+        tables stay, and the stage's first layer runs its backward last,
+        before its own reduce-scatter starts.
+        """
+        held = sm["grad_out"][stage_id] if self._ccfg.defers_grads and self._ccfg.m > 1 else 0
+        if self._ccfg.freeze or not (held or self._ccfg.overlaps_grad_reduce):
+            return 0
+        kept = 0
+        for chunk_id, chunk in enumerate(stages[stage_id]):
+            for lay_id, node in enumerate(chunk):
+                if self.is_regular_layer(node):
+                    micro = sm["micro"][stage_id][chunk_id][lay_id]
+                    kept += sm["dyn"][stage_id][chunk_id][lay_id] * (micro - 1) / micro
+                else:
+                    kept += sm["comm"][stage_id][chunk_id][lay_id]
+        ccfg, ctx = self._ccfg, self._ctx
+        try:
+            working, pending = self._overhead_obj.first_layer_working_set(stages, stage_id, record_lay_types)
+            kept += self.__held_before_last_backward(stages, stage_id, sm, record_lay_types)
+        finally:
+            self._ccfg, self._ctx = ccfg, ctx
+        held = max(0, held - pending) if held else 0
+        return kept + held + working + sm["root_grad"][stage_id]
+
+    def __name_main_module(self, ccfg) -> None:
+        """Name the submodule a model's stages are fitted on, or none for a model of one module.
+
+        A multimodal model's stages hold its submodules' layers together, and
+        a micro-batch's backward ends on the first of them; the moment the
+        main submodule's own first layer runs its backward is the one a stage
+        has to fit (F54).
+        """
+        if not ccfg.multimodal:
+            self.main_module = None
+            return
+        main = getattr(ccfg, "mm_main", None) or ccfg.mm_order[-1]
+        self.main_module = ccfg.mm_ccfgs[main].model_name
+
+    def __held_before_last_backward(self, stages, stage_id, sm, record_lay_types) -> float:
+        """This micro-batch's activations of the layers whose backward has not run at that moment.
+
+        A stage of one module ends a micro-batch's backward on its first
+        layer, with nothing of that micro-batch left to hold.  A stage that
+        also holds a vision tower ends it on the tower's first layer, but
+        the moment the language model's first layer runs its backward, every
+        activation the tower kept is still held: that is the moment the
+        stage has to fit, so what the tower keeps of this micro-batch counts
+        beside the other micro-batches' (F54).
+        """
+        if self.main_module is None:
+            return 0
+        held = 0
+        for chunk_id, chunk in enumerate(stages[stage_id]):
+            for lay_id, node in enumerate(chunk):
+                if not self.is_regular_layer(node):
+                    continue
+                if record_lay_types[(stage_id, chunk_id, lay_id)][0].model_name == self.main_module:
+                    break
+                micro = sm["micro"][stage_id][chunk_id][lay_id]
+                held += sm["dyn"][stage_id][chunk_id][lay_id] / micro
+        return held
+
     def __postprocess_stages(self, *args):
         """Build memory insights from raw stage evaluation buffers."""
         stages, record_lay_types = args[0], args[1]
@@ -647,6 +767,7 @@ class _Backbone:
             ins["Dynamic"] = sum(
                 sum(mem for mem in c) for c in sm["dyn"][stage_id]
             )
+            backward_end = self.__backward_end(stages, stage_id, sm, record_lay_types)
             self._ctx.init_tmp_buff()
             if not self._ccfg.freeze:
                 ins["Dynamic"] += self._overhead_obj.estimate(
@@ -656,6 +777,7 @@ class _Backbone:
             safety_buffer = 1024 * 1024 * 1024  # 1 GB
             if ins["Dynamic"] > 0:
                 ins["Dynamic"] += safety_buffer
+                ins["Dynamic"] = max(ins["Dynamic"], backward_end + safety_buffer)
             stage_accu = sm["logs"][stage_id].accu_mem_type
             ins["ModelParameters"] = self.mb(stage_accu[MemType.MODEL_PARAM])
             ins["OptimizerStates"] = self.mb(stage_accu[MemType.OPTIM_STATE])

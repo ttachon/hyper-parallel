@@ -60,6 +60,7 @@ def _vl_train_yaml() -> dict:
     """Return an AutoModels Trainer config for a vision-language model."""
     return {
         "model": {
+            "_target_": "hyper_parallel.models._transformers.HyperAutoModelForImageTextToText.from_pretrained",
             "pretrained_model_name_or_path": "local/vl",
             "torch_dtype": "bfloat16",
         },
@@ -142,6 +143,27 @@ class TestMultimodalCostModel(unittest.TestCase):
         peak = runner.instance.mem_eval.estimate_peak(verbose=False)
         self.assertGreater(peak, 0)
 
+    def test_a_stage_fits_the_language_models_backward(self) -> None:
+        """
+        Feature: the end-of-backward candidate of a stage holding two submodules.
+        Description: The vision-language model priced whole, and its language
+            model priced alone under the same strategy.
+        Expectation: The whole model needs more memory than its language
+            model alone, since a stage holds the tower beside it: the stage
+            has to fit the moment the language model's first layer runs its
+            backward, with every activation the tower keeps still held, not
+            the moment the tower's own first layer ends the backward (F54).
+            The layers the candidate reads are the language model's.
+        """
+        runner = self._build()
+        evaluator = runner.instance.mem_eval
+        whole = evaluator.ccfg
+        whole_peak = evaluator.estimate_peak(verbose=False)
+        self.assertEqual(evaluator.main_module, whole.mm_ccfgs["text"].model_name)
+        evaluator.set_config(whole.mm_ccfgs["text"])
+        alone = evaluator.estimate_peak(verbose=False)
+        self.assertGreater(whole_peak, alone)
+
     def test_strategy_update_reaches_both_submodules(self) -> None:
         """
         Feature: multimodal strategy fan-out.
@@ -156,6 +178,20 @@ class TestMultimodalCostModel(unittest.TestCase):
         self.assertEqual(ccfg.mm_ccfgs["text"].d, 2)
         self.assertEqual(ccfg.mm_ccfgs["vision"].t, 2)
         self.assertEqual(ccfg.mm_ccfgs["text"].t, 2)
+
+    def test_strategy_update_refreshes_each_submodule(self) -> None:
+        """
+        Feature: multimodal strategy fan-out.
+        Description: A submodule shares its parent's parser, so a refresh
+            through the parser used to land on the parent.
+        Expectation: The language model's embedding sharding follows its own
+            new degrees.
+        """
+        ccfg = self._build().instance.mem_eval.ccfg
+        text = ccfg.mm_ccfgs["text"]
+        self.assertEqual(text.shard_embed, 4, f"parsed shard_embed={text.shard_embed}")
+        ccfg.set_strategy(dp=2, mp=4)
+        self.assertEqual(text.shard_embed, 8, f"shard_embed={text.shard_embed}, want d * t = 8")
 
 
 if __name__ == "__main__":

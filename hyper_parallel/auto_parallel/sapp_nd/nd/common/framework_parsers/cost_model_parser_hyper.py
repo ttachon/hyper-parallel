@@ -22,12 +22,24 @@ Model hyperparameters are resolved with the same Transformers
 ``AutoConfig.from_pretrained`` path used by AutoModels. Legacy
 ``model.config_overrides`` remains supported for standalone search configs.
 
-Expected YAML structure::
+Expected YAML structure.  Only two things are required: the checkpoint to
+read the dimensions from, and the training sequence length::
 
     model:
       _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
       pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
-      torch_dtype: bfloat16
+      torch_dtype: bfloat16          # optional, default bfloat16
+
+    dataset:
+      data_transform:
+        max_seq_len: 4096            # or the legacy data.max_seq_len
+                                     # absent: the model's CONTEXT LIMIT is
+                                     # costed, which is rarely what you meant
+
+Everything below is optional, and on the search path it is ignored: the
+search varies these dimensions itself, and the device count, the batch size
+and the memory budget come from ``-d``, ``-b`` and ``-M`` (or from the
+search config).  Give them only to cost one fixed strategy::
 
     training:
       global_batch_size: 4
@@ -42,26 +54,70 @@ Expected YAML structure::
 
     activation_checkpoint:
       mode: full
+
+    context:
+      max_device_memory: "64GB"
+      device_num: 64
+      census: true                   # price each layer kind's activations
+                                     # from a census of a fake layer of it
+      expert_shard: group            # shard each strategy's routed experts
+                                     # over its whole expert DP group
+
+``model.config_overrides`` stays supported for standalone search configs,
+and wins over anything read from the checkpoint.
 """
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
+from hyper_parallel.auto_parallel.sapp_nd.nd.balancing_adapter import front_loaded_offset
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
     custom_default_transformer,
+    keeps_param_casts,
 )
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._layer_census import (
+    KindActivations,
+    activations_from_dict,
+    replacement_specs,
+)
 
 logger = logging.getLogger(__name__)
 
+# Every field a linear-attention group sets. A full-attention group restores
+# them, because the memory and communication estimates apply layer hooks in
+# place, one layer after another, rather than on a copy per group.
+_LINEAR_ATTN_FIELDS = (
+    "a", "dh", "n_kv", "attn_output_gate", "n_attBMM", "n_softmax",
+    "n_headCast", "n_linrec", "attn_extra_p", "n_qknorm",
+    "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
+)
+
+
+def _declared(ccfg: Any, name: str) -> Any:
+    """Return *name* as set on *ccfg*, else its class default, else 0.
+
+    Reading through ``CostModelConfig.__getattr__`` would return the same 0
+    for an unset field, but with a warning for every layer.
+    """
+    held = vars(ccfg)
+    return held[name] if name in held else getattr(type(ccfg), name, 0)
+
+
+def _restore_full_attention(ccfg: Any) -> None:
+    """Put back the attention fields a linear group displaced, if any."""
+    ccfg.attn_kind = "full"
+    for name, value in (getattr(ccfg, "full_attn", None) or {}).items():
+        setattr(ccfg, name, value)
 
 
 def custom_vision_tower(ccfg: Any) -> None:
@@ -73,7 +129,7 @@ def custom_vision_tower(ccfg: Any) -> None:
     custom_default_transformer(ccfg)
     # ViT blocks use a plain two-matmul MLP, not the LLM's gated triple.
     ccfg.n_ffMM = 2
-    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
+    ccfg.n_ffParamCast = ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     ccfg.n_normOp = 2
     ccfg.n_gather = 4
 
@@ -102,6 +158,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.mm_ccfgs = None
         self.ccfg.mm_order = None
         self._vision_spec = None
+        self._tie_word_embeddings = False
 
         # Resolve model hyperparameters via AutoModels' Transformers pipeline.
         self._resolve_model_config_pipeline()
@@ -136,12 +193,47 @@ class CostModelParserHyperV2(_CostModelParser):
         self.config_optimizer_shard(self.ccfg)
         self.config_comm_flag(self.ccfg)
         self._init_shard()
-        self.ccfg.layer_custom_config = [(self.ccfg.n_lay + self.ccfg.n_mtp, None)]
+        self._init_layer_stack()
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
 
         # --- Multimodal split (vision-language models only) ---
         self._resolve_multimodal()
+
+    # The AutoModels classes that build a vision-language checkpoint's
+    # vision tower; every other named class builds the language model alone.
+    _VISION_TARGETS = ("ImageTextToText", "Vision2Seq", "ConditionalGeneration")
+
+    def _builds_vision_tower(self) -> bool:
+        """Whether the run's model class builds the vision tower its checkpoint has.
+
+        HyperParallel's AutoModels trainer builds ``model._target_``:
+        ``HyperAutoModelForImageTextToText`` builds the tower, while
+        ``HyperAutoModelForCausalLM`` and the recipes' builders build the
+        language model alone and load the tower's weights as unexpected.
+        A yaml that names no class (the trainer requires one) and the
+        legacy schema price what the checkpoint has.
+        """
+        if not is_auto_models_schema(self.config):
+            return True
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        target = self._get_cfg_attr(model_raw, "_target_", None)
+        return not target or any(name in str(target) for name in self._VISION_TARGETS)
+
+    @staticmethod
+    def _without_mtp(spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Return *spec* without its MTP layers, as the AutoModels trainer builds the model.
+
+        It builds the Transformers causal LM, which has no MTP layer whatever
+        the checkpoint declares: Transformers loads their weights as
+        unexpected and never trains them (Qwen3.5's ``mtp.*``, DeepSeek-V3's
+        last layer).  The legacy schema's trainer is not this one.
+        """
+        layers = spec.get("layers")
+        if isinstance(layers, list):
+            spec["layers"] = [group for group in layers if not (isinstance(group, dict) and group.get("mtp"))]
+        spec["mtp_depth"] = 0
+        return spec
 
     def _resolve_model_config_pipeline(self):
         """Resolve model hyperparameters to populate ``ccfg``.
@@ -151,13 +243,60 @@ class CostModelParserHyperV2(_CostModelParser):
         ``model.config_overrides`` for standalone cost-model search files.
         A vision-language config additionally yields a ``vision`` sub-spec,
         held here until :meth:`_resolve_multimodal` can build its submodule.
+        The AutoModels trainer trains the model Transformers builds, which
+        has no MTP layer (:meth:`_without_mtp`), and a vision tower only
+        where its model class builds one (:meth:`_builds_vision_tower`).
+        ``context.census`` has the resolver run a census of each layer kind
+        (:meth:`_config_census`).
         """
         spec = resolve_hf_model_spec(
-            self._model_section(), self._visual_seq_len_override()
+            self._model_section(), self._visual_seq_len_override(), self._census_seq_len(), self._replacements()
         )
+        if is_auto_models_schema(self.config):
+            spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
+        if self._vision_spec and not self._builds_vision_tower():
+            self._vision_spec = None
+        self._tie_word_embeddings = bool(spec.get("tie_word_embeddings", False))
+        self._layer_types = spec.get("layer_types") or []
+        self._linear_attn = {
+            "n_k": self._spec_int(spec, "linear_num_key_heads"),
+            "d_k": self._spec_int(spec, "linear_key_head_dim"),
+            "n_v": self._spec_int(spec, "linear_num_value_heads"),
+            "d_v": self._spec_int(spec, "linear_value_head_dim"),
+            "conv": self._spec_int(spec, "linear_conv_kernel_dim"),
+        }
         self._apply_spec(self.ccfg, spec)
+        self._config_census(spec)
         self._resolve_device_capacity()
+
+    def _config_census(self, spec: Dict[str, Any]) -> None:
+        """Hold the census the spec states: each layer kind's record, and the output layer's.
+
+        The memory model prices a layer whose kind has a record with it,
+        rather than with its formulas, and the output layer with its own;
+        :meth:`_init_layer_stack` binds each kind's record.
+        """
+        census, output = spec.get("activations"), spec.get("output_activations")
+        self.ccfg.census = activations_from_dict(census) if census else None
+        self.ccfg.output_census = KindActivations.from_dict(output, "output_activations") if output else None
+
+    def _replacements(self) -> Tuple[Any, ...]:
+        """The module replacements the run's ``plan_overrides`` install, which a census runs its layers with."""
+        entries = self._config_to_flat_dict(self._get_cfg_attr(self.config, "plan_overrides", None))
+        return replacement_specs(entries if isinstance(entries, list) else ())
+
+    def _census_seq_len(self) -> int:
+        """The tokens to run a census of each layer kind at, 0 unless ``context.census`` asks for one.
+
+        A census gives bytes per token, which hardly depend on the length:
+        it runs at the dataset's, else at 4096 tokens, never at the model's
+        context limit.
+        """
+        ctx = self._get_cfg_attr(self.config, "context", Config({}))
+        if not self._get_cfg_attr(ctx, "census", False):
+            return 0
+        return self._dataset_seq_len() or 4096
 
     def _model_section(self) -> Dict[str, Any]:
         """Return the ``model`` section as a plain mapping."""
@@ -207,6 +346,17 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
         ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
+        ccfg.v_head_dim = self._spec_int(spec, "v_head_dim") or None
+        ccfg.qk_nope_head_dim = self._spec_int(spec, "qk_nope_head_dim") or None
+        # Qwen3.5 fuses the output gate into q_proj, doubling its width.
+        ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
+        # Qwen3 normalizes each head's queries and keys.
+        self.state_qk_norm(ccfg, spec.get("qk_norm", False))
+        # The biases and norms the spec states; unstated, the parameter
+        # formulas count their own.
+        for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "shared_expert_gate"):
+            setattr(ccfg, name, None if spec.get(name) is None else bool(spec[name]))
+        ccfg.layer_norms = self._spec_int(spec, "layer_norms") or None
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""
@@ -245,6 +395,107 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.is_mtp_in_offset = bool(ccfg.n_mtp)
         ccfg.multiple_of = self._spec_int(spec, "multiple_of", 256)
         ccfg.fdm = float(spec.get("ffn_dim_multiplier", 1.0) or 1.0)
+
+    # -- Layer stack ----------------------------------------------------
+
+    def _init_layer_stack(self, ccfg: Any = None) -> None:
+        """Group the body layers by attention flavour.
+
+        A hybrid model (Qwen3.5) states its stack in ``layer_types``. Without
+        it every layer is priced as full attention, which charges the
+        quadratic score term on layers that have no score matrix at all.
+        The MTP layers inherit the flavour of the last body group.
+        """
+        ccfg = ccfg if ccfg is not None else self.ccfg
+        total = int(ccfg.n_lay + ccfg.n_mtp)
+        kinds = [str(k) for k in self._layer_types[: int(ccfg.n_lay)]]
+        # A census binds a stack of one kind its record here, and each group
+        # of a hybrid stack its own as the group's hook applies.
+        census = getattr(ccfg, "census", None) or {}
+        ccfg.kind_activations = None
+        if not kinds or len(set(kinds)) <= 1 and "linear" not in "".join(kinds):
+            ccfg.layer_custom_config = [(total, None)]
+            if len(census) == 1:
+                ccfg.kind_activations = next(iter(census.values()))
+            return
+
+        groups = []
+        for kind in kinds:
+            if groups and groups[-1][0] == kind:
+                groups[-1][1] += 1
+            else:
+                groups.append([kind, 1])
+        groups[-1][1] += int(ccfg.n_mtp)
+
+        ccfg.layer_custom_config = [
+            (count, self._layer_hook(kind)) for kind, count in groups
+        ]
+        logger.info(
+            "layer stack: %s",
+            ", ".join(f"{count}x{kind}" for kind, count in groups),
+        )
+
+    def _layer_hook(self, kind: str):
+        """Return the hook that gives one layer group its attention flavour.
+
+        Same contract as the arch hooks: the memory backbone calls it with an
+        evaluator, the performance path with a bare config.
+        """
+        linear = dict(self._linear_attn)
+
+        def apply(lccfg: Any) -> None:
+            """Give *lccfg* this group's attention flavour, and its census record."""
+            lccfg.kind_activations = (getattr(lccfg, "census", None) or {}).get(kind)
+            if "linear" not in kind:
+                _restore_full_attention(lccfg)
+                return
+            if not (linear["n_v"] and linear["d_v"] and linear["d_k"]):
+                logger.warning(
+                    "layer_types declares %s but the config carries no linear "
+                    "attention dimensions; costing it as full attention", kind,
+                )
+                _restore_full_attention(lccfg)
+                return
+            if getattr(lccfg, "full_attn", None) is None:
+                lccfg.full_attn = {
+                    name: _declared(lccfg, name) for name in _LINEAR_ATTN_FIELDS
+                }
+            lccfg.attn_kind = "linear"
+            for name, value in linear.items():
+                setattr(lccfg, "lin_" + name, value)
+            # Map the flavour onto the q/k/v/o formula: the value heads carry
+            # the q-side width, the key heads the kv-side, and the gate
+            # projection is exactly a second q-wide tensor.
+            lccfg.a = linear["n_v"]
+            lccfg.dh = linear["d_v"]
+            lccfg.n_kv = linear["n_k"] * linear["d_k"] / linear["d_v"]
+            lccfg.attn_output_gate = True
+            # A recurrent layer keeps no score matrix, so none of the terms
+            # that scale with s^2 exist on it.
+            lccfg.n_attBMM = 0
+            lccfg.n_softmax = 0
+            lccfg.n_headCast = 0
+            lccfg.n_linrec = 1
+            # The kernel normalizes its queries and keys itself, with no weights.
+            lccfg.n_qknorm = 0
+            # Short convolution over the projected stream, the two per-head
+            # gates' projections the delta rule needs, each head's decay and
+            # time-step bias and the gated output norm's weight.
+            qkv_width = 2 * linear["n_k"] * linear["d_k"] + linear["n_v"] * linear["d_v"]
+            lccfg.attn_extra_p = (linear["conv"] * qkv_width + 2 * lccfg.h * linear["n_v"]
+                                  + 2 * linear["n_v"] + linear["d_v"])
+
+        def hook(e: Any) -> None:
+            """Apply the flavour through an evaluator or a bare config."""
+            # A bare config has to be wrapped; hasattr cannot tell, because a
+            # missing attribute on a Config resolves to 0 rather than raising.
+            if isinstance(e, CostModelConfig):
+                e = CWrap(e)
+            e.set_ccfg(apply)
+
+        # Verify mode names each group by its kind.
+        hook.kind = kind
+        return hook
 
     # -- Multimodal ----------------------------------------------------
 
@@ -300,7 +551,7 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.model_name = name
         cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
         cc.overwrite_eval_functions = dict(self.ccfg.overwrite_eval_functions)
-        cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
+        self._init_layer_stack(cc)
         cc.offset = self._even_offset()
         return cc
 
@@ -316,10 +567,15 @@ class CostModelParserHyperV2(_CostModelParser):
         self._apply_spec(cc, vision_spec)
         cc.v = 0  # patch embedding, not a vocabulary table
         cc.vocab_emb_dp = False
+        cc.tie_emb_out = False
         cc.n_mtp = 0
         cc.is_mtp_in_offset = False
         cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
         cc.layer_custom_config = [(cc.n_lay, None)]
+        # The language model's census is not the tower's, and the tower has
+        # no loss: its output keeps its family's sharding.
+        cc.census = cc.kind_activations = cc.output_census = None
+        cc.loss_parallel, cc.shards_logits = None, True
         cc.offset = self._front_loaded_offset(cc.n_lay)
         return cc
 
@@ -331,18 +587,10 @@ class CostModelParserHyperV2(_CostModelParser):
 
     def _front_loaded_offset(self, n_lay: int):
         """Return an offset placing every layer on the first pipeline stage."""
-        per_stage = max(0, n_lay // max(1, self.ccfg.p) // max(1, self.ccfg.vp))
-        head = n_lay - per_stage
-        if self.ccfg.vp > 1:
-            chunks = [[-per_stage] * self.ccfg.p for _ in range(self.ccfg.vp)]
-            chunks[0][0] = head
-            return chunks
-        stages = [-per_stage] * self.ccfg.p
-        stages[0] = head
-        return stages
+        return front_loaded_offset(n_lay, self.ccfg.p, self.ccfg.vp)
 
-    def _resolve_sequence_length(self) -> None:
-        """Prefer the Trainer dataset sequence length over the model limit."""
+    def _dataset_seq_len(self) -> int:
+        """The sequence length the dataset states, the legacy ``data.max_seq_len`` too, else 0."""
         data_raw = self._get_cfg_attr(self.config, "data", Config({}))
         legacy_seq_len = self._get_cfg_attr(data_raw, "max_seq_len", 0)
 
@@ -351,7 +599,26 @@ class CostModelParserHyperV2(_CostModelParser):
             dataset_raw, "data_transform", Config({}),
         )
         trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
-        seq_len = int(trainer_seq_len or legacy_seq_len or self.ccfg.s or 4096)
+        # Only the Online path carries data_transform.max_seq_len; an Indexed
+        # Dataset states its length as data_config.seq_length.
+        data_config_raw = self._get_cfg_attr(dataset_raw, "data_config", Config({}))
+        indexed_seq_len = self._get_cfg_attr(data_config_raw, "seq_length", 0)
+        return int(trainer_seq_len or indexed_seq_len or legacy_seq_len or 0)
+
+    def _resolve_sequence_length(self) -> None:
+        """Prefer the Trainer dataset sequence length over the model limit."""
+        stated = self._dataset_seq_len()
+        seq_len = int(stated or self.ccfg.s or 4096)
+        if not stated:
+            # The fallback is the model's context limit, orders of magnitude
+            # above any real training length on a long-context model, which
+            # makes the quadratic attention term meaningless.
+            logger.warning(
+                "no training sequence length in the config; costing the model "
+                "context limit of %d. Set dataset.data_transform.max_seq_len "
+                "(Online) or dataset.data_config.seq_length (Indexed).",
+                seq_len,
+            )
         self.ccfg.s = seq_len
 
     def _resolve_device_capacity(self) -> None:
@@ -419,6 +686,7 @@ class CostModelParserHyperV2(_CostModelParser):
         dp_shard = self._parse_parallel_dimensions(accel, fsdp)
         self._parse_sequence_parallelism(accel)
         self._parse_optimizer_parallelism(accel, dp_shard)
+        self._parse_expert_sharding(fsdp)
 
     def _parse_parallel_dimensions(self, accel, fsdp) -> int:
         """Populate mesh dimensions and return the data shard degree."""
@@ -502,8 +770,32 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
         )
 
+    def _parse_expert_sharding(self, fsdp) -> None:
+        """How HyperParallel's FSDP shards a routed expert under expert parallelism.
+
+        Over ``edp_shard_size`` ranks of its expert data-parallel group, 1 by
+        default: a run that states none keeps each of its experts whole on
+        every rank holding it.  The legacy schema states nothing, and the
+        family's rule applies.
+
+        One ``edp_shard_size`` cannot state what a launcher does that sets it,
+        strategy by strategy, to the whole expert data-parallel group, since
+        that group changes with EP; ``context.expert_shard: group`` states it.
+        """
+        if is_auto_models_schema(self.config):
+            self.ccfg.expert_shard = max(1, int(self._get_cfg_attr(fsdp, "edp_shard_size", 1) or 1))
+            ctx = self._get_cfg_attr(self.config, "context", Config({}))
+            rule = self._get_cfg_attr(ctx, "expert_shard", None)
+            if rule not in (None, "group"):
+                raise ValueError(f"context.expert_shard takes 'group' or nothing, not {rule!r}")
+            self.ccfg.expert_shard_group = rule == "group"
+
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
-        """Populate optimizer and gradient sharding settings."""
+        """Populate optimizer and gradient sharding settings.
+
+        HyperParallel's FSDP holds every gradient as its parameter, from the
+        first backward to the optimizer step, whatever the pipeline degree.
+        """
         is_auto_models = is_auto_models_schema(self.config)
         self.ccfg.has_op = (
             dp_shard > 1
@@ -514,13 +806,25 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         self.ccfg.op_weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (dp_shard if is_auto_models else self.ccfg.d * self.ccfg.t))
+        ) or (dp_shard if is_auto_models else self.ccfg.d))
         self.ccfg.has_grad_shard = bool(self._get_cfg_attr(accel,
                                                              "gradient_accumulation_shard",
                                                              False))
+        self.ccfg.grads_as_params = True
+        self.ccfg.accumulates_grads = True
+        self.ccfg.reshards = self._reshards_params()
+        # It adds each layer's reduce-scatter output to the accumulated
+        # gradient only in the root's backward hook.
+        self.ccfg.defers_grads = True
+        # It reduce-scatters a layer's gradients while the next layer's
+        # backward runs, and the root's in its backward hook.
+        self.ccfg.overlaps_grad_reduce = True
+        # It gathers the weights in the compute dtype, and a layer keeps no
+        # cast of them, whatever dp_shard.
+        self.ccfg.keeps_param_casts = False
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
-            else self.ccfg.d * self.ccfg.t
+            else self.ccfg.d
         )
 
     def _parse_batch(self):
@@ -545,7 +849,7 @@ class CostModelParserHyperV2(_CostModelParser):
         """Set training feature flags."""
         self.ccfg.has_fa = True
         self.ccfg.vocab_emb_dp = True
-        self.ccfg.tie_emb_out = False
+        self.ccfg.tie_emb_out = self._tie_word_embeddings
         self.ccfg.freeze = False
         legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
         training = self._get_cfg_attr(self.config, "training", legacy_train)
@@ -566,6 +870,10 @@ class CostModelParserHyperV2(_CostModelParser):
             "accelerator",
             self._get_cfg_attr(legacy_train, "accelerator", Config({})),
         )
+        # The trainer's lm_head gathers the logits whole on every TP rank
+        # unless the loss runs on them sharded.
+        self.ccfg.loss_parallel = bool(self._get_cfg_attr(accel, "loss_parallel", False))
+        self.ccfg.shards_logits = self.ccfg.loss_parallel
         cp_algo = self._get_cfg_attr(accel, "context_parallel_algo", None)
         if cp_algo:
             self.ccfg.cp_algo = cp_algo
@@ -587,8 +895,44 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         # Always a string: GlobalConfig.max_op only bounds OP by the data
         # parallel degree when this reads as a non-muon optimizer name, and
-        # the generated cost-model yaml carries no optimizer section.
+        # a train.yaml need not state its optimizer.
         self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
+        self._init_optimizer_states(optimizer, str(opt_type or ""))
+
+    def _reshards_params(self):
+        """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
+
+        It does after the layer's forward and after its backward, unless the
+        run keeps them gathered through either.
+        """
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
+        return bool(
+            self._get_cfg_attr(fsdp, "reshard_after_forward", True)
+            and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
+        )
+
+    def _init_optimizer_states(self, optimizer, target):
+        """State what HyperParallel's optimizer keeps per parameter.
+
+        Its AdamW keeps two moments and its Muon one momentum per matrix,
+        each ``zeros_like`` the gradient, which FSDP casts to the stored
+        parameter's dtype.  With ``fp32_main_params`` the optimizer keeps an
+        fp32 copy of each narrower parameter, and its states in fp32.
+        """
+        stored = self._stored_param_bytes()
+        fp32_main = bool(self._get_cfg_attr(optimizer, "fp32_main_params", False))
+        self.ccfg.optimizer_states = 1 if "muon" in target.lower() else 2
+        self.ccfg.optimizer_state_bytes = 4 if fp32_main else stored
+        self.ccfg.main_param_bytes = 4 if fp32_main and stored < 4 else 0
+
+    def _stored_param_bytes(self):
+        """The width FSDP stores the parameters in: the model's, whatever FSDP gathers them in."""
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        return self._bytes_from_dtype(
+            self._get_cfg_attr(self.config, "model_init_dtype", None)
+            or self._get_cfg_attr(model_raw, "torch_dtype", None)
+            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+        )
 
     def _parse_recompute(self):
         """Parse recompute mode.
@@ -628,15 +972,7 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.sel_rec = ac_mode == "selective"
 
-        self.ccfg.rec_op = Config({
-            "attBMM": 1,
-            "headCast": 1,
-            "dropout": 1,
-            "softmax": 1,
-            "normOp": 1,
-            "gather": 1,
-            "ffAct": 1,
-        })
+        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
 
     def _init_bytes(self):
         """Set FP byte sizes from AutoModels or legacy dtype fields.
@@ -707,8 +1043,8 @@ class CostModelParserHyperV2(_CostModelParser):
 
         To match the MF parser's *list*-based filtering behaviour (used by
         DeepSeek-V3 and other models that declare an explicit offset), this
-        parser emits a list offset of length ``pp`` (all zeros = even
-        balancing) by default.  An explicit offset supplied via
+        parser emits a list offset of length ``pp`` by default, one that
+        places every layer (:meth:`_balanced_offset`).  An explicit offset supplied via
         ``config_overrides.offset`` overrides this — a list is used as-is,
         and a non-zero int is broadcast to ``[int] * pp``.
         """
@@ -725,31 +1061,50 @@ class CostModelParserHyperV2(_CostModelParser):
             else:
                 self.ccfg.offset = [explicit] * self.ccfg.p
         else:
-            self.ccfg.offset = [0] * self.ccfg.p
+            self.ccfg.offset = self._balanced_offset()
 
-    def config_shard_emb(self) -> None:
-        """Configure embedding sharding based on current parallelism.
+    def _balanced_offset(self) -> list:
+        """An offset of length ``pp`` that places every layer the pipeline balances.
+
+        Each stage runs the layers per stage, and the first ones one more
+        each until the remainder has a stage, as the search's balancing
+        places them; all zeros where the pipeline divides the layers, or
+        interleaves, which the search balances itself.
+        """
+        pp = max(1, int(self.ccfg.p or 1))
+        layers = self.ccfg.n_lay + (self.ccfg.n_mtp if self.ccfg.is_mtp_in_offset else 0)
+        extra = layers % pp if int(self.ccfg.vp or 1) <= 1 else 0
+        return [1 if stage < extra else 0 for stage in range(pp)]
+
+    def config_shard_emb(self, ccfg: Any) -> None:
+        """Configure embedding sharding based on current parallelism, on *ccfg*.
 
         Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
         ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
-        configuration changes.  When ``vocab_emb_dp`` is enabled and pipeline
-        parallelism is disabled (``p == 1``), the embedding is sharded only
-        along the data-parallel dimension (``d``); otherwise it is sharded
-        along ``t * d``.
+        configuration changes.  HyperParallel's FSDP shards the table as every
+        parameter, over its group, the optimizer's ranks, and not the whole of
+        data parallelism under HSDP.  When ``vocab_emb_dp`` is enabled and
+        pipeline parallelism is disabled (``p == 1``), the embedding is sharded
+        only over those ranks; otherwise over ``t`` times them.
 
         Without this method, ``CostModelConfig.set_strategy`` skips the
         ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
         ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
-        producing an embedding-memory mismatch versus the MF parser.
+        producing an embedding-memory mismatch versus the MF parser.  A
+        multimodal submodule shares this parser, so the config to refresh is
+        passed in.
         """
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
+        ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
+        ccfg.shard_embed = (
+            ranks
+            if (ccfg.vocab_emb_dp and ccfg.p == 1)
+            else (ccfg.t * ranks)
         )
+        # FSDP gathers the table over its group to compute with it.
+        ccfg.gather_embed = ranks
 
-    def config_shard_recompute(self) -> None:
-        """Recompute ``shard_recompute_input`` after strategy changes.
+    def config_shard_recompute(self, ccfg: Any) -> None:
+        """Recompute ``shard_recompute_input`` after strategy changes, on *ccfg*.
 
         When ``recompute_slice_activation`` is ``True``, the recompute input
         is sharded by the current tensor-parallel degree ``t``; otherwise it
@@ -762,8 +1117,8 @@ class CostModelParserHyperV2(_CostModelParser):
         YAML), causing memory-estimation errors when the search explores
         strategies with different ``t`` values.
         """
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t if self._recompute_slice_activation else 1
+        ccfg.shard_recompute_input = (
+            ccfg.t if self._recompute_slice_activation else 1
         )
 
     def _init_shard(self):
@@ -786,7 +1141,7 @@ class CostModelParserHyperV2(_CostModelParser):
         (e.g. ``custom_qwen``) may override this during ``EvaluatorV2``
         initialisation.
         """
-        self.config_shard_emb()
+        self.config_shard_emb(self.ccfg)
         self.ccfg.shard_output_activ = 1
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
@@ -801,5 +1156,5 @@ class CostModelParserHyperV2(_CostModelParser):
                 self._get_cfg_attr(gc, "recompute_slice_activation", False),
             ),
         ))
-        self.config_shard_recompute()
+        self.config_shard_recompute(self.ccfg)
         self.ccfg.is_shard_mtp_param = True

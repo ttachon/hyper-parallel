@@ -18,11 +18,124 @@ import argparse
 import os
 import sys
 
+import yaml
+
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+import hyper_parallel.auto_parallel.sapp_nd.nd.ratios as Ratios
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    report,
+    verify_activations,
+    verify_flops,
+    verify_parameters,
+)
+
+
+def _apply_cli_overrides(search_cfg, cli_args):
+    """Override the search config's batch, memory budget and devices from the CLI.
+
+    Args:
+        search_cfg: The search config read from ``-s/--search-config``.
+        cli_args: The parsed CLI namespace.
+    """
+    if cli_args.device_type is not None:
+        # -A sets the device the search prices, as it does on the CLI path;
+        # only the search config's device_type reached the search before.
+        search_cfg.cluster_spec["device_type"] = cli_args.device_type
+    if cli_args.global_batch_size is not None:
+        search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
+    if cli_args.max_mem is not None:
+        # -M sets the device budget the search checks against, exactly as it
+        # does on the CLI path, instead of being silently ignored here.
+        search_cfg.cluster_spec["device_memory_gb"] = (
+            Memory.from_string(cli_args.max_mem.strip()).to_gb().size
+        )
+    if cli_args.devices is not None:
+        cards_per_node = search_cfg.cluster_spec.get("cards_per_node")
+        if not cards_per_node:
+            # The device type knows its node size (A3: 16); defaulting to 8
+            # silently halves an A3 node and invalidates every candidate.
+            device = Hard.device_map.get(cli_args.device_type)
+            cards_per_node = device.intra_node_num() if device else 8
+            search_cfg.cluster_spec["cards_per_node"] = cards_per_node
+            logger.info(
+                "cluster.cards_per_node not set, using %d from device type %s",
+                cards_per_node, cli_args.device_type,
+            )
+        cards_per_node = max(1, cards_per_node)
+        if cli_args.devices % cards_per_node:
+            logger.warning(
+                "devices=%d is not a multiple of cards_per_node=%d: "
+                "%d device(s) will not be placed",
+                cli_args.devices, cards_per_node,
+                cli_args.devices % cards_per_node,
+            )
+        search_cfg.cluster_spec["num_nodes"] \
+            = max(1, cli_args.devices // cards_per_node)
+
+
+def _compare_with_real_csv(runner, cli_args):
+    """Print ND's estimate next to the configurations measured in a classified CSV.
+
+    Args:
+        runner: The ND runner built from the CLI arguments.
+        cli_args: The parsed CLI namespace. Requires ``real_csv``; ND's
+            real-versus-estimate plot goes to ``output_dir`` when it is set.
+    """
+    if cli_args.output_dir is not None:
+        os.makedirs(cli_args.output_dir, exist_ok=True)
+    # Keep debug.csv beside the plot rather than inside the installed package.
+    Debug.set_output_dir(cli_args.output_dir)
+    configs_estimated, metrics = runner.compare_with_csv(
+        cli_args.real_csv, output_path=cli_args.output_dir, plot_idle=True
+    )
+    logger.output("%s", Debug.format_classified_comparison(configs_estimated))
+    Debug.print_correlations_classified([metrics])
+    if cli_args.write_ratios is not None:
+        ratios = Ratios.fit_ratios(configs_estimated)
+        Ratios.write_ratios(cli_args.write_ratios, ratios, configs_estimated, cli_args.real_csv)
+        for text in Ratios.report(configs_estimated, ratios):
+            logger.output("%s", text)
+        logger.output("Ratios written to %s; run_nd -c reads them", cli_args.write_ratios)
+
+
+def _priced_train_yaml(search_config: str) -> str:
+    """The train.yaml a search config names, which its search prices.
+
+    Args:
+        search_config: The search config's path.
+
+    Returns:
+        Its ``train_yaml``, or an empty string where it names none, as a
+        standalone search config does.
+    """
+    with open(search_config, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    named = raw.get("train_yaml") if isinstance(raw, dict) else None
+    return named if isinstance(named, str) else ""
+
+
+def _check_train_yaml(cli_parser: argparse.ArgumentParser, cli_args: argparse.Namespace) -> None:
+    """Refuse a -y that is not the train.yaml the search config prices.
+
+    The search prices the train.yaml its config names, and -y is the one
+    the resolved strategy is written over: two files would put one run's
+    strategy over another's run.
+
+    Args:
+        cli_parser: The parser, whose ``error()`` exits.
+        cli_args: The parsed CLI namespace, both files found.
+    """
+    priced = _priced_train_yaml(cli_args.search_config)
+    if priced and os.path.isfile(priced) and not os.path.samefile(priced, cli_args.yaml_config):
+        cli_parser.error(
+            f"-y names {cli_args.yaml_config}, but the search config prices its train_yaml, {priced}: "
+            "pass the same file"
+        )
 
 
 def _run_hyper_v2_search(cli_parser, cli_args):
@@ -54,17 +167,16 @@ def _run_hyper_v2_search(cli_parser, cli_args):
         cli_parser.error(f"search-config not found: {cli_args.search_config}")
     if not os.path.isfile(cli_args.yaml_config):
         cli_parser.error(f"yaml-config not found: {cli_args.yaml_config}")
+    _check_train_yaml(cli_parser, cli_args)
 
     set_verbose_level(cli_args.verbosity)
+    Debug.set_output_dir(cli_args.output_dir)
 
     search_cfg = read_search_config(cli_args.search_config)
+    _apply_cli_overrides(search_cfg, cli_args)
 
-    if cli_args.global_batch_size is not None:
-        search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
-    if cli_args.devices is not None:
-        search_cfg.cluster_spec["num_nodes"] = max(
-            1, cli_args.devices // max(1, search_cfg.cluster_spec.get("cards_per_node", 8))
-        )
+    if getattr(search_cfg, "parallelism_summary", ""):
+        logger.output("Parallelism: %s", search_cfg.parallelism_summary)
 
     errors = validate(search_cfg)
     hard_errors = [e for e in errors if e.severity == "error"]
@@ -187,8 +299,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-A",
         "--device_type",
-        default="A2",
-        help="choose device type between A2 or A3",
+        default=None,
+        help="choose device type between A2 or A3: A2 unless given, or a search config states one",
     )
     parser.add_argument(
         "-swap_os",
@@ -223,8 +335,8 @@ if __name__ == "__main__":
         "--mem_for_ppb",
         type=str,
         default="0GB",
-        help="Memory to reserve for pipeline balancing. "
-        "Will be decreased from the memory budget allowed by ND (default 0GB)",
+        help="Memory to reserve for pipeline balancing, taken out of the "
+        "memory budget ND allows (default 0GB).",
     )
     parser.add_argument(
         "-c",
@@ -240,8 +352,9 @@ if __name__ == "__main__":
         "--max_mem",
         type=str,
         default=None,
-        help="Memory to reserve for pipeline balancing. "
-        "Will be decreased from the memory budget allowed by ND (default 0GB)",
+        help="Device memory budget the search must fit in, e.g. '58GB'. "
+        "Overrides the yaml capacity and cluster.device_memory_gb. "
+        "To reserve memory instead of capping it, use -mem/--mem_for_ppb.",
     )
     parser.add_argument(
         "--train-yaml",
@@ -264,15 +377,51 @@ if __name__ == "__main__":
         "(hyper_v2 only). Scalar=fixed, list=candidates, 'auto'=ND decides.",
     )
     parser.add_argument(
+        "-V",
+        "--verify",
+        action="store_true",
+        help="Verify mode (hyper_v2 only): set the parameters ND prices of each "
+        "part of the model -y trains beside those of the Transformers layers "
+        "its checkpoint builds, and exit.",
+    )
+    parser.add_argument(
         "-o",
         "--output-dir",
         type=str,
         default=None,
         help="Directory for output files when using --search-config "
-        "(default: current directory).",
+        "(default: current directory), and for the real-versus-estimate "
+        "plot of --real_csv (no plot when omitted).",
+    )
+    parser.add_argument(
+        "--real_csv",
+        type=str,
+        default=None,
+        help="Instead of searching, compare ND's estimate with the configurations "
+        "measured in a classified profiling CSV (see nd.trace_classify).",
+    )
+    parser.add_argument(
+        "--ranking_csv",
+        type=str,
+        default=None,
+        help="Also write every configuration the search keeps, in ND's order, "
+        "to this CSV: rank, degrees, memory in MB, score and its parts.",
+    )
+    parser.add_argument(
+        "--write_ratios",
+        type=str,
+        default=None,
+        help="With --real_csv, fit a ratio per part, measured over ND's estimate, "
+        "on the configurations the CSV measured, write them to this JSON file "
+        "(the file -c reads) and print how well they predict each configuration "
+        "when fitted on the others.",
     )
 
     args = parser.parse_args()
+    if args.real_csv is not None and not os.path.isfile(args.real_csv):
+        parser.error(f"real_csv not found: {args.real_csv}")
+    if args.write_ratios is not None and args.real_csv is None:
+        parser.error("--write_ratios fits the ratios on a comparison: it needs --real_csv")
 
     max_mem = (
         Memory.from_string(args.max_mem.strip())
@@ -288,6 +437,21 @@ if __name__ == "__main__":
                 "\nProceeding without cache file..."
             )
             args.cache_file = None
+
+    if args.verify:
+        if args.framework != "hyper_v2":
+            parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
+        set_verbose_level(args.verbosity)
+        logger.output("Parameters")
+        for line in report(verify_parameters(args.yaml_config)):
+            logger.output(line)
+        logger.output("Forward FLOPs of one sequence; the time model prices the backward at twice them")
+        for line in report(verify_flops(args.yaml_config)):
+            logger.output(line)
+        logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
+        for line in report(verify_activations(args.yaml_config)):
+            logger.output(line)
+        sys.exit(0)
 
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)
@@ -305,9 +469,10 @@ if __name__ == "__main__":
         )
 
     set_verbose_level(args.verbosity)
+    Debug.set_output_dir(args.output_dir)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
-    machine = Hard.Machine(args.devices, args.device_type)
+    machine = Hard.Machine(args.devices, args.device_type or "A2")
 
     if args.framework == "hyperparallel2":
         if args.yaml_config is None or args.train_yaml is None or args.accelerate_yaml is None:
@@ -343,6 +508,10 @@ if __name__ == "__main__":
         # vpp_less_mem=args.less_memory,
     )
 
+    if args.real_csv is not None:
+        _compare_with_real_csv(nd_runner, args)
+        sys.exit(0)
+
     if YAML_FOLDER and not os.path.exists(YAML_FOLDER):
         os.makedirs(YAML_FOLDER)
 
@@ -351,4 +520,5 @@ if __name__ == "__main__":
         threads_num=None,  # args.threads_num
         top_num=args.top_config_number,
         cache_file=args.cache_file,
+        ranking_csv=args.ranking_csv,
     )

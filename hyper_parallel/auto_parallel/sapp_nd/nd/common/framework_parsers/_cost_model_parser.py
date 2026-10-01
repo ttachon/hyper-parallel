@@ -14,7 +14,7 @@
 # ============================================================================
 """cost model parser module"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import math
 from abc import ABC
@@ -22,6 +22,28 @@ from abc import abstractmethod
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
+
+# The recompute switches of HyperParallel's selective activation checkpointing
+# (hyper_parallel/distributed/activation_checkpoint.py). It keeps the outputs of
+# matmul and attention kernels and of reduce-scatter, all-to-all and all-reduce,
+# and recomputes everything else, all-gathers included. A switch at 1 keeps the
+# op's activation and 0 recomputes it. The policy also recomputes every other
+# projection matmul, which has no switch, so that part is not priced.
+HYPER_SELECTIVE_REC_OP = {
+    "attBMM": 1,
+    "headCast": 0,
+    "dropout": 0,
+    "softmax": 0,
+    "normOp": 0,
+    "gather": 0,
+    "ffAct": 0,
+}
+
+
+def runs_hyper_selective(ccfg: Any) -> bool:
+    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches are its switches."""
+    switches = vars(ccfg.rec_op) if getattr(ccfg, "rec_op", None) is not None else {}
+    return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
 class _CostModelParser(ABC):
@@ -39,37 +61,90 @@ class _CostModelParser(ABC):
         configuration values into the shared _CostModVar instance.
         """
 
+    @staticmethod
+    def hyper_rec_op(selective: bool | list) -> dict[str, int]:
+        """Recompute switches for a HyperParallel activation checkpoint mode.
+
+        Args:
+            selective: The parsed ``sel_rec``: truthy when the run uses
+                selective activation checkpointing.
+
+        Returns:
+            The switches for ``ccfg.rec_op``: :data:`HYPER_SELECTIVE_REC_OP`
+            for a selective run, and every op kept otherwise.
+        """
+        if selective:
+            return dict(HYPER_SELECTIVE_REC_OP)
+        return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
+
+    @staticmethod
+    def state_qk_norm(ccfg, qk_norm):
+        """State whether the model normalizes each head's queries and keys, and the QK-norm each layer runs.
+
+        A layer group whose attention has none, a linear one, states 0 instead.
+        """
+        ccfg.qk_norm = bool(qk_norm)
+        ccfg.n_qknorm = 1 if ccfg.qk_norm else 0
+
+    @staticmethod
+    def optimizer_ranks(ccfg):
+        """How many data-parallel ranks the optimizer shards a parameter over.
+
+        ``os_max_shard`` counts them, as MindSpore's ``optimizer_weight_shard_size``
+        and HyperParallel's ``dp_shard`` do, on top of TP's sharding.  A count
+        that does not divide DP shards over all of it, as MindSpore does.
+        """
+        ranks = int(ccfg.os_max_shard or 0)
+        return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
+
+    @staticmethod
+    def routed_expert_shard(ccfg, ranks):
+        """How many ranks a routed expert's parameters and optimizer states are sharded over.
+
+        A run that states its expert shard, as HyperParallel's ``edp_shard_size``,
+        shards an expert under expert parallelism over as many ranks of its expert
+        data-parallel group: the stage's ranks over EP, whatever their DP, CP or
+        TP, the group of ranks that hold the same experts.  Without expert
+        parallelism its FSDP shards the experts with the other parameters, over
+        the optimizer's *ranks*.  Stated by no one, the optimizer shards them over
+        the whole group.  A run that shards each strategy's experts over its
+        whole group (``expert_shard_group``) does so under expert parallelism
+        whatever shard it states, since the group changes with the strategy.
+        """
+        stated = getattr(ccfg, "expert_shard", None)
+        if getattr(ccfg, "expert_shard_group", False) and ccfg.ep > 1:
+            return max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep)
+        if not stated:
+            return (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
+        if ccfg.ep > 1:
+            return math.gcd(int(stated), max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep))
+        return ranks * ccfg.cp * ccfg.t_exp
+
     def config_optimizer_shard(self, ccfg):
-        """OP related variables"""
+        """OP related variables; a routed expert is sharded as :meth:`routed_expert_shard` says."""
+        # With optimizer sharding, a parameter is sharded over TP and then
+        # over the optimizer's data-parallel ranks.
+        ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
         # Non expert params
-        ccfg.shard_p_os_non_exp_partial = (
-            ccfg.os_max_shard if ccfg.has_op else ccfg.t
-        ) * ccfg.cp
+        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * ccfg.cp
         ccfg.shard_p_os_non_exp = (
             (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
         )
-        ccfg.shard_grad_non_exp = (
-            ccfg.shard_p_os_non_exp if ccfg.has_grad_shard else ccfg.t
-        )
 
         # Expert params
-        ccfg.shard_p_os_exp_partial = math.gcd(
-            ccfg.n_exp,
-            (ccfg.os_max_shard if ccfg.has_op else 1) * ccfg.t_exp,
-        )
-        ccfg.shard_p_os_exp = (
-            (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
-        )
-        ccfg.shard_grad_exp = (
-            ccfg.shard_p_os_exp
-            if ccfg.has_grad_shard
-            else ccfg.t_exp
-        )
-        ccfg.shard_grad_exp_partial = (
-            ccfg.shard_p_os_exp_partial
-            if ccfg.has_grad_shard
-            else ccfg.t_exp
-        )
+        ccfg.shard_p_os_exp_partial = math.gcd(ccfg.n_exp, ranks * ccfg.t_exp)
+        ccfg.shard_p_os_exp = _CostModelParser.routed_expert_shard(ccfg, ranks)
+
+        # Gradients: as the parameters are when FSDP holds them so, over the
+        # whole optimizer shard under gradient sharding, over TP alone
+        # otherwise.
+        if getattr(ccfg, "grads_as_params", False):
+            grads = (ccfg.shard_p_os_non_exp_partial, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
+        elif ccfg.has_grad_shard:
+            grads = (ccfg.shard_p_os_non_exp, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
+        else:
+            grads = (ccfg.t, ccfg.t_exp, ccfg.t_exp)
+        ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial = grads
 
     # def config_op_level(self, ccfg, strategy):
     #     def full_partial():

@@ -36,7 +36,8 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
     """Detect attention type from cost model config.
 
     Detection rules:
-    1. If kv_lora_rank > 0: MLA
+    1. If the keys and values come from a compressed latent (dc_kv > 0,
+       the latent width every parser states): MLA
     2. If n_kv < a: GQA
     3. Otherwise: MHA
 
@@ -47,13 +48,13 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
         AttentionType enum.
 
     Example:
-        >>> ccfg.kv_lora_rank = 512
+        >>> ccfg.dc_kv = 512
         >>> ccfg.a = 64
         >>> ccfg.n_kv = 64
         >>> detect_attention_type(ccfg)
         <AttentionType.MLA: 'mla'>
     """
-    if ccfg.kv_lora_rank > 0:
+    if ccfg.dc_kv > 0:
         return AttentionType.MLA
     if ccfg.n_kv < ccfg.a:
         return AttentionType.GQA
@@ -61,15 +62,18 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
 
 
 def compute_kv_dim(ccfg: Any) -> float:
-    """Return effective KV dimension per TP rank based on attention type.
+    """Return the width, per TP rank, of each of the K and V that CP exchanges.
 
-    When TP is active, KV heads are split across TP ranks, so each
-    rank holds only 1/t of the total KV dimension.  MLA is an
-    exception: the compressed latent vector is not split by TP,
-    so kv_lora_rank stays unchanged.
+    Context parallelism exchanges the attention's own keys and values,
+    after the projections, whose heads TP splits.  An MLA layer builds every
+    head's key and value from its latent before attention, the key at the
+    head width plus the rotary part every head shares, the value at the
+    head width, and those are what CP exchanges, not the latent: it acts on
+    the attention's inputs.  Their mean width is returned, since K and V
+    are counted as two tensors of one width.
 
     Args:
-        ccfg: Cost model config with attributes a, n_kv, dh, h, t, kv_lora_rank.
+        ccfg: Cost model config with attributes a, n_kv, dh, dhr, h, t, dc_kv.
 
     Returns:
         Effective KV dimension per TP rank (float).
@@ -77,7 +81,7 @@ def compute_kv_dim(ccfg: Any) -> float:
     attention_type = detect_attention_type(ccfg)
     t = max(1, ccfg.t)
     if attention_type == AttentionType.MLA:
-        return float(ccfg.kv_lora_rank)
+        return ccfg.n_kv * (2 * ccfg.dh + ccfg.dhr) / 2 / t
     if attention_type == AttentionType.GQA:
         n_kv = min(ccfg.n_kv if ccfg.n_kv > 0 else ccfg.a, ccfg.a)
         return n_kv * ccfg.dh / t
@@ -85,6 +89,11 @@ def compute_kv_dim(ccfg: Any) -> float:
 
 
 # class CostModelConfig(Config) :
+# What ``model_name`` says to target the config a strategy is set on
+# itself, which for a multimodal parent is neither of its submodules.
+_ITSELF = object()
+
+
 class CostModelConfig(PartitionGenerator):
     """cost model variables class"""
 
@@ -257,6 +266,8 @@ class CostModelConfig(PartitionGenerator):
 
     def __strategy_target(self, model_name):
         """Get the config object targeted by a strategy update."""
+        if model_name is _ITSELF:
+            return self
         if not self.multimodal:
             return self
         if model_name in self.mm_ccfgs:
@@ -264,6 +275,17 @@ class CostModelConfig(PartitionGenerator):
         raise TypeError(
             f"{self.model_name}:  model_name is required (multimodal)"
         )
+
+    def set_shared_strategy(self, **kwargs: Any) -> None:
+        """Apply a strategy to this config itself, a multimodal parent included.
+
+        :meth:`set_strategy` targets a submodule of a multimodal config,
+        never the parent; but the parent holds the strategy its submodules
+        share, and the partitions it combines are of that pipeline, so a
+        caller that gives every config of one pipeline its own placement
+        writes each of them through this.
+        """
+        self.set_strategy(**kwargs, model_name=_ITSELF)
 
     def set_strategy(self, **kwargs: Any) -> None:
         """overwrite parallelism"""
@@ -312,10 +334,12 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.b,
             target_ccfg.vp,
         )
-        if hasattr(target_ccfg.parser, "config_shard_emb"):
-            target_ccfg.parser.config_shard_emb()
-        if hasattr(target_ccfg.parser, "config_shard_recompute"):
-            target_ccfg.parser.config_shard_recompute()
+        # Every field the strategy decides follows it, on the config the
+        # strategy changed: a multimodal submodule shares its parent's
+        # parser, so the parser is told which config to refresh.
+        for refresh in ("config_shard_emb", "config_shard_recompute", "config_rec_op"):
+            if hasattr(target_ccfg.parser, refresh):
+                getattr(target_ccfg.parser, refresh)(target_ccfg)
         target_ccfg.parser.config_dp_tp_exp(target_ccfg)
         target_ccfg.parser.config_optimizer_shard(target_ccfg)
         target_ccfg.parser.config_comm_flag(target_ccfg)

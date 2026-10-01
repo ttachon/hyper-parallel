@@ -19,6 +19,43 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 
+def _grad_bytes(ccfg, width, without_pp=False):
+    """Return the bytes a gradient takes.
+
+    A run whose FSDP holds each gradient as its parameter keeps it in the
+    parameters' width at any pipeline degree.  Otherwise a gradient takes
+    the family's *width* under pipeline parallelism, and nothing without it
+    unless the family keeps its gradients then too (*without_pp*).
+    """
+    if getattr(ccfg, "grads_as_params", False):
+        return ccfg.bytes_p
+    return width if (without_pp or ccfg.p > 1) else 0
+
+
+def _optimizer_bytes(ccfg, width):
+    """Set what the optimizer keeps: a state's width, and its bytes per parameter.
+
+    A state takes the width the run states, else the family's *width*.  A
+    layer's parameter keeps as many states as the run's optimizer has, two
+    unless it says, and any copy of the parameters the optimizer keeps; the
+    embedding and output tables keep AdamW's two states.
+    """
+    ccfg.bytes_os = getattr(ccfg, "optimizer_state_bytes", None) or width
+    main_copy = getattr(ccfg, "main_param_bytes", None) or 0
+    ccfg.bytes_optim = (getattr(ccfg, "optimizer_states", None) or 2) * ccfg.bytes_os + main_copy
+    ccfg.bytes_optim_table = 2 * ccfg.bytes_os + main_copy
+
+
+def keeps_param_casts(ccfg):
+    """Whether a layer keeps a cast beside each matmul, as the formulas price it.
+
+    As the parser states it (``keeps_param_casts``); where none states it,
+    where the optimizer does not shard, the formulas' convention.
+    """
+    casts = getattr(ccfg, "keeps_param_casts", None)
+    return (not ccfg.has_op) if casts is None else bool(casts)
+
+
 class CWrap:
     """Temporary evaluator-like instance"""
 
@@ -56,19 +93,19 @@ def custom_default_transformer(ccfg):
     ccfg.n_attMM = 4  # num attention matmul
     ccfg.n_attBMM = 2  # num attention batch matmul
     ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
+        ccfg.n_attMM if keeps_param_casts(ccfg) else 0
     )  # num attention parameters cast
     ccfg.n_ffMM = 3  # num feedforward matmul
     ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
+        ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
     ccfg.n_softmax = 1  # num softmax
     ccfg.n_dropout = 0  # num dropout
     ccfg.n_normOp = 2  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 0  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
 
@@ -77,7 +114,8 @@ def custom_llama2(ccfg):
     """llama2"""
     custom_default_transformer(ccfg)
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2  # gradients
+    ccfg.bytes_grad = _grad_bytes(ccfg, 2, without_pp=True)  # gradients
+    ccfg.accumulates_grads = True  # it keeps them without a pipeline too
 
 
 def custom_mixtral(ccfg):
@@ -85,19 +123,23 @@ def custom_mixtral(ccfg):
     ccfg.n_attMM = 4  # num attention matmul
     ccfg.n_attBMM = 2  # num attention batch matmul
     ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
+        ccfg.n_attMM if keeps_param_casts(ccfg) else 0
     )  # num attention parameters cast
-    ccfg.n_ffMM = 0  # num feedforward matmul
-    ccfg.n_ffBMM = 3  # num feedforward batch matmul
+    # A gated expert runs three projections, matmuls like every other
+    # family's feed-forward.
+    ccfg.n_ffMM = 3  # num feedforward matmul
+    ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
+        ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
-    ccfg.n_softmax = 2  # num softmax
+    # The layers Transformers builds run one score softmax, the router's
+    # being the router's own, and two norms.
+    ccfg.n_softmax = 1  # num softmax
     ccfg.n_dropout = 0  # num dropout
-    ccfg.n_normOp = 5  # num normalization
+    ccfg.n_normOp = 2  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    ccfg.bytes_grad = _grad_bytes(ccfg, 2)  # gradients
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 0  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
     ccfg.hff = ccfg.hff_exp
@@ -111,19 +153,19 @@ def custom_t5(ccfg):
         c.n_attMM = 4  # num attention matmul
         c.n_attBMM = 1  # num attention batch matmul
         c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
+            c.n_attMM if keeps_param_casts(c) else 0
         )  # num attention parameters cast
         c.n_ffMM = 2  # num feedforward matmul
         c.n_ffBMM = 0  # num feedforward batch matmul
         c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
+            c.n_ffMM if keeps_param_casts(c) else 0
         )  # num feedforward parameters cast
         c.n_softmax = 2  # num softmax
         c.n_dropout = 5  # num dropout
         c.n_normOp = 2  # num normalization
         c.n_gather = 4  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
-        c.bytes_os = 4  # optimizer states
+        c.bytes_grad = _grad_bytes(c, 4)  # gradients
+        _optimizer_bytes(c, 4)
         c.bytes_dropout = 1  # dropout mask
         c.bytes_norm = 4  # normalization input
 
@@ -131,19 +173,19 @@ def custom_t5(ccfg):
         c.n_attMM = 8  # num attention matmul
         c.n_attBMM = 2  # num attention batch matmul
         c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
+            c.n_attMM if keeps_param_casts(c) else 0
         )  # num attention parameters cast
         c.n_ffMM = 2  # num feedforward matmul
         c.n_ffBMM = 0  # num feedforward batch matmul
         c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
+            c.n_ffMM if keeps_param_casts(c) else 0
         )  # num feedforward parameters cast
         c.n_softmax = 4  # num softmax
         c.n_dropout = 7  # num dropout
         c.n_normOp = 3  # num normalization
         c.n_gather = 6  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
-        c.bytes_os = 4  # optimizer states
+        c.bytes_grad = _grad_bytes(c, 4)  # gradients
+        _optimizer_bytes(c, 4)
         c.bytes_dropout = 1  # dropout mask
         c.bytes_norm = 4  # normalization input
 
@@ -157,6 +199,12 @@ def custom_t5(ccfg):
             e = CWrap(e)
         e.set_ccfg(decode)
 
+    # The model takes the byte widths every layer takes: the embedding and
+    # the output layer are priced on it, before and after any layer.
+    ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
+    _optimizer_bytes(ccfg, 4)
+    ccfg.bytes_dropout = 1  # dropout mask
+    ccfg.bytes_norm = 4  # normalization input
     ccfg.layer_custom_config = [
         (ccfg.n_lay // 2, hook_encode),
         (ccfg.n_lay // 2, hook_decode),
@@ -168,19 +216,19 @@ def custom_pangualpha(ccfg):
     ccfg.n_attMM = 4  # num attention matmul
     ccfg.n_attBMM = 1  # num attention batch matmul
     ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
+        ccfg.n_attMM if keeps_param_casts(ccfg) else 0
     )  # num attention parameters cast
     ccfg.n_ffMM = 2  # num feedforward matmul
     ccfg.n_ffBMM = 0  # num feedforward batch matmul
     ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
+        ccfg.n_ffMM if keeps_param_casts(ccfg) else 0
     )  # num feedforward parameters cast
     ccfg.n_softmax = 2  # num softmax
     ccfg.n_dropout = 5  # num dropout
     ccfg.n_normOp = 4  # num normalization
     ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
+    ccfg.bytes_grad = _grad_bytes(ccfg, 4)  # gradients
+    _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 1  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
 
@@ -188,22 +236,16 @@ def custom_pangualpha(ccfg):
 def custom_deepseek3(ccfg):
     """deepseekv3"""
     saved = Config({})
-    if ccfg.config_format == "yaml":
-        saved.hff = int(ccfg.hff)
-    elif ccfg.config_format == "json":
-        saved.hff = ccfg.ffn_hidden_size
-    else:
-        saved.hff = ccfg.specs.inter_dim
-        if not saved.hff:
-            saved.hff = ccfg.specs.hidden_dim
-        if not saved.hff:
-            saved.hff = ccfg.h
+    # A dense layer runs the model's feed-forward width, the parser's hff,
+    # whatever the config format.
+    saved.hff = ccfg.hff
     saved.n_chosen_exp = ccfg.n_chosen_exp
     saved.n_exp = ccfg.n_exp
     saved.n_shared_exp = ccfg.n_shared_exp
     saved.ep = ccfg.ep
     custom_default_transformer(ccfg)
-    ccfg.dh = 128
+    # Its heads at the value heads' width, 128 unless the model states it.
+    ccfg.dh = getattr(ccfg, "v_head_dim", None) or 128
 
     def dense(c):
         c.hff = saved.hff
@@ -247,7 +289,9 @@ def custom_qwen(ccfg):
     # if "72b" in ccfg.model_name :
     #     ccfg.s = ccfg.s * 3/4
     ccfg.shard_recompute_input = ccfg.t
-    ccfg.shard_output_activ = ccfg.t
+    # The output layer's logits split over TP only where the loss runs on
+    # them sharded; otherwise every rank gathers them whole.
+    ccfg.shard_output_activ = ccfg.t if getattr(ccfg, "shards_logits", True) else 1
     # ccfg.bytes_grad = 4
 
 

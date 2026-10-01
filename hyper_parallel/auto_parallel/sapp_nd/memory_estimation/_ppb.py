@@ -15,7 +15,7 @@
 """PPB input module"""
 from __future__ import annotations
 
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Tuple, TYPE_CHECKING
 from types import SimpleNamespace
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
@@ -79,23 +79,49 @@ class _PPB:
                 desc["memory_parameter"] = self.mb(res_stat) + d_out
                 desc["time"] = 1
             else:
-                ctx.current_node = LayerType.NOT_REC_LAYER
-                dyn_nrec = self._inner_dynamic_mem(ppb=True)
-                ctx.current_node = LayerType.SEL_REC_LAYER
-                dyn_srec = self._inner_dynamic_mem(ppb=True)
-                ctx.current_node = LayerType.FULL_REC_LAYER
-                dyn_frec = self._inner_dynamic_mem(ppb=True)
-                c = max(dyn_nrec[1], dyn_srec[1], dyn_frec[1])
-                desc["type"] = "BODY"
-                desc["memory_parameter"] = self.mb(res_stat)
-                desc["memory_parameter"] += self.mb(c)
-                desc["memory_activation"] = self.mb(dyn_nrec[0])
-                desc["memory_select_rec"] = self.mb(dyn_srec[0])
-                desc["memory_recompute"] = self.mb(dyn_frec[0])
-                desc["time"] = 1
+                self._body_memory(desc, ccfg, ctx, res_stat)
         finally:
             ctx.enable_node_log = original_enable_node_log
         return desc
+
+    def _body_memory(self, desc: dict, ccfg: CostModelConfig, ctx: Context, res_stat: float) -> None:
+        """Describe a body layer's memory under each option.
+
+        The balancer charges an option's memory once per micro-batch in
+        flight, and the layer's parameter memory once. Activations are kept
+        per micro-batch. Of the communication buffers, what grows with the
+        micro-batches in flight, such as a dense layer's gathered activations
+        and the expert all-to-all buffers, is charged per micro-batch, and
+        the rest, the largest any option keeps, once.
+        """
+        # The most micro-batches a stage keeps in flight under 1F1B.
+        many = max(2, min(getattr(ccfg, "p", 1), getattr(ccfg, "m", 1)))
+        dyn = {}
+        for key, node in (
+            ("memory_activation", LayerType.NOT_REC_LAYER),
+            ("memory_select_rec", LayerType.SEL_REC_LAYER),
+            ("memory_recompute", LayerType.FULL_REC_LAYER),
+        ):
+            ctx.current_node = node
+            dyn[key] = self._dynamic_mem(many)
+        desc["type"] = "BODY"
+        desc["memory_parameter"] = self.mb(res_stat) + self.mb(max(once for _, _, once in dyn.values()))
+        for key, (activation, per_micro_batch, _) in dyn.items():
+            desc[key] = self.mb(activation) + self.mb(per_micro_batch)
+        desc["time"] = 1
+
+    def _dynamic_mem(self, many: int) -> Tuple[float, float, float]:
+        """``(activation, buffers per micro-batch, buffers once)`` of the current layer.
+
+        The buffers are split by how they grow from one micro-batch in
+        flight to *many*: exact where they grow linearly or not at all, and
+        never under what the memory model keeps where a buffer that does not
+        grow hides the ones that do, as ``max(dp, tp, cp)`` has them.
+        """
+        _, more = self._inner_dynamic_mem(default_micro_factor=many)
+        activation, one = self._inner_dynamic_mem(ppb=True)
+        per_micro_batch = (more - one) / (many - 1)
+        return activation, per_micro_batch, one - per_micro_batch
 
     def ppb_combine_bodies(self, ppb_lay_desc: list) -> None:
         """combine descriptions into a new body"""

@@ -21,7 +21,7 @@ import numpy as np
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, RealParts, estimation_in_real_parts
 
@@ -34,76 +34,150 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_configs_by_position,
     get_table_quantity,
+    selective_shares,
 )
 
 
 GENERALIZE_PIPELINE_CALCULATION = False
 MANUAL_P2P_RATIO = 0.002
 BACKWARD_RATIO = 2
+# The chunk the gated delta rule's kernel and Transformers' own
+# implementation run a sequence in.
+GDN_CHUNK = 64
 
 
-def op_table(cfg):
-    """op compute load formulas"""
+def op_table(cfg, attn=None):
+    """op compute load formulas
+
+    Args:
+        cfg: the cost-model config.
+        attn: a layer group whose attention flavour differs from *cfg*'s.
+            Only the attention entries read it; everything else stays on
+            *cfg*, so the expert scaling applied by the caller is unaffected.
+    """
     table = {}
     # cfg.s /= cfg.cp
+    # Q,O cost h x (a*dh) each, K,V cost h x (n_kv*dh); the h*h form is the
+    # head_dim = h/a special case. A fused output gate doubles Q.
+    att = attn if attn is not None else cfg
+    d_h = att.dh or (cfg.h / att.a if att.a else 0)
+    d_q = att.a * d_h
     table["n_attMM"] = (
-        3 * (1 + cfg.n_kv / cfg.a) * cfg.b * cfg.s * cfg.h * cfg.h
+        1.5
+        * cfg.b
+        * cfg.s
+        * cfg.h
+        * (
+            ((2 if getattr(att, "attn_output_gate", False) else 1) + 1) * d_q
+            + 2 * att.n_kv * d_h
+        )
     )
+    # The chunked gated delta rule, per value head: within a chunk of
+    # GDN_CHUNK tokens, its keys against its keys and its queries, its
+    # solved weights against its values and its decayed keys, and its
+    # scores against its new values; the state read twice and written once
+    # a chunk.  Linear in the sequence, where an attention score is
+    # quadratic.  The entry exists only for a group that declares the
+    # flavour, so no other config needs to carry the count.
+    n_v, d_k, d_v = (getattr(att, name, 0) for name in ("lin_n_v", "lin_d_k", "lin_d_v"))
+    if n_v * d_k * d_v:
+        table["n_linrec"] = (3 * cfg.b * cfg.s * n_v
+                             * (2 * GDN_CHUNK * (3 * d_k + 2 * d_v) + 6 * d_k * d_v))
     table["n_ffMM"] = 6 * cfg.b * cfg.s * cfg.h * cfg.hff
-    table["n_attBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.h
+    # Every head's queries against every key, as wide as a head's queries
+    # and keys, an MLA head's with its rotary part; then the weights
+    # against the values, as wide as a head's values.
+    d_qk = (getattr(att, "qk_nope_head_dim", None) or d_h) + (getattr(att, "dhr", 0) or 0)
+    table["n_attBMM"] = 3 * cfg.b * cfg.s * cfg.s * att.a * (d_qk + d_h)
     table["n_ffBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.hff
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
-    table["n_ffAct"] = 21 * cfg.b * cfg.hff
+    table["n_ffAct"] = 21 * cfg.b * cfg.s * cfg.hff
 
     table["n_normOp"] = 30 * cfg.b * cfg.s * cfg.h * cfg.t / cfg.sp
+    # A QK-norm runs over every head's queries and keys, which TP splits.
+    # The entry exists only for a model that has one.
+    if getattr(cfg, "n_qknorm", 0):
+        table["n_qknorm"] = 30 * cfg.b * cfg.s * (att.a + att.n_kv) * d_h
     table["n_dropout"] = (
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )
-    if cfg.dc_kv != 0:  # Deepseek
-        table["n_attMM"] = (
-            3
-            / 2
-            * (
-                2 * cfg.dc_kv * cfg.n_kv * cfg.dh
-                + cfg.dc_q * cfg.a * (cfg.dh + cfg.dhr)
-                + cfg.h * (cfg.a * cfg.dh + cfg.dhr)
-            )
-            * cfg.b
-            * cfg.s
-        )
+    if cfg.dc_kv != 0:  # MLA
+        # The queries' latent and its up-projection, or one projection to
+        # every head; the keys' and values' shared down-projection beside
+        # the rotary key; their up-projections, a head's key at its own
+        # width and its value at the value heads'; the output projection.
+        d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
+        heads = cfg.a * (d_nope + cfg.dhr)
+        query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
+        weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+                   + cfg.a * cfg.dh * cfg.h)
+        table["n_attMM"] = 6 * cfg.b * cfg.s * weights / (getattr(cfg, "n_attMM", 0) or 4)
     for op in table:
         table[op] *= cfg.bytes_p / cfg.t / cfg.cp
     # cfg.s *= cfg.cp
     return table
 
 
+def _flavour_tables(cfg, attn=None):
+    """One (dense, expert) table pair for a given attention flavour.
+
+    A MoE layer's feed-forward entry prices the experts each token runs,
+    the shared experts, as wide as a routed one, and, spread over the
+    layer's feed-forward matmuls, the router and the shared experts' gate;
+    its activation function's entry the same experts, which run it at
+    their width, where a dense layer's runs it at the dense width.
+    """
+    base = op_table(cfg, attn)
+    exp = deepcopy(base)  # Verify this with MF MoEV2
+    group = attn if attn is not None else cfg
+    n_ff = max(getattr(group, "n_ffMM", 0) or 0, getattr(group, "n_ffBMM", 0) or 0) or 3
+    gate = 1 if cfg.n_shared_exp and getattr(cfg, "shared_expert_gate", None) else 0
+    experts = cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
+    width = experts + (cfg.n_exp + gate) / n_ff
+    exp["n_ffMM"] *= width / cfg.hff
+    exp["n_ffBMM"] *= width / cfg.hff
+    exp["n_ffAct"] *= experts / cfg.hff
+    return base, exp
+
+
+def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
+    """Price one regular layer with its group's config.
+
+    *tables* holds one table pair per attention flavour and gains one the
+    first time a flavour is priced.
+    """
+    kind = getattr(lcfg, "attn_kind", "full")
+    if kind not in tables:
+        tables[kind] = _flavour_tables(cfg, lcfg)
+    flop = get_table_quantity(
+        lcfg,
+        tables[kind][1] if (lcfg.n_exp > 1) else tables[kind][0],
+        layer,
+        with_recomp,
+        shares=selective_shares(lcfg, layer),
+    )
+    if ccfg.ttype == PerformanceType.TIME:
+        flop = estimate_comp_flop_time(lcfg, flop)
+    return flop
+
+
 # Evaluation functions
 def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
     """FW + BW"""
     _ = debugger
-    table = op_table(cfg)
-
-    table_exp = deepcopy(table)  # Verify this with MF MoEV2
-    table_exp["n_ffMM"] *= (
-        cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
-    )
-    table_exp["n_ffBMM"] *= (
-        cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
-    )
-
-    lccfgs = get_layer_custom_configs(cfg)
-    layer_count = 0
-    idx_lccfg = 0
+    # Full attention prices from the model's own attention dimensions.
+    tables = {"full": _flavour_tables(cfg)}
+    lccfg_at = get_layer_configs_by_position(cfg, stages)
 
     flops = []
-    for stage in stages:
+    for stage_id, stage in enumerate(stages):
         flops += [0]
-        for chunk in stage:
-            for layer in chunk:
+        for chunk_id, chunk in enumerate(stage):
+            for lay_id, layer in enumerate(chunk):
                 if layer == LayerType.EMBEDDING_LAYER:
                     continue
 
@@ -121,25 +195,9 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
                     )
                     continue
 
-                layer_count += 1
-                if (
-                    idx_lccfg + 1 < len(lccfgs)
-                    and lccfgs[idx_lccfg][1] <= layer_count
-                ):
-                    layer_count = 0
-                    idx_lccfg += 1
-
-                flop = get_table_quantity(
-                    lccfgs[idx_lccfg][0],
-                    table_exp if (lccfgs[idx_lccfg][0].n_exp > 1) else table,
-                    layer,
-                    with_recomp,
+                flops[-1] += _regular_layer_flop(
+                    cfg, ccfg, lccfg_at[(stage_id, chunk_id, lay_id)], tables, layer, with_recomp
                 )
-
-                if ccfg.ttype == PerformanceType.TIME:
-                    flop = estimate_comp_flop_time(lccfgs[idx_lccfg][0], flop)
-
-                flops[-1] += flop
 
     return flops
 
@@ -186,6 +244,20 @@ def get_dynamic_ratio(cfg):
     return 3 / 2 * (cfg.hff_exp + cfg.s) * (8192 / (cfg.h + cfg.s))
 
 
+def _weigh_comm_parts(debugger, comm_w):
+    """Weigh each stage's recorded communication parts as the stage time weighs them.
+
+    DP_REDUCE, the all-reduce's share of DP_COMM, is weighed where the
+    communication walk recorded it (``estimate_from_mem_comm``).
+    """
+    for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM]:
+        debugger.info[p] = [
+            comm_w * c for c in debugger.info[p]
+        ]
+    if isinstance(debugger.info[PerfParts.DP_REDUCE], list):
+        debugger.info[PerfParts.DP_REDUCE] = [comm_w * c for c in debugger.info[PerfParts.DP_REDUCE]]
+
+
 def estimate_stage(*args, **kwargs):
     """stage level estimation"""
     cfg = args[0]
@@ -223,10 +295,7 @@ def estimate_stage(*args, **kwargs):
     ]
 
     if debugger and debugger.is_enabled():
-        for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM]:
-            debugger.info[p] = [
-                comm_w * c for c in debugger.info[p]
-            ]
+        _weigh_comm_parts(debugger, comm_w)
         debugger.info[PerfParts.FW_COMPUTE] = [
             comp_w * comp / (1 + BACKWARD_RATIO) for comp in compute_perfs
         ]
@@ -336,6 +405,12 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
             time_sum,
         )
         debugger.info[PerfParts.BUBBLE] = bubble
+        # DP_COMM timed the stage's whole DP traffic, the time and the bubble
+        # above with it; its all-reduce is DP_REDUCE's, the rest FSDP's.
+        reduced = debugger.info[PerfParts.DP_REDUCE]
+        if isinstance(reduced, list):
+            debugger.info[PerfParts.DP_REDUCE] = reduced[last_straggler_idx] * cfg.m
+            debugger.info[PerfParts.DP_COMM] -= debugger.info[PerfParts.DP_REDUCE]
     return pipeline_perf
 
 
@@ -391,85 +466,6 @@ def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
     return p2p
 
 
-def estimate_layer_perf(*args, **kwargs):
-    """for PPB"""
-    cfg = args[0]
-    stages = kwargs.get("stages", args[2] if len(args) > 2 else None)
-    extra_custom_func = kwargs.get(
-        "extra_custom_func", args[3] if len(args) > 3 else None
-    )
-    ccfg = kwargs.get("ccfg", args[4] if len(args) > 4 else CustomConfig())
-    debugger = kwargs.get("debugger", args[5] if len(args) > 5 else None)
-    # cfg = CostModelConfig(mf_config)
-    # Process custom model config
-    if extra_custom_func:
-        extra_custom_func(cfg)
-    else:
-        logger.info("auto applying custom model config")
-        check_and_apply_custom_hook(cfg)
-
-    new_layer_config = []
-    stages = [[LayerType.EMBEDDING_LAYER]]
-    for _, layer in cfg.layer_custom_config:
-        new_layer_config.append((1, layer))
-        stages.append([LayerType.NOT_REC_LAYER])
-    stages.append([LayerType.OUTPUT_LAYER])
-    cfg.layer_custom_config = new_layer_config
-
-    logger.output("cfg.layer_custom_config = %s", cfg.layer_custom_config)
-    logger.output("stages = %s", stages)
-
-    cfg.n = cfg.d * cfg.t * cfg.p
-
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
-
-    logger.info(str(cfg))
-    logger.info(stages)
-    logger.info(ccfg)
-
-    perfs = {}
-    perfs["compute_perfs"] = estimate_comp(
-        cfg, ccfg, stages, with_recomp=False, debugger=debugger
-    )
-    logger.info("PerfEst: compute_perfs %s", perfs["compute_perfs"])
-    perfs["recompute_perfs"] = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(
-            cfg, ccfg, stages, with_recomp=True, debugger=debugger
-        )
-    )
-
-    perfs["comm_perfs"] = estimate_comm(
-        cfg, ccfg, stages, args[1], with_recomp=False, debugger=debugger
-    )
-    logger.info("PerfEst: comm_perfs %s", perfs["comm_perfs"])
-    perfs["recomm_perfs"] = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(
-            cfg, ccfg, stages, args[1], with_recomp=True, debugger=debugger
-        )
-    )
-    stage_perfs = estimate_stage(
-        cfg,
-        ccfg,
-        perfs["compute_perfs"],
-        perfs["comm_perfs"],
-        perfs["recompute_perfs"],
-        perfs["recomm_perfs"],
-        debugger=debugger,
-    )
-    logger.output("PerfEst: stage_perfs %s", stage_perfs)
-
-    for s, perf in enumerate(stage_perfs):
-        stage_perfs[s] = int(perf / 10**12)
-
-    return stage_perfs
-
-
-
 def apply_regression_coefficients(coeffs, debugger, old_perf):
     """
     applies the coefficients present in regression's cache_file
@@ -484,6 +480,9 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
             ratio = compute_ratio
         else:
             ratio = coeffs.get(part.name)
+            if ratio is None and part == PerfParts.DP_REDUCE:
+                # A file fitted before the all-reduce had a part of its own.
+                ratio = coeffs.get(PerfParts.DP_COMM.name)
         new_val = 0.0 if raw == 0.0 else raw * ratio
         debugger.info[part] = new_val
 
@@ -529,8 +528,10 @@ def _resolve_estimate_args(args, kwargs):
         device_type, memory).
     """
     cfg_input = args[0]
+    # A copy: the estimate applies layer hooks to its config in place, and the
+    # caller's config is the one the next estimate starts from.
     cfg = (
-        cfg_input
+        deepcopy(cfg_input)
         if isinstance(cfg_input, CostModelConfig)
         else CostModelConfig(cfg_input)
     )
@@ -545,6 +546,14 @@ def _resolve_estimate_args(args, kwargs):
     )
     memory = kwargs.get("memory", args[6] if len(args) > 6 else None)
     return _EstimateArgs(cfg, stages, extra_custom_func, ccfg, debugger, device_type, memory)
+
+
+def _user_hook(cfg: Any) -> Optional[Callable]:
+    """The hook a unimodal config's hook class gives it, as the memory estimate applies it."""
+    hooks = getattr(cfg, "hooks_dict", None)
+    if not hooks or getattr(cfg, "multimodal", False):
+        return None
+    return next(iter(hooks.values()))
 
 
 def _finalize_perf(perf, cache_file, debugger, memory):
@@ -569,6 +578,53 @@ def _finalize_perf(perf, cache_file, debugger, memory):
     return perf
 
 
+def _stage_parts(cfg, ccfg, stages, device_type, debugger):
+    """One config's per-stage compute, recompute, communication and recomputed communication."""
+    # Only the plain walks record parts. A stage's time takes what the
+    # recompute walks add as RECOMPUTE alone; recorded as communication too,
+    # it made the parts outgrow the time, and the bubble, their difference,
+    # went negative.
+    compute_perfs = estimate_comp(
+        cfg, ccfg, stages, with_recomp=False, debugger=debugger
+    )
+    recompute_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
+        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
+    )
+    comm_perfs = estimate_comm(
+        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
+    )
+    recomm_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
+        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
+    )
+    return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
+
+
+def _submodule_parts(cfg, ccfg, device_type, debugger):
+    """A multimodal model's per-stage parts, every submodule's summed (F2).
+
+    The submodules of a vision-language model run on one pipeline, so a
+    stage's time is the work of the layers on it, whichever submodule they
+    belong to, as the memory model sums what they keep there
+    (``combine_partition_multimodal``).  Each is priced on its own
+    partitions and under its own family, on a copy, so no submodule leaves
+    state for the next.
+    """
+    partitions = cfg.generate_partitions_vpp()
+    totals = None
+    for name in cfg.mm_order:
+        sub = deepcopy(cfg.mm_ccfgs[name])
+        check_and_apply_custom_hook(sub)
+        parts = _stage_parts(sub, ccfg, partitions[name], device_type, debugger)
+        totals = parts if totals is None else tuple(
+            [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
+        )
+    return totals
+
+
 # performance estimation
 def estimate_performance(*args, **kwargs):
     """main estimation"""
@@ -582,9 +638,13 @@ def estimate_performance(*args, **kwargs):
         memory,
     ) = _resolve_estimate_args(args, kwargs)
 
-    # Process custom model config
+    # Process custom model config: the config's own hook when its hook class
+    # gives it one, as the memory estimate applies it, else its family.
+    user_hook = _user_hook(cfg)
     if extra_custom_func:
         extra_custom_func(cfg)
+    elif user_hook is not None:
+        user_hook(CWrap(cfg))
     else:
         logger.info("auto applying custom model config")
         check_and_apply_custom_hook(cfg)
@@ -611,30 +671,21 @@ def estimate_performance(*args, **kwargs):
     logger.info(stages)
     logger.info(ccfg)
 
-    compute_perfs = estimate_comp(
-        cfg, ccfg, stages, with_recomp=False, debugger=debugger
-    )
-    recompute_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(
-            cfg, ccfg, stages, with_recomp=True, debugger=debugger
+    if getattr(cfg, "multimodal", False):
+        compute_perfs, recompute_perfs, comm_perfs, recomm_perfs = _submodule_parts(
+            cfg, ccfg, device_type, debugger
         )
-    )
-    comm_perfs = estimate_comm(
-        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
-    )
+        timed = cfg.mm_ccfgs[getattr(cfg, "mm_main", None) or cfg.mm_order[-1]]
+        timed.n = cfg.n
+    else:
+        compute_perfs, recompute_perfs, comm_perfs, recomm_perfs = _stage_parts(
+            cfg, ccfg, stages, device_type, debugger
+        )
+        timed = cfg
     logger.info("PerfEst: comm_perfs %s", comm_perfs)
-    recomm_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(
-            cfg, ccfg, stages, device_type, with_recomp=True, debugger=debugger
-        )
-    )
 
     stage_perfs = estimate_stage(
-        cfg,
+        timed,
         ccfg,
         compute_perfs,
         comm_perfs,
@@ -646,9 +697,9 @@ def estimate_performance(*args, **kwargs):
 
     stage_focused = kwargs.get("stage_focused", None)
     perf = estimate_perf(
-        cfg, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
+        timed, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
     )
-    perf += estimate_p2p(cfg, ccfg, stage_perfs, debugger=debugger)
+    perf += estimate_p2p(timed, ccfg, stage_perfs, debugger=debugger)
     logger.info("PerfEst: perf %s", perf)
 
     cache_file = kwargs.get("cache_file")

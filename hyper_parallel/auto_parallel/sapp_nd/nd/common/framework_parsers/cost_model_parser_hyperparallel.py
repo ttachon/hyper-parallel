@@ -19,6 +19,7 @@ import importlib.util
 import time
 import sys
 import os
+from hyper_parallel.auto_parallel._hf_model_spec import infer_qk_norm
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -163,15 +164,18 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.p = max(1, self.config.parallelism.pipeline_parallel_degree)
         self.ccfg.cp = max(1, self.config.parallelism.context_parallel_degree)
         self.ccfg.ep = max(1, self.config.parallelism.expert_parallel_degree)
+        # TorchTitan's FSDP2 frees a block's gathered parameters after its
+        # forward under the "always" policy, and under the default one when
+        # nothing is pipelined.
+        policy = self.config.parallelism.fsdp_reshard_after_forward or "default"
+        self.ccfg.reshards = policy == "always" or (policy == "default" and self.ccfg.p == 1)
         self.ccfg.sp = self.ccfg.t
         self.ccfg.vp = 1
-        self.ccfg.op_weight_shard = (
-            self.config.parallelism.data_parallel_shard_degree * self.ccfg.t
-        )
+        self.ccfg.op_weight_shard = self.config.parallelism.data_parallel_shard_degree
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
-            else self.ccfg.d * self.ccfg.t
-        )  # need correction
+            else self.ccfg.d
+        )
         self.ccfg.offset = 0  # important
         self.ccfg.full_rec = self.config.activation_checkpoint.mode == "full"
         self.ccfg.sel_rec = self.config.activation_checkpoint.mode == "selective"
@@ -205,21 +209,14 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.emb_out_in_offset = True
         self.ccfg.n_s_split = 1
         self.ccfg.cp_algo = "colossalai_cp"
-        self.ccfg.rec_op = Config({
-            "attBMM": 1,
-            "headCast": 1,
-            "dropout": 1,
-            "softmax": 1,
-            "normOp": 1,
-            "gather": 1,
-            "ffAct": 1,
-        })
+        self.ccfg.rec_op = Config(self.hyper_rec_op(self.ccfg.sel_rec))
         self.ccfg.pp_partition = None
 
     def __parse_hyperparam(self):
         """hyperparameter vars"""
-        self.ccfg.multiple_of = max(1, self.ccfg.specs.multiple_of)
-        self.ccfg.fdm = max(1, self.ccfg.specs.ffn_dim_multiplier)
+        # A flavor may state either as None, TorchTitan's default: no multiplier.
+        self.ccfg.multiple_of = max(1, self.ccfg.specs.multiple_of or 1)
+        self.ccfg.fdm = max(1, self.ccfg.specs.ffn_dim_multiplier or 1)
         self.ccfg.h = self.ccfg.specs.dim
         self.ccfg.hff = self.ccfg.specs.inter_dim
         if not self.ccfg.hff:
@@ -243,6 +240,12 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.dc_kv = self.ccfg.specs.kv_lora_rank
         self.ccfg.dc_q = self.ccfg.specs.q_lora_rank
         self.ccfg.dhr = self.ccfg.specs.qk_rope_head_dim
+        # TorchTitan's Qwen3 flavors normalize each head's queries and keys
+        # unless they state otherwise; its other families have no QK-norm.
+        stated = vars(self.ccfg.specs)
+        self.state_qk_norm(
+            self.ccfg, stated["qk_norm"] if "qk_norm" in stated else infer_qk_norm(self.ccfg.model_name)
+        )
         self.ccfg.k_1st_dense = self.ccfg.specs.n_dense_layers
         self.ccfg.is_mtp_in_offset = True
 
@@ -252,16 +255,17 @@ class CostModelParserHyperparallel(_CostModelParser):
             self.ccfg.specs.moe_inter_dim if self.ccfg.specs.moe_inter_dim
             else self.ccfg.hff
         )
-        if (
-            not hasattr(self.ccfg.specs, "moe_enabled")
-            or self.ccfg.specs.moe_enabled
-        ):
-            if self.ccfg.specs.moe_args:
-                self.ccfg.n_exp = self.ccfg.specs.moe_args.num_experts
-                self.ccfg.n_chosen_exp = self.ccfg.specs.moe_args.top_k
-                self.ccfg.n_shared_exp = (
-                    self.ccfg.specs.moe_args.num_shared_experts
-                )
+        # A flavor that states its experts runs them unless it says it does
+        # not: TorchTitan's DeepSeek-V3 states moe_args and no moe_enabled.
+        # The specs answer a missing field with 0, so read what they state.
+        stated = vars(self.ccfg.specs)
+        moe_enabled = stated["moe_enabled"] if "moe_enabled" in stated else True
+        if moe_enabled and self.ccfg.specs.moe_args:
+            self.ccfg.n_exp = self.ccfg.specs.moe_args.num_experts
+            self.ccfg.n_chosen_exp = self.ccfg.specs.moe_args.top_k
+            self.ccfg.n_shared_exp = (
+                self.ccfg.specs.moe_args.num_shared_experts
+            )
         else:
             self.ccfg.n_exp = 1
             self.ccfg.n_chosen_exp = 1
@@ -274,6 +278,9 @@ class CostModelParserHyperparallel(_CostModelParser):
         """training feature vars"""
         self.ccfg.has_op = True  # Assuming
         self.ccfg.has_grad_shard = True  # Assuming FSDP
+        # FSDP holds every gradient as its parameter, at any pipeline degree.
+        self.ccfg.grads_as_params = True
+        self.ccfg.accumulates_grads = True
         self.ccfg.freeze = False
         self.ccfg.has_fa = True  # Assuming
         self.ccfg.vp_less_mem = False
@@ -288,9 +295,13 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.m = self.ccfg.p
         self.ccfg.gbs = self.ccfg.b * self.ccfg.d * self.ccfg.m
 
+    def config_shard_emb(self, ccfg):
+        """Set how the embedding table is sharded, on *ccfg*: over TP alone."""
+        ccfg.shard_embed = ccfg.t
+
     def __init_shard(self):
         """sharding vars"""
-        self.ccfg.shard_embed = self.ccfg.t
+        self.config_shard_emb(self.ccfg)
         self.ccfg.shard_output_activ = True
         self.ccfg.shard_recompute_input = True
         self.ccfg.is_shard_mtp_param = True

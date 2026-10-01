@@ -504,6 +504,34 @@ data:
                          "inherited pp should be fixed as [2]")
         # GBS inherited from train.yaml
         self.assertEqual(config.constraint["global_batch_size"], 64)
+    def test_train_yaml_run_reaches_the_search(self) -> None:
+        """The train.yaml's run rides along, and the search config's model dtype wins."""
+        train_yaml = {
+            "model": {
+                "name": "llama",
+                "torch_dtype": "bfloat16",
+                "config_overrides": {
+                    "hidden_size": 2048, "num_hidden_layers": 16, "num_attention_heads": 16, "vocab_size": 50000,
+                },
+            },
+            "training": {"global_batch_size": 64, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            "fsdp_config": {"dp_shard_size": 8, "reshard_after_backward": False},
+        }
+        train_path = os.path.join(self.tmpdir, "train.yaml")
+        _write_yaml(train_path, train_yaml)
+        search_path = os.path.join(self.tmpdir, "search.yaml")
+        _write_yaml(search_path, {
+            "train_yaml": train_path,
+            "model": {"torch_dtype": "float32"},
+            "cluster": {"num_nodes": 2, "cards_per_node": 8},
+            "parallelism": {"tp": [1, 2, 4]},
+        })
+
+        run = read_search_config(search_path).run
+
+        self.assertEqual(run["model"], {"torch_dtype": "float32"})
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertFalse(run["fsdp_config"]["reshard_after_backward"])
 
 
 class TestHpYamlReader(unittest.TestCase):
@@ -652,6 +680,54 @@ class TestHpYamlReader(unittest.TestCase):
         config = read_hp_yaml_config(path)
 
         self.assertEqual(config.model_spec["device_num"], 32)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_yaml_states_its_run(self, mock_get_hf_config) -> None:
+        """The run's dtypes, FSDP, optimizer and clipping ride in ``run``, as stated."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="llama", num_hidden_layers=32, hidden_size=4096, intermediate_size=11008,
+            num_attention_heads=32, num_key_value_heads=8, vocab_size=128256, max_position_embeddings=8192,
+        )
+        raw = yaml.safe_load(_auto_models_hp_yaml_content())
+        raw["model_init_dtype"] = "bfloat16"
+        raw["training"]["max_grad_norm"] = 1.0
+        raw["fsdp_config"]["reshard_after_forward"] = False
+        raw["accelerator"]["context_parallel_algo"] = "ulysses_cp"
+        raw["optimizer"] = {"_target_": "hyper_parallel.optim.AdamW", "fp32_main_params": True}
+        raw["context"] = {"visual_seq_len": 2304, "device_num": 32}
+        path = os.path.join(self.tmpdir, "auto_models.yaml")
+        _write_yaml(path, raw)
+
+        run = read_hp_yaml_config(path).run
+
+        self.assertEqual(run["model"], {
+            "_target_": "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained",
+            "torch_dtype": "bfloat16",
+        })
+        self.assertEqual(run["model_init_dtype"], "bfloat16")
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertFalse(run["fsdp_config"]["reshard_after_forward"])
+        self.assertEqual(run["accelerator"]["context_parallel_algo"], "ulysses_cp")
+        self.assertTrue(run["optimizer"]["fp32_main_params"])
+        self.assertNotIn("activation_checkpoint", run)
+        self.assertEqual(run["context"], {"visual_seq_len": 2304})
+
+    def test_legacy_yaml_states_its_run_under_train(self) -> None:
+        """A legacy train.yaml's run comes from its model section and ``train``."""
+        raw = yaml.safe_load(_dense_hp_yaml_content())
+        raw["model"].update(param_init_type="float32", compute_dtype="bfloat16")
+        raw["train"]["max_grad_norm"] = 1.0
+        raw["train"]["optimizer"] = {"type": "AdamW"}
+        path = os.path.join(self.tmpdir, "train.yaml")
+        _write_yaml(path, raw)
+
+        run = read_hp_yaml_config(path).run
+
+        self.assertEqual(run["model"], {"param_init_type": "float32", "compute_dtype": "bfloat16"})
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertEqual(run["optimizer"], {"type": "AdamW"})
+        self.assertEqual(run["accelerator"]["tp_degree"], 4)
+        self.assertNotIn("gradient_checkpointing", run["training"])
 
     def test_hp_yaml_empty_accelerator_defaults(self) -> None:
         """Empty accelerator section produces default search_space (single-element lists)."""
@@ -1221,6 +1297,38 @@ class TestWriter(unittest.TestCase):
         self.assertEqual(data["accelerator"]["ep_size"], 2)
         self.assertEqual(data["training"]["global_batch_size"], 64)
         self.assertNotIn("train", data)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_states_the_priced_checkpoint_mode(self) -> None:
+        """The mode the search priced replaces the train yaml's, in each schema's spelling."""
+        legacy = os.path.join(self.tmpdir, "legacy_ac.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {},
+                       "gradient_checkpointing": {"activation_checkpoint": "none"}}}, fh)
+        auto_models = os.path.join(self.tmpdir, "auto_models_ac.yaml")
+        with open(auto_models, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "off", "swap_inputs": True}}, fh)
+        unstated = os.path.join(self.tmpdir, "auto_models_no_ac.yaml")
+        with open(unstated, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full"}
+        written = {}
+        for name, path, before in (("legacy", legacy, "none"), ("auto_models", auto_models, "off"),
+                                   ("unstated", unstated, "off")):
+            out = os.path.join(self.tmpdir, f"resolved_{name}.yaml")
+            with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+                write_resolved_yaml(config, path, out)
+            self.assertIn(f"{before} in the train yaml, full in the search", " ".join(logs.output))
+            with open(out, "r", encoding="utf-8") as fh:
+                written[name] = yaml.safe_load(fh)
+        self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "full")
+        self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "full", "swap_inputs": True})
+        self.assertEqual(written["unstated"]["activation_checkpoint"], {"mode": "full"})
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:

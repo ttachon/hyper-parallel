@@ -203,5 +203,128 @@ class TestTransformersEntryPoint(unittest.TestCase):
         self.assertEqual(result["hidden_size"], 2048)
 
 
+class TestFromConfigRecipe(unittest.TestCase):
+    """A from_config recipe names its model directory and its own shape."""
+
+    @staticmethod
+    def _released_config() -> SimpleNamespace:
+        """The released Qwen3.5-MoE shape, before any crop."""
+        return SimpleNamespace(
+            model_type="qwen3_5_moe", hidden_size=2048, num_hidden_layers=40,
+            num_attention_heads=16, num_key_value_heads=2, head_dim=256,
+            num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512,
+            vocab_size=248320, max_position_embeddings=262144,
+        )
+
+    def test_config_path_names_the_model_directory(self) -> None:
+        """A factory recipe carries config_path instead of a pretrained path."""
+        recorder = _Recorder(self._released_config())
+        with _stub_registry(recorder):
+            result = resolve_hf_model_spec({
+                "_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
+                "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base",
+            })
+        self.assertEqual(recorder.calls[0][0], "/home/tt/models/Qwen3.5-35B-A3B-Base")
+        self.assertEqual(result["name"], "qwen3_5_moe")
+        self.assertEqual(result["num_hidden_layers"], 40)
+
+    def test_factory_arguments_crop_the_released_config(self) -> None:
+        """The layer and expert counts the recipe builds beat the released ones."""
+        recorder = _Recorder(self._released_config())
+        with _stub_registry(recorder):
+            result = resolve_hf_model_spec({
+                "_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
+                "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base",
+                "num_hidden_layers": 8,
+                "num_experts": 64,
+                "torch_dtype": "bfloat16",
+            })
+        self.assertEqual(result["num_hidden_layers"], 8)
+        self.assertEqual(result["num_experts"], 64)
+        # Everything the recipe does not restate still comes from the released config.
+        self.assertEqual(result["hidden_size"], 2048)
+        self.assertEqual(result["num_experts_per_tok"], 8)
+
+    def test_config_overrides_still_beat_factory_arguments(self) -> None:
+        """The declared override form stays the last word."""
+        recorder = _Recorder(self._released_config())
+        with _stub_registry(recorder):
+            result = resolve_hf_model_spec({
+                "config_path": "/models/qwen",
+                "num_hidden_layers": 8,
+                "config_overrides": {"num_hidden_layers": 2},
+            })
+        self.assertEqual(result["num_hidden_layers"], 2)
+
+    def test_error_names_every_accepted_key(self) -> None:
+        """A model section with no shape at all says what would satisfy it."""
+        with self.assertRaises(ValueError) as raised:
+            resolve_hf_model_spec({"_target_": "some.factory", "torch_dtype": "bfloat16"})
+        message = str(raised.exception)
+        for key in ("pretrained_model_name_or_path", "config_path", "config_overrides"):
+            self.assertIn(key, message)
+
+
+class TestQkNorm(unittest.TestCase):
+    """Whether a model's attention normalizes its queries and keys is settled with its spec."""
+
+    _MODEL = {"hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000}
+
+    def _qk_norm(self, model_type: str, **stated: Any) -> Any:
+        """The QK-norm the spec of a *model_type* config stating *stated* settles on."""
+        with _stub_registry(_Recorder(SimpleNamespace(model_type=model_type, **self._MODEL, **stated))):
+            return resolve_hf_model_spec({"pretrained_model_name_or_path": "local/model"})["qk_norm"]
+
+    def test_the_qwen3_generation_normalizes_queries_and_keys(self) -> None:
+        """
+        Feature: the QK-norm of a Transformers config, which Qwen3's does not state.
+        Description: Qwen3, Qwen3-MoE, Qwen3.5-MoE, Qwen3-VL-MoE, Llama and Qwen2 configs.
+        Expectation: The Qwen3 generation has one, Llama and Qwen2 none.
+        """
+        types_ = ("qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl_moe", "llama", "qwen2")
+        self.assertEqual([self._qk_norm(model_type) for model_type in types_],
+                         [True, True, True, True, False, False])
+
+    def test_a_stated_qk_norm_wins(self) -> None:
+        """
+        Feature: the QK-norm of a Transformers config that states it.
+        Description: A Qwen3 config stating use_qk_norm False, and a GLM-4.5
+            one stating it True.
+        Expectation: Each is taken at its word.
+        """
+        self.assertEqual([self._qk_norm("qwen3", use_qk_norm=False), self._qk_norm("glm4_moe", use_qk_norm=True)],
+                         [False, True])
+
+
+class TestVectors(unittest.TestCase):
+    """The biases and norms a Transformers model's layers hold are settled with its spec."""
+
+    _MODEL = {"hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000}
+    _FACTS = ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "layer_norms", "shared_expert_gate")
+
+    def _facts(self, model_type: str, **stated: Any) -> Any:
+        """The vector facts the spec of a *model_type* config stating *stated* settles on."""
+        with _stub_registry(_Recorder(SimpleNamespace(model_type=model_type, **self._MODEL, **stated))):
+            spec = resolve_hf_model_spec({"pretrained_model_name_or_path": "local/model"})
+        return tuple(spec[name] for name in self._FACTS)
+
+    def test_each_family_holds_its_own(self):
+        """
+        Feature: the vector facts of a Transformers config.
+        Description: A Llama config stating attention_bias and mlp_bias, a
+            Qwen2 one stating neither, a Qwen2-MoE and a Qwen3.5-MoE one,
+            and a Mixtral one.
+        Expectation: Llama biases all four projections and its
+            feed-forward; Qwen2's generation its query, key and value
+            projections; Qwen's MoE generations gate their shared expert;
+            each layer holds two RMSNorms, and nothing else is biased.
+        """
+        self.assertEqual(self._facts("llama", attention_bias=True, mlp_bias=True), (True, True, True, False, 2, False))
+        self.assertEqual(self._facts("qwen2"), (True, False, False, False, 2, False))
+        self.assertEqual(self._facts("qwen2_moe")[0::5], (True, True))
+        self.assertEqual(self._facts("qwen3_5_moe")[0::5], (False, True))
+        self.assertEqual(self._facts("mixtral"), (False, False, False, False, 2, False))
+
+
 if __name__ == "__main__":
     unittest.main()

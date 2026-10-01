@@ -65,14 +65,16 @@ class ParallelizeLayer:
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
 
-        if "mem_for_ppb" in extra_config:
-            reserve_mem = extra_config.pop("mem_for_ppb")
-            self.mem_eval._ccfg.device_capacity.decrease(reserve_mem)
-
+        # The cap replaces the device's capacity, and the reserve comes out
+        # of whichever capacity holds.
         if "max_mem" in extra_config:
             max_mem = extra_config.pop("max_mem")
             if max_mem is not None:
                 self.mem_eval._ccfg.device_capacity.set(max_mem)
+
+        if "mem_for_ppb" in extra_config:
+            reserve_mem = extra_config.pop("mem_for_ppb")
+            self.mem_eval._ccfg.device_capacity.decrease(reserve_mem)
 
         logger.debug("before global config init")
 
@@ -83,6 +85,7 @@ class ParallelizeLayer:
                     self.mem_eval._ccfg.mm_ccfgs[sub_model],
                     dimensions,
                     mppb=manual_ppb,
+                    parent=self.mem_eval._ccfg,
                 )
             else:
                 self.config = GlobalConfig(
@@ -108,6 +111,10 @@ class ParallelizeLayer:
 
     def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""
+        # Bounds live on the module-level dimensions: start each search from
+        # none, or it keeps the tightest bound any earlier search set.
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
         vpp = (
             1
             if Dim.VPP in self.config.dimensions
@@ -219,11 +226,21 @@ class ParallelizeLayer:
             return False
         return True
 
+    def priced(self) -> Any:
+        """The config a candidate is priced on: the whole model, every submodule of it.
+
+        The search drives one submodule's strategy (:class:`GlobalConfig`
+        gives the others the same degrees), and a candidate is priced on the
+        model the run trains: a vision tower's parameters, activations and
+        compute count toward the stage that holds them (F2).
+        """
+        return self.mem_eval.ccfg
+
     def memory_estim(self, debugger: Any = None) -> Any:
         """Whether the config fits memory"""
         logger.debug("estimate_peak")
         verbose = logger.level < logging.INFO
-        self.mem_eval.set_config(self.config.ccfg)  # = self.config.ccfg
+        self.mem_eval.set_config(self.priced())
         # self.mem_eval = EvaluatorV2(self.config)
         logger.debug("ccfg = %s", str(self.config.ccfg))
         peak = self.mem_eval.estimate_peak(
@@ -367,7 +384,7 @@ class ParallelizeLayer:
                 logger.debug("before apply_async")
                 peak = pool.apply_async(
                     pool_estimate_memory,
-                    args=(copy.deepcopy(self.config.ccfg),),
+                    args=(copy.deepcopy(self.priced()),),
                     # args=(evaluator,),
                     # self.memory_estim,
                 )
@@ -397,7 +414,7 @@ class ParallelizeLayer:
                     score = pool.apply_async(
                         pool_estimate_performance,
                         args=(
-                            copy.deepcopy(self.config.ccfg),
+                            copy.deepcopy(self.priced()),
                             self.machine.device,
                             mem,
                             cache_file,
@@ -411,7 +428,7 @@ class ParallelizeLayer:
                             enable=self.enable_debug,
                         )
                         score = estimate_performance(
-                            self.config.ccfg,
+                            self.priced(),
                             debugger=debugger,
                             device_type=self.machine.device,
                             memory=mem,
@@ -424,7 +441,7 @@ class ParallelizeLayer:
                         del debug_parts[-2:]
                     else:
                         score = estimate_performance(
-                            self.config.ccfg,
+                            self.priced(),
                             device_type=self.machine.device,
                             memory=mem,
                         )
@@ -448,22 +465,31 @@ class ParallelizeLayer:
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
 
     def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
-        """Order the given space with performance estimation"""
+        """Order the given space with performance estimation.
+
+        A measured configuration the cost model cannot represent, such as
+        expert parallelism wider than DP x TP, is left out and named, so that
+        it does not end the comparison of every other one.
+        """
         scored_space = []
         debug_parts = []
         for config, real_time, real_comm_wait in space:
-            debugger = Debug.Debug(
-                config, info_type=Debug.PerfParts, enable=self.enable_debug
-            )
-            self.config.set_parallel_config(config)
-            peak_mem = self.memory_estim()
-            score = estimate_performance(
-                self.config.ccfg,
-                debugger=debugger,
-                device_type=self.machine.device,
-                stage_focused=0,
-            )  # , memory = mem)
-            debugger.write()
+            # The comparison needs the per-part split at any verbosity; debug.csv stays opt-in.
+            debugger = Debug.Debug(config, info_type=Debug.PerfParts, enable=True)
+            try:
+                self.config.set_parallel_config(config)
+                peak_mem = self.memory_estim()
+                score = estimate_performance(
+                    self.priced(),
+                    debugger=debugger,
+                    device_type=self.machine.device,
+                    stage_focused=0,
+                )  # , memory = mem)
+            except (TypeError, ValueError, ZeroDivisionError) as exc:
+                logger.output("ND cannot cost %s, left out of the comparison: %s", config, exc)
+                continue
+            if self.enable_debug:
+                debugger.write()
             debug_parts = list(debugger.info.keys())
             values = list(debugger.info.values())
             del values[-2:]
@@ -488,7 +514,7 @@ class ParallelizeLayer:
             logger.debug(self.mem_eval.get_strategy())
             peak_mem = self.memory_estim()
             score = estimate_performance(
-                self.config.ccfg,
+                self.priced(),
                 debugger=debugger,
                 device_type=self.machine.device,
             )  # , memory = mem)
@@ -515,8 +541,14 @@ class ParallelizeLayer:
         threads_num: Any = None,
         top_num: Any = None,
         cache_file: Any = None,
+        ranking_csv: Optional[str] = None,
     ) -> Any:
-        """Test some functions"""
+        """Search, order and print the configurations that fit memory.
+
+        ``ranking_csv``, when given, receives every one of them in ND's order.
+        It is written before anything is plotted, so a plot that fails cannot
+        take the ranking with it.
+        """
         start = time.time()
         space = self.generate_search_space(yaml_folder, threads_num)
         generation = time.time()
@@ -524,6 +556,13 @@ class ParallelizeLayer:
             space, threads_num, cache_file=cache_file
         )
         ordering = time.time()
+        if ranking_csv:
+            Debug.write_ranking_csv(scored_space, ranking_csv)
+            logger.output(
+                "ND's order of %d configuration(s) written to %s",
+                len(scored_space),
+                ranking_csv,
+            )
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )
@@ -543,8 +582,7 @@ class ParallelizeLayer:
             str(self.config.dimensions),
         )
         if self.enable_debug:
-            file_path = os.path.dirname(os.path.realpath(__file__))
-            output_path = os.path.join(file_path, "output")
+            output_path = Debug.output_dir()
             if scored_space:
                 Debug.plot_nd(
                     scored_space,
@@ -614,22 +652,64 @@ class ParallelizeLayer:
         self, csv_f, output_path=None, plot_idle=False
     ):
         """Run test to compare estimation with detailed profiling"""
+        return self.compare_with_csv(csv_f, output_path=output_path, plot_idle=plot_idle)[1]
+
+    def compare_with_csv(
+        self, csv_f: str, output_path: Optional[str] = None, plot_idle: bool = False
+    ) -> Tuple[list, Any]:
+        """Estimate every measured configuration of a classified profiling CSV.
+
+        With ``output_path``, three files named after the CSV go there: the
+        real-versus-estimate plot, ``<stem>.pdf``; with ``plot_idle``, the same
+        plot without idle, ``<stem>_no_idle.pdf``, ordered by the measured step
+        less idle; and ND's estimate of each configuration, memory included,
+        ``<stem>_estimates.csv``. Idle is half the step or more on a short
+        one and differs from run to run, while ND estimates none of it.
+
+        Args:
+            csv_f: CSV read by ``Debug.get_comm_classified_data``, e.g. written by
+                ``nd.trace_classify``.
+            output_path: Directory for ND's plots and estimates; none are written when None.
+            plot_idle: Whether the measured bars include the idle remainder.
+
+        Returns:
+            ``(configs_estimated, metrics)``: one ``(config, peak_mem, real_time, score,
+            values, real_parts)`` entry per measured configuration, ordered by measured
+            time, and ``Debug.correlation_with_classified_comms`` over them.
+        """
         configs = Debug.get_comm_classified_data(csv_f, plot_idle=plot_idle)
         configs_estimated, debug_parts = self.order_space_test_comm_classified(
             configs, order_by=2
         )
+        if not configs_estimated:
+            raise ValueError(f"ND cannot cost any configuration of {csv_f}")
 
         if output_path is not None:
+            title = self.plot_title()
             Debug.plot_vs_real_comm_classified(
                 configs_estimated,
                 csv_f,
                 output_path,
                 debug_parts,
-                title=self.plot_title(),
+                title=title,
                 plot_idle=plot_idle,
             )
+            if plot_idle:
+                Debug.plot_vs_real_comm_classified(
+                    sorted(configs_estimated, key=Debug.busy_time),
+                    csv_f,
+                    output_path,
+                    debug_parts,
+                    title=title,
+                    plot_idle=False,
+                    suffix="_no_idle",
+                )
+            stem = os.path.splitext(os.path.basename(csv_f))[0]
+            estimates = os.path.join(output_path, f"{stem}_estimates.csv")
+            Debug.write_estimates_csv(configs_estimated, estimates)
+            logger.output("ND's estimate of every configuration written to %s", estimates)
 
-        return Debug.correlation_with_classified_comms(configs_estimated)
+        return configs_estimated, Debug.correlation_with_classified_comms(configs_estimated)
 
 
 class ParallelizeMultiModal(ParallelizeLayer):

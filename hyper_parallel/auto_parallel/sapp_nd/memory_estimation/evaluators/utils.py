@@ -44,6 +44,33 @@ class EvalUtils:
     """Utility methods class, PP Microbatch factor formulas"""
 
     @staticmethod
+    def reduced_grads(ccfg: CostModelConfig, parts: tuple) -> tuple:
+        """What the gradients FSDP reduce-scatters weigh, whole and sharded.
+
+        Each part is its parameter count, the ranks the backward computes
+        its gradient over and the ranks the gradient is kept over.  A part
+        no other rank shards is not reduce-scattered: the gradient the
+        backward computes is the one it keeps.
+        """
+        reduced = [(size, computed, kept) for size, computed, kept in parts if kept > computed]
+        whole = sum(size / computed for size, computed, _ in reduced)
+        sharded = sum(size / kept for size, _, kept in reduced)
+        return whole * ccfg.bytes_grad, sharded * ccfg.bytes_grad
+
+    @staticmethod
+    def census_bytes(ctx: Context, tokens: float, kept: float, held: float) -> float:
+        """What a census states for *tokens*: what a layer keeps, *kept* bytes per token, or its working set.
+
+        As its backward's working set, the most that backward holds, *held*
+        per token; less what the layer keeps, and never below it, where the
+        stage's dynamic memory counts that already, as for a layer that
+        does not recompute.
+        """
+        if not ctx.working_set:
+            return tokens * kept
+        return tokens * (max(0.0, held - kept) if ctx.working_on_saved else held)
+
+    @staticmethod
     def mb(x: Union[float, dict, tuple]) -> int:
         """Convert Byte to MB"""
         if isinstance(x, dict):
@@ -214,11 +241,16 @@ class EvalUtils:
 
     @staticmethod
     def pp_seq1f1b_micro_factor(ccfg: CostModelConfig, ctx: Context) -> int:
-        """Seq1F1B Warm-up microbatches count"""
+        """Seq1F1B Warm-up microbatches count, in sequence chunks.
+
+        Each chunk holds ``n_s_split``'th of a micro-batch's sequence: the
+        count goes to ``ctx.seq_chunks``, and the backbone evaluates the node
+        at that length.
+        """
         stage_id, chunk_id = ctx.current_stage_id, ctx.current_chunk_id
         # Warm_up micros num compute
         micro_factor = 1
-        ccfg.s /= ccfg.n_s_split  # Splitting seq length
+        ctx.seq_chunks = max(1, ccfg.n_s_split)
         base_micro = min(ccfg.p, ccfg.m)
         if ccfg.vp == 1:
             micro_factor = base_micro - stage_id + ccfg.n_s_split - 1
