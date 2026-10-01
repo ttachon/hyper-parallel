@@ -296,8 +296,8 @@ done
 Override values are parsed as YAML, where the bare word `off` is the boolean
 false. The configuration normalizes that back to `"off"`, so both spellings
 select the same mode, and the quoted form says what it means.
-## Cropped Qwen3.5-MoE
 
+## Cropped Qwen3.5-MoE
 
 `cropped_qwen3_5_moe.py` and `train_qwen3_5_moe.yaml` build a layer-cropped
 Qwen3.5-35B-A3B text tower the same way, from configuration only. Qwen3.5-MoE
