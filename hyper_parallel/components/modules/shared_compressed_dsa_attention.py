@@ -26,6 +26,7 @@ unsupported calls; the original baseline uses a numerical reference off NPU.
 
 from __future__ import annotations
 
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -450,6 +451,21 @@ def _try_fused_compressed_topk(
     return fused_compressed_topk(query, key, merge_weight, compress_ratio, top_k, query_segments)
 
 
+_FUSED_SELECTION_PROVIDER = None
+
+
+def register_fused_selection_provider(provider: Any | None) -> None:
+    """Install an accelerator-specific provider for the three selection chains.
+
+    A provider returns ``None`` from a chain it cannot serve - the operator is
+    absent, or the shapes fall outside its constraints - and the reference
+    implementation below runs instead. Model families own their providers; see
+    ``hyper_parallel.models.deepseek_v41.adapter.ops.fused_lightning_indexer``.
+    """
+    global _FUSED_SELECTION_PROVIDER  # pylint: disable=global-statement
+    _FUSED_SELECTION_PROVIDER = provider
+
+
 @torch.no_grad()
 def compressed_causal_topk(
         query: torch.Tensor,
@@ -464,6 +480,7 @@ def compressed_causal_topk(
         minimum_key_indices: torch.Tensor | None = None,
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         use_fused: bool = False,
+        use_provider: bool = True,
 ) -> torch.Tensor:
     """Select compressed positions with V4.1's ratio-aware causal rule.
 
@@ -471,14 +488,18 @@ def compressed_causal_topk(
     path retains the rule ``key < floor((query + 1) / ratio)``: the native LI V2
     operators, the CANN adapter, and the bounded-query-chunk reference. Three
     paths are offered in this order. ``use_fused`` demands the native operators
-    and raises where they do not support the call. Otherwise an available CANN
-    adapter runs. Unsupported operator shapes and head-sharded score reductions
-    fall back to the reference implementation.
+    and raises where they do not support the call. Otherwise a registered
+    selection provider runs, then an available CANN adapter. Unsupported
+    operator shapes and head-sharded score reductions fall back to the
+    reference implementation.
 
     Args:
         query_segments: Local Q intersections and global compressed K prefixes.
         use_fused: Require the native LI V2 operators and raise if a nonempty
-            call is unsupported. False leaves the CANN and reference paths.
+            call is unsupported. False leaves the paths below it.
+        use_provider: Consult a provider installed by
+            ``register_fused_selection_provider``, which declines a call it
+            cannot serve. It never raises and never replaces ``use_fused``.
     """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
@@ -519,6 +540,14 @@ def compressed_causal_topk(
                 "Check the LI V2 extension, input shapes and ordinary causal geometry; no reference fallback was run."
             )
         return selected
+
+    if use_provider and _FUSED_SELECTION_PROVIDER is not None:
+        selected = _FUSED_SELECTION_PROVIDER.causal_topk(
+            query, key, merge_weight, compress_ratio=compress_ratio,
+            sparse_count=sparse_count, query_offset=query_offset,
+            reduce_sum=reduce_sum, minimum_key_indices=minimum_key_indices)
+        if selected is not None:
+            return selected
 
     if (compress_ratio <= 128 and reduce_sum is None
             and (minimum_key_indices is None or query_segments is not None)
@@ -644,7 +673,7 @@ def compressed_causal_candidates(
     candidate_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -679,12 +708,21 @@ def compressed_causal_topk_and_candidates(
         query_chunk_size: int = 256,
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
+        use_provider: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select Full-layer Top-K and candidate blocks from one score pass."""
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+    if use_provider and _FUSED_SELECTION_PROVIDER is not None:
+        selected = _FUSED_SELECTION_PROVIDER.topk_and_candidates(
+            query, key, merge_weight, compress_ratio=compress_ratio,
+            sparse_count=sparse_count, topk_blocks=topk_blocks,
+            block_size=block_size, query_offset=query_offset,
+            reduce_sum=reduce_sum, minimum_key_indices=minimum_key_indices)
+        if selected is not None:
+            return selected
     batch_size, sequence_length, _, head_dim = query.shape
     if key.ndim != 3 or key.shape[::2] != (batch_size, head_dim):
         raise ValueError(
@@ -714,7 +752,7 @@ def compressed_causal_topk_and_candidates(
     candidate_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -753,6 +791,7 @@ def compressed_candidate_topk(
         query_chunk_size: int = 256,
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
+        use_provider: bool = True,
 ) -> torch.Tensor:
     """Score only hierarchical candidate blocks and return global key ids."""
     if compress_ratio <= 0:
@@ -761,6 +800,14 @@ def compressed_candidate_topk(
         raise ValueError(f"block_size must be positive, got {block_size}")
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+    if use_provider and _FUSED_SELECTION_PROVIDER is not None:
+        selected = _FUSED_SELECTION_PROVIDER.candidate_topk(
+            query, key, merge_weight, candidate_blocks,
+            compress_ratio=compress_ratio, sparse_count=sparse_count,
+            block_size=block_size, query_offset=query_offset,
+            reduce_sum=reduce_sum, minimum_key_indices=minimum_key_indices)
+        if selected is not None:
+            return selected
     batch_size, sequence_length, _, head_dim = query.shape
     if key.ndim != 3 or key.shape[::2] != (batch_size, head_dim):
         raise ValueError(
@@ -811,7 +858,7 @@ def compressed_candidate_topk(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
             selected_key,
-        ).relu_()
+        ).relu()
         scores = (dots * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -1017,6 +1064,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         self.candidate_topk_blocks = module.candidate_topk_blocks
         self.candidate_block_size = module.candidate_block_size
         self.loss_coeff = module.loss_coeff
+        self.fused_indexer = bool(getattr(module, "fused_indexer", True))
         self.query_chunk_size = int(getattr(module, "query_chunk_size", 256))
         self.train(module.training)
 
@@ -1107,6 +1155,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 query_chunk_size=self.query_chunk_size,
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
+                use_provider=self.fused_indexer,
             )
         elif self.uses_candidates:
             if candidate_blocks is None:
@@ -1123,6 +1172,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 query_chunk_size=self.query_chunk_size,
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
+                use_provider=self.fused_indexer,
             )
         else:
             candidate_blocks = None
@@ -1140,6 +1190,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                                 (packed_sequence.indexer_segments(self.compress_ratio)
                                  if packed_sequence is not None and query.device.type == "npu" else None)),
                 use_fused=self.use_fused,
+                use_provider=self.fused_indexer,
             )
         return topk_indices, candidate_blocks
 
