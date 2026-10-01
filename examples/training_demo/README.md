@@ -191,3 +191,78 @@ only after all 16 ranks complete. Use
 [`deepseek_v41_validation.yaml`](deepseek_v41/deepseek_v41_validation.yaml) to
 generate reproducible structure, module-parity, precision, checkpoint, and
 performance evidence for the selected local environment.
+
+## DeepSeek-V4.1 fused operators on the nd/dsv41-fused branch
+
+This branch merges the three open fused-operator pull requests on top of
+`trainer_dev`, so one checkout carries all of them:
+
+- GitCode !1435 and GitHub #990, the CANN compressed attention adapter plus the
+  halo context-parallel gather, which starts the raw KV bank at `raw_start`;
+- GitHub #1016, the native LI V2, SMLA and fused KL operators;
+- GitHub #953, the pluggable Lightning Indexer provider.
+
+All three implement the same fused Indexer. Each keeps its own contract, and
+`compressed_causal_topk` offers them in a fixed order: the native operators,
+which `use_fused` demands and which raise rather than fall back; then a
+registered selection provider, which declines what it cannot serve; then the
+CANN adapter where it is available; then the reference chunk loop. PR #953
+arrived with its flag named `use_fused`, already taken by PR #1016 with the
+opposite default and the opposite failure behaviour, so on this branch the
+provider flag is `use_provider`.
+
+Two of these paths are active without asking:
+
+- the provider, which `adapter/registration.py` installs at import and which
+  disables itself for the rest of the process after an operator error;
+- the CANN adapter, which tests the installed interface and the input shapes.
+
+Only the native operators need opting in. Pass `use_fused_kernels: true` to the
+`SharedCompressedDSAAttention` entry under `plan_overrides` in
+`train_deepseek_v41_online.yaml`. That also selects fused SMLA attention and
+fused KL, and raises on an unsupported call instead of running the baseline.
+
+A run that silently takes the reference path looks like a run that takes a fused
+path, so the provider states the positive fact in the run's own log. Read the log
+rather than inferring a path from the absence of a warning.
+
+Fused attention and the halo gather are refused together. The native kernel
+addresses the whole global sequence, while a halo gather starts the raw bank at
+`raw_start`, and the two have never run together. `_apply_sparse_attention`
+raises on that combination instead of reading the bank at the wrong offsets.
+
+### Running the text crop on a 16-device host
+
+The crop needs only `config.json` and `tokenizer.json`, and loads no checkpoint
+tensor, so the model weights are never read. A quantized repack of the released
+repository serves equally well: its architecture fields are the released ones,
+and only the unread `engram_rotation_config` is added. Point the launcher at the
+directory that holds those two files:
+
+```bash
+bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
+    /mnt/data/dsv4/DeepSeek-V4.1-Flash-w8a8 tp1
+```
+
+The launcher refuses to start when either file is missing, writes the scaled
+Engram metadata and the deterministic Online JSONL under
+`output/training_demo/deepseek_v41`, and reuses both on later runs. Preparing the
+metadata needs `tokenizers`, `numpy` and a Transformers that carries
+`models.deepseek_v4`.
+
+### Comparing activation-checkpoint modes
+
+`train_deepseek_v41_online.yaml` ships `mode: "off"` and one training iteration.
+Override both to time the three modes at one topology:
+
+```bash
+for MODE in '"off"' selective full; do
+    bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
+        /mnt/data/dsv4/DeepSeek-V4.1-Flash-w8a8 tp1 \
+        --activation_checkpoint.mode=$MODE --training.train_iters=10
+done
+```
+
+Override values are parsed as YAML, where the bare word `off` is the boolean
+false. The configuration normalizes that back to `"off"`, so both spellings
+select the same mode, and the quoted form says what it means.
