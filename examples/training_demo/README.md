@@ -231,24 +231,54 @@ addresses the whole global sequence, while a halo gather starts the raw bank at
 `raw_start`, and the two have never run together. `_apply_sparse_attention`
 raises on that combination instead of reading the bank at the wrong offsets.
 
+### The model directory
+
+The crop loads no checkpoint tensor, so the model weights are never read and
+three small files are enough:
+
+| File | Why |
+|------|-----|
+| `config.json` | released architecture, and `model_type` must be `deepseek_v41` |
+| `tokenizer.json` | the Engram hash is defined over this exact tokenizer |
+| `tokenizer_config.json` | carries the end-of-sentence and padding tokens |
+
+A quantized repack of the released repository serves equally well: its
+architecture fields are the released ones, and only the unread
+`engram_rotation_config` is added.
+
+Do not leave out `tokenizer_config.json`. Without it the tokenizer still loads
+and still produces the same ids, but `eos_token_id` and `pad_token_id` are None,
+and `data/text/text_transform.py` appends the end-of-sentence token only when it
+is not None. Documents would then run together with no separator and nothing
+would report it. This check states the positive fact instead:
+
+```bash
+python -c "
+from transformers import AutoTokenizer
+t = AutoTokenizer.from_pretrained('/home/tt/models/DeepSeek-V4.1-Flash', local_files_only=True, use_fast=True)
+assert t.eos_token_id is not None and t.pad_token_id is not None, 'tokenizer_config.json missing or broken'
+print('ok', len(t), t.eos_token_id, t.pad_token_id)"
+```
+
+It prints `ok 129280 1 1` for the released tokenizer, whose `tokenizer.json` is
+6,367,257 bytes with md5 `8a8245dc7f6c6bfcb0684a4be4e17217`. Both the released
+repository and its w8a8 repack carry that same file.
+
 ### Running the text crop on a 16-device host
 
-The crop needs only `config.json` and `tokenizer.json`, and loads no checkpoint
-tensor, so the model weights are never read. A quantized repack of the released
-repository serves equally well: its architecture fields are the released ones,
-and only the unread `engram_rotation_config` is added. Point the launcher at the
-directory that holds those two files:
+Point the launcher at the directory holding those three files:
 
 ```bash
 bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
-    /mnt/data/dsv4/DeepSeek-V4.1-Flash-w8a8 tp1
+    /home/tt/models/DeepSeek-V4.1-Flash tp1
 ```
 
-The launcher refuses to start when either file is missing, writes the scaled
-Engram metadata and the deterministic Online JSONL under
+The launcher refuses to start when the config or the tokenizer is missing, writes
+the scaled Engram metadata and the deterministic Online JSONL under
 `output/training_demo/deepseek_v41`, and reuses both on later runs. Preparing the
 metadata needs `tokenizers`, `numpy` and a Transformers that carries
-`models.deepseek_v4`.
+`models.deepseek_v4`. It also tees the log, so read the log rather than the exit
+status.
 
 ### Comparing activation-checkpoint modes
 
@@ -258,7 +288,7 @@ Override both to time the three modes at one topology:
 ```bash
 for MODE in '"off"' selective full; do
     bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
-        /mnt/data/dsv4/DeepSeek-V4.1-Flash-w8a8 tp1 \
+        /home/tt/models/DeepSeek-V4.1-Flash tp1 \
         --activation_checkpoint.mode=$MODE --training.train_iters=10
 done
 ```
