@@ -97,7 +97,7 @@ from typing import (
 )
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forbidden-backend-import
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode  # pylint: disable=forbidden-backend-import
 from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
 from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
@@ -326,6 +326,12 @@ def _gated_delta_rule(modeling: Any) -> Callable[..., Tuple[torch.Tensor, None]]
     return run
 
 
+# Reading a scalar off a fake tensor raises, since it holds no data. Transformers'
+# grouped_mm fallback reads its group offsets so in its backward, and it takes that
+# fallback on CPU with torch 2.8 or older, the 910C's 2.7.1 among them.
+_SCALAR_READ = torch.ops.aten._local_scalar_dense.default  # pylint: disable=protected-access
+
+
 class _LiveBytes(TorchDispatchMode):
     """The storages the ops it sees allocate, and the bytes they hold while they live."""
 
@@ -358,6 +364,8 @@ class _LiveBytes(TorchDispatchMode):
             self.events.append((key, -size))
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        if func is _SCALAR_READ and isinstance(args[0], FakeTensor):
+            return 0  # shapes alone price the memory, whatever the scalar
         out = func(*args, **(kwargs or {}))
         for tensor in tree_flatten(out)[0]:
             if isinstance(tensor, torch.Tensor):
@@ -555,8 +563,9 @@ class _SavedOps(TorchDispatchMode):
 
 def _matmul_flops(func: Any, args: Sequence[Any]) -> int:
     """The FLOPs of *func* on *args* where it is a matmul, and 0 otherwise."""
-    if func not in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default,
-                    torch.ops.aten._grouped_mm.default):  # pylint: disable=protected-access
+    matmuls = (torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default)
+    grouped = getattr(torch.ops.aten, "_grouped_mm", None)  # first shipped in torch 2.8
+    if func not in (matmuls if grouped is None else (*matmuls, grouped.default)):
         return 0
     first, second = args[1:3] if func is torch.ops.aten.addmm.default else args[:2]
     return 2 * first.numel() * second.shape[-1]
