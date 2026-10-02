@@ -15,7 +15,6 @@
 """One configuration interface for parallelization"""
 
 import copy
-from math import gcd
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -329,21 +328,26 @@ class GlobalConfig:
         return [dim.from_config(self.ccfg)]
 
     def max_op(self, dp, tp, ep):
-        """Compute bound for dimension OP"""
-        if (
-            isinstance(self.ccfg.optimizer, str)
-            and "muon" not in self.ccfg.optimizer.lower()
-        ):
-            return dp
-        if self.ccfg.n_exp and self.ccfg.n_exp > 1:
-            exp_gcd = gcd(dp * tp // max(tp, ep), self.ccfg.n_exp)
-        else:
-            exp_gcd = dp
+        """Compute bound for dimension OP.
 
-        dc_kv_valid = self.ccfg.dc_kv and self.ccfg.dc_kv > 1
-        dhr_valid = self.ccfg.dhr and self.ccfg.dhr > 1
-        if dc_kv_valid and dhr_valid:
-            att_gcd = gcd(self.ccfg.h, self.ccfg.dc_kv + self.ccfg.dhr)
-        else:
-            att_gcd = self.ccfg.h
-        return gcd(exp_gcd, att_gcd)
+        OP is the runtime's ``dp_shard_size``, and all the runtime asks of it
+        is that the data-parallel group divide into a replicate axis and a
+        shard axis (``distributed/mesh.py``, ``MeshContext.build_meshs``), so
+        every divisor of DP is reachable.
+
+        Under Muon this used to narrow to a greatest common divisor over the
+        expert count and the attention widths.  Nothing in the runtime asks
+        for that: Newton-Schulz runs on a matrix's last two dimensions and the
+        optimizer all-gathers them whenever the shard falls there, running
+        locally when it does not (``core/optimizer/muon.py``,
+        ``_classify_parameters_for_step``; ``core/optimizer/
+        sharding_category.py``, ``is_last2d_sharded``), and a width that does
+        not divide a parameter is only logged, never refused.  The cap came in
+        with the original search import and cost the strategies engineers run:
+        at 64 devices with EP 16 it allowed no shard wider than 4, and at 16
+        devices with EP 16 none at all.  What Muon does change, one momentum
+        per matrix in place of two moments, the parser carries as
+        ``optimizer_states``.
+        """
+        del tp, ep  # the shard is bounded by the data-parallel group alone
+        return dp
