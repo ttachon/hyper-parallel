@@ -402,3 +402,27 @@ optimizer ND caps OP at `dp / ep`, a bound taken from MindSpeed's Muon, so it
 never generates OP 16 at EP 8 or above although the trainer runs it.
 `--framework` defaults to `hyper_v2`, the parser that reads this schema;
 run_nd's own default reads a different one.
+
+### ND's estimate of runs measured elsewhere
+
+`nd_rows.py` prices runs that did not come out of a sweep, one row each, from
+the first seven columns of a measurement sheet: `seq TP CP EP dp_shard
+edp_shard recompute`, the recompute `no`, `off`, `selective` or `full`,
+separated by tabs or spaces, a header line allowed. For every run it prints
+ND's peak memory in GiB, to read against the trainer's `max_allocated`, ND's
+step in seconds and its raw score, and writes the table to `<out>/nd_rows.tsv`:
+
+```bash
+python examples/training_demo/nd_rows.py --rows rows.tsv --out nd_rows_out
+```
+
+Each run's ND input is the config as the `rank` stage writes it, with the run's
+own degrees, expert shard and recompute mode, priced with `run_nd -mppb`, which
+takes the recompute the yaml states; without it ND prices every strategy fully
+recomputed, as the sweep's own stages do. The step is ND's parts times the
+ratios `compare` fitted on the 2026-09-30 round, at 8192 tokens with full
+recompute, and `--ratios` takes another round's `nd_ratios.json`. Ratios fitted
+at 8192 tokens do not hold at short sequences, where a step is mostly launch
+overhead and idle. `--gbs`, `--mbs` and `--layers` default to the sweep's 64, 1
+and 8, and `--config` to this demo's yaml. A run is cached in `--out` until its
+ND input changes, so adding rows prices only the new ones.
