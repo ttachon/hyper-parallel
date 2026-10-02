@@ -259,6 +259,8 @@ class _CostModelParser(ABC):
         # because a group of one still leaves it at zero under CP.
         ccfg.edp_group = _CostModelParser.expert_dp_group(ccfg)
         ccfg.d_exp = max(1, ccfg.d_exp)
+        # A MoE layer dispatches its tokens once and takes them back once.
+        ccfg.n_dispatch = 1 if ccfg.n_exp > 1 else 0
 
         exp_group1_invalid = ccfg.edp_group < 1 or ccfg.t_exp < 1
         exp_group2_invalid = ccfg.hff_exp < 1 or ccfg.n_exp < 1

@@ -789,6 +789,13 @@ class CostModelParserHyperV2(_CostModelParser):
             if rule not in (None, "group"):
                 raise ValueError(f"context.expert_shard takes 'group' or nothing, not {rule!r}")
             self.ccfg.expert_shard_group = rule == "group"
+            # What a MoE layer's token dispatch costs on this cluster.  A run
+            # that measured its own states the number; unstated, the estimate
+            # keeps the one measured on A3 (``estimate.MOE_DISPATCH``).
+            stated = self._get_cfg_attr(ctx, "moe_dispatch", None)
+            if stated is not None and float(stated) < 0:
+                raise ValueError(f"context.moe_dispatch takes a cost, not {stated!r}")
+            self.ccfg.moe_dispatch = float(stated) if stated is not None else 0
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
         """Populate optimizer and gradient sharding settings.

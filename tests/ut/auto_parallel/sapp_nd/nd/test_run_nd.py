@@ -774,9 +774,10 @@ class TestSappNDRunND(unittest.TestCase):
         fake_ccfg.optimizer = "muon"
         fake_ccfg.dc_kv = 2
         fake_ccfg.dhr = 2
+        experts = fake_ccfg.n_exp
         fake_ccfg.n_exp = 6
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
-        fake_ccfg.n_exp = 1
+        fake_ccfg.n_exp = experts
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             global_config.write(tmp_dir, parallel_config)
