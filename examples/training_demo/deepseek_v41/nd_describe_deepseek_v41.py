@@ -198,6 +198,25 @@ def unpriced(model_dir: str) -> List[Tuple[str, str]]:
     return [(name, what) for name, what in blocks if "None" not in what]
 
 
+def _stated_mtp(spec_yaml: str) -> List[str]:
+    """Return the multi-token-prediction fields *spec_yaml* states, if any.
+
+    No spelling of the field reaches the cost model through
+    ``config_overrides``, so one stated there is silently not priced.
+
+    Args:
+        spec_yaml: A train.yaml whose model states ``config_overrides``.
+
+    Returns:
+        The names it states, in the order they are read.
+    """
+    with open(spec_yaml, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    overrides = ((raw.get("model") or {}).get("config_overrides") or {})
+    return [name for name in ("mtp_depth", "num_nextn_predict_layers", "mtp_num_hidden_layers")
+            if overrides.get(name)]
+
+
 def _part_of(name: str) -> str:
     """Return the part a parameter named *name* belongs to."""
     for key, part in _PARTS:
@@ -275,25 +294,36 @@ def layer_kinds(layers: Mapping[int, Mapping[str, int]]) -> List[Tuple[Tuple[int
                   key=lambda pair: pair[0][0])
 
 
-def nd_layer_parameters(spec_yaml: str) -> Dict[str, float]:
-    """Return ND's parameters per part for one body layer of the spec at *spec_yaml*.
+def nd_layer_parameters(spec_yaml: str) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Return what ND makes of the spec at *spec_yaml*: one body layer's parts, and the stack around it.
 
     Args:
         spec_yaml: A train.yaml whose model states ``config_overrides``.
 
     Returns:
-        ND's count for each part it prices.
+        ND's parameters per part of one body layer, and the stack: ``layers``,
+        ``mtp_layers``, ``embedding`` and ``output``.  The stack is what catches
+        a description that states layers the run does not build.
     """
     # verify first: importing the cost model's own modules in another order
     # leaves _cost_model_variables partly initialized (a circular import).
     from hyper_parallel.auto_parallel.sapp_nd.nd.verify import nd_parameters
+    from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
+    from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
     from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import prepare_context
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 
     ccfg = copy.deepcopy(CostModelConfig(spec_yaml, framework="hyper_v2"))
     check_and_apply_custom_hook(ccfg)
-    return nd_parameters(ccfg, prepare_context())
+    ctx = prepare_context()
+    stack = {
+        "layers": float(getattr(ccfg, "n_lay", 0) or 0),
+        "mtp_layers": float(getattr(ccfg, "n_mtp", 0) or 0),
+        "embedding": 0.0 if EvalHead.shares_output_table(ccfg) else float(EvalHead.num_params_embed(ccfg, ctx)),
+        "output": float(EvalTail.num_params_output(ccfg, ctx)),
+    }
+    return nd_parameters(ccfg, ctx), stack
 
 
 def _print_spec(args: argparse.Namespace) -> None:
@@ -361,7 +391,7 @@ def _print_verify(args: argparse.Namespace) -> None:
     if not args.spec_yaml:
         raise SystemExit("verify needs --spec-yaml, a train.yaml whose model states config_overrides")
     held = inventory(build_crop(args.model_dir, args.assets, args.divisor, args.experts))
-    nd = nd_layer_parameters(args.spec_yaml)
+    nd, stack = nd_layer_parameters(args.spec_yaml)
     kinds = layer_kinds(held["layers"])
     plain = max(kinds, key=lambda pair: len(pair[0]))[1]
     print(f"ND's spec: {args.spec_yaml}")
@@ -379,7 +409,30 @@ def _print_verify(args: argparse.Namespace) -> None:
           f"({100 * (sum(nd.values()) / priced - 1):+.1f}%)")
     print(f"  parts with no ND field:        {missing:,.0f} "
           f"({100 * missing / (priced + missing):.1f}% of the layer)")
-    print(f"\nwhole crop: {held['total']:,} parameters")
+
+    # The stack, where a description that states layers the run never builds
+    # shows itself: a per-layer table cannot see an extra layer count.
+    body = len(held["layers"])
+    print(f"\n  {'the stack':26s} {'ND':>14s} {'the crop':>14s}")
+    print(f"  {'body layers':26s} {stack['layers']:>14,.0f} {body:>14,}"
+          f"{'   <- MISMATCH' if int(stack['layers']) != body else ''}")
+    print(f"  {'extra MTP layers':26s} {stack['mtp_layers']:>14,.0f} {0:>14,}"
+          f"{'   <- MISMATCH: the crop builds none' if stack['mtp_layers'] else ''}")
+    # A config_overrides spec cannot state MTP at all: no spelling of the field
+    # reaches n_mtp on this path. Say so, rather than let a stated field look
+    # priced because the row above happens to read 0.
+    named = _stated_mtp(args.spec_yaml)
+    if named and not stack["mtp_layers"]:
+        print(f"      your spec states {', '.join(named)}, and ND read none of it:"
+              f" MTP cannot be stated through config_overrides")
+    for part in ("embedding", "output"):
+        real = float(held["outside"].get(part, 0))
+        gap = f"{100 * (stack[part] / real - 1):+13.1f}%" if real else ""
+        print(f"  {part:26s} {stack[part]:>14,.0f} {real:>14,.0f}{gap}")
+
+    whole = sum(nd.values()) * (stack["layers"] + stack["mtp_layers"]) + stack["embedding"] + stack["output"]
+    print(f"\n  {'whole model':26s} {whole:>14,.0f} {held['total']:>14,}"
+          f"  {100 * (whole / held['total'] - 1):+.1f}%")
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
