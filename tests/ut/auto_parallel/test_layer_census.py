@@ -231,6 +231,29 @@ class TestLayerCensus(unittest.TestCase):
         with patch.object(sac, "SAC_IGNORED_OPS", ignored):
             self.assertEqual(census_layer(config, 1, 64, selective=True)[0], kept)
 
+    def test_the_census_takes_the_delta_rule_a_run_takes(self):
+        """
+        Feature: census_layer's gated delta rule.
+        Description: A linear-attention layer censused as the runtime's
+            dispatcher runs it, which defaults to Transformers' chunked
+            implementation, and censused with HyperParallel's kernel, whose
+            contract saves the rule's inputs, its cumulated gates, beta and
+            one chunk matrix and nothing more.
+        Expectation: The default is the eager rule, the kernel's contract
+            keeps strictly less, and a backend the runtime does not have is
+            refused.  A full-attention layer, which runs no delta rule, is
+            the same either way.
+        """
+        config = _qwen35_text()
+        eager, _ = census_layer(config, 0, 64)
+        kernel, _ = census_layer(config, 0, 64, gdn_backend="triton")
+        self.assertEqual(census_layer(config, 0, 64, gdn_backend="eager")[0], eager)
+        self.assertLess(kernel, eager)
+        self.assertEqual(census_layer(config, 1, 64, gdn_backend="triton")[0],
+                         census_layer(config, 1, 64)[0])
+        with self.assertRaises(ValueError):
+            census_layer(config, 0, 64, gdn_backend="fla")
+
     def test_each_kind_gets_its_record(self):
         """
         Feature: census_activations.
