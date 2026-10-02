@@ -38,6 +38,7 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_recomputed,
     census_saved_ops,
     replacement_specs,
+    _matmul_flops,
     _measure,
     _RecomputedMatmuls,
     _selective_contexts,
@@ -233,6 +234,46 @@ class TestLayerCensus(unittest.TestCase):
         ignored = set(sac.SAC_IGNORED_OPS) | {torch.ops.aten.empty.memory_format, torch.ops.aten.empty_like.default}
         with patch.object(sac, "SAC_IGNORED_OPS", ignored):
             self.assertEqual(census_layer(config, 1, 64, selective=True)[0], kept)
+
+    def test_a_census_runs_on_transformers_grouped_mm_fallback(self):
+        """
+        Feature: census_layer where torch has no CPU grouped_mm kernel.
+        Description: Each kind's MoE layer censused through Transformers'
+            grouped_mm fallback, which it takes on CPU with torch 2.8 or
+            older, the 910C's 2.7.1 among them; its backward reads the group
+            offsets off a fake tensor, which holds no data.
+        Expectation: The census runs, and the layer keeps what it keeps on
+            torch's own grouped_mm, but for the offsets, which the fallback
+            holds on its context, out of reach of autograd's saved-tensor hooks.
+        """
+        config = _qwen35_text()
+        for index in (0, 1):
+            native = census_layer(config, index, 64)
+            with patch("transformers.integrations.moe._can_use_grouped_mm", return_value=False):
+                fallback = census_layer(config, index, 64)
+            self.assertLessEqual(abs(native[0] - fallback[0]), 8 * config.num_experts)
+
+    def test_the_flop_count_needs_no_grouped_mm(self):
+        """
+        Feature: _matmul_flops on a torch without aten._grouped_mm.
+        Description: A matmul and an addition counted where aten has no
+            _grouped_mm, which first shipped in torch 2.8.
+        Expectation: The matmul's FLOPs are counted and the addition's are 0.
+        """
+        aten = torch.ops.aten
+
+        class _AtenWithoutGroupedMM:
+            """aten as torch 2.7 has it."""
+
+            def __getattr__(self, name):
+                if name == "_grouped_mm":
+                    raise AttributeError(name)
+                return getattr(aten, name)
+
+        left, right = torch.ones(4, 8), torch.ones(8, 2)
+        with patch.object(torch.ops, "aten", _AtenWithoutGroupedMM()):
+            self.assertEqual(_matmul_flops(aten.mm.default, (left, right)), 2 * 4 * 8 * 2)
+            self.assertEqual(_matmul_flops(aten.add.Tensor, (left, left)), 0)
 
     def test_each_kind_gets_its_record(self):
         """
