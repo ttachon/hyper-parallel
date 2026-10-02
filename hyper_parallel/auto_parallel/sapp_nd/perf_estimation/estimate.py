@@ -46,6 +46,34 @@ BACKWARD_RATIO = 2
 # The chunk the gated delta rule's kernel and Transformers' own
 # implementation run a sequence in.
 GDN_CHUNK = 64
+# What a MoE layer's dispatch costs a rank, per token, per hidden unit, per
+# expert a token routes to and per rank holding experts.  The work is the
+# sorting, permuting, zeroing and accumulating around the all-to-all, which
+# no matmul count sees, and it is the one cost that measurably grows with the
+# expert-parallel degree.  Over 15 profiled points of Qwen3.5-35B-A3B at 8192
+# tokens on 64 dies, device compute averages 5.85, 6.19, 6.59, 7.58 and 9.43 s
+# at EP 1, 2, 4, 8 and 16, a span of 61%, where this model without the term
+# spans 8%.  The increments over EP 1 are 222, 217, 230 and 230 ms a unit of
+# EP, so they follow EP itself rather than EP - 1: a layer sorts and permutes
+# its tokens by expert even where it holds every one of them, and the work
+# grows with the ranks it spreads them over.  With the term the estimate runs
+# 3.8 to 9.5% above the measured compute at every one of those degrees, where
+# it was 31% below at EP 16, and the rank correlation over the 15 points rises
+# from +0.51 to +0.64.  It does not change which strategy the search picks:
+# what holds that at EP 1 is the gather priced at 370 ms where 204 was
+# measured, an overlap threshold rather than a compute term.
+#
+# EMPIRICAL, and fitted at one shape.  It follows the tokens a rank routes, so
+# on the 128-token sweeps it adds 3.2 ms a unit of EP, where the measured
+# compute is flat from EP 4 to EP 64, 196 to 210 ms, and this would add 205 ms
+# by EP 64: at a shape whose step is launch bound, 53 to 67% of it idle,
+# neither this term nor the compute model under it holds.  Which kernels grow
+# with EP is not measured yet; a kernel table per EP at the training shape
+# would name them, and until one exists read this as a calibration carrying
+# the measured shape, not as a model of the dispatch.  A cluster that has
+# measured its own says so with ``context.moe_dispatch``, as it states the
+# ratios of the parts in a file.
+MOE_DISPATCH = 1040
 
 
 def op_table(cfg, attn=None):
@@ -129,7 +157,10 @@ def _flavour_tables(cfg, attn=None):
     the shared experts, as wide as a routed one, and, spread over the
     layer's feed-forward matmuls, the router and the shared experts' gate;
     its activation function's entry the same experts, which run it at
-    their width, where a dense layer's runs it at the dense width.
+    their width, where a dense layer's runs it at the dense width.  A MoE
+    layer also dispatches its tokens, which the table prices apart
+    (:data:`MOE_DISPATCH`); a dense layer does not, so only the expert
+    table carries that entry.
     """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
@@ -141,6 +172,11 @@ def _flavour_tables(cfg, attn=None):
     exp["n_ffMM"] *= width / cfg.hff
     exp["n_ffBMM"] *= width / cfg.hff
     exp["n_ffAct"] *= experts / cfg.hff
+    dispatch = getattr(cfg, "moe_dispatch", 0) or MOE_DISPATCH
+    exp["n_dispatch"] = (
+        dispatch * cfg.b * cfg.s * cfg.h * max(1, cfg.n_chosen_exp)
+        * max(1, getattr(cfg, "ep", 1) or 1) * cfg.bytes_p / cfg.t / cfg.cp
+    )
     return base, exp
 
 

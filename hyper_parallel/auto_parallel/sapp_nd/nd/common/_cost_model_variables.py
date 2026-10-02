@@ -132,6 +132,13 @@ class _CostModVar:
     # MoE
     t_exp: float = 0
     d_exp: float = 0
+    # One per MoE layer: the op count of the dispatch the layer runs to put
+    # each token on the rank holding the expert it routed to, and to take the
+    # result back (``_flavour_tables``).
+    n_dispatch: float = 0
+    # What that dispatch costs on this cluster, as ``context.moe_dispatch``
+    # states it; 0 leaves the measured default (``estimate.MOE_DISPATCH``).
+    moe_dispatch: float = 0
     # The ranks that hold the same experts, as the runtime's expert mesh spans
     # them; see ``_CostModelParser.expert_dp_group``.  ``d_exp`` is the older
     # per-CP, per-expert-TP-rank form of it and cannot carry CP.

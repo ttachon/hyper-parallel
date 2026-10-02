@@ -29,6 +29,7 @@ import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pyl
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
+    MOE_DISPATCH,
     _flavour_tables,
     estimate_performance,
     op_table,
@@ -143,6 +144,27 @@ class TestOpTable(unittest.TestCase):
         base, experts = _flavour_tables(cfg)
         self.assertEqual(experts["n_ffMM"], base["n_ffMM"] / 1024 * (3 * 64 + (8 + 1) / 3))
         self.assertEqual((experts["n_ffAct"], base["n_ffAct"]), (21 * 128 * 3 * 64 * 2 / 2, 21 * 128 * 1024 * 2 / 2))
+
+    def test_a_moe_layer_pays_for_its_dispatch(self):
+        """
+        Feature: _flavour_tables, the dispatch entry.
+        Description: The same layer of width 512 with 8 experts, 2 of them
+            chosen a token, at expert parallel 1 and at 4.
+        Expectation: Only the expert table prices a dispatch, a dense layer
+            running none; it prices each token's two experts over the ranks
+            the experts sit on, so it grows with the degree itself rather
+            than with the degree less one, as the measured compute does.
+        """
+        plain = SimpleNamespace(**{**vars(_cfg(128)), "hff_exp": 64, "n_exp": 8, "n_chosen_exp": 2,
+                                   "cap_fact": 1, "n_shared_exp": 1, "n_ffMM": 3, "ep": 1})
+        spread = SimpleNamespace(**{**vars(plain), "ep": 4})
+        base, one = _flavour_tables(plain)
+        _, four = _flavour_tables(spread)
+        self.assertNotIn("n_dispatch", base)
+        self.assertEqual(one["n_dispatch"], MOE_DISPATCH * 128 * 512 * 2 * 1 * 2 / 2)
+        self.assertEqual(four["n_dispatch"], 4 * one["n_dispatch"])
+        stated = SimpleNamespace(**{**vars(plain), "moe_dispatch": 2 * MOE_DISPATCH})
+        self.assertEqual(_flavour_tables(stated)[1]["n_dispatch"], 2 * one["n_dispatch"])
 
     def test_the_delta_rule_runs_in_chunks(self):
         """
