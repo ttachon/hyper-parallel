@@ -83,7 +83,7 @@ class EvalLayerComm:
         non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
         return (
             (non_exp, ccfg.t, ccfg.shard_p_os_non_exp_partial, ccfg.d * ccfg.cp * ccfg.t),
-            (routed / ccfg.ep, ccfg.t_exp, ccfg.shard_p_os_exp, ccfg.d_exp * ccfg.cp * ccfg.t_exp),
+            (routed / ccfg.ep, ccfg.t_exp, ccfg.shard_p_os_exp, max(1, int(ccfg.edp_group))),
             (shared, ccfg.t_exp, ccfg.shard_p_os_exp_partial, ccfg.d * ccfg.cp * ccfg.t_exp),
         )
 

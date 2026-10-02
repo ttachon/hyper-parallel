@@ -132,6 +132,10 @@ class _CostModVar:
     # MoE
     t_exp: float = 0
     d_exp: float = 0
+    # The ranks that hold the same experts, as the runtime's expert mesh spans
+    # them; see ``_CostModelParser.expert_dp_group``.  ``d_exp`` is the older
+    # per-CP, per-expert-TP-rank form of it and cannot carry CP.
+    edp_group: float = 0
     hff_exp: float = 0
     n_exp: float = 0
     n_chosen_exp: float = 0

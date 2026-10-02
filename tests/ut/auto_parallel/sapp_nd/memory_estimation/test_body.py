@@ -782,8 +782,14 @@ class TestConfigOptimizerShard(unittest.TestCase):
     def _make_parser_ccfg(
         n_exp=8, d_exp=4, cp=1, t_exp=1, ep=2,
         has_op=True, has_grad_shard=True, os_max_shard=1, d=4, t=1,
+        edp_group=None,
     ):
-        """Create a mock _CostModVar for parser-level shard tests."""
+        """Create a mock _CostModVar for parser-level shard tests.
+
+        A strategy's config carries the expert data-parallel group the runtime
+        forms.  Left out here, it is the older reconstruction from ``d_exp``,
+        which agrees with the group wherever EP divides DP.
+        """
         from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
         ccfg = MagicMock(spec=_CostModVar)
         ccfg.d = d
@@ -793,6 +799,7 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ccfg.cp = cp
         ccfg.t_exp = t_exp
         ccfg.ep = ep
+        ccfg.edp_group = d_exp * cp * t_exp if edp_group is None else edp_group
         ccfg.has_op = has_op
         ccfg.has_grad_shard = has_grad_shard
         ccfg.os_max_shard = os_max_shard
@@ -905,6 +912,55 @@ class TestConfigOptimizerShard(unittest.TestCase):
                 ccfg = self._make_parser_ccfg(n_exp=1, os_max_shard=ranks, has_op=has_op, d=8, t=4)
                 _CostModelParser.config_optimizer_shard(None, ccfg)
                 self.assertEqual(ccfg.shard_p_os_non_exp_partial, want)
+
+
+class TestExpertDataParallelGroup(unittest.TestCase):
+    """The ranks that hold the same experts, as the runtime's expert mesh spans them."""
+
+    @staticmethod
+    def _ccfg(d, t, cp, ep, etp=0, n_exp=8, hff_exp=1408):
+        """A config a strategy has just been laid over."""
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
+        ccfg = MagicMock(spec=_CostModVar)
+        ccfg.d, ccfg.t, ccfg.cp, ccfg.ep, ccfg.etp = d, t, cp, ep, etp
+        ccfg.n_exp, ccfg.hff_exp = n_exp, hff_exp
+        ccfg.t_exp, ccfg.d_exp, ccfg.edp_group = t, 0, 0
+        return ccfg
+
+    def test_context_parallelism_does_not_change_the_group(self):
+        """CP takes its ranks from DP, so the group a strategy keeps is the same.
+
+        On 64 ranks at EP 16, 4 ranks hold the same experts whatever CP takes,
+        since the runtime spreads its experts over the stage's whole dp * cp *
+        tp domain. The older reconstruction floors DP by EP first, so it reads
+        4, 2, 1 and then 0, and zero made a runnable strategy look invalid.
+        """
+        got, legacy = {}, {}
+        for cp in (1, 2, 4, 8):
+            ccfg = self._ccfg(d=64 // cp, t=1, cp=cp, ep=16)
+            _CostModelParser.config_dp_tp_exp(None, ccfg)
+            got[cp] = ccfg.edp_group
+            legacy[cp] = ccfg.d // ccfg.ep if ccfg.d >= ccfg.ep else ccfg.d * ccfg.t // ccfg.ep
+        self.assertEqual(got, {1: 4, 2: 4, 4: 4, 8: 4})
+        self.assertEqual(legacy, {1: 4, 2: 2, 4: 1, 8: 0})
+
+    def test_tensor_parallel_ranks_hold_experts_too(self):
+        """Without expert tensor parallelism, TP's ranks are part of the domain.
+
+        At DP 8 and TP 4 with EP 16, 2 ranks hold the same experts; stating an
+        expert tensor shard of 2 halves that group again.
+        """
+        plain = self._ccfg(d=8, t=4, cp=1, ep=16)
+        _CostModelParser.config_dp_tp_exp(None, plain)
+        sharded = self._ccfg(d=8, t=4, cp=1, ep=16, etp=2)
+        _CostModelParser.config_dp_tp_exp(None, sharded)
+        self.assertEqual((plain.edp_group, sharded.edp_group), (2, 1))
+
+    def test_a_stage_narrower_than_its_experts_is_refused(self):
+        """A strategy spreading experts over more ranks than the stage holds."""
+        ccfg = self._ccfg(d=2, t=1, cp=1, ep=16)
+        with self.assertRaises(TypeError):
+            _CostModelParser.config_dp_tp_exp(None, ccfg)
 
 
 if __name__ == "__main__":

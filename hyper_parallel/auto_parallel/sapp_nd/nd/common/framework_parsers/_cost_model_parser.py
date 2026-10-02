@@ -98,6 +98,29 @@ class _CostModelParser(ABC):
         return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
 
     @staticmethod
+    def expert_dp_group(ccfg):
+        """How many ranks hold the same experts.
+
+        The runtime spreads the experts over a whole pipeline stage: its expert
+        mesh is ``(edp_replicate, edp_shard, ep)`` over the ``dp * cp * tp``
+        ranks of the device mesh, so ``dp * cp * tp / ep`` ranks hold the same
+        experts, and an expert tensor shard divides that group again
+        (``hyper_parallel/distributed/mesh.py``,
+        ``MeshContext._build_expert_parallel_mesh``).
+
+        ``d_exp`` cannot stand in for this group.  It is floored by EP against
+        DP alone, so it loses the remainder when EP does not divide DP and
+        falls to zero once EP passes DP, which is what context parallelism
+        does: DP counts the stage's ranks apart from CP and TP, so a strategy
+        keeps its group while its DP shrinks with CP.  Returning zero made a
+        runnable strategy look invalid, and the consumers that rebuild the
+        group as ``d_exp * cp * t_exp`` cannot express a group narrower than
+        CP.
+        """
+        expert_tp = int(ccfg.etp) if ccfg.etp > 1 else 1
+        return int(ccfg.d * ccfg.t * ccfg.cp) // int(expert_tp * ccfg.ep)
+
+    @staticmethod
     def routed_expert_shard(ccfg, ranks):
         """How many ranks a routed expert's parameters and optimizer states are sharded over.
 
@@ -112,12 +135,20 @@ class _CostModelParser(ABC):
         whatever shard it states, since the group changes with the strategy.
         """
         stated = getattr(ccfg, "expert_shard", None)
+        # The group as the runtime forms it, once a strategy has been laid over
+        # the config; a dense model and the parser's own doubles state none, and
+        # keep the older reconstruction from d_exp, which agrees with it
+        # wherever EP divides DP.
+        whole = max(1, int(ccfg.d * ccfg.cp * ccfg.t // max(1, int(ccfg.ep))))
+        group = max(1, int(ccfg.edp_group)) if ccfg.edp_group else whole
         if getattr(ccfg, "expert_shard_group", False) and ccfg.ep > 1:
-            return max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep)
+            return group
         if not stated:
-            return (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
+            if not ccfg.has_op:
+                return ccfg.cp * ccfg.t_exp
+            return group if ccfg.edp_group else ccfg.d_exp * ccfg.cp * ccfg.t_exp
         if ccfg.ep > 1:
-            return math.gcd(int(stated), max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep))
+            return math.gcd(int(stated), group)
         return ranks * ccfg.cp * ccfg.t_exp
 
     def config_optimizer_shard(self, ccfg):
@@ -187,6 +218,12 @@ class _CostModelParser(ABC):
             if ((ccfg.d == 1) or not ccfg.has_op)
             else (2 if not ccfg.has_grad_shard else 3)
         )  # data parallel comm factor
+        # Left on d_exp on purpose: this factor asks whether a rank shares its
+        # expert shard with another, which is the group's replicas, not the
+        # whole group, and edp_group counts TP's ranks as well.  Under context
+        # parallelism d_exp reads 1 where the group holds several, so the
+        # factor is still wrong there; it needs the replica count, which is
+        # the group over shard_p_os_exp.
         ccfg.comm_d_exp = (
             0
             if ((ccfg.d_exp == 1) or not ccfg.has_op)
@@ -216,11 +253,19 @@ class _CostModelParser(ABC):
             if ccfg.t_exp * ccfg.ep > ccfg.d * ccfg.t:
                 ccfg.t_exp = 1
 
-        exp_group1_invalid = ccfg.d_exp < 1 or ccfg.t_exp < 1
+        # The group the runtime forms, which is what every consumer wants; a
+        # strategy is impossible only when the stage holds fewer ranks than it
+        # spreads experts over.  d_exp stays the older form, and is clamped
+        # because a group of one still leaves it at zero under CP.
+        ccfg.edp_group = _CostModelParser.expert_dp_group(ccfg)
+        ccfg.d_exp = max(1, ccfg.d_exp)
+
+        exp_group1_invalid = ccfg.edp_group < 1 or ccfg.t_exp < 1
         exp_group2_invalid = ccfg.hff_exp < 1 or ccfg.n_exp < 1
         if exp_group1_invalid or exp_group2_invalid:
             raise TypeError(
-                f"MoE parsing error: d_exp({ccfg.d_exp})/t_exp({ccfg.t_exp})/"
+                f"MoE parsing error: edp_group({ccfg.edp_group})/"
+                f"t_exp({ccfg.t_exp})/"
                 f"hff_exp({ccfg.hff_exp})/n_exp({ccfg.n_exp})/"
-                f"DP = {ccfg.d}, TP = {ccfg.t}, EP = {ccfg.ep}/"
+                f"DP = {ccfg.d}, TP = {ccfg.t}, EP = {ccfg.ep}, CP = {ccfg.cp}/"
             )
