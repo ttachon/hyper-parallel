@@ -308,9 +308,36 @@ def _print_spec(args: argparse.Namespace) -> None:
     print("#   because the validation crop builds neither an MTP nor a DSpark layer.")
 
 
+def layer_tensors(model: Any, layer: int) -> List[Tuple[str, Tuple[int, ...], int, str]]:
+    """Return one layer's parameter tensors: name, shape, count and the part each belongs to.
+
+    Args:
+        model: The crop, as :func:`build_crop` builds it.
+        layer: The body layer to list, by its index in the released stack.
+
+    Returns:
+        ``(name within the layer, shape, parameters, part)`` in model order.
+    """
+    prefix = f"model.layers.{layer}."
+    return [(name[len(prefix):], tuple(param.shape), param.numel(), _part_of(name))
+            for name, param in model.named_parameters() if name.startswith(prefix)]
+
+
 def _print_inventory(args: argparse.Namespace) -> None:
     """Print the crop's measured parameter inventory."""
-    held = inventory(build_crop(args.model_dir, args.assets, args.divisor, args.experts))
+    model = build_crop(args.model_dir, args.assets, args.divisor, args.experts)
+    if args.tensors is not None:
+        rows = layer_tensors(model, args.tensors)
+        if not rows:
+            raise SystemExit(f"the crop has no body layer {args.tensors}")
+        print(f"layer {args.tensors}, tensor by tensor:\n")
+        print(f"  {'tensor':44s} {'shape':24s} {'parameters':>12s}  part")
+        for name, shape, count, part in rows:
+            flag = part if part in _ND_PARTS else f"{part} (no ND field)"
+            print(f"  {name:44s} {str(shape):24s} {count:>12,}  {flag}")
+        print(f"\n  {'whole layer':44s} {'':24s} {sum(row[2] for row in rows):>12,}")
+        return
+    held = inventory(model)
     print(f"total parameters: {held['total']:,}\n")
     print("body, by part:")
     for part, count in sorted(held["parts"].items(), key=lambda pair: -pair[1]):
@@ -364,6 +391,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--divisor", type=int, default=8, help="the crop's text_parameter_divisor")
     parser.add_argument("--experts", type=int, default=16, help="the crop's num_routed_experts")
     parser.add_argument("--spec-yaml", help="a train.yaml stating config_overrides, for verify")
+    parser.add_argument("--tensors", type=int, metavar="LAYER",
+                        help="with inventory, list this body layer's tensors with their shapes "
+                             "instead of the whole model's parts")
     args = parser.parse_args(argv)
     if args.command in ("inventory", "verify") and not args.assets:
         parser.error(f"{args.command} needs --assets, the prepared Engram assets file")
