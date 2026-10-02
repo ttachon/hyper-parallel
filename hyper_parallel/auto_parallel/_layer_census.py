@@ -126,6 +126,14 @@ _TP_FIELDS = (
 # The softmax statistics flash attention keeps per head and token.
 _FLASH_STATS = 8
 
+# The gated delta rules a run can take, named as the runtime names them
+# (``components/modules/gated_delta_net.py``): Transformers' own chunked
+# implementation, and HyperParallel's kernel, whose saved set the census holds
+# as a contract.  The runtime defaults to eager and so does the census.
+_EAGER_GDN = "eager"
+_HYPER_GDN = "triton"
+_GDN_BACKENDS = (_EAGER_GDN, _HYPER_GDN)
+
 # The census's attention kernels, which HyperParallel's selective policy
 # saves as it saves the runtime's: its own flash attention, and the contract
 # of the kernel its fused attention calls.
@@ -302,7 +310,8 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         shared: Tensors the model shares between its layers, which a
             checkpointed forward's count leaves out.
         ops: Where given, tells each storage the forward saves apart by
-            the op saving it, counting its bytes into ``ops.saved``.
+            the op that first saves it, counting its bytes into
+            ``ops.saved``, which then sums to the bytes returned.
 
     Returns:
         The bytes the forward saves, its inputs included, and the bytes of
@@ -318,7 +327,14 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         then.
     """
     stored = {p.untyped_storage()._cdata for p in params}  # pylint: disable=protected-access
-    saved: Dict[int, int] = {}
+    # Counted by the storage in the lifetime it has now, as the tracker counts
+    # them: a fake tensor's storage is cheap and short lived, so one the
+    # forward has freed can hand its address to a later save, and counting by
+    # address alone lost whichever of the two it saw first.  Which pair
+    # collided depended on what had run before, so a layer did not measure the
+    # same twice.
+    saved: Dict[Tuple[int, int], int] = {}
+    saved_op: Dict[Tuple[int, int], str] = {}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
         """Count a tensor autograd saves, unless it is a parameter's, toward the op that first saves it."""
@@ -326,9 +342,10 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         op = ops.op(tensor) if ops is not None else None
         address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
         if address not in stored:
-            if op is not None and address not in saved:
-                ops.saved[op] = ops.saved.get(op, 0) + tensor.untyped_storage().nbytes()
-            saved[address] = tensor.untyped_storage().nbytes()
+            key = live.key(tensor)
+            if op is not None:
+                saved_op.setdefault(key, op)
+            saved[key] = tensor.untyped_storage().nbytes()
         return tensor
 
     live = _LiveBytes()
@@ -350,6 +367,13 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
     finally:
         for handle in handles:
             handle.remove()
+    # A storage's bytes count toward the op that first saved it, read from the
+    # same record as the total, so the two agree whatever a fake tensor does
+    # with a storage address it has freed.
+    for address, size in saved.items():
+        op = saved_op.get(address)
+        if op is not None:
+            ops.saved[op] = ops.saved.get(op, 0) + size
     grads += [live.key(p.grad) for p in params if p.grad is not None]
     return kept if checkpointed else sum(saved.values()), live.peak(start, left_out, grads)
 
@@ -673,15 +697,33 @@ def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
 
 
 @contextlib.contextmanager
-def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
+def _fake_layer(config: Any, layer_index: int, gdn_backend: str = _EAGER_GDN,
                 replacements: Sequence[Any] = ()) -> Iterator[Tuple[Any, Any]]:
     """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels.
 
-    The gated delta rule runs HyperParallel's kernel's contract, or, where
-    *contracts* is false, Transformers' own chunked implementation.  Where
-    *replacements* are given, the modules they name are HyperParallel's fused
-    ones, running under the kernels' contracts for as long as the layer does.
+    *gdn_backend* names the gated delta rule the layer runs, as the runtime
+    names it: ``"eager"`` for Transformers' own chunked implementation,
+    ``"triton"`` for HyperParallel's kernel's contract, which saves the rule's
+    inputs, the cumulated gates, beta and one chunk matrix and nothing more.
+    Eager is the default because it is the rule a run reaches: the runtime's
+    dispatcher defaults to it (``components/modules/gated_delta_net.py``,
+    ``chunk_gated_delta_rule``), the only caller that can select the kernel is
+    the context-parallel wrapper, which defaults to eager as well, and no
+    recipe states a backend.  The two are not interchangeable: a layer keeping
+    the kernel's saved set keeps less than half as much.
+
+    Where *replacements* are given, the modules they name are HyperParallel's
+    fused ones, running under the kernels' contracts for as long as the layer
+    does.
+
+    Raises:
+        ValueError: If *gdn_backend* names no backend the runtime has.
     """
+    if gdn_backend not in _GDN_BACKENDS:
+        raise ValueError(
+            f"unsupported GDN backend {gdn_backend!r}; "
+            f"expected one of {sorted(_GDN_BACKENDS)}."
+        )
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
     config = copy.deepcopy(config)
@@ -699,8 +741,9 @@ def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
             torch.set_default_dtype(default)
         for module in layer.modules():
             if hasattr(module, "chunk_gated_delta_rule"):
-                module.chunk_gated_delta_rule = (_gated_delta_rule(modeling) if contracts
-                                                 else modeling.torch_chunk_gated_delta_rule)
+                module.chunk_gated_delta_rule = (
+                    _gated_delta_rule(modeling) if gdn_backend == _HYPER_GDN
+                    else modeling.torch_chunk_gated_delta_rule)
         if replacements:
             holder = _Holder(layers=layer)
             _replaced(holder, replacements)
@@ -769,7 +812,7 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
         tokens (``scores``), a linear attention's recurrence (``linrec``),
         and the parts of the feed-forward :func:`_parameter_part` names.
     """
-    with _fake_layer(config, layer_index, contracts=False) as (layer, rotary):
+    with _fake_layer(config, layer_index) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         positions = _positions(rotary, hidden, seq_length)
         counter = _PartFlops(layer)
@@ -780,7 +823,8 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
 
 def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False,
                  ops: Optional[Dict[str, int]] = None,
-                 replacements: Sequence[Any] = ()) -> Tuple[int, int]:
+                 replacements: Sequence[Any] = (),
+                 gdn_backend: str = _EAGER_GDN) -> Tuple[int, int]:
     """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
 
     Args:
@@ -793,6 +837,7 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
             the bytes it saves by the op saving them (:class:`_SavedOps`).
         replacements: The module replacements a run installs
             (:func:`replacement_specs`).
+        gdn_backend: The gated delta rule the run takes (:func:`_fake_layer`).
 
     Returns:
         The bytes the forward keeps for the backward, its input included,
@@ -800,7 +845,8 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         most, its own gradients included, less the parameters and those
         gradients.
     """
-    with _fake_layer(config, layer_index, replacements=replacements) as (layer, rotary):
+    with _fake_layer(config, layer_index, gdn_backend=gdn_backend,
+                     replacements=replacements) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         if replacements:
@@ -993,7 +1039,8 @@ def census_output_activations(config: Any, seq_length: int = 4096,
 
 
 def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int = 4096,
-                       replacements: Sequence[Any] = ()) -> Dict[str, KindActivations]:
+                       replacements: Sequence[Any] = (),
+                       gdn_backend: str = _EAGER_GDN) -> Dict[str, KindActivations]:
     """What a layer of each kind of *layers* keeps and holds, per token, at TP 1 and TP 2.
 
     Args:
@@ -1003,6 +1050,7 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
         seq_length: The tokens the census runs a layer at.
         replacements: The module replacements a run installs
             (:func:`replacement_specs`).
+        gdn_backend: The gated delta rule the run takes (:func:`_fake_layer`).
 
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
@@ -1023,10 +1071,12 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
         ops_1: Dict[str, int] = {}
         ops_2: Dict[str, int] = {}
         (saved_1, working_1), (saved_2, working_2) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops, replacements=replacements)
+            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops,
+                         replacements=replacements, gdn_backend=gdn_backend)
             for tp, ops in ((1, ops_1), (2, ops_2)))
         (kept_1, _), (kept_2, _) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True, replacements=replacements)
+            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True,
+                         replacements=replacements, gdn_backend=gdn_backend)
             for tp in (1, 2))
         attention_mm, ffn_mm = census_recomputed(config, layer_index, seq_length)
         out[kind] = KindActivations(
