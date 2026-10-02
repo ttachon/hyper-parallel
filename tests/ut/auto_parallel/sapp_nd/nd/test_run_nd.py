@@ -768,10 +768,15 @@ class TestSappNDRunND(unittest.TestCase):
         finally:
             Dim.TP.reset_bound()
 
+        # Muon does not narrow the optimizer shard: with an expert count and
+        # MLA widths sharing only a factor of 2 with DP, the cap that came in
+        # with the original search import returned 2 of the 4 available ranks.
         fake_ccfg.optimizer = "muon"
         fake_ccfg.dc_kv = 2
         fake_ccfg.dhr = 2
+        fake_ccfg.n_exp = 6
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
+        fake_ccfg.n_exp = 1
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             global_config.write(tmp_dir, parallel_config)
