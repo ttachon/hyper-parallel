@@ -41,6 +41,7 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
+    normalize_activation_checkpoint_layers,
 )
 from hyper_parallel.distributed.attention_swap import (
     apply_attention_swap,
@@ -356,14 +357,18 @@ def _apply_activation_features(
     compile_for_execution: bool,
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
+    activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
+    # A per-layer plan given with recompute off would otherwise be dropped.
+    normalize_activation_checkpoint_layers(activation_checkpoint, activation_checkpoint_layers)
     if activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
+            layers=activation_checkpoint_layers,
         )
     validate_attention_swap(
         activation_swap,
@@ -410,6 +415,7 @@ def apply_model_infrastructure(
     activation_checkpoint: Optional[str] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
+    activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -466,6 +472,7 @@ def apply_model_infrastructure(
         compile_for_execution,
         mesh,
         swap_inputs=swap_inputs,
+        activation_checkpoint_layers=activation_checkpoint_layers,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.
