@@ -220,6 +220,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
             [
                 "AcceleratorConfig",
                 "ActivationCheckpointConfig",
+                "ActivationCheckpointLayerRange",
                 "CompileConfig",
                 "DataLoaderConfig",
                 "DatasetConfig",
