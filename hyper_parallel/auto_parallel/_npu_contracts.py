@@ -227,9 +227,12 @@ def _v41_sparse_saves(ctx: Any, inputs: Tuple[Any, ...], output: torch.Tensor) -
     and head, not the eight-wide pair the dense fused attention keeps,
     because that caller views them as (batch, tokens, heads).
     """
-    query, key_value, sparse_indices, _sinks, rope_head_dim, _scale = inputs
+    query, key_value, sparse_indices, sinks, rope_head_dim, _scale = inputs
     batch, heads, seq, head_dim = query.shape
     keys, selected = key_value.shape[2], sparse_indices.shape[-1]
+    # The gradients go back in the shapes the caller passed, which are not
+    # the token-major ones the kernel is given.
+    ctx.gradients = tuple((tuple(tensor.shape), tensor.dtype) for tensor in (query, key_value, sinks))
     # The caller pads the keys so every one of them is selected at most
     # once and the sink still has a row of its own.
     padded = max(keys + 1, selected + 2)
@@ -246,10 +249,13 @@ def _v41_sparse_saves(ctx: Any, inputs: Tuple[Any, ...], output: torch.Tensor) -
     )
 
 
-_V41_SPARSE.register_autograd(
-    lambda ctx, grad: (torch.empty_like(ctx.saved_tensors[0]), torch.empty_like(ctx.saved_tensors[1]),
-                       None, torch.empty_like(ctx.saved_tensors[8]), None, None),
-    setup_context=_v41_sparse_saves)
+def _v41_sparse_backward(ctx: Any, grad: torch.Tensor) -> Tuple[Any, ...]:
+    """A gradient for the queries, the keys and the sinks, in the shapes they came in."""
+    gradients = [torch.empty(shape, dtype=dtype, device=grad.device) for shape, dtype in ctx.gradients]
+    return gradients[0], gradients[1], None, gradients[2], None, None
+
+
+_V41_SPARSE.register_autograd(_v41_sparse_backward, setup_context=_v41_sparse_saves)
 
 
 def npu_sparse_attention_with_scalar_sink(query: torch.Tensor, key_value: torch.Tensor,

@@ -848,6 +848,23 @@ class TestV41SparseAttentionContract(unittest.TestCase):
         got = _saved_bytes(lambda: self._call(seq, heads, head_dim, selected, rope))
         self.assertEqual(got, want)
 
+    def test_its_backward_hands_each_input_a_gradient_of_its_own_shape(self):
+        """
+        Feature: a backward through the contract.
+        Expectation: The queries, the keys and the sinks each get a
+            gradient shaped as they were passed, which is not the
+            token-major layout the kernel is handed: the caller gives
+            (batch, heads, tokens, head dim) and the kernel takes
+            (tokens, heads, head dim). Returning the saved shapes instead
+            makes autograd refuse the whole backward.
+        """
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = self._call(seq=64)
+            out.sum().backward()
+        # The backward ran, which is the assertion: autograd checks every
+        # gradient against its input's shape and raises otherwise.
+        self.assertEqual(tuple(out.shape), (1, 64, 8, 64))
+
     def test_the_installer_binds_both_paths_and_restores_them(self):
         """
         Feature: v41_attention_contract, which the census installs around a
