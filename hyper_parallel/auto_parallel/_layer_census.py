@@ -91,6 +91,7 @@ from typing import (
     Iterator,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -111,6 +112,22 @@ logger = logging.getLogger(__name__)
 
 class CensusUnavailable(RuntimeError):
     """A census cannot run here: this host cannot build the modules the run installs."""
+
+
+class LayerTraffic(NamedTuple):
+    """What one forward of a layer moves, by part: its bytes, the parameters among them, and its ops.
+
+    Bytes of the whole layer on a micro-batch of one sequence, as
+    :func:`census_flops` counts its FLOPs, so that the two quantities can be
+    set beside each other part by part.  ``parameter`` is the share of
+    ``moved`` that is the layer's own weights, which a strategy shards where
+    it leaves the activations alone, and ``launches`` is how many ops the
+    forward dispatches, views excluded.
+    """
+
+    moved: Dict[str, float]
+    parameter: Dict[str, float]
+    launches: Dict[str, int]
 
 
 # The fields a census record states in pairs: what a layer keeps under
@@ -855,13 +872,21 @@ def _fake_layer(config: Any, layer_index: int, gdn_backend: str = _EAGER_GDN,
         yield layer, rotary
 
 
-class _PartFlops(TorchDispatchMode):
-    """A layer's forward FLOPs by part: its matmuls' toward the part running them, flash attention's the scores'."""
+class _ByPart(TorchDispatchMode):
+    """A walk over a layer's forward that attributes each op to the part of the layer running it."""
 
-    def __init__(self, layer: Any) -> None:
-        """Follow which of *layer*'s modules runs, and which tensors are its parameters."""
+    def __init__(self, layer: Any, recurrent: bool = True) -> None:
+        """Follow which of *layer*'s modules runs, and which tensors are its parameters.
+
+        *recurrent* is whether an attention of this layer has a recurrence to
+        name: where it has none, an op of the attention that no weight takes
+        part in is the attention's own, its mask or its rotary.  A walk that
+        counts only matmuls leaves it at the default, because a weightless
+        matmul under an attention is a recurrence or a score, and a score is
+        counted on its own.
+        """
         super().__init__()
-        self.flops: Dict[str, int] = {}
+        self.recurrent = recurrent
         self.params = {param.untyped_storage()._cdata  # pylint: disable=protected-access
                        for param in layer.parameters()}
         self.running: List[str] = []
@@ -879,12 +904,23 @@ class _PartFlops(TorchDispatchMode):
         self.running.pop()
 
     def _part(self, args: Sequence[Any]) -> str:
-        """The part a matmul on *args* runs for: its module's, or an attention's recurrence where no weight takes part."""
+        """The part an op on *args* runs for: its module's, or an attention's recurrence where no weight takes part."""
         part = _parameter_part(f"{self.running[-1]}.weight") if self.running else "ffn"
         weighted = any(isinstance(arg, torch.Tensor)
                        and arg.untyped_storage()._cdata in self.params  # pylint: disable=protected-access
                        for arg in args)
-        return "linrec" if part == "attention" and not weighted else part
+        if part == "attention" and not weighted and self.recurrent:
+            return "linrec"
+        return part
+
+
+class _PartFlops(_ByPart):
+    """A layer's forward FLOPs by part: its matmuls' toward the part running them, flash attention's the scores'."""
+
+    def __init__(self, layer: Any) -> None:
+        """Count no FLOPs yet, and follow *layer*'s modules."""
+        super().__init__(layer)
+        self.flops: Dict[str, int] = {}
 
     def _add(self, part: str, flops: int) -> None:
         """Count *flops* toward *part*."""
@@ -898,6 +934,52 @@ class _PartFlops(TorchDispatchMode):
             self._add("scores", 2 * batch * heads * seq * key.shape[2] * (width + value.shape[-1]))
         elif flops := _matmul_flops(func, args):
             self._add(self._part(args), flops)
+        return out
+
+
+class _PartTraffic(_ByPart):
+    """The bytes a layer's forward moves by part, the parameters among them, and the ops it dispatches.
+
+    An op reads the tensors it is given and writes the tensors it returns.
+    A view writes nothing and reads nothing: it renames bytes its producer
+    already wrote, and no kernel runs for it, so it counts for neither.  A
+    tensor given to an op twice is read twice, as the count is of the op's
+    arguments rather than of the storages behind them.
+
+    The parameters are counted again on their own, because a strategy
+    divides their traffic where it leaves the activations' alone: the degree
+    sharding a parameter divides the bytes read of it, and the routed
+    experts' part is the one the expert-parallel degree divides.
+    """
+
+    def __init__(self, layer: Any, recurrent: bool = True) -> None:
+        """Move nothing yet, and follow *layer*'s modules."""
+        super().__init__(layer, recurrent=recurrent)
+        self.moved: Dict[str, float] = {}
+        self.parameter: Dict[str, float] = {}
+        self.launches: Dict[str, int] = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        kwargs = kwargs or {}
+        out = func(*args, **kwargs)
+        if func.namespace == "prim" or getattr(func, "is_view", False):
+            return out
+        part = ("scores" if func is torch.ops.nd_census.flash_attention.default
+                else self._part(args))
+        moved = parameter = 0
+        for tensor in tree_flatten((args, kwargs))[0]:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            size = tensor.numel() * tensor.element_size()
+            moved += size
+            if tensor.untyped_storage()._cdata in self.params:  # pylint: disable=protected-access
+                parameter += size
+        for tensor in tree_flatten(out)[0]:
+            if isinstance(tensor, torch.Tensor):
+                moved += tensor.numel() * tensor.element_size()
+        self.moved[part] = self.moved.get(part, 0.0) + moved
+        self.parameter[part] = self.parameter.get(part, 0.0) + parameter
+        self.launches[part] = self.launches.get(part, 0) + 1
         return out
 
 
@@ -922,6 +1004,41 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
         with counter:
             _run(layer, hidden, positions)
     return counter.flops
+
+
+def census_traffic(config: Any, layer_index: int, seq_length: int,
+                   gdn_backend: str = _EAGER_GDN) -> LayerTraffic:
+    """What one forward of layer *layer_index* of *config* moves, by the part of the layer moving it.
+
+    The quantity the time model counts is matmul FLOPs, and the cluster's
+    kernel tables put those at 6.3 to 7.1% of a profiled step of this model.
+    This counts the other quantity a step could be priced by, on the same
+    forward and with no device, so that a measured round can set each
+    beside the time it took.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+        gdn_backend: The gated delta rule the run takes (:func:`_fake_layer`).
+            It is the largest single choice here: Transformers' own chunked
+            rule runs a matmul a chunk and the kernel's contract is one op.
+
+    Returns:
+        A :class:`LayerTraffic` of the whole layer at tensor and context
+        parallelism 1, by the parts :func:`census_flops` prices
+        (:class:`_PartTraffic`).
+    """
+    with _fake_layer(config, layer_index, gdn_backend=gdn_backend) as (layer, rotary):
+        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
+        positions = _positions(rotary, hidden, seq_length)
+        # The rule's own module is what a layer has a recurrence by, as
+        # _fake_layer finds it to settle which rule the layer runs.
+        recurrent = any(hasattr(module, "chunk_gated_delta_rule") for module in layer.modules())
+        counter = _PartTraffic(layer, recurrent=recurrent)
+        with counter:
+            _run(layer, hidden, positions)
+    return LayerTraffic(counter.moved, counter.parameter, counter.launches)
 
 
 def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False,

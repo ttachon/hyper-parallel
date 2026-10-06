@@ -42,6 +42,7 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_parameters,
     census_recomputed,
     census_saved_ops,
+    census_traffic,
     replacement_specs,
     tp_config,
 )
@@ -390,6 +391,45 @@ class TestLayerCensus(unittest.TestCase):
         linear = census_flops(config, 0, seq)
         self.assertGreater(linear["linrec"], 0)
         self.assertNotIn("scores", linear)
+
+    def test_a_layers_forward_traffic_by_part(self):
+        """
+        Feature: census_traffic.
+        Description: Each kind's layer of the model of width 64 on 32
+            tokens, under Transformers' own chunked gated delta rule and
+            under the kernel's contract.
+        Expectation: Each part reads its own parameters once in a forward,
+            so their bytes are its parameter count at two bytes apiece, and
+            a part never moves fewer bytes than its parameters hold.  A
+            linear-attention layer's recurrence moves the most bytes and
+            dispatches the most ops of it, and moves far more for each FLOP
+            it runs than the projections do, which is what a model priced by
+            FLOPs alone leaves out.  A full-attention layer has a scores
+            part, which the attention kernel runs in one op, and no
+            recurrence.  The kernel's contract collapses the recurrence,
+            where Transformers' rule runs matmuls a chunk at a time, and
+            moves nothing else of the layer differently.
+        """
+        config, seq = _qwen35_text(), 32
+        flops = census_flops(config, 0, seq)
+        linear, full = (census_traffic(config, index, seq) for index in (0, 1))
+        for index, traffic in ((0, linear), (1, full)):
+            parameters = census_parameters(config, index)
+            self.assertEqual(traffic.parameter,
+                             {part: 2.0 * parameters.get(part, 0) for part in traffic.parameter})
+            for part, moved in traffic.moved.items():
+                self.assertGreaterEqual(moved, traffic.parameter[part], part)
+        self.assertEqual(max(linear.moved, key=linear.moved.get), "linrec")
+        self.assertEqual(max(linear.launches, key=linear.launches.get), "linrec")
+        self.assertGreater(linear.moved["linrec"] / flops["linrec"],
+                           linear.moved["attention"] / flops["attention"])
+        self.assertEqual(full.launches["scores"], 1)
+        self.assertNotIn("linrec", full.moved)
+        kernel = census_traffic(config, 0, seq, gdn_backend="triton")
+        self.assertLess(kernel.launches["linrec"], linear.launches["linrec"])
+        self.assertLess(kernel.moved["linrec"], linear.moved["linrec"])
+        self.assertEqual({part: size for part, size in kernel.moved.items() if part != "linrec"},
+                         {part: size for part, size in linear.moved.items() if part != "linrec"})
 
     def test_mla_values_keep_their_width(self):
         """

@@ -30,11 +30,20 @@ of each matmul entry, which prices the backward as twice the forward.  The
 table's feed-forward entry covers the whole feed-forward, its experts,
 shared expert and router included.
 
-Last, it sets what each kind keeps for its backward for each op, per
+It then sets what each kind keeps for its backward for each op, per
 token of the whole layer, as the op records price it (shared decision S1,
 :class:`~hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block.EvalRecords`)
 beside what the census measures each op saving
 (:func:`~hyper_parallel.auto_parallel._layer_census.census_saved_ops`).
+
+Last, it sets the bytes each kind's forward moves
+(:func:`~hyper_parallel.auto_parallel._layer_census.census_traffic`) beside
+the FLOPs the op table prices of the same forward.  The time model counts
+the FLOPs and nothing else, and the cluster's kernel tables put those at
+6.3 to 7.1% of a profiled step of Qwen3.5-35B-A3B at 8192 tokens, so this
+section reports the other quantity a step could be priced by rather than a
+difference: the two are in different units, and what a round compares is
+each against the time it took.
 """
 from __future__ import annotations
 
@@ -50,6 +59,7 @@ from hyper_parallel.auto_parallel._layer_census import (
     census_flops,
     census_parameters,
     census_saved_ops,
+    census_traffic,
 )
 from hyper_parallel.auto_parallel._op_records import load_op_records
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
@@ -76,6 +86,18 @@ class VerifyRow(NamedTuple):
     part: str
     nd: float
     census: float
+    count: int = 1
+
+
+class TrafficRow(NamedTuple):
+    """One part of a forward: the bytes it moves, the parameters among them, its ops, and the FLOPs ND prices of it."""
+
+    where: str
+    part: str
+    moved: float
+    parameter: float
+    launches: int
+    flops: float
     count: int = 1
 
 
@@ -254,6 +276,62 @@ def verify_flops(yaml_path: str) -> List[VerifyRow]:
     rows.append(VerifyRow("layers", "total", sum(row.count * row.nd for row in rows),
                           sum(row.count * row.census for row in rows)))
     return rows
+
+
+def verify_traffic(yaml_path: str) -> List[TrafficRow]:
+    """The bytes each kind of the model a train.yaml trains moves in a forward, beside the FLOPs ND prices.
+
+    Args:
+        yaml_path: An AutoModels train.yaml, whose model names a Transformers
+            checkpoint.
+
+    Returns:
+        A row per part of the first layer of each kind of its language model
+        on one sequence of the run's length, the census's feed-forward parts
+        summed as the time model prices them, each kind's whole, then the
+        layers' whole.  A part's parameters are the share of its bytes that
+        a strategy shards: on a layer that routes, the feed-forward row's
+        are its experts'.
+
+    Raises:
+        ValueError: The train.yaml names no Transformers checkpoint.
+    """
+    _, text, ccfg = _priced(yaml_path)
+    rows = []
+    for name, (index, count, lccfg) in _kinds(ccfg).items():
+        flops, traffic = nd_flops(ccfg, lccfg), census_traffic(text, index, int(ccfg.s))
+        moved, parameter, launches = (dict(field) for field in traffic)
+        for part in _FFN_PARTS[1:]:
+            for field in (moved, parameter, launches):
+                field["ffn"] = field.get("ffn", 0) + field.pop(part, 0)
+        where = f"{name} x{count}"
+        rows += [TrafficRow(where, part, moved.get(part, 0.0), parameter.get(part, 0.0),
+                            launches.get(part, 0), flops.get(part, 0.0), count)
+                 for part in sorted(set(moved) | set(flops)) if moved.get(part) or flops.get(part)]
+        rows.append(TrafficRow(where, "total", sum(moved.values()), sum(parameter.values()),
+                               sum(launches.values()), sum(flops.values()), count))
+    rows.append(TrafficRow("layers", "total", *(sum(row.count * getattr(row, field) for row in rows
+                                                    if row.part == "total")
+                                                for field in ("moved", "parameter", "launches", "flops"))))
+    return rows
+
+
+def traffic_report(rows: List[TrafficRow]) -> List[str]:
+    """The lines of a traffic report: each part's bytes, the parameters among them, its ops and ND's FLOPs.
+
+    The last column is the bytes a part moves for each FLOP ND prices of it,
+    and the spread down it is the reading: a part that moves much and
+    multiplies little is priced near nothing.  The FLOPs are the op table's
+    matmul entries, as the FLOPs section reports them, so a part with no
+    matmul of its own shows none.
+    """
+    lines = [f"{'where':26s} {'part':12s} {'bytes moved':>17s} {'parameters':>15s} "
+             f"{'ops':>8s} {'ND FLOPs':>17s} {'bytes/FLOP':>11s}"]
+    for row in rows:
+        ratio = f"{row.moved / row.flops:11.4f}" if row.flops else f"{'':>11s}"
+        lines.append(f"{row.where:26s} {row.part:12s} {row.moved:17,.0f} {row.parameter:15,.0f} "
+                     f"{row.launches:8,d} {row.flops:17,.0f} {ratio}")
+    return lines
 
 
 def report(rows: List[VerifyRow]) -> List[str]:

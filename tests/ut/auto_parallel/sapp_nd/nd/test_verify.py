@@ -23,7 +23,14 @@ from unittest.mock import patch
 import yaml
 
 from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters, census_saved_ops
-from hyper_parallel.auto_parallel.sapp_nd.nd.verify import report, verify_activations, verify_flops, verify_parameters
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    report,
+    traffic_report,
+    verify_activations,
+    verify_flops,
+    verify_parameters,
+    verify_traffic,
+)
 
 _HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
 _RUN_ND = "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd"
@@ -88,6 +95,12 @@ def _verify_flops(config):
     """verify_flops of the train yaml of *config*."""
     with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
         return verify_flops(_train_yaml(folder))
+
+
+def _verify_traffic(config):
+    """verify_traffic of the train yaml of *config*."""
+    with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+        return verify_traffic(_train_yaml(folder))
 
 
 class TestVerifyParameters(unittest.TestCase):
@@ -249,6 +262,52 @@ class TestVerifyActivations(unittest.TestCase):
         self.assertEqual({row.where for row in rows}, {"decoder x2"})
 
 
+class TestVerifyTraffic(unittest.TestCase):
+    """Verify mode sets the bytes a forward moves beside the FLOPs ND prices of it."""
+
+    def test_each_parts_traffic_beside_its_flops(self):
+        """
+        Feature: verify_traffic and traffic_report.
+        Description: The hybrid model, a linear-attention layer and a
+            full-attention one, on 4096 tokens.
+        Expectation: A row per part that either moves bytes or runs a
+            matmul, the census's feed-forward parts summed as the op table
+            prices them, so that row's parameters are the experts'; each
+            kind's total the sum of its rows, and the layers' total those by
+            their layer counts.  The recurrence moves the most of a
+            linear-attention layer and moves the most for each FLOP the
+            table prices of it, and the report prints bytes for each FLOP
+            only where the part runs one.
+        """
+        rows = _verify_traffic(_qwen35_text())
+        self.assertEqual([(row.where, row.part) for row in rows], [
+            ("linear_attention x1", "attention"), ("linear_attention x1", "ffn"),
+            ("linear_attention x1", "linrec"), ("linear_attention x1", "norm"),
+            ("linear_attention x1", "total"),
+            ("full_attention x1", "attention"), ("full_attention x1", "ffn"),
+            ("full_attention x1", "norm"), ("full_attention x1", "scores"),
+            ("full_attention x1", "total"), ("layers", "total")])
+        by = {(row.where, row.part): row for row in rows}
+        linear = [row for row in rows if row.where == "linear_attention x1" and row.part != "total"]
+        self.assertEqual(by[("linear_attention x1", "total")].moved, sum(row.moved for row in linear))
+        self.assertEqual(by[("linear_attention x1", "total")].launches, sum(row.launches for row in linear))
+        self.assertEqual(by[("layers", "total")].moved,
+                         sum(row.count * row.moved for row in rows
+                             if row.part == "total" and row.where != "layers"))
+        self.assertEqual(max(linear, key=lambda row: row.moved).part, "linrec")
+        self.assertEqual(max((row for row in linear if row.flops),
+                             key=lambda row: row.moved / row.flops).part, "linrec")
+        self.assertEqual(by[("linear_attention x1", "ffn")].parameter,
+                         2.0 * sum(census_parameters(_qwen35_text(), 0)[part]
+                                   for part in ("routed", "shared", "router")))
+        lines = traffic_report(rows)
+        self.assertEqual(len(lines), len(rows) + 1)
+        self.assertIn("bytes/FLOP", lines[0])
+        recurrence = by[("linear_attention x1", "linrec")]
+        self.assertTrue(lines[3].rstrip().endswith(f"{recurrence.moved / recurrence.flops:.4f}"))
+        self.assertTrue(lines[4].rstrip().endswith("0"))
+
+
 class TestRunNdVerify(unittest.TestCase):
     """run_nd -V prints the verify report and exits."""
 
@@ -273,6 +332,8 @@ class TestRunNdVerify(unittest.TestCase):
             self.assertTrue(any("linear_attention x1" in line and "router" in line for line in logs.output))
             self.assertTrue(any("Forward FLOPs" in line for line in logs.output))
             self.assertTrue(any("linear_attention x1" in line and "linrec" in line for line in logs.output))
+            self.assertTrue(any("Bytes a forward" in line for line in logs.output))
+            self.assertTrue(any("bytes/FLOP" in line for line in logs.output))
             self.assertTrue(any("full_attention x1" in line and "attBMM" in line for line in logs.output))
             with patch.object(sys, "argv", ["run_nd.py", "-y", path, "-V"]), self.assertRaises(SystemExit) as done:
                 runpy.run_module(_RUN_ND, run_name="__main__")
