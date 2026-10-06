@@ -60,6 +60,7 @@ import itertools
 import json
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import time
@@ -80,6 +81,16 @@ PEAK_PATTERN = re.compile(
     r"memory/device_max_allocated_gb=([0-9.]+).*?"
     r"memory/device_max_reserved_gb=([0-9.]+)"
 )
+# The trainer's own metric line, one per step on rank 0, its fields sorted after
+# the step number: "step=7 epoch=0 ... performance/step_time=6.2425 ...", in
+# seconds. LoggingCallback writes it, EnvironMeterCallback measures it as the
+# slowest rank's wall time for the step.
+STEP_TIME_PATTERN = re.compile(r"\bstep=(\d+)\b.*?\bperformance/step_time=([0-9.eE+-]+)")
+# The column the classified CSV carries the trainer's step time in, read by
+# nd.debug.get_comm_classified_data, which spells it TRAINER_STEP. Named in both
+# places rather than imported: this launcher needs nothing but the standard
+# library, so it runs under whichever python the control node has.
+TRAINER_STEP_COLUMN = "step_trainer"
 REMOTE_PROFILES = "output/sweep_profiles"
 STAGES = ("select", "rank", "mirror", "data", "run", "fetch", "classify", "compare", "plot")
 # The degrees a strategy is named by, as ND's ranking and the classified CSV
@@ -697,25 +708,83 @@ def wait_for(sweep: Sweep, run_id: Optional[str]) -> str:
         time.sleep(sweep.args.poll)
 
 
-def harvest_peaks(sweep: Sweep, run_id: Optional[str]) -> Dict[str, float]:
+def read_training_log(sweep: Sweep, run_id: Optional[str]) -> str:
+    """Return rank 0's training log for *run_id*, empty where there is none.
+
+    One read serves every figure harvested from it: the log of a long run is
+    megabytes, and the control node fetches it over ssh.
+
+    Args:
+        sweep: The round being run, for the log directory and the first node.
+        run_id: The kit's id for one launch; None where the launch gave none.
+
+    Returns:
+        The log's text, empty where there is no run or it cannot be read.
+    """
+    if not run_id:
+        return ""
+    log = f"{sweep.env['log_dir']}/{run_id}.node0.log"
+    return subprocess.run(
+        ["ssh", f"{sweep.env['ssh_user']}@{sweep.env['nodes'][0]}", f"cat {log}"],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    ).stdout or ""
+
+
+def harvest_peaks(text: str) -> Dict[str, float]:
     """Return the peak device memory the trainer logged, in GiB.
 
     Read from the training log rather than the profiler: the trainer reports it
     every step at no cost, so the timing pass yields memory without the
     allocator recording that would distort the very step it is timing.
+
+    Args:
+        text: One run's training log, as ``read_training_log`` returns it.
+
+    Returns:
+        The run's highest allocated and reserved figures, or nothing where the
+        log holds neither.
     """
-    if not run_id:
-        return {}
-    log = f"{sweep.env['log_dir']}/{run_id}.node0.log"
-    text = subprocess.run(
-        ["ssh", f"{sweep.env['ssh_user']}@{sweep.env['nodes'][0]}", f"cat {log}"],
-        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    ).stdout or ""
     found = PEAK_PATTERN.findall(text)
     if not found:
         return {}
     return {"max_allocated_gb": max(float(a) for a, _ in found),
             "max_reserved_gb": max(float(r) for _, r in found)}
+
+
+def harvest_step_times(text: str, after: int) -> Dict[str, Any]:
+    """Return the trainer's own step time in ms, over the steps after *after*.
+
+    The classified step time is the mean of the PROFILED steps, and profiling
+    is not free: on this cluster it costs 0.33 to 0.84 s a step at EP 1, 0.09
+    to 0.16 at EP 2 and 0.01 to 0.10 at EP 8, which reversed EP 1 against EP 2
+    over the 2 October round. The trainer times every step at no cost and logs
+    the slowest rank's, so the steps the profiler left alone give the same run
+    its honest step time, and ranking moves onto that while every part stays
+    the profile's.
+
+    *after* is the end of the profiling window, which is excluded with the
+    steps inside it: that step pays the synchronous CANN parse of what was
+    profiled, 166 to 248 s, and would swamp any mean it entered.
+
+    Args:
+        text: One run's training log, as ``read_training_log`` returns it.
+        after: The last step to leave out, the profiling window's end.
+
+    Returns:
+        The mean step in milliseconds, its standard deviation, how many steps
+        it covers and which, or nothing where the log holds no such step.
+    """
+    found = [(int(number), float(value) * 1000.0)
+             for number, value in STEP_TIME_PATTERN.findall(text)]
+    clean = {number: value for number, value in found if number > after}
+    if not clean:
+        return {}
+    steps = sorted(clean)
+    times = [clean[number] for number in steps]
+    return {"step_trainer": round(statistics.fmean(times), 3),
+            "step_trainer_sd": round(statistics.stdev(times), 3) if len(times) > 1 else 0.0,
+            "step_trainer_n": len(times),
+            "step_trainer_steps": f"{steps[0]}-{steps[-1]}"}
 
 
 def _duration(seconds: float) -> str:
@@ -756,6 +825,7 @@ def run_pass(sweep: Sweep, memory: bool, progress: Progress) -> Dict[str, Any]:
     """Run every strategy once, returning each one's status and peaks."""
     results: Dict[str, Any] = {}
     label = "memory" if memory else "timing"
+    _, profile_end = _split_ints(sweep.args.profile_steps)
     for point in sweep.points:
         print(f"\n===== {progress.header(sweep.started)}: {point.tag} ({label}) =====",
               flush=True)
@@ -763,10 +833,14 @@ def run_pass(sweep: Sweep, memory: bool, progress: Progress) -> Dict[str, Any]:
         status = wait_for(sweep, run_id)
         progress.done += 1
         print(status, flush=True)
+        log = read_training_log(sweep, run_id)
+        # Only the timing pass yields an honest step time: the memory pass
+        # records the allocator, which moves the very step it would be read from.
+        step_times = {} if memory else harvest_step_times(log, after=profile_end)
         results[point.tag] = {
             "run_id": run_id, "status": status,
             "failed": "\nFAILED:" in status or "TIMED OUT" in status,
-            **point.dims, **harvest_peaks(sweep, run_id)}
+            **point.dims, **harvest_peaks(log), **step_times}
     failed = [tag for tag, data in results.items() if data.get("failed")]
     if failed:
         print(f"\n{len(failed)} of {len(sweep.points)} strategies failed the "
@@ -796,6 +870,16 @@ def stage_run(sweep: Sweep) -> None:
     count = write_peaks_csv(results, sweep.out / "memory.csv")
     print(f"\npeak memory for {count} strategy(ies) in "
           f"{sweep.out / 'memory.csv'}", flush=True)
+    timed = [data for data in results.values()
+             if isinstance(data, dict) and data.get("step_trainer")]
+    if timed:
+        window = sorted({data["step_trainer_steps"] for data in timed})
+        print(f"the trainer's own step time for {len(timed)} strategy(ies), over "
+              f"step(s) {', '.join(window)}: classify writes it beside the profiled "
+              "one, which is what the comparison then ranks on", flush=True)
+    else:
+        print("no unprofiled step time harvested: the comparison will rank on the "
+              "profiled steps, which cost 0.33 to 0.84 s a step at EP 1", flush=True)
     if sweep.args.profile_memory == "separate":
         results["memory_pass"] = run_pass(sweep, memory=True, progress=progress)
     (sweep.out / "run_states.json").write_text(
@@ -846,11 +930,53 @@ def classify(sweep: Sweep, point: Point) -> Optional[Path]:
     return part
 
 
-def merge_csv(parts: Sequence[Path], merged: Path) -> int:
-    """Concatenate single-row classified CSVs, keeping one header."""
+def load_step_times(sweep: Sweep) -> Dict[str, float]:
+    """The trainer's own step time per strategy, as the run stage harvested it.
+
+    Read back from ``run_states.json`` rather than passed down, so classifying a
+    directory a previous invocation ran keeps the figure. A directory whose
+    profiles were put there by hand has no such file and simply has no column.
+
+    Args:
+        sweep: The round being classified, for its output directory.
+
+    Returns:
+        The step in milliseconds per strategy tag, leaving out any strategy the
+        run stage harvested none for, and empty where there is no record.
+    """
+    states = sweep.out / "run_states.json"
+    if not states.is_file():
+        return {}
+    try:
+        recorded = json.loads(states.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {tag: data["step_trainer"] for tag, data in recorded.items()
+            if isinstance(data, dict) and data.get("step_trainer")}
+
+
+def merge_csv(parts: Sequence[Tuple[str, Path]], merged: Path,
+              step_times: Optional[Dict[str, float]] = None) -> int:
+    """Concatenate single-row classified CSVs, keeping one header.
+
+    Each part is one strategy, named by its tag, so *step_times* adds that
+    strategy's unprofiled step time as a column of the merged CSV. The
+    classifier's own per-strategy CSVs are left as they are: they hold what the
+    profile measured, and the honest total is the harness's to add.
+
+    Args:
+        parts: One ``(tag, path)`` per classified strategy.
+        merged: The CSV to write, which ND reads with ``--real_csv``.
+        step_times: The trainer's own step in milliseconds per tag; a strategy
+            missing from it gets an empty cell, never a guess.
+
+    Returns:
+        How many strategies the merged CSV holds.
+    """
+    step_times = step_times or {}
     rows: List[List[str]] = []
     header: Optional[List[str]] = None
-    for part in parts:
+    for tag, part in parts:
         with open(part, newline="", encoding="utf-8") as handle:
             table = list(csv.reader(handle))
         if len(table) < 2:
@@ -859,12 +985,14 @@ def merge_csv(parts: Sequence[Path], merged: Path) -> int:
             header = table[0]
         elif table[0] != header:
             raise SystemExit(f"{part}: header differs from the first CSV")
-        rows += table[1:]
+        measured = step_times.get(tag)
+        rows += [row + ([f"{measured:.3f}"] if measured else [""])
+                 for row in table[1:]]
     if header is None:
         return 0
     with open(merged, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(header)
+        writer.writerow(header + [TRAINER_STEP_COLUMN])
         writer.writerows(rows)
     return len(rows)
 
@@ -894,9 +1022,13 @@ def require_importable(sweep: Sweep) -> None:
 def stage_classify(sweep: Sweep) -> None:
     """Classify every profiled strategy into one combined CSV."""
     require_importable(sweep)
-    parts = [part for part in (classify(sweep, p) for p in sweep.points) if part]
-    count = merge_csv(parts, sweep.merged_csv)
-    print(f"\n{count} configuration(s) in {sweep.merged_csv}", flush=True)
+    parts = [(point.tag, part) for point, part
+             in ((point, classify(sweep, point)) for point in sweep.points) if part]
+    step_times = load_step_times(sweep)
+    count = merge_csv(parts, sweep.merged_csv, step_times)
+    harvested = sum(1 for tag, _ in parts if tag in step_times)
+    print(f"\n{count} configuration(s) in {sweep.merged_csv}, "
+          f"{harvested} of them with the trainer's own step time", flush=True)
 
 
 def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
@@ -1064,6 +1196,18 @@ def _nd_estimates(sweep: Sweep) -> Dict[Tuple[int, ...], Dict[str, str]]:
     return {_strategy_key(row): row for row in _read_rows(sweep.estimates_csv)}
 
 
+def _measured_step(row: Dict[str, str]) -> float:
+    """The step a strategy is ranked on: the trainer's own, else the profiled one.
+
+    ``time`` is the mean of the profiled steps, and the Ascend profiler costs
+    0.33 to 0.84 s a step at EP 1 against 0.01 to 0.10 at EP 8. Ranking on it
+    put EP 1 ahead of EP 2 over the 2 October round where the trainer's own
+    times put every EP 2 point ahead, so the honest total is what a verdict
+    about which strategy to run must use. The parts stay the profile's.
+    """
+    return float(row.get(TRAINER_STEP_COLUMN) or row["time"])
+
+
 def _ranking_table(sweep: Sweep, ranking: Sequence[Dict[str, str]],
                    measured: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     """One row per measured strategy with ND's rank, score and memory, in ND's order.
@@ -1076,7 +1220,7 @@ def _ranking_table(sweep: Sweep, ranking: Sequence[Dict[str, str]],
         nd_of.setdefault(_strategy_key(row), row)
     estimates = _nd_estimates(sweep)
     peaks = {_strategy_key(row): row for row in _read_rows(sweep.out / "memory.csv")}
-    times = [float(row["time"]) for row in measured]
+    times = [_measured_step(row) for row in measured]
     table = []
     for row, step, place in zip(measured, times, _ranks(times)):
         key = _strategy_key(row)
@@ -1088,6 +1232,8 @@ def _ranking_table(sweep: Sweep, ranking: Sequence[Dict[str, str]],
             "nd_memory_gib": (f"{float(memory_row['memory_mb']) / 1024:.1f}"
                               if memory_row else ""),
             "measured_ms": f"{step:.1f}", "measured_rank": f"{place:g}",
+            "step_source": "trainer" if row.get(TRAINER_STEP_COLUMN) else "profiled",
+            "profiled_ms": f"{float(row['time']):.1f}",
             "peak_allocated_gib": peaks.get(key, {}).get("max_allocated_gb", ""),
         })
     table.sort(key=lambda entry: int(entry["nd_rank"] or 10 ** 9))
@@ -1111,6 +1257,19 @@ def _print_verdict(table: Sequence[Dict[str, str]]) -> None:
         print(f"Rank correlation of ND's score with the measured step over the "
               f"{len(ranked)} it ranks: {correlation:+.2f} (1 is ND's order exactly).",
               flush=True)
+    trainer = [entry for entry in table if entry["step_source"] == "trainer"]
+    if len(trainer) == len(table):
+        print("Every step above is the trainer's own, over the steps it did not "
+              "profile; the parts are the profile's.", flush=True)
+    elif trainer:
+        print(f"{len(trainer)} of {len(table)} steps above are the trainer's own and "
+              "the rest are the mean of the profiled steps, which is not a like for "
+              "like comparison: profiling costs 0.33 to 0.84 s a step at EP 1.",
+              flush=True)
+    else:
+        print("Every step above is the mean of the PROFILED steps, which costs 0.33 "
+              "to 0.84 s a step at EP 1 and 0.01 to 0.10 at EP 8. Re-run the run "
+              "stage, or this round's order may be the instrument's.", flush=True)
 
 
 def report_ranking(sweep: Sweep, ranking: Sequence[Dict[str, str]]) -> None:
@@ -1121,6 +1280,10 @@ def report_ranking(sweep: Sweep, ranking: Sequence[Dict[str, str]]) -> None:
     when it is not. A strategy outside ND's ranking, one its search does not
     generate or one it believes does not fit, has no rank; ``compare`` above
     still prints its estimate.
+
+    The step every verdict here rests on is the trainer's own wherever the run
+    stage harvested it, and the profiled mean otherwise, which the CSV records
+    per strategy in ``step_source`` and the last line says aloud.
     """
     measured = _read_rows(sweep.merged_csv)
     if not measured:
