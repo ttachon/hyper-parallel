@@ -1204,17 +1204,20 @@ class TestKernelContracts(unittest.TestCase):
         """
         Feature: census_layer on a DeepSeek-V4 config, the family the
             DeepSeek-V4.1 recipe's factory builds.
-        Expectation: The census refuses, naming the kernels and what the
-            eager path it would otherwise measure keeps, rather than
-            answering with the bytes of a layer no run builds.  Before this
-            it raised AttributeError out of the rotary embedding, which no
-            caller catches, so the whole cost model stopped.
+        Expectation: The census refuses, and for the reason that is true of
+            this function: the family's layers cannot be priced one at a
+            time, because most of them consume what a source layer wrote
+            earlier in the same forward.  Before this it raised
+            AttributeError out of the rotary embedding, which no caller
+            catches, so the whole cost model stopped instead of falling back
+            to the formulas.
         """
         with self.assertRaises(CensusUnavailable) as refusal:
             census_layer(_deepseek_v4(), 0, 128)
         said = str(refusal.exception)
         self.assertIn("deepseek_v4", said)
-        self.assertIn("Lightning Indexer", said)
+        self.assertIn("one at a time", said)
+        self.assertIn("whole stack", said)
         self.assertIn("not as a bound", said)
 
     def test_the_whole_stack_of_kinds_is_refused_as_one(self):

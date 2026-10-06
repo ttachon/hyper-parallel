@@ -676,11 +676,18 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
 # contract in :mod:`~hyper_parallel.auto_parallel._npu_contracts` states what
 # its kernels save; stating one is what takes it out again.
 _NO_ACTIVATION_CONTRACT: Dict[str, str] = {
-    # Empty while every family with kernels of its own has its contracts
-    # stated.  DeepSeek-V4 was the entry that forced this guard and now has
-    # them (:data:`_FAMILY_CONTRACTS`); the next family to arrive with a
-    # kernel and no contract belongs here rather than being priced from the
-    # path its run does not take.
+    "deepseek_v4": (
+        "its layers cannot be priced one at a time. 31 of the DeepSeek-V4.1 crop's 40 layers consume "
+        "compressed keys and values, or an Indexer key, that a source layer wrote earlier in the same "
+        "forward, and refuse to run without it; its hidden state carries a hyper-connection dimension "
+        "and a mixing state this builds no path for; and its rotary embedding is a pair of flavours a "
+        "layer picks between. What it needs is a census of the whole stack at once, which measures "
+        "26.542 GiB a rank at 4096 tokens against a 37.6 GiB measured peak and is not this function. "
+        "The kernels' own contracts are stated and ready for it "
+        "(:func:`~hyper_parallel.auto_parallel._npu_contracts.v41_attention_contract`, "
+        ":func:`~hyper_parallel.auto_parallel._npu_contracts.v41_indexer_contract`); until the stack "
+        "census is here, state the records it measured as model.config_overrides.activations"
+    ),
 }
 
 # The families whose own modules call kernels this host has not got, with the
@@ -761,8 +768,8 @@ def _no_contract(config: Any) -> None:
     missing = _NO_ACTIVATION_CONTRACT.get(family)
     if missing is not None:
         raise CensusUnavailable(
-            f"no census of a {config.model_type} layer: {missing}; state the kernels' contracts, "
-            f"or drop context.census and read the formulas' memory as an estimate, not as a bound"
+            f"no census of a {config.model_type} layer: {missing}. Or drop context.census and read "
+            f"the formulas' memory as an estimate, not as a bound"
         )
     if family in _FAMILY_CONTRACTS and not _contracts_install(config):
         raise CensusUnavailable(

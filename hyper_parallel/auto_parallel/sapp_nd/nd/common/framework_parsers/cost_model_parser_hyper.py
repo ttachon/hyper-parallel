@@ -257,11 +257,24 @@ class CostModelParserHyperV2(_CostModelParser):
         return spec
 
     def _model_section(self) -> Dict[str, Any]:
-        """Return the ``model`` section as a plain mapping."""
-        model_raw = self._config_to_flat_dict(
-            self._get_cfg_attr(self.config, "model", Config({}))
-        )
-        return model_raw if isinstance(model_raw, dict) else {}
+        """Return the ``model`` section as a plain mapping, ``_target_`` included.
+
+        ``_config_to_flat_dict`` drops every key beginning with an
+        underscore, which is right for the private fields a ``Config``
+        carries and wrong for exactly one: ``_target_`` names the factory
+        that builds the model.  Stripping it left the resolver reading the
+        directory beside it as a checkpoint, and for a model Transformers
+        cannot build, falling back to a hand-written description of a config
+        that was one call away.
+        """
+        section = self._get_cfg_attr(self.config, "model", Config({}))
+        model_raw = self._config_to_flat_dict(section)
+        if not isinstance(model_raw, dict):
+            return {}
+        target = self._get_cfg_attr(section, "_target_", None)
+        if target:
+            model_raw["_target_"] = str(target)
+        return model_raw
 
     def _visual_seq_len_override(self) -> int:
         """Return ``context.visual_seq_len`` when the config declares one."""
