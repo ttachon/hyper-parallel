@@ -23,10 +23,13 @@ import importlib
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.distributed.activation_checkpoint import (
+    normalize_activation_checkpoint_layers,
+)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -56,15 +59,24 @@ class ActivationCheckpointConfig:
 
     ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
     ``"selective"``.
+
+    ``layers`` runs some transformer blocks in another mode than ``mode``,
+    which every block it does not name runs and which must then be ``"full"``
+    or ``"selective"``. Its keys are block indices, or inclusive ranges written
+    ``"first-last"``, and its values are ``"off"``, ``"full"`` or
+    ``"selective"``. With ``mode: full`` and ``layers: {6-7: off}``, blocks 6
+    and 7 keep their activations and every other block is recomputed.
     """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    layers: Optional[Dict[Union[int, str], str]] = None
 
     def __post_init__(self) -> None:
-        """Reject ambiguous values for activation input swapping."""
+        """Reject ambiguous values for activation input swapping and the per-layer plan."""
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        self.layers = normalize_activation_checkpoint_layers(self.mode, self.layers)
 
 
 @dataclass
