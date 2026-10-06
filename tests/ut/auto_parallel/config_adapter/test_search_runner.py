@@ -519,11 +519,12 @@ class TestModelSectionIsTheSpec(unittest.TestCase):
         self.assertEqual(hp_yaml["context"]["max_device_memory"], "60.0GB")
 
     def test_auto_recompute_describes_the_model_fully_recomputed(self):
-        """With recompute "auto", candidates are kept fully recomputed, so the model is described so."""
+        """With recompute "auto" or "per_layer", candidates are kept fully recomputed, so the model is described so."""
         runner = self._get_runner()
         config = _make_full_config()
-        config.estimator["recompute_strategy"] = "auto"
-        self.assertEqual(runner._build_hp_yaml_dict(config)["activation_checkpoint"]["mode"], "full")
+        for strategy in ("auto", "per_layer"):
+            config.estimator["recompute_strategy"] = strategy
+            self.assertEqual(runner._build_hp_yaml_dict(config)["activation_checkpoint"]["mode"], "full")
 
 
 # The run a train.yaml states beyond the strategy: the model's dtype, FSDP's
@@ -771,7 +772,67 @@ class TestSearchStrategies(unittest.TestCase):
         kwargs = mock_parallelize_cls.call_args.kwargs
         self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_CENSUS_MODES)
         self.assertEqual(kwargs["recompute_selective"], HYPER_SELECTIVE_REC_OP)
+        self.assertFalse(kwargs["recompute_mode_per_layer"])
         self.assertEqual(result["activation_checkpoint"], "selective")
+        self.assertNotIn("activation_checkpoint_layers", result)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_chooses_a_mode_per_layer(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """
+        Feature: search_strategies, recompute "per_layer".
+        Description: A search asking for a mode per layer, its best
+            candidate running full on its first three layers and off on the
+            last five; then the same search with the modes narrowed, and a
+            census stated.
+        Expectation: The search chooses among the trainer's modes for each
+            layer, and the result states the plan as the trainer reads it:
+            its mode, and the layers that run another. The narrowed modes
+            reach the search whatever the census.
+        """
+        # pylint: disable=import-outside-toplevel,unused-import
+        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # noqa: F401
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import LayerRange, RecomputeChoice
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+        mock_dims = MagicMock()
+        mock_dims.dims_val = {
+            _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
+            _MOCK_CP: 1, _MOCK_EP: 1, _MOCK_MBN: 2,
+        }
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [(mock_dims, 1024.0, 0.05, [])]
+
+        def option(recompute: Optional[frozenset]) -> LayerOption:
+            """An option recomputing *recompute*, costs aside."""
+            return LayerOption(recompute=recompute, memory_per_micro_batch=1.0, memory_once=0.0,
+                               forward_time=1.0, backward_time=2.0)
+
+        plan = RecomputeChoice(
+            ranges=(LayerRange(0, 3, None, option(None), "full"), LayerRange(3, 5, None, option(frozenset()), "off")),
+            stage_memory=(900.0,), stage_savings=(1.0,))
+        mock_runner.recompute_choices = {mock_dims: plan}
+        mock_runner.recompute_per_layer.return_value = (None, None)
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.estimator["recompute_strategy"] = "per_layer"
+        result = sr.search_strategies(config)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertTrue(kwargs["auto_recompute"])
+        self.assertTrue(kwargs["recompute_mode_per_layer"])
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_RECOMPUTE_MODES)
+        self.assertEqual(result["activation_checkpoint"], "full")
+        self.assertEqual(result["activation_checkpoint_layers"], {"3-7": "off"})
+
+        census = _make_full_config(run={"context": {"census": True}})
+        census.estimator.update(recompute_strategy="per_layer", recompute_modes=("off", "full"))
+        sr.search_strategies(census)
+        self.assertEqual(mock_parallelize_cls.call_args.kwargs["recompute_modes"], ("off", "full"))
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",

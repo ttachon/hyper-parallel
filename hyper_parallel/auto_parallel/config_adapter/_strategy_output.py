@@ -22,7 +22,7 @@ configuration stub.
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml  # type: ignore[import-untyped]
 
@@ -153,13 +153,21 @@ def _check_batch_derivation(data: Dict[str, Any], resolved: Dict[str, Any]) -> N
         )
 
 
-def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
+def _inject_activation_checkpoint(data: Dict[str, Any], mode: str,
+                                  layers: Optional[Dict[str, str]] = None) -> None:
     """Set the activation checkpoint mode the search chose for every layer.
 
     The AutoModels schema states it as ``activation_checkpoint.mode``
     (``off``, ``full`` or ``selective``), the older one as
     ``train.gradient_checkpointing.activation_checkpoint``, where ``off``
-    is spelled ``none``.
+    is spelled ``none``. The layers *layers* names run another mode, which
+    the AutoModels schema states as ``activation_checkpoint.layers``; a plan
+    the train yaml states gives way to the search's, which it was not priced
+    with.
+
+    Raises:
+        ValueError: For *layers* in the older schema, which has no field
+            for them.
     """
     if is_auto_models_schema(data):
         section = data.get("activation_checkpoint")
@@ -167,7 +175,18 @@ def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
             section = data["activation_checkpoint"] = {}
         before = section.get("mode", "off")
         section["mode"] = mode
+        stated = section.pop("layers", None)
+        if layers:
+            section["layers"] = dict(layers)
+        if stated and stated != layers:
+            logger.info("activation_checkpoint.layers %s in the train yaml, %s in the search: writing the search's",
+                        stated, layers or "none")
     else:
+        if layers:
+            raise ValueError(
+                "the search chose a mode per layer, which only the AutoModels schema's activation_checkpoint.layers "
+                "states; the train yaml uses train.gradient_checkpointing"
+            )
         checkpointing = data["train"].get("gradient_checkpointing")
         if not isinstance(checkpointing, dict):
             checkpointing = data["train"]["gradient_checkpointing"] = {}
@@ -183,7 +202,8 @@ def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
     if resolved.get("activation_checkpoint"):
-        _inject_activation_checkpoint(data, resolved["activation_checkpoint"])
+        _inject_activation_checkpoint(data, resolved["activation_checkpoint"],
+                                      resolved.get("activation_checkpoint_layers"))
     if is_auto_models_schema(data):
         accelerator = data["accelerator"]
         for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
@@ -437,8 +457,9 @@ def write_resolved_yaml(
     The resolved strategy is read from ``config.resolved_strategy``.
     Supported keys: ``dp_shard``, ``dp_replicate``, ``tp_degree``,
     ``pipeline_parallel_degree``, ``context_parallel_degree``,
-    ``expert_parallel_degree``, ``global_batch_size`` and
-    ``activation_checkpoint``, the mode every layer runs.
+    ``expert_parallel_degree``, ``global_batch_size``,
+    ``activation_checkpoint``, the mode every layer runs but those
+    ``activation_checkpoint_layers`` gives another.
 
     Args:
         config: NormalizedConfig with ``resolved_strategy`` set.

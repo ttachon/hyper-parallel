@@ -436,6 +436,35 @@ recompute: "full"
         _write_yaml(path, content)
         config = read_search_config(path)
         self.assertEqual(config.estimator["recompute_strategy"], "full")
+        self.assertNotIn("recompute_modes", config.estimator)
+
+    def test_recompute_modes_narrow_the_trainers(self) -> None:
+        """
+        Feature: recompute_modes in a search config.
+        Description: A search choosing a mode per layer among off and full,
+            off unquoted as YAML reads it; then a mode the trainer does not
+            run, and no mode at all.
+        Expectation: The modes reach the estimator, off spelled as the
+            trainer spells it; the other two are refused.
+        """
+        model = """
+model:
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
+  vocab_size: 32000
+recompute: per_layer
+"""
+        path = os.path.join(self.tmpdir, "recompute_modes.yaml")
+        _write_yaml(path, model + "recompute_modes: [off, full]\n")
+        config = read_search_config(path)
+        self.assertEqual(config.estimator["recompute_strategy"], "per_layer")
+        self.assertEqual(config.estimator["recompute_modes"], ("off", "full"))
+        for stated in ("[off, sometimes]", "[]"):
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + f"recompute_modes: {stated}\n")
+                with self.assertRaises(ValueError):
+                    read_search_config(path)
 
     def test_fsdp_dimension_mapped(self) -> None:
         """fsdp short name maps to data_parallel_shard_degree."""
@@ -1375,6 +1404,55 @@ class TestWriter(unittest.TestCase):
                 written[name] = yaml.safe_load(fh)
         self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "none")
         self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "off", "swap_inputs": True})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_sets_the_chosen_plan_per_layer(self) -> None:
+        """
+        Feature: write_resolved_yaml, activation_checkpoint_layers.
+        Description: A search that chose full recompute with layers 3 to 7
+            off, written over an AutoModels train.yaml stating a plan of its
+            own and over one stating none; then over the older schema; then a
+            search that chose one mode for every layer, written over the
+            train.yaml with a plan.
+        Expectation: The plan is written as activation_checkpoint.layers,
+            replacing the train.yaml's, whose replacement is logged, with
+            the mode and the train.yaml's other options kept; YAML reads it
+            back with off a string. The older schema has no field for it and
+            is refused. One mode for every layer leaves no plan.
+        """
+        with_plan = os.path.join(self.tmpdir, "auto_models_plan.yaml")
+        with open(with_plan, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "full", "swap_inputs": False, "layers": {"6-7": "off"}}}, fh)
+        without = os.path.join(self.tmpdir, "auto_models_no_plan.yaml")
+        with open(without, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}}, fh)
+        legacy = os.path.join(self.tmpdir, "legacy_plan.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {}}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full",
+                                    "activation_checkpoint_layers": {"3-7": "off"}}
+        out = os.path.join(self.tmpdir, "resolved_plan.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            write_resolved_yaml(config, with_plan, out)
+        self.assertIn("activation_checkpoint.layers {'6-7': 'off'} in the train yaml", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"],
+                             {"mode": "full", "swap_inputs": False, "layers": {"3-7": "off"}})
+        write_resolved_yaml(config, without, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "layers": {"3-7": "off"}})
+        with self.assertRaisesRegex(ValueError, "activation_checkpoint.layers"):
+            write_resolved_yaml(config, legacy, out)
+
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full"}
+        write_resolved_yaml(config, with_plan, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "swap_inputs": False})
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:

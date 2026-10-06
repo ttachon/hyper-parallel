@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 # too, where the census priced it.
 TRAINER_RECOMPUTE_MODES = ("off", "full")
 TRAINER_CENSUS_MODES = ("off", "selective", "full")
+# The search config's recompute values that choose among those modes: "auto"
+# one for every layer, "per_layer" one for each layer, which the trainer runs
+# as activation_checkpoint.layers.
+CHOSEN_RECOMPUTE = ("auto", "per_layer")
 
 def _get_dim_module():
     """Lazy-import the sapp_nd dimensions module."""
@@ -263,8 +267,10 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if visual_seq_len:
         context["visual_seq_len"] = int(visual_seq_len)
 
-    # Under "auto" the search keeps what fits fully recomputed: describe it so.
-    gc_dict: Dict[str, Any] = {"mode": {"none": "off", "auto": "full"}.get(recompute, recompute)}
+    # Choosing the recompute, the search keeps what fits fully recomputed:
+    # describe it so.
+    stated_mode = "full" if recompute in CHOSEN_RECOMPUTE else {"none": "off"}.get(recompute, recompute)
+    gc_dict: Dict[str, Any] = {"mode": stated_mode}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
         gc_dict["recompute_slice_activation"] = bool(recompute_slice)
@@ -500,20 +506,28 @@ def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
     """The recompute the search chose for the best configuration, for the result.
 
     Args:
-        nd_runner: The search, run with recompute "auto".
+        nd_runner: The search, run with recompute "auto" or "per_layer".
         best_entry: The best scored entry.
 
     Returns:
         ``activation_checkpoint``, the mode the trainer runs every layer
         with: the chosen one, or ``full``, the policy the configuration was
-        scored with when there was nothing to choose. With a choice per layer
-        possible, ``recompute_per_layer`` also gives each layer's own fastest
-        option and the score and memory it would reach: what the trainer
-        would gain from running each layer its own way.
+        scored with when there was nothing to choose. Under "per_layer",
+        ``activation_checkpoint_layers`` gives the layers that run another
+        mode, as the trainer's ``activation_checkpoint.layers`` states them,
+        where there are any. With a choice per layer possible,
+        ``recompute_per_layer`` also gives each layer's own fastest option of
+        its kind's front and the score and memory it would reach: what the
+        trainer would gain from running each layer its own way, switch by
+        switch.
     """
-    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import to_records  # pylint: disable=C0415
+    # pylint: disable=C0415
+    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import to_records, trainer_plan
     choice = nd_runner.recompute_choices.get(best_entry[0])
-    result: Dict[str, Any] = {"activation_checkpoint": choice.mode if choice is not None else "full"}
+    mode, layers = trainer_plan(choice) if choice is not None else ("full", {})
+    result: Dict[str, Any] = {"activation_checkpoint": mode}
+    if layers:
+        result["activation_checkpoint_layers"] = layers
     per_layer, score = nd_runner.recompute_per_layer(best_entry[0])
     if per_layer is not None:
         result["recompute_per_layer"] = {
@@ -557,14 +571,19 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (  # pylint: disable=C0415
         HYPER_SELECTIVE_REC_OP,
     )
-    auto = config.estimator.get("recompute_strategy") == "auto"
+    strategy = config.estimator.get("recompute_strategy")
+    auto = strategy in CHOSEN_RECOMPUTE
     census = bool((hp_config.get("context") or {}).get("census"))
     trainer = {
         "auto_recompute": True,
-        "recompute_modes": TRAINER_CENSUS_MODES if census else TRAINER_RECOMPUTE_MODES,
+        # The search config may narrow the modes, as to leave out a mode the
+        # estimate prices faster than the device runs it.
+        "recompute_modes": tuple(config.estimator.get("recompute_modes")
+                                 or (TRAINER_CENSUS_MODES if census else TRAINER_RECOMPUTE_MODES)),
         # The trainer's selective mode runs its policy, whatever switches
         # the mode the model is described with sets.
         "recompute_selective": dict(HYPER_SELECTIVE_REC_OP),
+        "recompute_mode_per_layer": strategy == "per_layer",
     }
     nd_runner = _Par.Parallelize(
         "hyper_v2",

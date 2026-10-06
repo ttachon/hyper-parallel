@@ -32,11 +32,14 @@ knapsack weighs it with them.
 
 A runtime that runs every layer one way, such as HyperParallel's trainer with
 its ``activation_checkpoint.mode``, gets the fastest of its modes that fits
-instead, from the same budgets: see :data:`MODES`. A model priced on several
-submodules, a vision tower beside a language model, gets no choice per layer,
-whose budgets would be built from one submodule's layers; its runtime's mode
-is stated on every submodule, and the whole model priced under each
-(:func:`mode_ranges`, :func:`whole_modes`).
+instead, from the same budgets: see :data:`MODES`. One that runs a mode per
+layer, as the same trainer does with ``activation_checkpoint.layers``, gets
+each layer the fastest of its modes, chosen as a layer's options are, and
+:func:`trainer_plan` states the choice as the trainer reads it. A model
+priced on several submodules, a vision tower beside a language model, gets no
+choice per layer, whose budgets would be built from one submodule's layers;
+its runtime's mode is stated on every submodule, and the whole model priced
+under each (:func:`mode_ranges`, :func:`whole_modes`).
 
 With a host link, a choice per layer may also offload: a stage's first layers
 run plain and move what they keep per micro-batch to the host after their
@@ -61,6 +64,7 @@ per stage, and with two, the largest share of the chunks'.
 """
 import itertools
 import math
+from collections import Counter
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
@@ -116,12 +120,15 @@ class LayerRange:
         kind: Their kind; ``None`` for a model priced on its config as it
             stands.
         option: The option they run.
+        mode: For a choice of a mode per layer, the mode they run, one of
+            :data:`MODES`; ``None`` otherwise.
     """
 
     first: int
     count: int
     kind: Optional[LayerKind]
     option: LayerOption
+    mode: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -502,17 +509,19 @@ def _assign(layers: Sequence[_Layer], choices: Sequence[StageChoice]) -> Dict[in
     return chosen
 
 
-def _ranges(layers: Sequence[_Layer], chosen: Dict[int, LayerOption]) -> Tuple[LayerRange, ...]:
-    """The options as ranges of consecutive layers of one kind, in model order."""
+def _ranges(
+    layers: Sequence[_Layer], chosen: Dict[int, LayerOption], modes: Optional[Mapping[LayerOption, str]] = None
+) -> Tuple[LayerRange, ...]:
+    """The options as ranges of consecutive layers of one kind, in model order, with *modes* each option's mode."""
     ranges = []
     for layer in sorted(layers, key=lambda layer: layer.index):
         option = chosen[layer.index]
         kind = layer.key[1]
         last = ranges[-1] if ranges else None
         if last is not None and last.option == option and last.kind == kind and last.first + last.count == layer.index:
-            ranges[-1] = LayerRange(last.first, last.count + 1, kind, option)
+            ranges[-1] = replace(last, count=last.count + 1)
         else:
-            ranges.append(LayerRange(layer.index, 1, kind, option))
+            ranges.append(LayerRange(layer.index, 1, kind, option, None if modes is None else modes[option]))
     return tuple(ranges)
 
 
@@ -523,15 +532,17 @@ def _result(
     mode: Optional[str],
     fronts: Mapping[Hashable, Tuple[LayerOption, ...]],
     own: Mapping[LayerOption, LayerOption],
+    modes: Optional[Mapping[LayerOption, str]] = None,
 ) -> RecomputeChoice:
     """The choice of *chosen* options, with each stage's memory and time saved.
 
     *own* maps an option charged a working set to its option of its kind,
-    which the ranges report.
+    which the ranges report; for a choice of a mode per layer, *modes* maps
+    each kind's option to its mode, which they report too.
     """
     every = [layer for stage_layers in layers for layer in stage_layers]
     return RecomputeChoice(
-        ranges=_ranges(every, {index: own.get(option, option) for index, option in chosen.items()}),
+        ranges=_ranges(every, {index: own.get(option, option) for index, option in chosen.items()}, modes),
         stage_memory=tuple(
             _stage_memory(stage_layers, stage_peaks, chosen, fronts, own) / MEGABYTE
             for stage_layers, stage_peaks in zip(layers, peaks)
@@ -869,6 +880,7 @@ def choose_recompute(
     modes: Optional[Sequence[str]] = None,
     link: Optional[HostLink] = None,
     selective: Optional[Mapping[str, int]] = None,
+    per_layer: bool = False,
 ) -> Optional[RecomputeChoice]:
     """The fastest recompute option of every layer that fits, at the evaluator's current strategy.
 
@@ -890,6 +902,11 @@ def choose_recompute(
             whatever its train yaml's mode. The mode is offered where every
             kind's profile measures that setting whole, as a census prices
             it; the formulas do not price the matmuls the policy recomputes.
+        per_layer: With *modes*, give each layer the fastest of them that
+            fits rather than one for every layer, for a runtime that runs a
+            mode per layer, as HyperParallel's trainer does with
+            ``activation_checkpoint.layers``. Each range then names its mode
+            (:func:`trainer_plan`), and no layer offloads, which no mode does.
 
     Returns:
         The choice, or ``None`` when there is none to make: a multimodal
@@ -913,17 +930,47 @@ def choose_recompute(
     stages, peaks = _stages(evaluator, layers, fronts, own)
     capacity = config.device_capacity.to_mb().size * MEGABYTE
     if by_mode is not None:
+        if per_layer:
+            return _each_layer(layers, stages, peaks, fronts, own, (bucket, capacity), _option_modes(by_mode))
         one = _one_mode(layers, peaks, by_mode, modes, fronts, own, capacity)
         return None if one is None else _result(layers, peaks, one[1], one[0], fronts, own)
     if link is not None and config.vp == 1:
         return _offload_result(layers, stages, peaks, fronts, own, _link(link, evaluator), bucket, capacity)
+    return _each_layer(layers, stages, peaks, fronts, own, (bucket, capacity))
+
+
+def _option_modes(by_mode: Mapping[Hashable, Mapping[str, LayerOption]]) -> Dict[LayerOption, str]:
+    """Each option of every kind's modes, by the mode it runs."""
+    return {option: mode for options in by_mode.values() for mode, option in options.items()}
+
+
+def _each_layer(
+    layers: Sequence[Sequence[_Layer]],
+    stages: Sequence[Stage],
+    peaks: Sequence[_Peaks],
+    fronts: Mapping[Hashable, Tuple[LayerOption, ...]],
+    own: Mapping[LayerOption, LayerOption],
+    sizes: Tuple[float, float],
+    modes: Optional[Mapping[LayerOption, str]] = None,
+) -> Optional[RecomputeChoice]:
+    """Each layer's fastest option of its kind's that fits, stage by stage.
+
+    Args:
+        sizes: ``(bucket, capacity)``, the knapsack's granularity and the
+            device's memory, in bytes.
+        modes: For a choice of a mode per layer, each option's mode.
+
+    Returns:
+        The choice, or ``None`` when some stage does not fit.
+    """
+    bucket, capacity = sizes
     chosen: Dict[int, LayerOption] = {}
     for stage_layers, stage, stage_peaks in zip(layers, stages, peaks):
         stage_chosen = _choose_stage(stage_layers, stage, stage_peaks, fronts, own, bucket, capacity)
         if stage_chosen is None:
             return None
         chosen.update(stage_chosen)
-    return _result(layers, peaks, chosen, None, fronts, own)
+    return _result(layers, peaks, chosen, None, fronts, own, modes)
 
 
 def _offload_result(
@@ -975,8 +1022,9 @@ def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
 
     Returns:
         One ``{"first", "count", "kind", "recompute"}`` per range, in model
-        order, with ``"offload": True`` for a range that offloads; ``kind``
-        is the kind's name, or ``None``.
+        order, with ``"offload": True`` for a range that offloads and
+        ``"mode"`` for one a choice of a mode per layer gave its mode;
+        ``kind`` is the kind's name, or ``None``.
     """
     records = []
     for item in choice.ranges:
@@ -988,16 +1036,70 @@ def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
         }
         if item.option.link_bandwidth:
             record["offload"] = True
+        if item.mode is not None:
+            record["mode"] = item.mode
         records.append(record)
     return records
 
 
+def trainer_plan(choice: RecomputeChoice) -> Tuple[str, Dict[str, str]]:
+    """The choice as HyperParallel's trainer states it: ``activation_checkpoint.mode`` and ``.layers``.
+
+    The trainer runs every layer its mode but those its plan names, by index
+    or by an inclusive range ``"first-last"``. The mode is the one most
+    layers run of those that recompute, full on a tie, or off where none
+    recomputes; the plan names the other layers, consecutive layers of one
+    mode in one entry whatever their kinds.
+
+    The indices are the choice's, which count the body layers in model order,
+    MTP's after the decoder's: the indices of the trainer's blocks, for a
+    model without MTP layers.
+
+    Args:
+        choice: A choice of one mode for every layer, or of a mode per layer
+            (:func:`choose_recompute` with *per_layer*).
+
+    Returns:
+        ``(mode, layers)``, *layers* empty when every layer runs *mode*.
+
+    Raises:
+        ValueError: For a choice of options no mode stands for, each layer's
+            own from its kind's front.
+    """
+    if choice.mode is not None:
+        return choice.mode, {}
+    if any(item.mode is None for item in choice.ranges):
+        raise ValueError("the trainer runs a mode per layer, and this choice gives some layers options that are not "
+                         "one; choose among its modes with per_layer")
+    counts = Counter()
+    for item in choice.ranges:
+        counts[item.mode] += item.count
+    recomputing = [mode for mode in ("full", "selective") if counts[mode]]
+    if not recomputing:
+        return "off", {}
+    mode = max(recomputing, key=lambda name: counts[name])
+    runs: List[List[Any]] = []
+    for item in sorted(choice.ranges, key=lambda item: item.first):
+        if runs and runs[-1][2] == item.mode and runs[-1][1] + 1 == item.first:
+            runs[-1][1] = item.first + item.count - 1
+        else:
+            runs.append([item.first, item.first + item.count - 1, item.mode])
+    return mode, {
+        (str(first) if first == last else f"{first}-{last}"): run_mode
+        for first, last, run_mode in runs
+        if run_mode != mode
+    }
+
+
 def describe(choice: RecomputeChoice) -> str:
-    """The choice as one line per range of layers, after its mode when one was chosen for every layer."""
+    """The choice as one line per range of layers, after its mode when one was chosen for every layer.
+
+    A range a choice of a mode per layer gave its mode reads as the mode.
+    """
     lines = [] if choice.mode is None else [f"every layer: {choice.mode}"]
     for item in choice.ranges:
         last = item.first + item.count - 1
         layers = f"layer {item.first}" if item.count == 1 else f"layers {item.first}-{last}"
         kind = f" ({item.kind.name})" if item.kind is not None else ""
-        lines.append(f"{layers}{kind}: {option_label(item.option)}")
+        lines.append(f"{layers}{kind}: {option_label(item.option) if item.mode is None else item.mode}")
     return "\n".join(lines)

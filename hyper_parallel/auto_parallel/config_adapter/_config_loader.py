@@ -280,6 +280,32 @@ def _describe_parallelism(
     return "; ".join(parts)
 
 
+def _stated_recompute_modes(raw: Dict[str, Any]) -> Dict[str, Tuple[str, ...]]:
+    """Return the trainer modes ``recompute_modes`` lets a search choose among, as the estimator's entry.
+
+    Under ``recompute: auto`` or ``per_layer`` the search chooses among the
+    trainer's activation checkpoint modes: off and full, and its selective
+    policy where a census prices it. ``recompute_modes`` narrows them. YAML
+    reads an unquoted ``off`` as False.
+
+    Returns:
+        ``{"recompute_modes": modes}``, or an empty dict where the search
+        config states none.
+
+    Raises:
+        ValueError: For an empty list, or a mode the trainer does not run.
+    """
+    stated = raw.get("recompute_modes")
+    if stated is None:
+        return {}
+    listed = list(stated) if isinstance(stated, (list, tuple)) else [stated]
+    modes = tuple("off" if mode is False else str(mode) for mode in listed)
+    unknown = sorted(set(modes) - {"off", "selective", "full"})
+    if unknown or not modes:
+        raise ValueError(f"recompute_modes {listed}: expected some of off, selective and full")
+    return {"recompute_modes": modes}
+
+
 def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     """Construct a NormalizedConfig from a parsed Search Config YAML dict.
 
@@ -360,6 +386,7 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         "type": "symbolic",
         "recompute_strategy": str(raw.get("recompute", "none")),
         "enable_profiling_calibration": False,
+        **_stated_recompute_modes(raw),
     }
 
     constraint: Dict[str, Any] = {

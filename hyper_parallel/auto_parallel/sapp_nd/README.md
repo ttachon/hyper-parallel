@@ -60,6 +60,19 @@ constraint:
 recompute: "full"
 ```
 
+`recompute` sets how the search treats activation checkpointing. `auto`
+chooses one of the trainer's modes for every layer of each candidate.
+`per_layer` chooses one for each layer, and `resolved.yaml` states that
+plan as `activation_checkpoint.mode` and `activation_checkpoint.layers`
+(`{mode: full, layers: {3-7: off}}`). Either way the search chooses among
+off and full, plus the trainer's selective policy where the train.yaml asks
+for a census; `recompute_modes: [off, full]` narrows that list. Any other
+value prices every layer fully recomputed. The choice fills
+`memory_limit_gb`, which is compared with the memory ND estimates a run
+allocates. A run also holds what its allocator reserves beyond that, 7 to
+16 GiB a rank on the Qwen3.5-MoE crop at 8192 tokens, so set the limit below
+what the device leaves by that much.
+
 Both are run the same way:
 
 ```bash

@@ -32,6 +32,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     choose_recompute,
     describe,
     mode_ranges,
+    trainer_plan,
     whole_modes,
 )
 
@@ -150,6 +151,13 @@ class ParallelizeLayer:
         # The switches such a runtime's selective mode sets, where they are
         # not the config's; see recompute.candidate.choose_recompute.
         self.recompute_selective = extra_config.pop("recompute_selective", None)
+        # With recompute_modes, each layer gets the fastest of them that fits
+        # rather than one for every layer: a runtime that runs a mode per
+        # layer, as HyperParallel's trainer does with activation_checkpoint.layers.
+        self.recompute_mode_per_layer = bool(extra_config.pop("recompute_mode_per_layer", False))
+        if self.recompute_mode_per_layer and not (auto_recompute and self.recompute_modes):
+            raise ValueError("recompute_mode_per_layer gives each layer one of the recompute_modes auto_recompute "
+                             "chooses among; give both")
         # With auto_offload, a choice per layer may offload each stage's first
         # layers over the host link: host_link, else the device's own.
         auto_offload = extra_config.pop("auto_offload", False)
@@ -553,7 +561,8 @@ class ParallelizeLayer:
         else:
             self.mem_eval.set_config(self.config.ccfg)
             choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
-                                      link=self.offload_link, selective=self.recompute_selective)
+                                      link=self.offload_link, selective=self.recompute_selective,
+                                      per_layer=self.recompute_mode_per_layer)
         if choice is not None:
             self.recompute_choices[parallel_config] = choice
         return choice
@@ -730,17 +739,7 @@ class ParallelizeLayer:
             "Offset & Recompute were%s computed from config info", is_not
         )
         if self.auto_recompute:
-            logger.output(
-                "Recompute was chosen %s for %d of %d configurations",
-                "per layer" if self.recompute_modes is None else "among " + ", ".join(self.recompute_modes),
-                len(self.recompute_choices),
-                len(scored_space),
-            )
-            if scored_space and scored_space[0][0] in self.recompute_choices:
-                logger.output(
-                    "Recompute of the best configuration:\n%s",
-                    describe(self.recompute_choices[scored_space[0][0]]),
-                )
+            self._log_recompute(scored_space)
         logger.output(
             "Device number is %d, global batch size is %d, dimensions are %s",
             self.machine.number,
@@ -758,6 +757,22 @@ class ParallelizeLayer:
                     max_num=top_num,
                 )
         return scored_space
+
+    def _log_recompute(self, scored_space: Any) -> None:
+        """Log how the recompute was chosen, and the best configuration's, as the trainer states it where it can."""
+        if self.recompute_modes is None:
+            how = "per layer"
+        else:
+            how = ("per layer among " if self.recompute_mode_per_layer else "among ") + ", ".join(self.recompute_modes)
+        logger.output("Recompute was chosen %s for %d of %d configurations", how, len(self.recompute_choices),
+                      len(scored_space))
+        best = self.recompute_choices.get(scored_space[0][0]) if scored_space else None
+        if best is None:
+            return
+        logger.output("Recompute of the best configuration:\n%s", describe(best))
+        if self.recompute_mode_per_layer and best.mode is None:
+            mode, layers = trainer_plan(best)
+            logger.output("As the trainer runs it: activation_checkpoint mode %s, layers %s", mode, layers)
 
     def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any, folder: Optional[str] = None) -> str:
         """Write the pipeline balancer's layer description of the k-th configuration.

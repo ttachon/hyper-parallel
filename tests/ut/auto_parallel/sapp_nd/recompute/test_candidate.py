@@ -57,10 +57,12 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     mode_recompute,
     option_label,
     to_records,
+    trainer_plan,
     whole_modes,
 )
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption, build_front, layer_profiles
 from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import MEGABYTE, Stage
+from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES
 
 DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
@@ -198,6 +200,26 @@ def _option(recompute: Any) -> LayerOption:
     """An option recomputing *recompute*, costs aside."""
     return LayerOption(recompute=recompute, memory_per_micro_batch=0.0, memory_once=0.0, forward_time=1.0,
                        backward_time=2.0)
+
+
+def _per_layer(*spans: Tuple[int, int, Optional[str], Optional[str]]) -> RecomputeChoice:
+    """A choice of a mode per layer, each span ``(first, count, kind's name, mode)`` running its mode's option."""
+    ranges = tuple(
+        LayerRange(first, count, None if kind is None else SimpleNamespace(name=kind),
+                   _option(mode_recompute(mode, HYPER_SELECTIVE_REC_OP) if mode else frozenset({"ffAct"})), mode)
+        for first, count, kind, mode in spans
+    )
+    return RecomputeChoice(ranges=ranges, stage_memory=(1.0,), stage_savings=(0.0,))
+
+
+def _plan_modes(mode: str, layers: Dict[str, str], count: int) -> List[str]:
+    """Each of *count* layers' mode, as the trainer reads a plan."""
+    modes = [mode] * count
+    for key, value in layers.items():
+        first, _, last = key.partition("-")
+        for index in range(int(first), int(last or first) + 1):
+            modes[index] = value
+    return modes
 
 
 class TestOnDeepSeek(unittest.TestCase):
@@ -1051,6 +1073,54 @@ class TestOneMode(unittest.TestCase):
         self.assertGreater(sum(each.stage_savings), sum(one.stage_savings))
         self.assertLessEqual(each.memory, capacity)
 
+    def test_a_mode_per_layer_fits_and_runs_as_the_trainer_states_it(self):
+        """
+        Feature: choose_recompute modes per_layer, and trainer_plan.
+        Description: The heaviest stage, plain, a little too big for the
+            device: off or full for every layer, then for each layer, then
+            each layer's own option of its kind's front.
+        Expectation: One mode must recompute every layer fully. A mode per
+            layer saves time within the device, each range naming off or
+            full and running its option, and each stage keeps what the
+            config priced whole with those ranges keeps, to its MB; each
+            layer's own option saves at least as much. The trainer's plan
+            gives every layer its mode, the MTP layer last.
+        """
+        evaluator = self._evaluator()
+        capacity = max(_stage_peaks(evaluator, full_rec=False)) - 64
+        _with_capacity(evaluator, capacity)
+        one = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        each = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        own = choose_recompute(evaluator, Hard.Device_A2)
+        self.assertEqual(one.mode, "full")
+        self.assertIsNone(each.mode)
+        for item in each.ranges:
+            self.assertIn(item.mode, ("off", "full"))
+            self.assertEqual(item.option.recompute, mode_recompute(item.mode, {}))
+        self.assertEqual({item.mode for item in each.ranges}, {"off", "full"})
+        self.assertGreater(sum(each.stage_savings), sum(one.stage_savings))
+        self.assertGreaterEqual(sum(own.stage_savings) * (1 + 1e-12), sum(each.stage_savings))
+        self.assertLessEqual(each.memory, capacity)
+        for mine, model in zip(each.stage_memory, _stage_peaks_of(evaluator, each)):
+            self.assertLessEqual(abs(mine - model), 1.0)
+        modes = [item.mode for item in each.ranges for _ in range(item.count)]
+        self.assertEqual(len(modes), 8)
+        self.assertEqual(_plan_modes(*trainer_plan(each), len(modes)), modes)
+
+    def test_a_mode_per_layer_on_a_roomy_device_is_one_mode(self):
+        """
+        Feature: choose_recompute modes per_layer.
+        Description: A 1 TB device, off or full for each layer.
+        Expectation: Every layer off, as one mode for every layer gives,
+            which the trainer states as its mode alone.
+        """
+        evaluator = _with_capacity(self._evaluator(), 1024 * 1024)
+        each = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        one = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        self.assertEqual({item.mode for item in each.ranges}, {"off"})
+        self.assertEqual(each.stage_memory, one.stage_memory)
+        self.assertEqual(trainer_plan(each), ("off", {}))
+
     def test_the_modes_recompute_what_their_names_say(self):
         """
         Feature: mode_recompute.
@@ -1180,6 +1250,72 @@ class TestDescribe(unittest.TestCase):
                                  stage_savings=(0.0,), mode="off")
         self.assertEqual(describe(choice).splitlines(), ["every layer: off", "layers 0-3: no recompute"])
 
+    def test_a_mode_per_layer_reads_as_its_modes(self):
+        """
+        Feature: describe and to_records.
+        Description: A choice of a mode per layer over two kinds.
+        Expectation: Each range reads as its mode, and its record states it
+            beside the switches it recomputes.
+        """
+        choice = _per_layer((0, 3, "linear_attention", "full"), (3, 1, "full_attention", "selective"))
+        self.assertEqual(describe(choice).splitlines(),
+                         ["layers 0-2 (linear_attention): full", "layer 3 (full_attention): selective"])
+        records = to_records(choice)
+        self.assertEqual(records[0], {"first": 0, "count": 3, "kind": "linear_attention", "recompute": "full",
+                                      "mode": "full"})
+        self.assertEqual(records[1]["mode"], "selective")
+        self.assertEqual(records[1]["recompute"], [name for name in SWITCHES if name in _POLICY])
+
+
+class TestTrainerPlan(unittest.TestCase):
+    """A choice of a mode per layer, as HyperParallel's trainer states it."""
+
+    def test_the_layers_that_do_not_run_the_mode_by_range_whatever_their_kinds(self):
+        """
+        Feature: trainer_plan.
+        Description: Eight layers, full attention at 3 and 7: the first three
+            fully recomputed and the last five off, ranges split by kind.
+        Expectation: Full, the only mode that recomputes though fewer layers
+            run it, and one entry for layers 3 to 7.
+        """
+        choice = _per_layer((0, 3, "linear_attention", "full"), (3, 1, "full_attention", "off"),
+                            (4, 3, "linear_attention", "off"), (7, 1, "full_attention", "off"))
+        self.assertEqual(trainer_plan(choice), ("full", {"3-7": "off"}))
+        self.assertEqual(_plan_modes(*trainer_plan(choice), 8), ["full"] * 3 + ["off"] * 5)
+
+    def test_a_tie_between_the_modes_that_recompute_goes_to_full(self):
+        """
+        Feature: trainer_plan.
+        Description: Two layers selective, two fully recomputed, one off.
+        Expectation: Full, and each other layer by its own index.
+        """
+        choice = _per_layer((0, 1, None, "selective"), (1, 2, None, "full"), (3, 1, None, "off"),
+                            (4, 1, None, "selective"))
+        self.assertEqual(trainer_plan(choice), ("full", {"0": "selective", "3": "off", "4": "selective"}))
+
+    def test_one_mode_states_no_layers(self):
+        """
+        Feature: trainer_plan.
+        Description: Every layer off per layer, every layer selective per
+            layer, and one mode chosen for every layer.
+        Expectation: The mode alone each time.
+        """
+        self.assertEqual(trainer_plan(_per_layer((0, 2, "a", "off"), (2, 2, "b", "off"))), ("off", {}))
+        self.assertEqual(trainer_plan(_per_layer((0, 4, None, "selective"))), ("selective", {}))
+        one = RecomputeChoice(ranges=(LayerRange(0, 4, None, _option(None)),), stage_memory=(1.0,),
+                              stage_savings=(0.0,), mode="full")
+        self.assertEqual(trainer_plan(one), ("full", {}))
+
+    def test_options_no_mode_stands_for_are_refused(self):
+        """
+        Feature: trainer_plan.
+        Description: A choice of each layer's own option, one of which
+            recomputes the activations alone.
+        Expectation: Refused: the trainer runs modes, not switch sets.
+        """
+        with self.assertRaises(ValueError):
+            trainer_plan(_per_layer((0, 2, None, "full"), (2, 2, None, None)))
+
 
 class TestAutoRecomputeSearch(unittest.TestCase):
     """The search scores each candidate with its layers' options."""
@@ -1246,6 +1382,63 @@ class TestAutoRecomputeSearch(unittest.TestCase):
         with self.assertRaises(ValueError):
             Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
                             auto_recompute=True, recompute_modes=("off", "sometimes"))
+
+    def test_a_mode_per_layer_needs_the_modes_auto_recompute_chooses_among(self):
+        """
+        Feature: ParallelizeLayer recompute_mode_per_layer.
+        Description: Ask for a mode per layer without the modes, then
+            without auto recompute.
+        Expectation: Both refused.
+        """
+        with self.assertRaises(ValueError):
+            Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
+                            auto_recompute=True, recompute_mode_per_layer=True)
+        with self.assertRaises(ValueError):
+            Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"), dimensions=[Dim.TP],
+                            recompute_modes=("off", "full"), recompute_mode_per_layer=True)
+
+    def test_a_mode_per_layer_scores_each_candidate_no_worse_than_one_mode(self):
+        """
+        Feature: ParallelizeLayer recompute_mode_per_layer.
+        Description: Order the space on a 4.2 GB device, choosing off or
+            full for every layer, then for each layer.
+        Expectation: The same candidates; every one gets a mode per layer,
+            each range naming its mode, fits and scores no worse than with
+            one mode for every layer, and one that one mode must recompute
+            fully scores better. The log gives the best's plan as the
+            trainer runs it.
+        """
+        set_verbose_level(1)
+        scored = {}
+        for per_layer in (False, True):
+            for dim in Dim.ALL_DIMS:
+                dim.reset_bound()
+            runner = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"),
+                                     dimensions=[Dim.TP, Dim.PP], max_mem=Memory.from_string("4.2GB"),
+                                     auto_recompute=True, recompute_modes=("off", "full"),
+                                     recompute_mode_per_layer=per_layer).instance
+            results, _ = runner.device_loops(({}, 0), None)
+            space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+            ordered, _ = runner.order_search_space(space, None, None)
+            scored[per_layer] = {str(config): (score, runner.recompute_choices[config]) for config, _, score, _
+                                 in ordered}
+            for config, memory, _, _ in ordered:
+                self.assertTrue(runner.mem_eval.mem_fit(memory))
+        self.assertEqual(set(scored[True]), set(scored[False]))
+        better = 0
+        for config, (score, choice) in scored[True].items():
+            one_score, one = scored[False][config]
+            self.assertIsNone(choice.mode)
+            self.assertTrue(all(item.mode in ("off", "full") for item in choice.ranges))
+            self.assertLessEqual(score, one_score * (1 + 1e-12))
+            better += one.mode == "full" and score < one_score
+        self.assertGreater(better, 0)
+        with patch.object(Par.logger, "output") as output:
+            runner._log_recompute(ordered)  # pylint: disable=protected-access
+        lines = [call.args[0] % call.args[1:] for call in output.call_args_list]
+        self.assertTrue(lines[0].startswith("Recompute was chosen per layer among off, full for "))
+        self.assertEqual(lines[-1], "As the trainer runs it: activation_checkpoint mode %s, layers %s"
+                         % trainer_plan(runner.recompute_choices[ordered[0][0]]))
 
     def test_one_mode_per_candidate_and_the_per_layer_choice_of_one(self):
         """

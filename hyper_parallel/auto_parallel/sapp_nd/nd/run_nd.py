@@ -205,19 +205,32 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     write_resolved_yaml(search_cfg, cli_args.yaml_config, resolve_path)
     logger.output("Resolved strategy written to %s", resolve_path)
     if "activation_checkpoint" in result:
-        logger.output("Activation checkpoint mode for every layer: %s", result["activation_checkpoint"])
-        per_layer = result.get("recompute_per_layer")
-        if per_layer:
-            logger.output(
-                "With each layer run its own way, the score would be %.2e at %.0f MB: %s",
-                per_layer["score"], per_layer["memory_estimate_mb"], per_layer["ranges"],
-            )
+        _log_activation_checkpoint(result)
     logger.output(
         "Optimal strategy: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
         "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
         "mem=%(memory_estimate_mb).0f MB score=%(score).2e",
         result,
     )
+
+
+def _log_activation_checkpoint(result):
+    """Log the activation checkpointing a search chose: its mode, the layers that run another, and each layer's own.
+
+    Args:
+        result: The search's result, which states ``activation_checkpoint``.
+    """
+    if result.get("activation_checkpoint_layers"):
+        logger.output("Activation checkpoint mode %s, and per layer: %s", result["activation_checkpoint"],
+                      result["activation_checkpoint_layers"])
+    else:
+        logger.output("Activation checkpoint mode for every layer: %s", result["activation_checkpoint"])
+    per_layer = result.get("recompute_per_layer")
+    if per_layer:
+        logger.output(
+            "With each layer run its own way, the score would be %.2e at %.0f MB: %s",
+            per_layer["score"], per_layer["memory_estimate_mb"], per_layer["ranges"],
+        )
 
 
 if __name__ == "__main__":
