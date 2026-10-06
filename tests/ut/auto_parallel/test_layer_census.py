@@ -767,5 +767,94 @@ class TestCensusPricing(unittest.TestCase):
             self.assertAlmostEqual(log[(0, 0, index, "S")]["_activ"], kept, delta=1)
 
 
+def _deepseek_v4():
+    """A four-layer DeepSeek-V4 config of width 256, the family the V4.1 recipe's factory builds."""
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import (  # pylint: disable=C0415
+        DeepseekV4Config,
+    )
+    return DeepseekV4Config(vocab_size=1024, hidden_size=256, num_hidden_layers=4,
+                            num_attention_heads=4, num_key_value_heads=1, head_dim=64,
+                            intermediate_size=128, moe_intermediate_size=128, n_routed_experts=4,
+                            num_experts_per_tok=2, q_lora_rank=32)
+
+
+class TestKernelContracts(unittest.TestCase):
+    """A census of a model whose kernels no contract states is refused, not answered."""
+
+    def test_a_model_whose_kernels_no_contract_states_is_refused(self):
+        """
+        Feature: census_layer on a DeepSeek-V4 config, the family the
+            DeepSeek-V4.1 recipe's factory builds.
+        Expectation: The census refuses, naming the kernels and what the
+            eager path it would otherwise measure keeps, rather than
+            answering with the bytes of a layer no run builds.  Before this
+            it raised AttributeError out of the rotary embedding, which no
+            caller catches, so the whole cost model stopped.
+        """
+        with self.assertRaises(CensusUnavailable) as refusal:
+            census_layer(_deepseek_v4(), 0, 128)
+        said = str(refusal.exception)
+        self.assertIn("deepseek_v4", said)
+        self.assertIn("Lightning Indexer", said)
+        self.assertIn("not as a bound", said)
+
+    def test_the_whole_stack_of_kinds_is_refused_as_one(self):
+        """
+        Feature: census_activations on the same config, the entry the model
+            spec calls.
+        Expectation: It refuses with the same reason, which the spec
+            catches, so a run asking for a census of this family is priced
+            by the formulas rather than stopped.
+        """
+        with self.assertRaises(CensusUnavailable):
+            census_activations(_deepseek_v4(), [{"kind": "decoder", "count": 4}], seq_length=128)
+
+    def test_the_parameters_of_such_a_layer_are_still_counted(self):
+        """
+        Feature: census_parameters on the same config.
+        Expectation: It answers, because which kernel runs a layer does not
+            change how many parameters it has, and verify mode sets these
+            beside what ND prices.  Only what a layer keeps for its
+            backward depends on the kernel.
+        """
+        parts = census_parameters(_deepseek_v4(), 0)
+        self.assertIn("routed", parts)
+        self.assertGreater(parts["routed"], 0)
+        self.assertGreater(parts["attention"], 0)
+
+    def test_a_run_told_it_has_no_census_is_told_its_memory_is_not_a_bound(self):
+        """
+        Feature: resolve_hf_model_spec asked for a census with the model
+            stated by hand, as a model Transformers cannot build must be.
+        Expectation: The warning says the memory is an estimate and not a
+            bound, because the formulas alone have measured 37 to 55% below
+            a real peak and a search filters feasibility on that number.
+        """
+        model = {"config_overrides": {"hidden_size": 64, "num_hidden_layers": 2,
+                                      "num_attention_heads": 4, "vocab_size": 128}}
+        with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING") as logs:
+            resolve_hf_model_spec(model, census_seq_len=128)
+        said = "\n".join(logs.output)
+        self.assertIn("NOT a bound", said)
+        self.assertIn("may still run out of memory", said)
+
+    def test_stated_records_are_taken_without_that_warning(self):
+        """
+        Feature: the same spec, with the census records its reader measured
+            stated in the overrides.
+        Expectation: The records reach the spec and nothing warns that the
+            memory is not a bound, since it then rests on a measurement;
+            this is the route a model Transformers cannot build has to its
+            records.
+        """
+        record = {"saved": 1024.0, "saved_tp": 0.0, "working": 2048.0,
+                  "working_tp": 0.0, "seq_length": 128}
+        model = {"config_overrides": {"hidden_size": 64, "num_hidden_layers": 2,
+                                      "num_attention_heads": 4, "vocab_size": 128,
+                                      "activations": {"decoder": record}}}
+        spec = resolve_hf_model_spec(model, census_seq_len=128)
+        self.assertEqual(spec["activations"]["decoder"], record)
+
+
 if __name__ == "__main__":
     unittest.main()
