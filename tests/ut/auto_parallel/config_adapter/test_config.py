@@ -1455,6 +1455,30 @@ class TestWriter(unittest.TestCase):
             self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "swap_inputs": False})
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_leaves_out_the_cost_models_context(self) -> None:
+        """
+        Feature: write_resolved_yaml, context.
+        Description: An AutoModels train.yaml asking the cost model for a
+            census, which the trainer has no section for.
+        Expectation: The resolved yaml leaves the section out, and says so;
+            the train.yaml keeps it.
+        """
+        path = os.path.join(self.tmpdir, "auto_models_census.yaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}, "context": {"census": True}}, fh)
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2}
+        out = os.path.join(self.tmpdir, "resolved_census.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            write_resolved_yaml(config, path, out)
+        self.assertIn("left out of the resolved yaml", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertNotIn("context", yaml.safe_load(fh))
+        with open(path, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["context"], {"census": True})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
         """A strategy that contradicts the trainer batch derivation is refused."""
         original_yaml_path = os.path.join(self.tmpdir, "auto_models_batch.yaml")

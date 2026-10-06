@@ -199,6 +199,18 @@ def _inject_activation_checkpoint(data: Dict[str, Any], mode: str,
         )
 
 
+def _drop_cost_model_context(data: Dict[str, Any]) -> None:
+    """Leave out the cost model's own ``context`` section, which the trainer's AutoModels schema refuses.
+
+    A train.yaml the search reads states its pricing options there, such as
+    ``context.census``; the trainer has no such section and refuses the
+    whole file over it.
+    """
+    if is_auto_models_schema(data) and data.pop("context", None) is not None:
+        logger.info("context states how the cost model prices the run, and the trainer refuses it: "
+                    "left out of the resolved yaml")
+
+
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
     if resolved.get("activation_checkpoint"):
@@ -452,7 +464,9 @@ def write_resolved_yaml(
 
     Copies the original ``train.yaml`` and replaces the parallel
     dimension fields with the resolved strategy values.  This produces
-    a complete, immediately launchable training configuration.
+    a complete, immediately launchable training configuration: an
+    AutoModels one leaves out the cost model's ``context`` section, which
+    the trainer refuses.
 
     The resolved strategy is read from ``config.resolved_strategy``.
     Supported keys: ``dp_shard``, ``dp_replicate``, ``tp_degree``,
@@ -474,6 +488,7 @@ def write_resolved_yaml(
     """
     _validate_strategy_and_yaml(config, original_yaml_path)
     data = _load_yaml_to_inject(original_yaml_path)
+    _drop_cost_model_context(data)
     _apply_searched_batch_size(data, config)
     _inject_resolved_strategy(data, config.resolved_strategy)
     _write_output_yaml(data, output_path, overwrite, original_yaml_path)
