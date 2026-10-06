@@ -29,9 +29,11 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.ratios as Ratios
 from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
     report,
+    traffic_report,
     verify_activations,
     verify_flops,
     verify_parameters,
+    verify_traffic,
 )
 
 
@@ -450,6 +452,10 @@ if __name__ == "__main__":
             logger.output(line)
         logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
         for line in report(verify_activations(args.yaml_config)):
+            logger.output(line)
+        logger.output("Bytes a forward of one sequence moves, the whole layer, beside the FLOPs the time model "
+                      "prices of it")
+        for line in traffic_report(verify_traffic(args.yaml_config)):
             logger.output(line)
         sys.exit(0)
 
