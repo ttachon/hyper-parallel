@@ -896,6 +896,36 @@ class TestV41SparseAttentionContract(unittest.TestCase):
             self.assertIsNot(module.npu_sparse_attention_with_scalar_sink,
                              npu_sparse_attention_with_scalar_sink)
 
+    def test_the_indexer_contract_wraps_every_selection_and_restores_them(self):
+        """
+        Feature: v41_indexer_contract, which states that the fused Lightning
+            Indexer keeps nothing for a backward.
+        Expectation: Where the V4.1 attention is in the tree, all four
+            selection functions are bound to a wrapper inside the context
+            and restored on the way out. The wrapper computes the same
+            indices, since no_grad changes whether a graph is recorded and
+            never what is computed, so the contract needs no shape declared.
+            Where the module is absent it is a no-op that says so.
+        """
+        import importlib  # pylint: disable=C0415
+        from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+            _V41_SELECTION,
+            v41_indexer_contract,
+        )
+        try:
+            module = importlib.import_module(
+                "hyper_parallel.components.modules.shared_compressed_dsa_attention")
+        except ImportError:
+            module = None
+        before = ({name: getattr(module, name) for name in _V41_SELECTION}
+                  if module is not None else {})
+        with v41_indexer_contract() as wrapped:
+            self.assertEqual(wrapped, module is not None)
+            for name, original in before.items():
+                self.assertIsNot(getattr(module, name), original)
+        for name, original in before.items():
+            self.assertIs(getattr(module, name), original)
+
     def test_what_it_keeps_follows_the_sequence_and_not_its_square(self):
         """
         Feature: the contract against the reference path beside it.

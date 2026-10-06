@@ -48,6 +48,7 @@ census left (:func:`_drop_fake_caches`, F55).
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 import importlib.machinery
 import sys
@@ -470,3 +471,73 @@ def v41_attention_contract(rope_head_dim: int) -> Iterator[bool]:
     finally:
         for name, value in held.items():
             setattr(module, name, value)
+
+
+# The Lightning Indexer's selection functions, which return the chosen
+# indices and nothing else.  One of the four already states that it needs no
+# autograd graph; the other three do not, which is the whole of this contract.
+_V41_SELECTION = (
+    "compressed_causal_topk",
+    "compressed_causal_candidates",
+    "compressed_causal_topk_and_candidates",
+    "compressed_candidate_topk",
+)
+
+
+@contextlib.contextmanager
+def v41_indexer_contract() -> Iterator[bool]:
+    """DeepSeek-V4.1's Indexer selection as its fused operator keeps it, which is nothing.
+
+    The selection returns int32 indices, and the Indexer's own KL loss
+    differentiates itself by hand, under ``no_grad``, from the projections
+    rather than through the selection.  So no gradient flows through the
+    scores, and the fused operator keeps nothing for a backward.  Running the
+    selection without recording a graph states exactly that, and needs no
+    shape declared, because ``no_grad`` changes whether a graph is kept and
+    never what is computed: the indices are the same indices.
+
+    Install it only for a run that takes the fused selection.  A run that
+    falls back to the reference really does keep those bytes, measured at
+    4.36 GiB a rank on the validation crop at 2048 tokens across the eight
+    layers that carry an Indexer, so for that run the bytes are not an
+    artefact and a census must count them.  Which path a run takes is settled
+    by a probe at runtime and recorded nowhere
+    (``v41_fused_indexer`` reaches the selection as ``use_provider``, whose
+    contract is to fall back silently), so this cannot be inferred from the
+    recipe.
+
+    Of the four, ``compressed_causal_topk`` already carries
+    ``@torch.no_grad()`` and is wrapped here only for uniformity.  That the
+    other three do not is a defect in the runtime rather than in the cost
+    model: on the reference path they hold an fp32 score of one sequence by
+    another that no backward reads, which three decorators would free.  That
+    change belongs to the model's owners, so the census states the contract
+    and does not alter what a run keeps.
+
+    Yields:
+        Whether the selection was there to wrap, which is False on a tree
+        that carries no V4.1 attention.
+    """
+    try:
+        module = importlib.import_module(_V41_ATTENTION)
+    except ImportError:
+        yield False
+        return
+
+    def without_a_graph(selection: Any) -> Any:
+        """*selection*, computing the same indices without recording a graph."""
+        @functools.wraps(selection)
+        def run(*args: Any, **kwargs: Any) -> Any:
+            """The selection's own indices, with no graph kept behind them."""
+            with torch.no_grad():
+                return selection(*args, **kwargs)
+        return run
+
+    held = {name: getattr(module, name) for name in _V41_SELECTION if hasattr(module, name)}
+    for name, selection in held.items():
+        setattr(module, name, without_a_graph(selection))
+    try:
+        yield bool(held)
+    finally:
+        for name, selection in held.items():
+            setattr(module, name, selection)
