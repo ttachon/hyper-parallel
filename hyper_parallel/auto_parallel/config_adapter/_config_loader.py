@@ -457,6 +457,19 @@ def _census_replacements(raw: Dict[str, Any], census_seq_len: int) -> tuple:
     return replacement_specs(raw.get("plan_overrides") or ())
 
 
+def _training_seq_len(raw: Dict[str, Any]) -> Any:
+    """Return the training sequence length an AutoModels YAML states, or None.
+
+    Reads the three spellings the SAPP-ND parser accepts, in its order, so the
+    two halves of the cost model agree on where the length comes from: the
+    Online path's, an Indexed Dataset's, the legacy one.
+    """
+    dataset_raw = _get_dict(raw, "dataset")
+    return (_get_dict(dataset_raw, "data_transform").get("max_seq_len")
+            or _get_dict(dataset_raw, "data_config").get("seq_length")
+            or _get_dict(raw, "data").get("max_seq_len"))
+
+
 def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     """Construct a normalized config from the current AutoModels schema."""
     model_raw = _get_dict(raw, "model")
@@ -464,13 +477,9 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
     accelerator_raw = _get_dict(raw, "accelerator")
     fsdp_raw = _get_dict(raw, "fsdp_config")
     activation_raw = _get_dict(raw, "activation_checkpoint")
-    dataset_raw = _get_dict(raw, "dataset")
-    data_transform_raw = _get_dict(dataset_raw, "data_transform")
 
     context_raw = _get_dict(raw, "context")
-    # Both spellings the SAPP-ND parser accepts, so the two halves of the
-    # cost model agree on where the training sequence length comes from.
-    seq_len = data_transform_raw.get("max_seq_len") or _get_dict(raw, "data").get("max_seq_len")
+    seq_len = _training_seq_len(raw)
     # A census builds its layers from the checkpoint's config, which only
     # this reader resolves: the search hands ND the spec, its records in it.
     census_seq_len = int(seq_len or 4096) if context_raw.get("census") else 0
@@ -482,9 +491,9 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
         model_spec["max_position_embeddings"] = seq_len
     else:
         logger.warning(
-            "no dataset.data_transform.max_seq_len (nor data.max_seq_len): costing "
-            "the model's context limit of %s tokens, which for a long-context model "
-            "puts every candidate out of memory",
+            "no dataset.data_transform.max_seq_len, dataset.data_config.seq_length "
+            "nor data.max_seq_len: costing the model's context limit of %s tokens, "
+            "which for a long-context model puts every candidate out of memory",
             model_spec.get("max_position_embeddings", 4096),
         )
         model_spec.setdefault("max_position_embeddings", 4096)

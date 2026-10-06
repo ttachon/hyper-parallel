@@ -593,6 +593,28 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(config.pp_config["micro_batch_num"], 8)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_reads_an_indexed_dataset_length(self, mock_get_hf_config) -> None:
+        """An Indexed Dataset's data_config.seq_length is the length, below the Online path's."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=32, hidden_size=4096, intermediate_size=11008,
+            num_attention_heads=32, num_key_value_heads=8, vocab_size=128256,
+            max_position_embeddings=262144, num_experts=1,
+        )
+        indexed = _auto_models_hp_yaml_content().replace(
+            "  data_transform:\n    max_seq_len: 2048\n", "  data_config:\n    seq_length: 8192\n")
+        both = _auto_models_hp_yaml_content().replace(
+            "  data_transform:\n", "  data_config:\n    seq_length: 8192\n  data_transform:\n")
+        for name, content, expected in (("indexed", indexed, 8192), ("both", both, 2048)):
+            with self.subTest(dataset=name):
+                path = os.path.join(self.tmpdir, f"auto_models_{name}.yaml")
+                _write_yaml(path, content)
+
+                config = read_hp_yaml_config(path)
+
+                length = config.model_spec["max_position_embeddings"]
+                self.assertEqual(length, expected, f"dataset={name}, length={length}")
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_spec_carries_head_dim_and_mtp(self, mock_get_hf_config) -> None:
         """Loader resolves head_dim and the Transformers MTP spelling."""
         mock_get_hf_config.return_value = SimpleNamespace(
