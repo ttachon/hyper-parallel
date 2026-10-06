@@ -120,6 +120,15 @@ class RealParts(Enum):
         return self.name.lower()
 
 
+# An optional column of a classified CSV, and the key it is read into: the
+# trainer's own step time in milliseconds, measured on steps the profiler left
+# alone. It is not a RealParts member, so every consumer that walks that enum
+# ignores it. ``examples/training_demo/sweep_qwen3_5_moe.py`` writes the column
+# and spells the name again rather than importing it, because that launcher
+# runs on the cluster's control node with nothing but the standard library.
+TRAINER_STEP = "step_trainer"
+
+
 class MemParts(Enum):
     """decomposition of memory"""
 
@@ -648,13 +657,29 @@ def get_diff_dims(csv_f):
 
 
 def get_comm_classified_data(csv_f, plot_idle=False):
-    """Read time components of different configurations on a given csv file"""
+    """Read time components of different configurations on a given csv file.
+
+    ``time`` is the mean of the PROFILED steps, which is what the instrument
+    read and not what the model costs: on Ascend the profiler adds 0.33 to
+    0.84 s a step at EP 1 and 0.01 to 0.10 at EP 8, which is enough to reverse
+    a ranking. A CSV may therefore carry ``step_trainer`` as well, the
+    trainer's own step time over steps it did not profile, and this reads it
+    into the parts under the same name for whoever ranks the round.
+
+    It is deliberately NOT substituted for ``time`` here. The parts carry the
+    profiler's cost too, so the step less its parts goes negative against the
+    honest total on 4 of the 15 points of the 2 October round, to -499 ms at
+    EP 1, where against the profiled step the same residual is +96 to +454.
+    Idle stays a profiled quantity until the parts have a correction of their
+    own; only the total is honest enough to rank on.
+    """
     configs = []
     with open(csv_f, newline="", encoding="utf-8") as csv_file:
         rows = csv.DictReader(csv_file)
         for row in rows:
             logger.info(row)
             time = float(row.pop("time"))
+            trainer_step = (row.pop(TRAINER_STEP, "") or "").strip()
             config = []
             comm_wait_time_classified = {}
             total_wait = 0
@@ -677,6 +702,8 @@ def get_comm_classified_data(csv_f, plot_idle=False):
                     dim = Dim.get_dim(component)
                     config.append((dim, dim.from_str(value_str)))
             comm_wait_time_classified["BUBBLE"] = comm_wait_time_classified.get(str(RealParts.PP_WAIT))
+            if trainer_step:
+                comm_wait_time_classified[TRAINER_STEP] = float(trainer_step)
             if plot_idle:
                 comm_wait_time_classified["IDLE"] = time - total_wait
                 logger.info(

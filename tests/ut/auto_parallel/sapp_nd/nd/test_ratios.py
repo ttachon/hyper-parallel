@@ -137,6 +137,50 @@ class TestRatios(unittest.TestCase):
         self.assertEqual(len(pick), 1)
         self.assertIn("the fastest, DP 64 EP 2 OP 32, 650.0", pick[0])
 
+    def test_the_report_ranks_on_the_trainer_step_where_the_round_has_one(self):
+        """
+        Feature: ratios.report, ratios.step.
+        Description: The round with the trainer's own step time added to each
+            strategy's measured parts, ordered against the profiled steps: EP 1
+            is the dearest profiled at 700 ms and the cheapest unprofiled at 640,
+            which is what the profiler's 0.33 to 0.84 s at EP 1 does to a round.
+        Expectation: The report's fastest, its cost of following and its step
+            column are the trainer's, and the last line says how many strategies
+            it had one for; the busy time, fitted part by part, is untouched.
+        """
+        entries = _round()
+        trainer = {(1, 64): 640.0, (2, 32): 660.0, (2, 1): 700.0}
+        for entry in entries:
+            key = (int(entry[0].val(Dim.EP)), int(entry[0].val(Dim.OP)))
+            entry[5][Debug.TRAINER_STEP] = trainer[key]
+        self.assertEqual([Ratios.step(entry) for entry in entries], [640.0, 660.0, 700.0])
+
+        lines = Ratios.report(entries, Ratios.fit_ratios(entries))
+        pick = [line for line in lines if line.startswith("Corrected, ND ranks")][0]
+        self.assertIn("the fastest, DP 64 OP 64, 640.0", pick)
+        self.assertIn("the trainer's own on 3 of 3 strategies", lines[-1])
+        self.assertAlmostEqual(Ratios.busy(entries[0]), 630.0)
+
+    def test_the_report_falls_back_to_the_profiled_step(self):
+        """
+        Feature: ratios.report, ratios.step.
+        Description: The same round as every other test here, whose strategies
+            carry no trainer step, and one where a single strategy has one.
+        Expectation: The profiled step is used where there is nothing better, and
+            the last line counts how many strategies each column covered, so a
+            mixed round cannot be read as a like for like comparison.
+        """
+        entries = _round()
+        self.assertEqual([Ratios.step(entry) for entry in entries], [700.0, 650.0, 720.0])
+        lines = Ratios.report(entries, Ratios.fit_ratios(entries))
+        self.assertIn("the trainer's own on 0 of 3 strategies", lines[-1])
+
+        entries[2][5][Debug.TRAINER_STEP] = 600.0
+        mixed = Ratios.report(entries, Ratios.fit_ratios(entries))
+        self.assertIn("the trainer's own on 1 of 3 strategies", mixed[-1])
+        self.assertIn("the fastest, DP 64 EP 2, 600.0",
+                      [line for line in mixed if line.startswith("Corrected, ND ranks")][0])
+
     def test_a_round_without_compute_cannot_be_fitted(self):
         """
         Feature: ratios.fit_ratios.

@@ -115,6 +115,69 @@ class TestTraceClassify(unittest.TestCase):
     def _path(self, name):
         return os.path.join(self.tmpdir, name)
 
+    def _classified_csv(self, name, extra_column=None, extra_value=None):
+        """A one-row classified CSV of the 2 October EP 1 OP 64 point, plus a column."""
+        header = ["DP", "EP", "OP", "time", "comp", "dp_wait", "op_wait", "ep_wait",
+                  "mp_wait", "cp_wait", "pp_wait", "sp_wait"]
+        row = ["64", "1", "64", "6804.575", "5783.602", "559.399", "398.453",
+               "0", "0", "0", "0", "0"]
+        if extra_column:
+            header.append(extra_column)
+            row.append(extra_value)
+        path = self._path(name)
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerow(row)
+        return path
+
+    def test_the_reader_takes_the_trainer_step_beside_the_profiled_one(self):
+        """
+        Feature: debug.get_comm_classified_data.
+        Description: A classified CSV carrying the harness's step_trainer column,
+            the trainer's own step time for the same run, and one without it.
+        Expectation: The column reaches the parts under its own name while the
+            step and every part stay the profile's, and a CSV without it reads
+            exactly as before.
+        """
+        path = self._classified_csv("trainer.csv", Debug.TRAINER_STEP, "6276.0")
+        _, time, real = Debug.get_comm_classified_data(path, plot_idle=True)[0]
+        self.assertAlmostEqual(time, 6804.575)
+        self.assertAlmostEqual(real[Debug.TRAINER_STEP], 6276.0)
+        plain = Debug.get_comm_classified_data(self._classified_csv("plain.csv"), plot_idle=True)[0]
+        self.assertNotIn(Debug.TRAINER_STEP, plain[2])
+        self.assertAlmostEqual(plain[1], time)
+
+    def test_idle_stays_measured_against_the_profiled_step(self):
+        """
+        Feature: debug.get_comm_classified_data.
+        Description: The row above, whose profiled step is 6804.6 ms, whose parts
+            sum to 6741.5 and whose trainer step is 6276.0.
+        Expectation: Idle is the profiled step less the parts and is NOT the
+            trainer's step less them: the parts carry the profiler's cost too, so
+            a residual taken across the two columns goes negative, as it does on
+            4 of that round's 15 points.
+        """
+        path = self._classified_csv("trainer.csv", Debug.TRAINER_STEP, "6276.0")
+        _, time, real = Debug.get_comm_classified_data(path, plot_idle=True)[0]
+        parts = sum(value for name, value in real.items()
+                    if name not in {"IDLE", "BUBBLE", Debug.TRAINER_STEP})
+        self.assertAlmostEqual(real["IDLE"], time - parts, places=6)
+        self.assertGreater(real["IDLE"], 0.0)
+        self.assertLess(real[Debug.TRAINER_STEP] - parts, 0.0)
+
+    def test_an_unknown_column_is_still_refused(self):
+        """
+        Feature: debug.get_comm_classified_data.
+        Description: A CSV carrying a column that is neither a dimension, a part,
+            nor the trainer's step.
+        Expectation: Refused, so a misspelt dimension cannot be read as data; the
+            trainer's step is admitted by name and nothing else is.
+        """
+        path = self._classified_csv("unknown.csv", "step_trainer_sd", "30.0")
+        with self.assertRaises(ValueError):
+            Debug.get_comm_classified_data(path, plot_idle=True)
+
     def test_split_trace_assigns_every_part(self):
         """
         Feature: trace_classify.split_trace.
