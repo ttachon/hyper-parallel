@@ -308,6 +308,28 @@ class TestVerifyTraffic(unittest.TestCase):
         self.assertTrue(lines[4].rstrip().endswith("0"))
 
 
+    def test_a_dense_and_an_mla_model_report_their_own_parts(self):
+        """
+        Feature: verify_traffic on a model with no recurrence.
+        Description: A Llama of one layer kind and a DeepSeek-V3 of a dense
+            layer and an expert one, both of width 64 on 4096 tokens.
+        Expectation: Each kind reports the parts it runs and no recurrence,
+            since the rename of a weightless attention op belongs to a layer
+            that has a rule; the scores are one op, the attention kernel's,
+            and every part reads its own parameters once.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        for config, kinds in ((_one_kind(LlamaConfig), {"decoder x2"}),
+                              (_deepseek_v3(), {"dense x1", "moe x1"})):
+            rows = _verify_traffic(config)
+            self.assertEqual({row.where for row in rows}, kinds | {"layers"})
+            for row in rows:
+                self.assertNotEqual(row.part, "linrec")
+                self.assertGreater(row.moved, 0)
+            scores = [row for row in rows if row.part == "scores"]
+            self.assertEqual({row.launches for row in scores}, {1})
+
+
 class TestRunNdVerify(unittest.TestCase):
     """run_nd -V prints the verify report and exits."""
 
