@@ -23,6 +23,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -356,18 +357,28 @@ def _apply_activation_features(
     compile_for_execution: bool,
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
+    activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
-    if activation_checkpoint not in (None, "off"):
+    has_layer_checkpoint = bool(activation_checkpoint_layer_ranges)
+    has_active_layer_checkpoint = any(
+        isinstance(layer_range, Mapping) and layer_range.get("mode", "off") != "off"
+        for layer_range in activation_checkpoint_layer_ranges or ()
+    )
+    if activation_checkpoint not in (None, "off") or has_layer_checkpoint:
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
+            layer_ranges=activation_checkpoint_layer_ranges,
         )
+    effective_checkpoint = activation_checkpoint
+    if effective_checkpoint in (None, "off") and has_active_layer_checkpoint:
+        effective_checkpoint = "layerwise"
     validate_attention_swap(
         activation_swap,
-        activation_checkpoint=activation_checkpoint,
+        activation_checkpoint=effective_checkpoint,
         enable_compile=compile_for_execution,
         pp_size=getattr(mesh, "pp_size", 1),
     )
@@ -408,6 +419,7 @@ def apply_model_infrastructure(
     freeze_config: Optional[Any] = None,
     compile_config: Optional[Union[CompileConfig, dict]] = None,
     activation_checkpoint: Optional[str] = None,
+    activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
     is_meta_device: bool = False,
@@ -466,6 +478,7 @@ def apply_model_infrastructure(
         compile_for_execution,
         mesh,
         swap_inputs=swap_inputs,
+        activation_checkpoint_layer_ranges=activation_checkpoint_layer_ranges,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.

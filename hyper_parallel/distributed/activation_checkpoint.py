@@ -16,7 +16,7 @@
 
 import logging
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -188,6 +188,15 @@ class _LayerContainerInfo:
     container: nn.Module
     path: str
     blocks: tuple[_TransformerBlockInfo, ...]
+
+
+@dataclass(frozen=True)
+class _LayerRecomputeRange:
+    """Mode overrides for consecutive transformer layers."""
+
+    first: int
+    count: Optional[int]
+    mode: str
 
 
 def _get_checkpoint_wrapped_module(module: nn.Module) -> Optional[nn.Module]:
@@ -569,16 +578,20 @@ def _register_forward_prefetch_layers(containers: list[_LayerContainerInfo]) -> 
     swap_manager = SwapManager()
     for container_info in containers:
         wrapper_chains = {}
-        for block_info in container_info.blocks:
+        for block_index, block_info in enumerate(container_info.blocks):
             current_block = getattr(block_info.parent, block_info.child_name, None)
             if not isinstance(current_block, nn.Module):
                 continue
             for relative_path, wrapper in _find_checkpoint_wrappers(current_block).items():
-                wrapper_chains.setdefault(relative_path, []).append(wrapper)
+                wrapper_chains.setdefault(relative_path, []).append((block_index, wrapper))
 
         wired_modules: list[nn.Module] = []
         for wrappers in wrapper_chains.values():
-            for current_wrapper, next_wrapper in zip(wrappers, wrappers[1:]):
+            for (current_index, current_wrapper), (next_index, next_wrapper) in zip(
+                wrappers, wrappers[1:]
+            ):
+                if next_index != current_index + 1:
+                    continue
                 swap_manager.set_forward_prefetch_layer(current_wrapper, next_wrapper)
                 wired_modules.extend((current_wrapper, next_wrapper))
         wired_modules = list(dict.fromkeys(wired_modules))  # dedupe, keep order
@@ -749,9 +762,9 @@ def _validate_activation_checkpoint_config(
     Raises:
         ValueError: The mode or ``swap_inputs`` has an unsupported value.
     """
-    if activation_checkpoint not in ("full", "selective"):
+    if activation_checkpoint not in (None, "off", "full", "selective"):
         raise ValueError(
-            "activation_checkpoint.mode must be 'full' or 'selective', but got "
+            "activation_checkpoint.mode must be off, full or selective, but got "
             f"{activation_checkpoint!r}"
         )
     if not isinstance(swap_inputs, bool):
@@ -765,6 +778,54 @@ def _validate_activation_checkpoint_config(
             "activation_checkpoint.swap_inputs is not supported with torch.compile; "
             "input swapping will be disabled."
         )
+
+
+def _normalize_layer_recompute_ranges(
+    layer_ranges: Optional[Sequence[Mapping[str, Any]]],
+) -> tuple[_LayerRecomputeRange, ...]:
+    """Validate and normalize consecutive per-layer mode overrides."""
+    if layer_ranges is None:
+        return ()
+    if isinstance(layer_ranges, (str, bytes)) or not isinstance(layer_ranges, Sequence):
+        raise ValueError("activation_checkpoint.layer_ranges must be a sequence of mappings")
+
+    normalized = []
+    previous_end = 0
+    for index, raw_range in enumerate(layer_ranges):
+        if not isinstance(raw_range, Mapping):
+            raise ValueError(f"activation_checkpoint.layer_ranges[{index}] must be a mapping")
+        unknown = sorted(set(raw_range) - {"first", "count", "mode"})
+        if unknown:
+            raise ValueError(
+                f"activation_checkpoint.layer_ranges[{index}] has unknown fields {unknown}"
+            )
+        first = raw_range.get("first", 0)
+        count = raw_range.get("count")
+        mode = raw_range.get("mode", "off")
+        if isinstance(first, bool) or not isinstance(first, int) or first < previous_end:
+            raise ValueError(
+                "activation_checkpoint.layer_ranges must be ordered, non-overlapping, "
+                "and start at non-negative integer indices"
+            )
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
+        ):
+            raise ValueError(
+                f"activation_checkpoint.layer_ranges[{index}].count must be a positive integer "
+                "or null"
+            )
+        if mode not in ("off", "full", "selective"):
+            raise ValueError(
+                f"activation_checkpoint.layer_ranges[{index}].mode must be off, full or selective; "
+                f"got {mode!r}"
+            )
+        if count is None and index != len(layer_ranges) - 1:
+            raise ValueError(
+                "only the final activation_checkpoint.layer_ranges entry may omit count"
+            )
+        normalized.append(_LayerRecomputeRange(first, count, mode))
+        previous_end = first + (count or 0)
+    return tuple(normalized)
 
 
 def _resolve_activation_checkpoint_containers(
@@ -852,6 +913,89 @@ def _apply_selective_checkpointing(
     )
 
 
+def _mode_for_layer(
+    layer_index: int,
+    ranges: tuple[_LayerRecomputeRange, ...],
+    default_mode: str,
+) -> str:
+    """Return the layer's override, or the activation-checkpoint default."""
+    for layer_range in ranges:
+        if layer_index < layer_range.first:
+            break
+        if layer_range.count is None or layer_index < layer_range.first + layer_range.count:
+            return layer_range.mode
+    return default_mode
+
+
+def _apply_layerwise_checkpointing(
+    containers: list[_LayerContainerInfo],
+    ranges: tuple[_LayerRecomputeRange, ...],
+    default_mode: str,
+    has_kv_sharing: bool,
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+) -> int:
+    """Wrap transformer layers with their configured checkpoint modes."""
+    has_selective_layers = any(
+        _mode_for_layer(index, ranges, default_mode) == "selective"
+        for index in range(sum(len(container.blocks) for container in containers))
+    )
+    context_fn = (
+        make_selective_checkpoint_context_fn()
+        if has_selective_layers and not enable_compile and not has_kv_sharing
+        else None
+    )
+    if has_selective_layers and has_kv_sharing:
+        logger.warning(
+            "Selective activation checkpointing is not supported for KV-shared models; "
+            "selected layers will use submodule activation checkpointing."
+        )
+    wrapped_count = 0
+    layer_index = 0
+    for container_info in containers:
+        for block_info in container_info.blocks:
+            current_block = getattr(block_info.parent, block_info.child_name, None)
+            mode = _mode_for_layer(layer_index, ranges, default_mode)
+            layer_index += 1
+            if not isinstance(current_block, nn.Module) or mode == "off":
+                continue
+            if _is_checkpoint_wrapped(current_block):
+                continue
+
+            if has_kv_sharing:
+                wrapped_count += apply_submodule_checkpointing(
+                    [current_block],
+                    has_kv_sharing=True,
+                    enable_compile=enable_compile,
+                    swap_inputs=swap_inputs,
+                )
+                continue
+
+            if mode == "selective":
+                if enable_compile:
+                    wrapped = checkpoint_wrapper(
+                        current_block,
+                        policy_fn=compile_selective_checkpoint_policy,
+                    )
+                else:
+                    wrapped = checkpoint_wrapper(
+                        current_block,
+                        swap_inputs=swap_inputs,
+                        context_fn=context_fn,
+                    )
+            elif enable_compile:
+                wrapped = checkpoint_wrapper(current_block)
+            else:
+                wrapped = checkpoint_wrapper(
+                    current_block,
+                    **_eager_checkpoint_kwargs(swap_inputs),
+                )
+            setattr(block_info.parent, block_info.child_name, wrapped)
+            wrapped_count += 1
+    return wrapped_count
+
+
 def _apply_full_checkpointing(
     model: nn.Module,
     containers: list[_LayerContainerInfo],
@@ -917,25 +1061,65 @@ def _apply_activation_checkpointing(
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
     swap_inputs: bool = False,
+    layer_ranges: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> nn.Module:
-    """Apply full or selective recomputation to discovered transformer layers.
+    """Apply full, selective or layer-specific recomputation to transformer layers.
 
     Validates the requested options, discovers the repeated-block containers that
-    advertise HuggingFace checkpointing support, then delegates to the
-    mode-specific wrapper. Swap prefetch chains are registered afterwards for
-    every configuration that wrapped the layers itself.
+    advertise HuggingFace checkpointing support, then delegates to the requested
+    wrapper. Explicit layer ranges override the default mode.
     """
+    normalized_ranges = _normalize_layer_recompute_ranges(layer_ranges)
     _validate_activation_checkpoint_config(
         activation_checkpoint,
         swap_inputs,
         enable_compile,
     )
+    if activation_checkpoint in (None, "off") and layer_ranges is None:
+        return model
+
     containers = _resolve_activation_checkpoint_containers(model)
     ac_layers = _flatten_layer_container_infos(containers)
+    for layer_range in normalized_ranges:
+        end = (
+            len(ac_layers)
+            if layer_range.count is None
+            else layer_range.first + layer_range.count
+        )
+        if layer_range.first >= len(ac_layers) or end > len(ac_layers):
+            raise ValueError(
+                "activation_checkpoint.layer_ranges references layers outside the discovered model "
+                f"range [0, {len(ac_layers)}): first={layer_range.first}, count={layer_range.count}"
+            )
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
+
+    if layer_ranges is not None:
+        default_mode = activation_checkpoint or "off"
+        wrapped_count = _apply_layerwise_checkpointing(
+            containers,
+            normalized_ranges,
+            default_mode,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+        has_active_range = any(
+            _mode_for_layer(index, normalized_ranges, default_mode) != "off"
+            for index in range(len(ac_layers))
+        )
+        if has_active_range:
+            _warn_if_nothing_wrapped(wrapped_count, "layerwise", containers)
+        logger.info(
+            "Layerwise activation checkpointing wrapped %d module(s) in: %s",
+            wrapped_count,
+            ", ".join(container.path for container in containers),
+        )
+        if swap_inputs and not enable_compile:
+            _register_forward_prefetch_layers(containers)
+        return model
 
     if activation_checkpoint == "selective":
         wrapped_count = _apply_selective_checkpointing(

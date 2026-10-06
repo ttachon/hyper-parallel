@@ -26,6 +26,7 @@ definitions.
 __all__ = [
     "AcceleratorConfig",
     "ActivationCheckpointConfig",
+    "ActivationCheckpointLayerRange",
     "CompileConfig",
     "DataLoaderConfig",
     "DatasetConfig",
@@ -57,6 +58,7 @@ from hyper_parallel.trainer.config.optimization import (
 from hyper_parallel.trainer.config.parallelism import (
     AcceleratorConfig,
     ActivationCheckpointConfig,
+    ActivationCheckpointLayerRange,
     PlanOverride,
     _import_module_type,
     entries_to_module_replacements,

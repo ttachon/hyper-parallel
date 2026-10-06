@@ -149,7 +149,28 @@ ckpt_output = ckpt_block_func(x)
 swap_output = swap_block_func(x)
 ```
 
-### 4. 单 tensor 卸载
+### 4. 按层设置重计算模式
+
+`activation_checkpoint.layer_ranges` 可为连续层区间单独指定 `off`、`full` 或 `selective`。
+未覆盖的层使用 `activation_checkpoint.mode` 的值。层索引从 0 开始，按模型发现的 Transformer
+层顺序编号；区间不能重叠，引用的层必须存在。
+
+```yaml
+activation_checkpoint:
+  mode: off
+  layer_ranges:
+    - first: 0
+      count: 2
+      mode: full
+    - first: 2
+      count: 6
+      mode: selective
+```
+
+`count` 可省略或设为 `null`，表示从 `first` 延伸到最后一层，且只能用于最后一个区间。
+将区间模式设为 `off` 可覆盖全局 `full` 或 `selective` 模式，在指定层关闭重计算。
+
+### 5. 单 tensor 卸载
 
 `swap_tensor_wrapper` 适用于只想卸载某几个明确的大激活 tensor。它需要在模块的 `forward` / `construct` 内部调用，会把其中符合条件的 tensor 注册到当前 swap group 中，等待后续 offload / prefetch 调度。
 

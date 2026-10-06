@@ -51,20 +51,89 @@ class AcceleratorConfig:
 
 
 @dataclass
+class ActivationCheckpointLayerRange:
+    """Activation-checkpoint mode for a consecutive range of transformer layers."""
+
+    first: int = 0
+    count: Optional[int] = None
+    mode: Literal["off", "full", "selective"] = "off"
+
+    def __post_init__(self) -> None:
+        """Validate one layer range before model construction."""
+        if (
+            isinstance(self.first, bool)
+            or not isinstance(self.first, int)
+            or self.first < 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.layer_ranges.first must be a non-negative integer"
+            )
+        if self.count is not None and (
+            isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1
+        ):
+            raise ValueError(
+                "activation_checkpoint.layer_ranges.count must be a positive integer or null"
+            )
+        if self.mode not in ("off", "full", "selective"):
+            raise ValueError(
+                "activation_checkpoint.layer_ranges.mode must be one of off, full, selective; "
+                f"got {self.mode!r}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain mapping for the model-build API."""
+        return {"first": self.first, "count": self.count, "mode": self.mode}
+
+
+@dataclass
 class ActivationCheckpointConfig:
     """Activation-checkpoint options exposed by the initial YAML schema.
 
-    ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
-    ``"selective"``.
+    ``swap_inputs`` is consumed only when ``mode`` or a layer range enables
+    checkpointing. ``layer_ranges`` overrides ``mode`` for the listed layers.
     """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    layer_ranges: Optional[List[ActivationCheckpointLayerRange]] = None
 
     def __post_init__(self) -> None:
-        """Reject ambiguous values for activation input swapping."""
+        """Reject invalid swap flags and overlapping layer ranges."""
+        if self.mode not in (None, "off", "full", "selective"):
+            raise ValueError(
+                "activation_checkpoint.mode must be off, full, selective or null; "
+                f"got {self.mode!r}"
+            )
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        if self.layer_ranges is None:
+            return
+        if not isinstance(self.layer_ranges, list):
+            raise TypeError("activation_checkpoint.layer_ranges must be a list or null")
+
+        normalized = []
+        for item in self.layer_ranges:
+            if isinstance(item, Mapping):
+                item = ActivationCheckpointLayerRange(**dict(item))
+            if not isinstance(item, ActivationCheckpointLayerRange):
+                raise TypeError(
+                    "activation_checkpoint.layer_ranges entries must be mappings or "
+                    "ActivationCheckpointLayerRange values"
+                )
+            normalized.append(item)
+
+        previous_end = 0
+        for index, item in enumerate(normalized):
+            if item.first < previous_end:
+                raise ValueError(
+                    "activation_checkpoint.layer_ranges must be ordered and non-overlapping"
+                )
+            if item.count is None and index != len(normalized) - 1:
+                raise ValueError(
+                    "only the final activation_checkpoint.layer_ranges entry may omit count"
+                )
+            previous_end = item.first + (item.count or 0)
+        self.layer_ranges = normalized
 
 
 @dataclass
