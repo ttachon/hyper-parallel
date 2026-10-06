@@ -1108,6 +1108,58 @@ class TestV41SparseAttentionContract(unittest.TestCase):
         self.assertAlmostEqual(large / small, 2.0, delta=0.05)
 
 
+class TestRecipeConfigFactory(unittest.TestCase):
+    """A recipe that builds its model through a factory is asked, not its checkpoint path."""
+
+    def test_a_section_naming_no_factory_is_left_alone(self):
+        """
+        Feature: _factory_config on a model section with no _target_, or one
+            naming a factory it does not know.
+        Expectation: None, so every model that resolves through AutoConfig
+            keeps resolving through it and this path costs them nothing.
+        """
+        from hyper_parallel.auto_parallel._hf_model_spec import (  # pylint: disable=C0415
+            _factory_config,
+        )
+        self.assertIsNone(_factory_config({}))
+        self.assertIsNone(_factory_config({"_target_": "some.other.builder"}))
+        self.assertIsNone(_factory_config({"pretrained_model_name_or_path": "Qwen/Qwen3-8B"}))
+
+    def test_a_known_factory_that_cannot_build_is_refused_not_ignored(self):
+        """
+        Feature: _factory_config where _target_ names a factory it knows and
+            that factory cannot build its config, as on a tree carrying no
+            V4.1 model.
+        Expectation: ValueError naming the factory. Falling back quietly to
+            the formulas would price a different model from the one the
+            recipe builds, which is how a recipe stating an eightfold crop
+            came to be priced from the released config.
+        """
+        from hyper_parallel.auto_parallel._hf_model_spec import (  # pylint: disable=C0415
+            _CONFIG_FACTORIES,
+            _factory_config,
+        )
+        target = next(iter(_CONFIG_FACTORIES))
+        with self.assertRaises(ValueError) as refusal:
+            _factory_config({"_target_": target, "config_path": "no/such/dir",
+                             "engram_assets_path": "no/such/file"})
+        self.assertIn(target, str(refusal.exception))
+
+    def test_every_factory_pair_names_the_same_module(self):
+        """
+        Feature: the _CONFIG_FACTORIES table.
+        Expectation: Each model factory and its config factory come from one
+            module, which is what makes them a declared pair rather than two
+            names that happen to look alike.
+        """
+        from hyper_parallel.auto_parallel._hf_model_spec import (  # pylint: disable=C0415
+            _CONFIG_FACTORIES,
+        )
+        self.assertTrue(_CONFIG_FACTORIES)
+        for model_factory, config_factory in _CONFIG_FACTORIES.items():
+            self.assertEqual(model_factory.rpartition(".")[0], config_factory.rpartition(".")[0])
+
+
 class TestTensorParallelConfig(unittest.TestCase):
     """A rank's share of a config divides each width once, whatever it is called."""
 

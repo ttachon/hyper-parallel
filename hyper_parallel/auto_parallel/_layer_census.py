@@ -675,15 +675,75 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
 # build does (:func:`_replaced`, F53).  A family belongs here only while no
 # contract in :mod:`~hyper_parallel.auto_parallel._npu_contracts` states what
 # its kernels save; stating one is what takes it out again.
-_NO_ACTIVATION_CONTRACT = {
-    "deepseek_v4": (
-        "its sparse attention and Lightning Indexer run as NPU kernels with no torch path a run "
-        "takes, and no contract states what they save, so a census here would price Transformers' "
-        "eager attention instead: that keeps an fp32 score of one sequence by another, and each "
-        "Indexer layer keeps seven fp32 candidate scores. Measured on the DeepSeek-V4.1 crop at "
-        "4096 tokens it reads 77.9 GiB a rank against a 37.6 GiB measured peak"
-    ),
+_NO_ACTIVATION_CONTRACT: Dict[str, str] = {
+    # Empty while every family with kernels of its own has its contracts
+    # stated.  DeepSeek-V4 was the entry that forced this guard and now has
+    # them (:data:`_FAMILY_CONTRACTS`); the next family to arrive with a
+    # kernel and no contract belongs here rather than being priced from the
+    # path its run does not take.
 }
+
+# The families whose own modules call kernels this host has not got, with the
+# contracts their census runs under.  A family here is measured as its run
+# behaves; a family in :data:`_NO_ACTIVATION_CONTRACT` is refused instead.
+_FAMILY_CONTRACTS = ("deepseek_v4",)
+
+
+@contextlib.contextmanager
+def _family_contracts(config: Any) -> Iterator[None]:
+    """The contracts the modules of *config*'s family run under, for what runs inside.
+
+    DeepSeek-V4's attention and Indexer are chosen on the device the tensors
+    are on, so a census, whose tensors are fake and on none, would take the
+    reference beside each kernel and measure a layer no run builds (F53).
+    Both contracts stand in instead.
+
+    The Indexer's is installed only where the config asks for the fused
+    selection, which is what ``v41_fused_indexer`` states and what a run
+    would try.  A run whose node cannot serve that operator falls back
+    silently and then keeps about 9 GiB a rank more than this prices, which
+    is a property of the runtime and not of the estimate, so it is said out
+    loud rather than guessed at.
+
+    Whether they can be installed at all is :func:`_no_contract`'s to
+    refuse, since a layer's parameters do not depend on which kernel runs it
+    and are counted from the same fake layer.
+    """
+    if str(getattr(config, "model_type", "")) not in _FAMILY_CONTRACTS:
+        yield
+        return
+    from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+        v41_attention_contract,
+        v41_indexer_contract,
+    )
+    rope = int(getattr(config, "qk_rope_head_dim", 0) or 0)
+    fused = bool(getattr(config, "v41_fused_indexer", True))
+    with contextlib.ExitStack() as installed:
+        installed.enter_context(v41_attention_contract(rope))
+        if fused:
+            installed.enter_context(v41_indexer_contract())
+        else:
+            logger.info("census of a %s layer: the recipe asks for the reference Indexer "
+                        "selection, whose scores it keeps", config.model_type)
+        yield
+
+
+def _contracts_install(config: Any) -> bool:
+    """Whether this tree carries the modules *config*'s family's contracts stand in for.
+
+    True for a family that needs none, so only a family with kernels of its
+    own can be refused for want of them.
+    """
+    from hyper_parallel.auto_parallel._npu_contracts import _V41_ATTENTION  # pylint: disable=C0415
+    carries = {"deepseek_v4": _V41_ATTENTION}
+    path = carries.get(str(getattr(config, "model_type", "")))
+    if path is None:
+        return True
+    try:
+        importlib.import_module(path)
+    except ImportError:
+        return False
+    return True
 
 
 def _no_contract(config: Any) -> None:
@@ -697,11 +757,22 @@ def _no_contract(config: Any) -> None:
             does, so this refuses rather than answer with the bytes of a
             layer the run does not build.
     """
-    missing = _NO_ACTIVATION_CONTRACT.get(str(getattr(config, "model_type", "")))
+    family = str(getattr(config, "model_type", ""))
+    missing = _NO_ACTIVATION_CONTRACT.get(family)
     if missing is not None:
         raise CensusUnavailable(
             f"no census of a {config.model_type} layer: {missing}; state the kernels' contracts, "
             f"or drop context.census and read the formulas' memory as an estimate, not as a bound"
+        )
+    if family in _FAMILY_CONTRACTS and not _contracts_install(config):
+        raise CensusUnavailable(
+            f"no census of a {config.model_type} layer here: its sparse attention and Lightning "
+            f"Indexer run as NPU kernels whose contracts are stated, and this tree carries none of "
+            f"the modules to install them on, so a census would measure the reference beside each "
+            f"kernel instead. Measured that way on the DeepSeek-V4.1 crop at 4096 tokens it reads "
+            f"86.4 GiB a rank against a 37.6 GiB measured peak. Price it from a tree carrying the "
+            f"model, or drop context.census and read the formulas' memory as an estimate, not as a "
+            f"bound"
         )
 
 
@@ -888,6 +959,7 @@ def _fake_layer(config: Any, layer_index: int, gdn_backend: str = _EAGER_GDN,
     config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
     modeling.ALL_ATTENTION_FUNCTIONS.register(_FLASH, _flash_attention)
     with npu_contracts() if replacements else contextlib.nullcontext(), \
+            _family_contracts(config), \
             FakeTensorMode(allow_non_fake_inputs=True):
         default = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)

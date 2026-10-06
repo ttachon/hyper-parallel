@@ -26,6 +26,7 @@ cost-model backends must keep working without it.
 """
 import copy
 import dataclasses
+import importlib
 import logging
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -60,6 +61,26 @@ _CONFIG_KWARG_NAMES = (
 # through a factory (``_target_`` plus ``config_path``) and never loads a
 # checkpoint, so it carries no pretrained path.
 _MODEL_PATH_ALIASES = ("pretrained_model_name_or_path", "config_path")
+
+# The config a recipe's own factory builds, for the factories whose model
+# ``AutoConfig`` cannot resolve: the path beside ``_target_`` is then a
+# directory Transformers refuses, and the shape the run really trains is the
+# one this function returns.  DeepSeek-V4.1 is the case that forced it:
+# Transformers 5.14.1 has no ``deepseek_v41``, and the factory's arguments are
+# a recipe for deriving the shape (a divisor and an expert count) rather than
+# the canonical fields :func:`_explicit_overrides` can harvest, so nothing
+# short of calling it knows what the run builds.  A factory is consulted
+# BEFORE ``AutoConfig``, because where both answer they answer differently and
+# the factory is the one that says what the run trains: V4.1's crops the
+# released model eightfold, and the released config would price a model nobody
+# runs.  One line a family, and the entry is the declaration that the two are
+# a pair.
+_CONFIG_FACTORIES = {
+    "hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model."
+    "build_cropped_deepseek_v41":
+        "hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model."
+        "build_deepseek_v41_validation_config",
+}
 
 # Canonical text-tower fields, with the Transformers aliases that carry them.
 # First populated alias wins, so Hyper-internal names keep priority over the
@@ -280,6 +301,45 @@ def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
     """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
     config = _get_hf_config(model_raw)
     return config, _text_tower(config)
+
+
+def _factory_config(model_raw: Mapping[str, Any]) -> Any:
+    """The config the recipe's own factory builds, or None where it names none.
+
+    The model section's keys are offered to the factory by name, filtered to
+    the ones it accepts, so a recipe states its shape once and the cost model
+    reads the same statement the trainer does.  Anything the factory cannot
+    take, such as a dtype or a placement switch, is left out rather than
+    refused.
+
+    Returns:
+        A Transformers config, or None where ``_target_`` names no factory
+        this knows.
+
+    Raises:
+        ValueError: If the factory is known but cannot build its config, since
+            a recipe that names one and then fails is a broken recipe rather
+            than a model to price by formula.
+    """
+    import inspect  # pylint: disable=C0415
+
+    target = str(model_raw.get("_target_") or "")
+    path = _CONFIG_FACTORIES.get(target)
+    if path is None:
+        return None
+    module_path, _, name = path.rpartition(".")
+    try:
+        factory = getattr(importlib.import_module(module_path), name)
+        accepted = inspect.signature(factory).parameters
+        offered = {key: value for key, value in model_raw.items() if key in accepted}
+        logger.info("building the config %s states, through %s", target.rpartition(".")[2], name)
+        return factory(**offered)
+    except (ImportError, AttributeError, TypeError, OSError, KeyError, ValueError) as exc:
+        raise ValueError(
+            f"model._target_ names {target}, whose config factory {name} could not build its "
+            f"config ({exc}); the cost model prices what that factory builds, so fix the recipe "
+            f"rather than let the formulas price a different model"
+        ) from exc
 
 
 def _model_path(model_raw: Mapping[str, Any]) -> Optional[str]:
@@ -510,8 +570,12 @@ def resolve_hf_model_spec(
             "model.config_path or model.config_overrides for Auto Parallel search"
         )
 
+    # A recipe that builds its model through a factory is asked first: the
+    # path beside _target_ is a directory that factory reads, not a checkpoint
+    # to price, and where the two disagree the factory is what the run trains.
+    model_config = _factory_config(model_raw)
     try:
-        model_config = _get_hf_config(model_raw)
+        model_config = model_config if model_config is not None else _get_hf_config(model_raw)
     except (ImportError, OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
         if _describes_a_model(explicit):
             logger.warning(
