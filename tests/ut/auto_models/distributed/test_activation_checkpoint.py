@@ -28,6 +28,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
+from hyper_parallel.trainer.config.parallelism import ActivationCheckpointConfig
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -390,3 +391,44 @@ class TestActivationCheckpointSwapInputs(unittest.TestCase):
                     )
 
                 swap_manager.set_forward_prefetch_layer.assert_not_called()
+
+
+class TestLayerwiseActivationCheckpointing(unittest.TestCase):
+    """Tests for per-layer activation-checkpoint mode overrides."""
+
+    def test_config_ranges_override_global_mode_by_layer(self):
+        """Full, selective, and off ranges should be applied in discovered order."""
+        config = ActivationCheckpointConfig(
+            mode="full",
+            layer_ranges=[
+                {"first": 0, "count": 1, "mode": "off"},
+                {"first": 2, "count": 1, "mode": "selective"},
+            ],
+        )
+        model = _DiscoveryModel()
+        layer_ranges = [item.to_dict() for item in config.layer_ranges]
+
+        with (
+            patch(
+                f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper",
+                new=_checkpoint_wrapper,
+            ),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.ensure_profiler_ops_sac_ignored"),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.ensure_fsdp_ops_sac_ignored"),
+        ):
+            result = _apply_activation_checkpointing(
+                model,
+                config.mode,
+                layer_ranges=layer_ranges,
+            )
+
+        text_first = model.text_tower.decoder["2"]
+        text_second = model.text_tower.decoder["7"]
+        image_first = model.image_tower.decoder["2"]
+        image_second = model.image_tower.decoder["7"]
+
+        self.assertIs(result, model)
+        self.assertFalse(hasattr(text_first, "checkpoint_kwargs"))
+        self.assertEqual(text_second.checkpoint_kwargs.get("swap_inputs"), False)
+        self.assertTrue(callable(image_first.checkpoint_kwargs.get("context_fn")))
+        self.assertEqual(image_second.checkpoint_kwargs.get("swap_inputs"), False)
