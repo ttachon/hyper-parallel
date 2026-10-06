@@ -778,6 +778,121 @@ def _deepseek_v4():
                             num_experts_per_tok=2, q_lora_rank=32)
 
 
+def _saved_bytes(run) -> int:
+    """The bytes *run*'s forward saves for its backward, on fake tensors."""
+    seen, total = set(), 0
+
+    def pack(tensor):
+        nonlocal total
+        address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
+        if address not in seen:
+            seen.add(address)
+            total += tensor.untyped_storage().nbytes()
+        return tensor
+
+    with FakeTensorMode(allow_non_fake_inputs=True), \
+            torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        run()
+    return total
+
+
+class TestV41SparseAttentionContract(unittest.TestCase):
+    """The contract of DeepSeek-V4.1's sparse attention keeps what its kernel's caller keeps."""
+
+    @staticmethod
+    def _call(seq: int, heads: int = 8, head_dim: int = 64, selected: int = 32, rope: int = 8):
+        """Run the contract once at *seq* tokens, with the caller's layouts."""
+        from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+            npu_sparse_attention_with_scalar_sink,
+        )
+        query = torch.randn(1, heads, seq, head_dim, dtype=torch.bfloat16, requires_grad=True)
+        key_value = torch.randn(1, 1, seq, head_dim, dtype=torch.bfloat16, requires_grad=True)
+        indices = torch.zeros(1, seq, selected, dtype=torch.int32)
+        sinks = torch.randn(heads, dtype=torch.bfloat16, requires_grad=True)
+        out = npu_sparse_attention_with_scalar_sink(query, key_value, indices, sinks, rope, 0.125)
+        return out
+
+    def test_the_output_has_the_shape_its_caller_reshapes_to(self):
+        """
+        Feature: the contract's output.
+        Expectation: A row per token and head, (batch, tokens, heads, head
+            dim), which is the shape the kernel's caller returns after it
+            rescales the sink's share out of the softmax sum.
+        """
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = self._call(seq=128)
+        self.assertEqual(tuple(out.shape), (1, 128, 8, 64))
+
+    def test_it_keeps_the_nine_tensors_its_caller_keeps(self):
+        """
+        Feature: what the contract saves for its backward.
+        Expectation: Exactly the nine tensors
+            _NpuSparseAttentionWithScalarSink hands save_for_backward, in
+            its shapes: the queries and padded keys token-major, the two
+            auxiliary rotary coordinates, the selected indices with the
+            sink's column, two fp32 statistics of one scalar a token and
+            head, the output, and the sink's share of each row.
+        """
+        seq, heads, head_dim, selected, rope = 128, 8, 64, 32, 8
+        padded = max(seq + 1, selected + 2)
+        want = (
+            seq * heads * head_dim * 2          # queries, token-major
+            + padded * head_dim * 2             # padded keys
+            + seq * heads * rope * 2            # query rope coordinates
+            + padded * rope * 2                 # key rope coordinates
+            + seq * (selected + 1) * 4          # selected indices plus the sink's column
+            + seq * heads * 4 * 2               # the two fp32 statistics
+            + seq * heads * head_dim * 2        # the output
+            + seq * heads * 4                   # the sink's share of each row
+        )
+        got = _saved_bytes(lambda: self._call(seq, heads, head_dim, selected, rope))
+        self.assertEqual(got, want)
+
+    def test_the_installer_binds_both_paths_and_restores_them(self):
+        """
+        Feature: v41_attention_contract, which the census installs around a
+            V4.1 layer.
+        Expectation: Where the V4.1 attention is in the tree, both the
+            kernel's name and the reference beside it are bound to the
+            contract inside the context and restored on the way out, since
+            a layer picks between them by the device it runs on and a
+            census is on none. Where the module is absent, as on the
+            cost model's own lineage, it is a no-op that says so.
+        """
+        import importlib  # pylint: disable=C0415
+        from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+            npu_sparse_attention_with_scalar_sink,
+            v41_attention_contract,
+        )
+        try:
+            module = importlib.import_module(
+                "hyper_parallel.components.modules.shared_compressed_dsa_attention")
+        except ImportError:
+            module = None
+        with v41_attention_contract(64) as patched:
+            self.assertEqual(patched, module is not None)
+            if module is not None:
+                self.assertIs(module.npu_sparse_attention_with_scalar_sink,
+                              npu_sparse_attention_with_scalar_sink)
+                self.assertIsNot(module._reference_sparse_attention, None)  # pylint: disable=W0212
+        if module is not None:
+            self.assertIsNot(module.npu_sparse_attention_with_scalar_sink,
+                             npu_sparse_attention_with_scalar_sink)
+
+    def test_what_it_keeps_follows_the_sequence_and_not_its_square(self):
+        """
+        Feature: the contract against the reference path beside it.
+        Expectation: Doubling the tokens roughly doubles what is kept. This
+            is the whole reason the contract is needed: the reference keeps
+            an fp32 score of one sequence by another, which quadruples, and
+            on the V4.1 crop that read 77.9 GiB a rank at 4096 tokens
+            against a 37.6 GiB measured peak.
+        """
+        small = _saved_bytes(lambda: self._call(seq=256))
+        large = _saved_bytes(lambda: self._call(seq=512))
+        self.assertAlmostEqual(large / small, 2.0, delta=0.05)
+
+
 class TestKernelContracts(unittest.TestCase):
     """A census of a model whose kernels no contract states is refused, not answered."""
 
