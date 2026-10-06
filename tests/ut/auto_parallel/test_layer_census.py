@@ -910,6 +910,43 @@ class TestV41SparseAttentionContract(unittest.TestCase):
         self.assertAlmostEqual(large / small, 2.0, delta=0.05)
 
 
+class TestTensorParallelConfig(unittest.TestCase):
+    """A rank's share of a config divides each width once, whatever it is called."""
+
+    def test_one_width_under_two_names_is_divided_once(self):
+        """
+        Feature: tp_config on a DeepSeek-V4 config, whose attribute_map maps
+            intermediate_size onto moe_intermediate_size, so a model whose
+            feed-forward is all experts states one width under two names.
+        Expectation: A rank of 2 holds half that width. Dividing each name in
+            turn gave a quarter, so the layer the census built as a rank's
+            share was half the width it should be, the split derived from the
+            pair came out too large, and ND over-rewarded tensor parallelism.
+        """
+        from hyper_parallel.auto_parallel._layer_census import tp_config  # pylint: disable=C0415
+        config = _deepseek_v4()
+        self.assertEqual(config.intermediate_size, config.moe_intermediate_size)
+        whole = config.moe_intermediate_size
+        half = tp_config(config, 2)
+        self.assertEqual(half.moe_intermediate_size, whole // 2)
+        self.assertEqual(half.intermediate_size, whole // 2)
+        self.assertEqual(half.num_attention_heads, config.num_attention_heads // 2)
+
+    def test_two_widths_under_two_names_are_each_divided(self):
+        """
+        Feature: tp_config on a Qwen3-MoE config, which keeps the dense and
+            the expert width apart.
+        Expectation: Both are halved, so de-duplicating the aliased pair does
+            not stop a model that really has two widths from splitting both.
+        """
+        from hyper_parallel.auto_parallel._layer_census import tp_config  # pylint: disable=C0415
+        config = _qwen3_moe()
+        self.assertNotEqual(config.intermediate_size, config.moe_intermediate_size)
+        half = tp_config(config, 2)
+        self.assertEqual(half.intermediate_size, config.intermediate_size // 2)
+        self.assertEqual(half.moe_intermediate_size, config.moe_intermediate_size // 2)
+
+
 class TestKernelContracts(unittest.TestCase):
     """A census of a model whose kernels no contract states is refused, not answered."""
 

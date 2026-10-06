@@ -807,13 +807,30 @@ def _classes(modeling: Any) -> Tuple[type, type]:
 
 
 def tp_config(config: Any, tp: int) -> Any:
-    """*config* as one of *tp* tensor-parallel ranks holds its layers: heads and widths divided."""
+    """*config* as one of *tp* tensor-parallel ranks holds its layers: heads and widths divided.
+
+    Two of the fields divided can be one field.  A Transformers config class
+    may declare an ``attribute_map``, and DeepSeek-V4's maps
+    ``intermediate_size`` onto ``moe_intermediate_size``, so a model whose
+    feed-forward is all experts states one width under two names.  Dividing
+    each name in turn then divides that width by *tp* twice, and the layer
+    built as a rank's share is a quarter as wide at TP 2 rather than half,
+    which makes the split the census derives from the pair too large and ND
+    over-reward tensor parallelism.  Qwen3-MoE keeps the two apart, which is
+    why this stayed hidden.  Each underlying attribute is divided once.
+    """
     config = copy.deepcopy(config)
     config.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    aliases = getattr(type(config), "attribute_map", None) or {}
+    divided = set()
     for name in _TP_FIELDS:
+        target = aliases.get(name, name)
+        if target in divided:
+            continue
         value = getattr(config, name, None)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             setattr(config, name, max(1, value // tp))
+            divided.add(target)
     return config
 
 
