@@ -183,26 +183,6 @@ class TestConfigOverrides(unittest.TestCase):
         ):
             self._parse("--model.width=[unclosed")
 
-    def test_activation_checkpoint_layer_plan(self) -> None:
-        """A per-layer plan resolves from an override and is stored one way."""
-        config = self._parse(
-            "--activation_checkpoint.mode=full",
-            "--activation_checkpoint.layers={6-7: off, 0: selective}",
-        )
-        layers = config.activation_checkpoint.layers
-        self.assertEqual(
-            layers, {"0": "selective", "6-7": "off"},
-            msg=f"case: layer_plan_override, layers={layers!r}")
-
-    def test_activation_checkpoint_layer_plan_needs_recompute(self) -> None:
-        """A plan given while recompute is off is refused instead of being dropped."""
-        with self.assertRaisesRegex(
-            ValueError,
-            r"must then be 'full' or 'selective', but got 'off'",
-            msg="case: layer_plan_needs_recompute",
-        ):
-            self._parse("--activation_checkpoint.layers={0: full}")
-
 
 if __name__ == "__main__":
     unittest.main()

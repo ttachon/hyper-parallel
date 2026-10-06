@@ -15,11 +15,10 @@
 """Activation checkpointing helpers for distributed model components."""
 
 import logging
-import re
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -189,22 +188,6 @@ class _LayerContainerInfo:
     container: nn.Module
     path: str
     blocks: tuple[_TransformerBlockInfo, ...]
-
-
-# The modes a block can run in a per-layer plan.
-_LAYER_MODES = ("off", "full", "selective")
-# A per-layer plan's key: one block index, or an inclusive range of them.
-_LAYER_RANGE_PATTERN = re.compile(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?")
-
-
-@dataclass(frozen=True)
-class _LayerModeRange:
-    """Consecutive blocks that one entry of a per-layer plan runs in one mode."""
-
-    key: str
-    first: int
-    last: int
-    mode: str
 
 
 def _get_checkpoint_wrapped_module(module: nn.Module) -> Optional[nn.Module]:
@@ -569,29 +552,6 @@ def _warn_if_nothing_wrapped(
     )
 
 
-def _report_wrapped(
-    wrapped_count: int,
-    activation_checkpoint: str,
-    containers: list[_LayerContainerInfo],
-) -> None:
-    """Warn when a mode wrapped no module, then log what it wrapped."""
-    _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
-    paths = ", ".join(container.path for container in containers)
-    if activation_checkpoint == "selective":
-        logger.info(
-            "Selective activation checkpointing applied to %d layer(s) in: %s",
-            wrapped_count,
-            paths,
-        )
-        return
-    logger.info(
-        "%s activation checkpointing wrapped %d submodule(s) in: %s",
-        activation_checkpoint.capitalize(),
-        wrapped_count,
-        paths,
-    )
-
-
 def _find_checkpoint_wrappers(module: nn.Module, prefix: str = "") -> dict[str, nn.Module]:
     """Find outermost checkpoint wrappers by their relative module paths."""
     if _is_checkpoint_wrapped(module):
@@ -774,115 +734,6 @@ def _try_disable_use_cache(sub_config: Any) -> None:
         pass
 
 
-def _parse_layer_range(key: Union[int, str]) -> tuple[int, int]:
-    """Read one plan key: a block index, or an inclusive range ``"first-last"``."""
-    if isinstance(key, int) and not isinstance(key, bool):
-        if key < 0:
-            raise ValueError(
-                f"activation_checkpoint.layers keys must not be negative, but got {key}"
-            )
-        return key, key
-    match = _LAYER_RANGE_PATTERN.fullmatch(key) if isinstance(key, str) else None
-    if match is None:
-        raise ValueError(
-            "activation_checkpoint.layers keys must be a layer index or a range "
-            f"'first-last', but got {key!r}"
-        )
-    first = int(match.group(1))
-    last = first if match.group(2) is None else int(match.group(2))
-    if last < first:
-        raise ValueError(
-            f"activation_checkpoint.layers range {key!r} ends before it starts"
-        )
-    return first, last
-
-
-def _parse_layer_mode(key: Union[int, str], value: Any) -> str:
-    """Read the mode one plan entry gives its blocks."""
-    # PyYAML reads an unquoted ``off`` as False, as the trainer's literal
-    # fields also accept.
-    if value is False:
-        return "off"
-    if isinstance(value, str) and value in _LAYER_MODES:
-        return value
-    raise ValueError(
-        f"activation_checkpoint.layers[{key!r}] must be one of {_LAYER_MODES}, "
-        f"but got {value!r}"
-    )
-
-
-def _parse_layer_plan(
-    activation_checkpoint: Optional[str],
-    layers: Optional[Mapping[Union[int, str], Any]],
-) -> tuple[_LayerModeRange, ...]:
-    """Read a per-layer plan into ranges ordered by their first block.
-
-    Raises:
-        ValueError: The plan is malformed, two of its entries overlap, or it is
-            given with a mode that recomputes nothing.
-    """
-    if not layers:
-        return ()
-    if not isinstance(layers, Mapping):
-        raise ValueError(
-            "activation_checkpoint.layers must be a mapping, but got "
-            f"{type(layers).__name__}"
-        )
-    if activation_checkpoint not in ("full", "selective"):
-        raise ValueError(
-            "activation_checkpoint.layers gives some layers another mode than "
-            "activation_checkpoint.mode, which must then be 'full' or 'selective', "
-            f"but got {activation_checkpoint!r}"
-        )
-    plan = sorted(
-        (
-            _LayerModeRange(str(key), *_parse_layer_range(key), _parse_layer_mode(key, value))
-            for key, value in layers.items()
-        ),
-        key=lambda item: item.first,
-    )
-    for previous, current in zip(plan, plan[1:]):
-        if current.first <= previous.last:
-            raise ValueError(
-                f"activation_checkpoint.layers entries {previous.key!r} and "
-                f"{current.key!r} overlap"
-            )
-    return tuple(plan)
-
-
-def normalize_activation_checkpoint_layers(
-    activation_checkpoint: Optional[str],
-    layers: Optional[Mapping[Union[int, str], Any]],
-) -> Optional[dict[str, str]]:
-    """Validate a per-layer activation checkpoint plan and write it one way.
-
-    The plan gives some transformer blocks another mode than
-    ``activation_checkpoint``, which every block it does not name runs. Each key
-    is a block's index in its repeated-block container, or an inclusive range
-    of indices written ``"first-last"``; each value is ``"off"``, ``"full"`` or
-    ``"selective"``. Whether the indices exist is checked when the plan is
-    applied to a model.
-
-    Args:
-        activation_checkpoint: The mode of every block the plan does not name.
-        layers: The plan, or ``None`` or an empty mapping for none.
-
-    Returns:
-        The plan with string keys in layer order and string modes, or ``None``
-        when there is no plan.
-
-    Raises:
-        ValueError: The plan is malformed, two of its entries overlap, or it is
-            given with a mode other than ``"full"`` or ``"selective"``.
-
-    Example:
-        normalize_activation_checkpoint_layers("full", {"6-7": False})
-        # {"6-7": "off"}
-    """
-    plan = _parse_layer_plan(activation_checkpoint, layers)
-    return {item.key: item.mode for item in plan} or None
-
-
 def _validate_activation_checkpoint_config(
     activation_checkpoint: Optional[str],
     swap_inputs: bool,
@@ -1061,208 +912,66 @@ def _apply_full_checkpointing(
     return _wrap_layer_containers(containers, full_checkpoint_wrapper)
 
 
-def _block_index(block: _TransformerBlockInfo) -> int:
-    """Read a block's index from the name its container registers it under."""
-    if not block.child_name.isdecimal():
-        raise ValueError(
-            "activation_checkpoint.layers needs blocks registered under their index, "
-            f"but found {block.fqn!r}"
-        )
-    return int(block.child_name)
-
-
-def _format_indices(indices: list[int]) -> str:
-    """Format block indices as inclusive ranges, such as ``0-5, 8``."""
-    ranges: list[list[int]] = []
-    for index in sorted(indices):
-        if ranges and index == ranges[-1][1] + 1:
-            ranges[-1][1] = index
-        else:
-            ranges.append([index, index])
-    return ", ".join(
-        str(first) if first == last else f"{first}-{last}" for first, last in ranges
-    )
-
-
-def _block_modes(
-    containers: list[_LayerContainerInfo],
-    plan: tuple[_LayerModeRange, ...],
-    activation_checkpoint: str,
-) -> dict[str, str]:
-    """Give every discovered block the mode the plan names for it, or the default.
-
-    Returns:
-        Each block's mode, by its fully qualified name.
-
-    Raises:
-        ValueError: A plan is given for a model with several repeated-block
-            containers, whose indices it cannot tell apart, or it names a
-            block the container does not hold.
-    """
-    modes = {
-        block.fqn: activation_checkpoint
-        for container in containers
-        for block in container.blocks
-    }
-    if not plan:
-        return modes
-    if len(containers) != 1:
-        raise ValueError(
-            "activation_checkpoint.layers needs one repeated block container, but "
-            f"the model has {len(containers)}: "
-            f"{', '.join(container.path for container in containers)}"
-        )
-    container = containers[0]
-    blocks = {_block_index(block): block for block in container.blocks}
-    for item in plan:
-        for index in range(item.first, item.last + 1):
-            if index not in blocks:
-                raise ValueError(
-                    f"activation_checkpoint.layers[{item.key!r}] names layer {index}, "
-                    f"but {container.path} holds layers {_format_indices(list(blocks))}"
-                )
-            modes[blocks[index].fqn] = item.mode
-    return modes
-
-
-def _describe_block_modes(container: _LayerContainerInfo, modes: dict[str, str]) -> str:
-    """Name each mode's blocks as index ranges, such as ``full 0-5; off 6-7``."""
-    indices_by_mode: dict[str, list[int]] = {}
-    for block in container.blocks:
-        indices_by_mode.setdefault(modes[block.fqn], []).append(_block_index(block))
-    return "; ".join(
-        f"{mode} {_format_indices(indices)}" for mode, indices in indices_by_mode.items()
-    )
-
-
-def _containers_running(
-    containers: list[_LayerContainerInfo],
-    modes: dict[str, str],
-    activation_checkpoint: str,
-) -> list[_LayerContainerInfo]:
-    """Keep each container's blocks that run one mode, dropping emptied containers."""
-    selected = []
-    for container in containers:
-        blocks = tuple(
-            block for block in container.blocks
-            if modes[block.fqn] == activation_checkpoint
-        )
-        if blocks:
-            selected.append(
-                _LayerContainerInfo(container=container.container, path=container.path, blocks=blocks)
-            )
-    return selected
-
-
-def _clear_hf_checkpointing(
-    containers: list[_LayerContainerInfo],
-    modes: dict[str, str],
-) -> None:
-    """Turn HuggingFace-native checkpointing off on every block not fully recomputed.
-
-    Enabling it sets the flag on every ``GradientCheckpointingLayer`` of the
-    model, and each such block reads its own flag when it is called.
-    """
-    for container in containers:
-        for block in container.blocks:
-            if modes[block.fqn] != "full":
-                block.module.gradient_checkpointing = False
-
-
-def _apply_block_modes(
-    model: nn.Module,
-    containers: list[_LayerContainerInfo],
-    modes: dict[str, str],
-    has_kv_sharing: bool,
-    *,
-    enable_compile: bool,
-    swap_inputs: bool,
-) -> bool:
-    """Recompute every block in its mode, the fully recomputed blocks first.
-
-    The fully recomputed blocks go first because the HuggingFace-native path
-    enables checkpointing on every block at once, before it is cleared on the
-    others; a block left ``"off"`` is not wrapped at all.
-
-    Returns:
-        Whether Hyper Parallel's own wrappers wrapped any block, whose swap
-        prefetch chains then need registering.
-    """
-    wrapped_itself = False
-    full = _containers_running(containers, modes, "full")
-    if full:
-        wrapped_count = _apply_full_checkpointing(
-            model,
-            full,
-            _flatten_layer_container_infos(full),
-            has_kv_sharing,
-            enable_compile=enable_compile,
-            swap_inputs=swap_inputs,
-        )
-        if wrapped_count is None:
-            _clear_hf_checkpointing(containers, modes)
-        else:
-            _report_wrapped(wrapped_count, "full", full)
-            wrapped_itself = True
-    selective = _containers_running(containers, modes, "selective")
-    if selective:
-        wrapped_count = _apply_selective_checkpointing(
-            selective,
-            _flatten_layer_container_infos(selective),
-            has_kv_sharing,
-            enable_compile=enable_compile,
-            swap_inputs=swap_inputs,
-        )
-        _report_wrapped(wrapped_count, "selective", selective)
-        wrapped_itself = True
-    return wrapped_itself
-
-
 def _apply_activation_checkpointing(
     model: nn.Module,
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
     swap_inputs: bool = False,
-    layers: Optional[Mapping[Union[int, str], Any]] = None,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers.
 
     Validates the requested options, discovers the repeated-block containers that
     advertise HuggingFace checkpointing support, then delegates to the
     mode-specific wrapper. Swap prefetch chains are registered afterwards for
-    every configuration that wrapped the layers itself. ``layers`` gives some
-    blocks another mode than ``activation_checkpoint``, which every other block
-    runs: see :func:`normalize_activation_checkpoint_layers`.
+    every configuration that wrapped the layers itself.
     """
     _validate_activation_checkpoint_config(
         activation_checkpoint,
         swap_inputs,
         enable_compile,
     )
-    plan = _parse_layer_plan(activation_checkpoint, layers)
     containers = _resolve_activation_checkpoint_containers(model)
-    modes = _block_modes(containers, plan, activation_checkpoint)
+    ac_layers = _flatten_layer_container_infos(containers)
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
 
-    if plan:
-        logger.info(
-            "Activation checkpointing per layer in %s: %s",
-            containers[0].path,
-            _describe_block_modes(containers[0], modes),
+    if activation_checkpoint == "selective":
+        wrapped_count = _apply_selective_checkpointing(
+            containers,
+            ac_layers,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
         )
-    wrapped_itself = _apply_block_modes(
-        model,
-        containers,
-        modes,
-        has_kv_sharing,
-        enable_compile=enable_compile,
-        swap_inputs=swap_inputs,
-    )
-    # The HuggingFace-native path wraps nothing itself, so it registers no
-    # swap prefetch chain.
-    if swap_inputs and not enable_compile and wrapped_itself:
+        _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
+        logger.info(
+            "Selective activation checkpointing applied to %d layer(s) in: %s",
+            wrapped_count,
+            ", ".join(container.path for container in containers),
+        )
+    else:
+        wrapped_count = _apply_full_checkpointing(
+            model,
+            containers,
+            ac_layers,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+        if wrapped_count is None:
+            # The HuggingFace-native path returns early in the original flow and
+            # therefore skips both the warning and the swap prefetch registration.
+            return model
+        _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
+        logger.info(
+            "%s activation checkpointing wrapped %d submodule(s) in: %s",
+            activation_checkpoint.capitalize(),
+            wrapped_count,
+            ", ".join(container.path for container in containers),
+        )
+
+    if swap_inputs and not enable_compile:
         _register_forward_prefetch_layers(containers)
     return model
