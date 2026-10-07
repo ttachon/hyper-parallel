@@ -24,6 +24,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import torch
+
 from hyper_parallel.auto_parallel import _hf_model_spec as spec_mod
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
@@ -134,6 +136,23 @@ class TestSharedExpertDerivation(unittest.TestCase):
                                               "config_overrides": dict(overrides)})
         for spec in (stated, fallback):
             self.assertEqual((spec["num_shared_experts"], spec["intermediate_size"]), (2, 512))
+
+    def test_the_checkpoints_dtype_is_read_by_name(self) -> None:
+        """
+        Feature: resolve_hf_model_spec, the checkpoint's dtype (I12).
+        Description: A checkpoint whose config holds its dtype as torch's
+            bfloat16, as newer Transformers state it under dtype, resolved
+            with no torch_dtype in the section, with auto, and with float32.
+        Expectation: bfloat16 by name for the first two, auto stating
+            nothing over the checkpoint; the section's float32 for the last.
+        """
+        recorder = _Recorder(SimpleNamespace(model_type="llama", hidden_size=1024, num_hidden_layers=4,
+                                             num_attention_heads=8, vocab_size=32000, dtype=torch.bfloat16))
+        got = []
+        for stated in ({}, {"torch_dtype": "auto"}, {"torch_dtype": "float32"}):
+            with _stub_registry(recorder):
+                got.append(resolve_hf_model_spec({"pretrained_model_name_or_path": "x", **stated})["torch_dtype"])
+        self.assertEqual(got, ["bfloat16", "bfloat16", "float32"])
 
 
 class TestVisualSequenceLength(unittest.TestCase):

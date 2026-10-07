@@ -680,6 +680,8 @@ def _write_minimal_hp_yaml(cp_algo=None, cp_degree=2):
     content = {
         "model": {
             "name": "test-tiny",
+            # Stated, so the parser has no dtype to warn about (I12).
+            "param_init_type": "float32",
             "config_overrides": {
                 "hidden_size": 256,
                 "num_hidden_layers": 2,
@@ -869,10 +871,14 @@ class TestTheParserReadsTheStatedRun(unittest.TestCase):
         self.assertEqual(ccfg.optimizer, "hyper_parallel.optim.AdamW")
 
     def test_no_stated_run_takes_the_defaults(self):
-        """A config read from no train.yaml keeps the parser's defaults."""
+        """A config read from no train.yaml keeps the parser's defaults.
+
+        It states no dtype and no checkpoint does, so its weights, and the
+        optimizer states that follow them, are bfloat16 (I12).
+        """
         ccfg = self._parse(_make_full_config())
-        self.assertEqual(ccfg.bytes_p, 4)
-        self.assertEqual(ccfg.optimizer_state_bytes, 4)
+        self.assertEqual(ccfg.bytes_p, 2)
+        self.assertEqual(ccfg.optimizer_state_bytes, 2)
         self.assertEqual(ccfg.main_param_bytes, 0)
         self.assertEqual(ccfg.cp_algo, "colossalai_cp")
 

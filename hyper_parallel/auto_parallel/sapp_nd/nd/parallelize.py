@@ -36,6 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_const
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     CostModelConfig,
     detect_attention_type,
+    unset_reads_report,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
     HYPER_FRAMEWORKS,
@@ -756,6 +757,8 @@ class ParallelizeLayer:
                 "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
                 priced.s,
             )
+        for line in unset_reads_report():
+            logger.output(line)
         logger.output(
             "Space generation took %.2fs and ordering took %.2fs",
             generation,

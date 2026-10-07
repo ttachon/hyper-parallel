@@ -1008,6 +1008,35 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.dh, 128)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_an_unstated_dtype_is_the_checkpoints(self, mock_hf):
+        """
+        Feature: the model's dtype where the config states none (I12).
+        Description: An AutoModels config with no FSDP precision, stating no
+            torch_dtype, then auto, then float32, over a checkpoint saved in
+            bfloat16; then no dtype anywhere, the checkpoint stating none.
+        Expectation: The checkpoint's bfloat16 for both the stored and the
+            computing width where nothing or auto is stated, as the runtime
+            loads it, where they were 4 bytes; a stated float32 wins; with
+            no dtype anywhere, bfloat16 and a warning.
+        """
+        got = []
+        for stated, saved in ((None, "bfloat16"), ("auto", "bfloat16"), ("float32", "bfloat16"), (None, None)):
+            mock_hf.return_value = self._hf_config(**({"torch_dtype": saved} if saved else {}))
+            config = _auto_models_config()
+            config["model"].pop("torch_dtype")
+            config["fsdp_config"].pop("mix_precision")
+            if stated:
+                config["model"]["torch_dtype"] = stated
+            with self.assertLogs(
+                "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper",
+                level="WARNING",
+            ) as said:
+                ccfg = _make_ccfg(config)
+            warned = any("states the model's dtype" in line for line in said.output)
+            got.append((ccfg.bytes_p, ccfg.bytes_compute, ccfg.optimizer_state_bytes, warned))
+        self.assertEqual(got, [(2, 2, 2, False), (2, 2, 2, False), (4, 4, 4, False), (2, 2, 2, True)])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_head_dim_defaults_to_hidden_over_heads(self, mock_hf):
         """
         Feature: attention head dimension fallback.
@@ -1457,8 +1486,9 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.shard_output_activ, 1)
         self.assertEqual(ccfg.shard_recompute_input, 1)
 
-        # bytes
-        self.assertEqual(ccfg.bytes_p, 4)
+        # bytes: no dtype stated and no checkpoint to read one from, so the
+        # weights are bfloat16, as they compute (I12)
+        self.assertEqual(ccfg.bytes_p, 2)
         self.assertEqual(ccfg.bytes_compute, 2)
         self.assertEqual(ccfg.bytes_softmax, 4)
 

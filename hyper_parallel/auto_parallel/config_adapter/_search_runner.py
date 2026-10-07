@@ -40,7 +40,7 @@ CONFIG_OVERRIDE_FIELDS = [
     "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
     "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim", "capacity_factor", "offset",
     "head_dim", "vision", "attn_output_gate", "qk_norm", "tie_word_embeddings",
-    "qkv_bias", "o_bias", "mlp_bias",
+    "qkv_bias", "o_bias", "mlp_bias", "torch_dtype",
     "layer_types", "linear_num_key_heads", "linear_key_head_dim",
     "linear_num_value_heads", "linear_value_head_dim",
     "linear_conv_kernel_dim", "activations", "output_activations",
