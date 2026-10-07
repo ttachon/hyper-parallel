@@ -544,6 +544,7 @@ class ParallelizeLayer:
         ranking_csv: Optional[str] = None,
         exhaustive: int = 0,
         force_exhaustive: int = 0,
+        fforce_exhaustive: int = 0,
         dimensions: Optional[list] = None,
     ) -> Any:
         """Search, order and print the configurations that fit memory.
@@ -555,6 +556,8 @@ class ParallelizeLayer:
         When ``force_exhaustive >= exhaustive``, append that many qualifying
         results per dimension. Otherwise, append at least ``force_exhaustive``
         and count those additions toward the ``exhaustive`` minimum.
+        ``fforce_exhaustive`` takes precedence and reserves distinct additions
+        for each requested dimension.
         """
         start = time.time()
         space = self.generate_search_space(yaml_folder, threads_num)
@@ -573,7 +576,17 @@ class ParallelizeLayer:
 
         plot_space = scored_space
         exhaustive_additions = []
-        if exhaustive > 0 or force_exhaustive > 0:
+        has_exhaustive = (
+            exhaustive > 0 or force_exhaustive > 0 or fforce_exhaustive > 0
+        )
+        if fforce_exhaustive > 0:
+            plot_space, exhaustive_additions = _fforce_exhaustive_plot_space(
+                scored_space,
+                dimensions if dimensions is not None else self.config.dimensions,
+                top_num,
+                fforce_exhaustive,
+            )
+        elif exhaustive > 0 or force_exhaustive > 0:
             plot_space, exhaustive_additions = _exhaustive_plot_space(
                 scored_space,
                 dimensions if dimensions is not None else self.config.dimensions,
@@ -633,11 +646,9 @@ class ParallelizeLayer:
                     dbg,
                     title=self.plot_title(),
                     max_num=(
-                        len(plot_space)
-                        if exhaustive > 0 or force_exhaustive > 0
-                        else top_num
+                        len(plot_space) if has_exhaustive else top_num
                     ),
-                    include_all=exhaustive > 0 or force_exhaustive > 0,
+                    include_all=has_exhaustive,
                 )
         return scored_space
 
@@ -909,6 +920,49 @@ def _exhaustive_plot_space(
     plot_space = [
         entry for entry in scored_space if entry[0].unique_name() in selected_ids
     ]
+    additions = [
+        entry for entry in plot_space if entry[0].unique_name() not in normal_ids
+    ]
+    return plot_space, additions
+
+
+def _fforce_exhaustive_plot_space(
+    scored_space: list,
+    dimensions: list,
+    top_num: Optional[int],
+    fforce_exhaustive: int,
+) -> tuple:
+    """Add distinct ranked configs for each dimension to the normal plot."""
+    normal_plot = Debug.top_plot_configs(scored_space, top_num)
+    selected_ids = {entry[0].unique_name() for entry in normal_plot}
+    added_by_dimension = {}
+
+    for dimension in dimensions:
+        added = 0
+        for entry in scored_space:
+            config_id = entry[0].unique_name()
+            if config_id in selected_ids:
+                continue
+            if entry[0].has_dim(dimension) and entry[0].val(dimension) > 1:
+                selected_ids.add(config_id)
+                added += 1
+                if added >= fforce_exhaustive:
+                    break
+        added_by_dimension[dimension] = added
+
+    for dimension, added in added_by_dimension.items():
+        if added < fforce_exhaustive:
+            logger.warning(
+                "Only %d of %d unique exhaustive result(s) found for dimension %s",
+                added,
+                fforce_exhaustive,
+                dimension,
+            )
+
+    plot_space = [
+        entry for entry in scored_space if entry[0].unique_name() in selected_ids
+    ]
+    normal_ids = {entry[0].unique_name() for entry in normal_plot}
     additions = [
         entry for entry in plot_space if entry[0].unique_name() not in normal_ids
     ]

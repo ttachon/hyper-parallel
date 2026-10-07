@@ -1589,6 +1589,64 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(len(standard_plot.data), 3)
         self.assertEqual(len(exhaustive_plot.data), 4)
 
+    def test_fforce_exhaustive_adds_distinct_results_per_dimension(self) -> None:
+        """Test each requested dimension receives distinct additional configs."""
+        dimensions = [Dim.DP, Dim.EP, Dim.TP, Dim.CP, Dim.OP]
+        candidate_values = [
+            {Dim.DP: 2, Dim.EP: 2},
+            {Dim.DP: 4, Dim.EP: 4},
+            {Dim.EP: 8},
+            {Dim.EP: 16},
+            {Dim.TP: 2},
+            {Dim.TP: 4},
+            {Dim.CP: 2},
+            {Dim.CP: 4},
+            {Dim.OP: 2},
+            {Dim.OP: 4},
+        ]
+        scored_space = [
+            (
+                Dim.Dimensions([(dimension, 1) for dimension in dimensions], all_dims=dimensions),
+                128,
+                1.0,
+                [],
+            )
+        ]
+        scored_space.extend(
+            (
+                Dim.Dimensions(
+                    [
+                        (dimension, values.get(dimension, 1))
+                        for dimension in dimensions
+                    ],
+                    all_dims=dimensions,
+                ),
+                128,
+                float(index),
+                [],
+            )
+            for index, values in enumerate(candidate_values, start=2)
+        )
+
+        plot_space, additions = Par._fforce_exhaustive_plot_space(
+            scored_space,
+            dimensions,
+            top_num=1,
+            fforce_exhaustive=2,
+        )
+        addition_ids = {entry[0].unique_name() for entry in additions}
+
+        self.assertEqual(len(additions), 10)
+        self.assertEqual(len(addition_ids), 10)
+        self.assertEqual(len(plot_space), 11)
+        for dimension in dimensions:
+            qualifying = sum(
+                1
+                for entry in additions
+                if entry[0].has_dim(dimension) and entry[0].val(dimension) > 1
+            )
+            self.assertGreaterEqual(qualifying, 2)
+
     def test_a_comparison_writes_a_plot_without_idle_and_its_estimates(self) -> None:
         """
         Feature: the files run_nd --real_csv writes beside its plot.
@@ -1764,10 +1822,12 @@ class TestSappNDRunND(unittest.TestCase):
                 patch.object(Par, "Parallelize", _FakeParallelize), \
                 patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
             option_forms = [
-                ["-e", "5", "-ee", "2"],
-                ["--exhaustive", "5", "--force_exhaustive", "2"],
+                (["-e", "5", "-ee", "2"], 5, 2, 0),
+                (["--exhaustive", "5", "--force_exhaustive", "2"], 5, 2, 0),
+                (["-eee", "2"], 0, 0, 2),
+                (["--fforce-exhaustive", "2"], 0, 0, 2),
             ]
-            for options in option_forms:
+            for options, exhaustive, force_exhaustive, fforce_exhaustive in option_forms:
                 _FakeParallelize.instances = []
                 argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"] + options
                 with patch.object(sys, "argv", argv):
@@ -1777,8 +1837,9 @@ class TestSappNDRunND(unittest.TestCase):
                     )
 
                 run_kwargs = _FakeParallelize.instances[-1].last_run_kwargs()
-                self.assertEqual(run_kwargs["exhaustive"], 5)
-                self.assertEqual(run_kwargs["force_exhaustive"], 2)
+                self.assertEqual(run_kwargs["exhaustive"], exhaustive)
+                self.assertEqual(run_kwargs["force_exhaustive"], force_exhaustive)
+                self.assertEqual(run_kwargs["fforce_exhaustive"], fforce_exhaustive)
 
     def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
         """
