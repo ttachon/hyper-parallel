@@ -1776,6 +1776,34 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(split[Debug.PerfParts.DP_COMM] + split[Debug.PerfParts.DP_REDUCE],
                          plain[Debug.PerfParts.DP_COMM])
 
+    def test_the_straggler_check_speaks_when_its_parts_miss_its_time(self) -> None:
+        """
+        Feature: estimate_pipeline, the check of the straggler stage's parts.
+        Description: Two stages of 12 and 18 whose recorded parts add up to
+            their times, then the same with the straggler's DP part 3 short.
+        Expectation: Nothing said when they agree; one error naming the
+            straggler stage when they do not, and either way the bubble is the
+            pipeline's time less the parts, so the parts and the bubble still
+            add up to the time.
+        """
+        cfg = _make_perf_cfg(p=2, vp=1, m=2)
+        timed = (Debug.PerfParts.FW_COMPUTE, Debug.PerfParts.BW_COMPUTE, Debug.PerfParts.RECOMPUTE,
+                 Debug.PerfParts.MP_COMM, Debug.PerfParts.EP_COMM, Debug.PerfParts.CP_COMM)
+        for short, errors in ((0.0, 0), (3.0, 1)):
+            with self.subTest(short=short):
+                debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, 2)], all_dims=[Dim.DP]), Debug.PerfParts)
+                for part in timed:
+                    debugger.info[part] = [1.0, 2.0]
+                debugger.info[Debug.PerfParts.DP_COMM] = [6.0, 6.0 - short]
+                with patch.object(PerfEstimate, "nd_logger") as nd_logger:
+                    time = PerfEstimate.estimate_pipeline(cfg, [12.0, 18.0], debugger=debugger)
+                self.assertEqual(nd_logger.error.call_count, errors)
+                if errors:
+                    self.assertEqual(nd_logger.error.call_args[0][1], 1)
+                parts = sum(debugger.info[part] for part in timed + (Debug.PerfParts.DP_COMM,))
+                self.assertEqual(parts, 2 * (18.0 - short))
+                self.assertEqual(debugger.info[Debug.PerfParts.BUBBLE] + parts, time)
+
     def test_performance_formula_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.

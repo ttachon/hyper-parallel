@@ -14,10 +14,12 @@
 # ============================================================================
 """performance estimation"""
 import json
+import math
 from copy import deepcopy
 from typing import Any, Callable, NamedTuple, Optional
 import numpy as np
 
+from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
@@ -74,6 +76,9 @@ GDN_CHUNK = 64
 # measured its own says so with ``context.moe_dispatch``, as it states the
 # ratios of the parts in a file.
 MOE_DISPATCH = 1040
+# How far a stage's recorded parts may stray from its time: they are its time
+# taken apart, so only by rounding.
+PARTS_REL_TOL = 1e-9
 
 
 def op_table(cfg, attn=None):
@@ -345,6 +350,26 @@ def estimate_stage(*args, **kwargs):
     #return stage
 
 
+def _check_stage_parts(time_sum, stage_time, stage):
+    """Say so when the parts recorded for a stage do not add up to its time.
+
+    The parts are the stage's time taken apart, so they agree with it to
+    rounding.  A gap means a walk recorded less, or more, than the time
+    counts, and the bubble, what is left of the pipeline's time once the
+    parts are taken out, silently takes the difference.
+    """
+    if math.isclose(time_sum, stage_time, rel_tol=PARTS_REL_TOL, abs_tol=PARTS_REL_TOL):
+        return
+    nd_logger.error(
+        "the parts recorded for stage %d sum to %.6E where its time is %.6E (%+.3f%%), "
+        "and the bubble takes the difference",
+        stage,
+        time_sum,
+        stage_time,
+        100 * (time_sum - stage_time) / stage_time if stage_time else 0.0,
+    )
+
+
 def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
     """pipeline level estimation"""
     logger.info("stage_perfs = %s", stage_perfs)
@@ -423,9 +448,9 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
             )
             time_sum += debugger.info[k]
 
-        if abs(time_sum - straggler_time * cfg.m) < 1e-9:
-            logger.warning("Inconsistency found in straggler time calculation")
-            time_sum = straggler_time * cfg.m
+        # The bubble stays the pipeline's time less the parts, so the parts
+        # and the bubble still sum to the total the ratios are fitted on.
+        _check_stage_parts(time_sum, stage_perfs[last_straggler_idx] * cfg.m, last_straggler_idx)
         logger.info(
             "straggler time = %.2E. %s x stragglers = %.2E",
             straggler_time,
