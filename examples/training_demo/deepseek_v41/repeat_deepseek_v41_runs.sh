@@ -64,8 +64,22 @@ POINTS=${POINTS:-"1:1 1:2 1:4 1:8 1:16 2:1 16:16"}
 REPEATS=${REPEATS:-3}
 # Steps 1 and 2 are warmup and the data loader's first touch. With no profiler
 # there is no window to skip, so everything after SKIP_STEPS is clean.
-TRAIN_ITERS=${TRAIN_ITERS:-10}
-SKIP_STEPS=${SKIP_STEPS:-5}
+#
+# Six is a CEILING, not a preference, and step 7 dies on every strategy:
+# prepare_deepseek_v41_online_data.py writes documents of 24 tokens times 1024
+# repetitions plus one, 24577, which is 6 x 4096 + 1, so PlaintextTransform
+# cuts each document into six full 4096-token pieces and a ONE-TOKEN tail (the
+# appended EOS). Documents 0 to 15 give exactly 96 full pieces, which is six
+# steps at a batch of 16, and their sixteen one-token tails stay buffered until
+# step 7. There cu_seq_lens carries a boundary of 1, and the V4.1 attention
+# refuses it: "packed sample boundaries must align with the CSA2 compression
+# ratio 2; misaligned boundaries=[1]". No generator argument avoids it, because
+# a document is always 24 x repetitions + 1 tokens, which is always odd, and
+# 4096 is even, so the tail is odd whatever --sequence-length is passed. Fixing
+# it means padding each document to an even token count, which the generator
+# cannot do without a tokenizer. Raise this only with data that has been fixed.
+TRAIN_ITERS=${TRAIN_ITERS:-6}
+SKIP_STEPS=${SKIP_STEPS:-2}
 GLOBAL_BATCH=${GLOBAL_BATCH:-16}
 MICRO_BATCH=${MICRO_BATCH:-1}
 SEQ_LEN=${SEQ_LEN:-4096}
