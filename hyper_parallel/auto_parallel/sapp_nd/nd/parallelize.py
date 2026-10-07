@@ -747,6 +747,15 @@ class ParallelizeLayer:
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )
+        priced = self.priced()
+        if not getattr(priced, "seq_len_stated", True):
+            # A warning at parse time scrolls past a search's lines; this one
+            # sits under the table it qualifies (I11).
+            logger.output(
+                "Every number above is priced at %d tokens, the model's context limit: the config states no "
+                "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
+                priced.s,
+            )
         logger.output(
             "Space generation took %.2fs and ordering took %.2fs",
             generation,

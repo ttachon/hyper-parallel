@@ -358,6 +358,21 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             ccfg = _make_ccfg(cfg)
             self.assertEqual(ccfg.s, expected, msg=f"extra={extra}")
 
+    def test_a_length_nobody_stated_is_recorded(self):
+        """
+        Feature: CostModelParserHyperV2 seq_len resolution, the record of a substitution (I11).
+        Description: The dense model with its data.max_seq_len of 2048, then
+            with no training length anywhere and a context limit of 32768.
+        Expectation: The first is stated; the second is costed at the
+            context limit and records that nobody stated it, which a search
+            then prints under its ranking.
+        """
+        stated = _dense_overrides(data={"max_seq_len": 2048})
+        unstated = _dense_overrides(model={"config_overrides": {"max_position_embeddings": 32768}})
+        unstated.pop("data")
+        self.assertEqual([(ccfg.s, ccfg.seq_len_stated) for ccfg in map(_make_ccfg, (stated, unstated))],
+                         [(2048, True), (32768, False)])
+
     def test_overrides_missing_kv_heads_fallback(self):
         """
         Feature: CostModelParserHyperV2 KV-head fallback.

@@ -610,6 +610,8 @@ class CostModelParserHyperV2(_CostModelParser):
         """Prefer the Trainer dataset sequence length over the model limit."""
         stated = self._dataset_seq_len()
         seq_len = int(stated or self.ccfg.s or 4096)
+        # The ranking says so beside its table, where a reader looks (I11).
+        self.ccfg.seq_len_stated = bool(stated)
         if not stated:
             # The fallback is the model's context limit, orders of magnitude
             # above any real training length on a long-context model, which

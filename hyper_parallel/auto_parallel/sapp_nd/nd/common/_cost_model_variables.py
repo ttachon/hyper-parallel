@@ -55,6 +55,9 @@ class _CostModVar:
     # The device count a caller states, as run_nd -d does, which a parser
     # takes where its config cannot state one; 0 where none is stated.
     devices: int = 0
+    # False where the config states no training sequence length and the
+    # parser costs the model's context limit in its place.
+    seq_len_stated: bool = True
 
     # Strategy
     d: float = 0

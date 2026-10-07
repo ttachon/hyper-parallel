@@ -1640,6 +1640,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False),
                                         dimensions=[Dim.DP, Dim.OP])
         runner.batch_reachable = lambda: True
+        runner.priced = SimpleNamespace
         runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
         runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
         with tempfile.TemporaryDirectory() as tmp_dir, \
@@ -2657,6 +2658,35 @@ class TestSappNDRunND(unittest.TestCase):
                 self.assertEqual(error.call_count, 0 if reachable else 1)
                 if not reachable:
                     self.assertEqual(error.call_args.args[1:4], (16, 16, "64"))
+
+    def test_a_ranking_priced_at_a_length_nobody_stated_says_so_under_its_table(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length (I11).
+        Description: A search over one configuration of a model whose config
+            states no training length, so the parser costed its context
+            limit of 32768; then the same model with a stated length.
+        Expectation: The line under the table names the 32768 tokens and why;
+            with a stated length nothing is said.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False), dimensions=[Dim.DP])
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        for stated, said in ((False, 1), (True, 0)):
+            with self.subTest(stated=stated), patch.object(Par.logger, "output") as output:
+                runner.priced = lambda stated=stated: SimpleNamespace(seq_len_stated=stated, s=32768)
+                runner.run_generation_to_ordering(None)
+                lines = [call.args[0] % call.args[1:] for call in output.call_args_list
+                         if "context limit" in call.args[0]]
+                self.assertEqual(len(lines), said)
+                if said:
+                    self.assertIn("priced at 32768 tokens", lines[0])
 
     def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
         """
