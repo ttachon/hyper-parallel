@@ -91,9 +91,11 @@ def compute_kv_dim(ccfg: Any) -> float:
 
 
 # Each read of a config field no parser set, by field and by the function
-# that read it. The config prices such a field as 0, so a model feature
-# nobody parsed costs nothing and the estimate stays plausible; a search says
-# which were read, under its ranking (I9).
+# that read it. The config hands such a field over as 0, so a model feature
+# nobody parsed costs nothing unless its reader has a fallback of its own, and
+# the estimate stays plausible; a search says which were read, under its
+# ranking (I9). A reader with a fallback, such as _flavour_tables' three
+# feed-forward matmuls, is named too: the record cannot tell it apart.
 UNSET_READS: DefaultDict[str, Counter] = defaultdict(Counter)
 # The fields whose absence means there is nothing to price: a submodule
 # copied without its parent's hooks takes the predefined ones.
@@ -125,8 +127,8 @@ def unset_reads_report() -> List[str]:
         for attr, readers in sorted(UNSET_READS.items())
     )
     UNSET_READS.clear()
-    return [f"The estimate read {count} config field(s) no parser set, each priced as 0 "
-            f"(run_nd --strict refuses them): {fields}"]
+    return [f"The estimate read {count} config field(s) no parser set, each handed over as 0, which a reader "
+            f"without a fallback of its own prices as 0 (run_nd --strict refuses them): {fields}"]
 
 
 # class CostModelConfig(Config) :
