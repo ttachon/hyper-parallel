@@ -1639,6 +1639,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False),
                                         dimensions=[Dim.DP, Dim.OP])
+        runner.batch_reachable = lambda: True
         runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
         runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
         with tempfile.TemporaryDirectory() as tmp_dir, \
@@ -2587,6 +2588,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(debug_parts, [])
         self.assertEqual(runner.order_search_space([], None, None), ([], []))
 
+        runner.batch_reachable = lambda: True
         runner.generate_search_space = lambda folder, threads_num: [(_ParallelConfig(), 10)]
         runner.order_search_space = (
             lambda space, threads_num, cache_file: ([(space[0][0], 10, 2.0, [])], [])
@@ -2606,6 +2608,55 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(Par.pool_estimate_memory("config"), 7)
         with patch.object(Par, "estimate_performance", return_value=9):
             self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
+
+    def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
+        """
+        Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
+        Description: A config at DP 2, PP 2, micro-batches of 4 and two of
+            them, searched over EP and OP alone, so -l names neither MB nor PP,
+            given a candidate whose loop counted four micro-batches.
+        Expectation: The candidate carries the loop's four and its batch is
+            DP x MB x MBS with them, 32; kept from the config, the two made
+            another batch, 16.
+        """
+        fake_ccfg = _FakeCostModelConfig()
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = fake_ccfg
+        global_config.dimensions = [Dim.EP, Dim.OP]
+        candidate = global_config.make_parallel_config((2, 2, 2, 1), (4, 4), (1, 1, 2, False))
+        self.assertEqual(candidate.val(Dim.MBN), 4)
+        self.assertEqual(global_config.global_batch_size(candidate), 32)
+        self.assertIn(Dim.MBN, global_config.dimensions)
+
+    def test_a_search_no_candidate_of_which_makes_the_batch_stops_with_one_line(self) -> None:
+        """
+        Feature: ParallelizeLayer.batch_reachable (M6).
+        Description: 64 devices searched over EP and OP alone, so every
+            candidate is DP 64 with micro-batches of 1, for a batch of 16, then
+            of 128.
+        Expectation: No candidate makes 16, so the search stops before
+            building one, with one error naming the batch, the yaml's and DP x
+            MBS, 64; 128 is two micro-batches of it, and nothing is said.
+        """
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        fake_ccfg = _FakeCostModelConfig()
+        fake_ccfg.d, fake_ccfg.t, fake_ccfg.p, fake_ccfg.b, fake_ccfg.m = 64, 1, 1, 1, 1
+        fake_ccfg.accumulates_grads = True
+        fake_ccfg.gbs = 16
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = fake_ccfg
+        global_config.dimensions = [Dim.EP, Dim.OP]
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.config = global_config
+        runner.machine = SimpleNamespace(number=64)
+        for batch, reachable in ((16, False), (128, True)):
+            with self.subTest(batch=batch), patch.object(Par.logger, "error") as error:
+                runner.global_batch_size = batch
+                self.assertEqual(runner.batch_reachable(), reachable)
+                self.assertEqual(error.call_count, 0 if reachable else 1)
+                if not reachable:
+                    self.assertEqual(error.call_args.args[1:4], (16, 16, "64"))
 
     def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
         """

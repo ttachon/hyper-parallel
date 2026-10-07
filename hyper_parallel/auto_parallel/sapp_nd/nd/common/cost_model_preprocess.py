@@ -103,9 +103,10 @@ class CostModelConfig(PartitionGenerator):
         hook_cls: Any = None,
         framework: Any = None,
         source_code: Any = None,
+        devices: int = 0,
     ) -> None:
-        """Initialise the cost model from a config, hooks and framework name."""
-        super().__init__(input_config, hook_cls, framework, source_code)
+        """Initialise the cost model from a config, hooks and framework name, and the devices a caller states."""
+        super().__init__(input_config, hook_cls, framework, source_code, devices)
         logger.debug(
             "parser = %s for %s", str(self.parser), str(self.model_name)
         )

@@ -403,6 +403,39 @@ class ParallelizeLayer:
                     space = self.batch_loops(space, pool, (dp, tp, pp, cp))
         return space
 
+    def batch_reachable(self) -> bool:
+        """Whether any candidate the loops build makes the global batch; one line says so where none does.
+
+        Each candidate's batch is its DP x MB x MBS, MB the batch over DP and
+        MBS, so a batch that is no whole number of micro-batches of any DP x
+        MBS the loops reach is refused in every candidate, each with an error.
+        The search stops before building one, with this line instead.
+        """
+        number = self.machine.number
+        reached = set()
+        for tp in self.config.space(Dim.TP, number):
+            for pp in self.config.space(Dim.PP, number // tp):
+                for cp in self.config.space(Dim.CP, number // tp // pp):
+                    dp = number // tp // cp // pp
+                    if dp < 1:
+                        break
+                    for mbs in self.config.space(Dim.MBS, self.global_batch_size // pp // dp):
+                        mbn = self.global_batch_size // dp // mbs
+                        candidate = self.config.make_parallel_config((dp, tp, pp, cp), (mbs, mbn), (1, 1, 1, False))
+                        if self.config.global_batch_size(candidate) == self.global_batch_size:
+                            return True
+                        reached.add(self.config.dim_val(Dim.DP, candidate) * mbs)
+        logger.error(
+            "No candidate makes a global batch of %d (the yaml states %d): the candidates the search builds "
+            "have DP x MBS of %s, and %d is no whole number of micro-batches of any. State -b as a multiple "
+            "of one of them, or let DP shrink by naming PP, CP or MP in -l.",
+            self.global_batch_size,
+            self.config.ccfg.gbs,
+            ", ".join(str(batch) for batch in sorted(reached)),
+            self.global_batch_size,
+        )
+        return False
+
     def batch_loops(self, space: Any, pool: Any, dtpc_p: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
         dp, _, pp, _ = dtpc_p
@@ -666,6 +699,8 @@ class ParallelizeLayer:
             generation and ordering took.
         """
         scored_space, dbg, generation, ordering = [], [], 0.0, 0.0
+        if not self.batch_reachable():
+            return scored_space, dbg, generation, ordering
         for mode in self.recompute_modes or (None,):
             if mode is not None:
                 logger.output("Search with recompute %s", mode)

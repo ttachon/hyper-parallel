@@ -1296,6 +1296,30 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertTrue(any("device_num" in m for m in captured.output))
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_missing_device_num_takes_the_callers_device_count(self, mock_hf):
+        """
+        Feature: cluster size fallback, the device count a caller states (M6).
+        Description: The same AutoModels config, dp_shard_size 4 at TP 4 and
+            PP 2 with a global batch of 64 and micro-batches of 2, parsed for
+            a caller that states 64 devices, as run_nd -d does; then 60.
+        Expectation: d is the 64 devices over TP x PP x CP, 8, as the runtime
+            derives it from the world size, not dp_shard_size's 4, and the
+            micro-batch count follows it, 4; 60 devices, which TP x PP does
+            not divide, are refused.
+        """
+        mock_hf.return_value = self._hf_config()
+        for devices, want in ((64, (8, 4)), (60, None)):
+            with self.subTest(devices=devices):
+                ccfg = _ParserCostModelConfig(_auto_models_config())
+                ccfg.devices = devices
+                if want is None:
+                    with self.assertRaisesRegex(ValueError, "-d"):
+                        CostModelParserHyperV2(ccfg).parse()
+                    continue
+                CostModelParserHyperV2(ccfg).parse()
+                self.assertEqual((ccfg.d, ccfg.m), want)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_vl_offsets_are_two_dimensional_when_interleaved(self, mock_hf):
         """
         Feature: multimodal placement under virtual pipelining.

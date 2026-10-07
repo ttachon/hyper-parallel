@@ -740,9 +740,19 @@ class CostModelParserHyperV2(_CostModelParser):
         has no replicate field, since the runtime derives it from the world
         size, so without ``context.device_num`` an HSDP run would understate
         the cluster by exactly its replicate factor.
+
+        Without ``context.device_num``, an AutoModels config takes the device
+        count its caller states (``run_nd -d``), as the runtime takes the
+        world size its launcher gives it.  Read from ``dp_shard_size`` alone,
+        a one-node yaml searched on more devices kept its one node's degree,
+        and its micro-batch count with it, in every candidate (M6).
         """
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         device_num = int(self._get_cfg_attr(ctx, "device_num", 0) or 0)
+        source = "context.device_num"
+        if not device_num and is_auto_models_schema(self.config):
+            device_num = int(getattr(self.ccfg, "devices", 0) or 0)
+            source = "the device count (-d)"
         if not device_num:
             if is_auto_models_schema(self.config) and dp_replicate == 1:
                 logger.warning(
@@ -754,7 +764,7 @@ class CostModelParserHyperV2(_CostModelParser):
         denom = self.ccfg.t * self.ccfg.p * self.ccfg.cp
         if denom < 1 or device_num % denom:
             raise ValueError(
-                f"context.device_num={device_num} is not divisible by "
+                f"{source}={device_num} is not divisible by "
                 f"t*p*cp={denom}"
             )
         return max(1, device_num // denom)
