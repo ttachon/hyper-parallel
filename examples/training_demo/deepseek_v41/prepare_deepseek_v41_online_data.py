@@ -40,7 +40,14 @@ def prepare_online_data(output_path: Path, *, num_samples: int = 128, sequence_l
                 f"DeepSeek V4.1 Online validation document {sample_index}. "
                 "Engram hashing and shared compressed attention remain active. "
             )
-            output_file.write(json.dumps({"text": sentence * repetitions}) + "\n")
+            # Strip the trailing space. It is one more token, and it is what
+            # made a document 24577 tokens, which is 6 x 4096 + 1: the text
+            # transform then cut six full pieces and a one-token tail, and that
+            # tail becomes a packed boundary of 1, which the V4.1 attention
+            # refuses for every layer whose compression ratio is 2. Stripped, a
+            # document is exactly 24576 tokens, six full pieces and no tail, so
+            # every boundary is a multiple of 4096 and therefore even.
+            output_file.write(json.dumps({"text": (sentence * repetitions).strip()}) + "\n")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
