@@ -522,9 +522,12 @@ def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
         switch. ``offloaded_layers`` names the layers a choice offloads, as
         ``"first"`` or ``"first-last"``, where it offloads any: the plan
         states them off, the trainer running no offload yet.
+        ``offloaded_gib`` gives, by the same names, the GiB each of those
+        layers moves to the host per micro-batch, and ``offloaded_share``
+        the share of what it keeps that is.
     """
     # pylint: disable=C0415
-    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import to_records, trainer_plan
+    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import offloaded_share, to_records, trainer_plan
     choice = nd_runner.recompute_choices.get(best_entry[0])
     mode, layers = trainer_plan(choice) if choice is not None else ("full", {})
     result: Dict[str, Any] = {"activation_checkpoint": mode}
@@ -533,10 +536,11 @@ def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
     # Only a choice per layer offloads; one mode for every layer states no ranges of its own.
     offloaded = [item for item in getattr(choice, "ranges", ()) if item.option.link_bandwidth]
     if offloaded:
-        result["offloaded_layers"] = [
-            str(item.first) if item.count == 1 else f"{item.first}-{item.first + item.count - 1}"
-            for item in offloaded
-        ]
+        names = [str(item.first) if item.count == 1 else f"{item.first}-{item.first + item.count - 1}"
+                 for item in offloaded]
+        result["offloaded_layers"] = names
+        result["offloaded_gib"] = {name: item.option.link_bandwidth / 2 ** 30 for name, item in zip(names, offloaded)}
+        result["offloaded_share"] = {name: offloaded_share(item.option) for name, item in zip(names, offloaded)}
     per_layer, score = nd_runner.recompute_per_layer(best_entry[0])
     if per_layer is not None:
         result["recompute_per_layer"] = {

@@ -838,42 +838,98 @@ def _offloaded_indices(choice: RecomputeChoice) -> List[int]:
 
 
 class TestOffloadWindow(unittest.TestCase):
-    """A stage's first layers offload while their copies keep pace with the forward."""
+    """A stage's first layers offload what their copies carry while the forward runs."""
 
     @staticmethod
-    def _limit(copies: Sequence[float], ending: Optional[int] = None) -> int:
-        """How many of four layers, each with a forward of 1, may offload with *copies* to the host."""
+    def _shares(copies: Sequence[float], ending: Optional[int] = None, per_byte: float = 1.0) -> List[float]:
+        """What each of four layers with a forward of 1 moves to the host, keeping *copies* bytes each."""
         stage_layers = []
         for position in range(len(copies)):
             key = ("unit", None) + (("ends warm-up",) if position == ending else ())
             stage_layers.append(Candidate._Layer(position, key, 1, _option(frozenset())))  # pylint: disable=protected-access
         plain = [LayerOption(recompute=frozenset(), memory_per_micro_batch=copy, memory_once=0.0, forward_time=1.0,
                              backward_time=2.0) for copy in copies]
-        link = Candidate._Link(per_byte=1.0, overlap=1.0)  # pylint: disable=protected-access
-        return Candidate._offload_limit(stage_layers, plain, link)  # pylint: disable=protected-access
+        link = Candidate._Link(per_byte=per_byte, overlap=1.0)  # pylint: disable=protected-access
+        return Candidate._offload_shares(stage_layers, plain, link)  # pylint: disable=protected-access
 
-    def test_a_layer_cannot_offload_more_than_the_forward_left_after_it(self):
+    def test_a_layer_moves_what_the_forward_left_after_it_carries(self):
         """
         Feature: the offload window.
         Description: Four layers with a forward of 1 each, whose copies take
             half a forward, one forward, one and a half forwards, or four.
-        Expectation: Each offloaded layer's copy, with those after it, fits
-            in the forward left after it: three layers at half and at one
-            forward, two at one and a half, none at four; the last layer,
-            with no forward left after it, never.
+        Expectation: One stream copies each layer's activations once its
+            forward ends and is done when the forward is: three layers move
+            all they keep at half and at one forward, two at one and a half,
+            and at four the first moves what the three forwards after it
+            carry, three quarters of what it keeps; the last layer, with no
+            forward left after it, nothing.
         """
-        self.assertEqual(self._limit([0.5] * 4), 3)
-        self.assertEqual(self._limit([1.0] * 4), 3)
-        self.assertEqual(self._limit([1.5] * 4), 2)
-        self.assertEqual(self._limit([4.0] * 4), 0)
+        self.assertEqual(self._shares([0.5] * 4), [0.5, 0.5, 0.5, 0.0])
+        self.assertEqual(self._shares([1.0] * 4), [1.0, 1.0, 1.0, 0.0])
+        self.assertEqual(self._shares([1.5] * 4), [1.5, 1.5, 0.0, 0.0])
+        self.assertEqual(self._shares([4.0] * 4), [3.0, 0.0, 0.0, 0.0])
 
     def test_the_layer_that_ends_warm_up_keeps_its_activations(self):
         """
         Feature: the offload window.
         Description: Copies that take no time, the third layer ending warm-up.
-        Expectation: Only the two layers before it may offload.
+        Expectation: Only the two layers before it move anything, all they
+            keep.
         """
-        self.assertEqual(self._limit([0.0] * 4, ending=2), 2)
+        self.assertEqual(self._shares([1.0] * 4, ending=2, per_byte=0.0), [1.0, 1.0])
+
+    @staticmethod
+    def _unit_layers(count: int) -> Tuple[Dict[Any, Tuple[LayerOption, ...]], List[Any]]:
+        """*count* layers of one kind that keep 4 MB plain and 1 MB fully recomputed, with a forward of 1."""
+        # pylint: disable=protected-access
+        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=4 * MEGABYTE, memory_once=0.0,
+                            forward_time=1.0, backward_time=2.0)
+        full = LayerOption(recompute=None, memory_per_micro_batch=MEGABYTE, memory_once=0.0, forward_time=1.0,
+                           backward_time=3.0)
+        fronts = {("unit", None): (plain, full)}
+        return fronts, [Candidate._Layer(index, ("unit", None), 1, full) for index in range(count)]
+
+    def _offload_stage(self, count: int, budget: float, per_byte: float) -> Tuple[Dict[int, LayerOption], float]:
+        """The choice of *count* unit layers in *budget* MB, with a link that takes *per_byte* forwards a MB."""
+        # pylint: disable=protected-access
+        fronts, layers = self._unit_layers(count)
+        stage = Stage(groups=Candidate._groups(layers), budget=budget * MEGABYTE)
+        link = Candidate._Link(per_byte=per_byte / MEGABYTE, overlap=1.0)
+        return Candidate._offload_stage(layers, stage, Candidate._Peaks(0.0), fronts, {}, link, MEGABYTE,
+                                        budget * MEGABYTE)
+
+    def test_a_layer_offloads_the_part_its_window_carries(self):
+        """
+        Feature: the choice of a stage whose first layers may offload.
+        Description: Three layers that keep 4 MB plain and 1 MB fully
+            recomputed, in 7 MB, which hold one plain layer, and a link that
+            carries 2 MB in the two forwards after the first.
+        Expectation: The first layer runs plain and moves half of what it
+            keeps to the host, and the third runs plain too: its backward
+            releases room for those 2 MB to come back, so nothing is held in
+            transit and the stage keeps 7 MB.
+        """
+        chosen, transit = self._offload_stage(3, 7, 1.0)
+        self.assertEqual(transit, 0.0)
+        self.assertEqual([chosen[index].link_bandwidth for index in range(3)], [2 * MEGABYTE, 0.0, 0.0])
+        self.assertEqual([chosen[index].recompute for index in range(3)], [frozenset(), None, frozenset()])
+        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 7 * MEGABYTE)
+        self.assertEqual(option_label(chosen[0]), "no recompute, 50% offloaded to the host")
+
+    def test_a_copy_back_with_no_room_to_land_is_not_offloaded(self):
+        """
+        Feature: the choice of a stage whose first layers may offload.
+        Description: Two such layers in 6 MB, which hold one plain layer,
+            and a link that carries 2 MB in the forward of the second.
+        Expectation: Nothing offloads: the first layer's 2 MB would come
+            back while the second's backward holds all it keeps, and held in
+            transit they leave the second no more room than it has without
+            the link.
+        """
+        chosen, transit = self._offload_stage(2, 6, 0.5)
+        self.assertEqual(transit, 0.0)
+        self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
+        self.assertEqual(sorted(chosen[index].recompute is None for index in range(2)), [False, True])
 
     def test_no_layer_offloads_to_save_only_rounding(self):
         """
@@ -1060,13 +1116,16 @@ class TestOffload(unittest.TestCase):
         """
         Feature: describe and to_records.
         Description: A choice that offloads its first layers.
-        Expectation: Their line says so, and their record states offload.
+        Expectation: Their line says so and how much of what they keep they
+            move, with a link whose copies take no time all of it, and
+            their record states offload and the bytes each moves.
         """
         choice = choose_recompute(self._evaluator("pp1", 0.2), Hard.Device_A2, link=_FAST_LINK)
         first = choice.ranges[0]
         self.assertTrue(first.option.link_bandwidth)
-        self.assertTrue(describe(choice).splitlines()[0].endswith("no recompute, offloaded to the host"))
+        self.assertTrue(describe(choice).splitlines()[0].endswith("no recompute, 100% offloaded to the host"))
         self.assertEqual(to_records(choice)[0]["offload"], True)
+        self.assertEqual(to_records(choice)[0]["offloaded_bytes"], first.option.link_bandwidth)
         self.assertTrue(all("offload" not in record for record, item in zip(to_records(choice), choice.ranges)
                             if not item.option.link_bandwidth))
 

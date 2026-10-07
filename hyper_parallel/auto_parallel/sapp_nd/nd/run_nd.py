@@ -39,11 +39,17 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
 )
 
 
-def _compute_ratio(cli_parser, cache_file):
-    """The COMPUTE ratio of a ratios file, the milliseconds one unit of the estimate's compute stands for.
+def _link_ratio(cli_parser, cache_file):
+    """The ratio of a ratios file that times a copy: its FORWARD ratio, else its COMPUTE ratio.
+
+    FORWARD, where a round measured the forward on its own, is the
+    milliseconds one unit of the forward the estimate prices stands for: the
+    window the copies to the host hide in. COMPUTE stands for the forward and
+    the backward together, which the estimate may split otherwise than the
+    device runs them.
 
     Args:
-        cli_parser: The parser, to report a file that states none.
+        cli_parser: The parser, to report a file that states neither.
         cache_file: The ratios file of -c, or ``None``.
 
     Returns:
@@ -52,20 +58,23 @@ def _compute_ratio(cli_parser, cache_file):
     if cache_file is None:
         return None
     with open(cache_file, encoding="utf-8") as handle:
-        ratio = json.load(handle).get("COMPUTE")
+        ratios = json.load(handle)
+    name = "FORWARD" if "FORWARD" in ratios else "COMPUTE"
+    ratio = ratios.get(name)
     if not isinstance(ratio, (int, float)) or ratio <= 0:
-        cli_parser.error(f"{cache_file} states no positive COMPUTE ratio to calibrate the host link with")
+        cli_parser.error(f"{cache_file} states no positive {name} ratio to calibrate the host link with")
     return float(ratio)
 
 
 def _link_figures(cli_parser, cli_args):
     """The host link figures the CLI states for -ao, ``None`` for each it leaves to the device.
 
-    With a ratios file (-c), its COMPUTE ratio turns a copy's seconds into
-    the estimate's units, in place of the device's sustained throughput.
+    With a ratios file (-c), its FORWARD or COMPUTE ratio turns a copy's
+    seconds into the estimate's units, in place of the device's sustained
+    throughput (:func:`_link_ratio`).
 
     Args:
-        cli_parser: The parser, to report a ratios file with no COMPUTE ratio.
+        cli_parser: The parser, to report a ratios file with neither ratio.
         cli_args: The parsed CLI namespace.
 
     Returns:
@@ -75,7 +84,7 @@ def _link_figures(cli_parser, cli_args):
         "gib_per_s": cli_args.host_link_gibps,
         "sustained_tflops": cli_args.sustained_tflops,
         "overlap": getattr(cli_args, "host_link_overlap", None),
-        "ms_per_unit": _compute_ratio(cli_parser, getattr(cli_args, "cache_file", None)),
+        "ms_per_unit": _link_ratio(cli_parser, getattr(cli_args, "cache_file", None)),
     }
 
 
@@ -268,8 +277,15 @@ def _log_activation_checkpoint(result):
     else:
         logger.output("Activation checkpoint mode for every layer: %s", result["activation_checkpoint"])
     if result.get("offloaded_layers"):
+        moved = result.get("offloaded_gib", {})
+        shares = result.get("offloaded_share", {})
+        layers = ", ".join(
+            f"{name} ({moved[name]:.2f} GiB a micro-batch, {shares[name]:.0%} of what it keeps)"
+            if name in moved and name in shares else name
+            for name in result["offloaded_layers"]
+        )
         logger.output("Offloaded to the host, priced as offload should run: layers %s. The trainer runs no offload "
-                      "yet, so the plan it is given keeps them off", ", ".join(result["offloaded_layers"]))
+                      "yet, so the plan it is given keeps them off", layers)
     per_layer = result.get("recompute_per_layer")
     if per_layer:
         logger.output(
@@ -427,7 +443,7 @@ if __name__ == "__main__":
         default=None,
         help="The device's sustained TFLOP/s at the training precision, for "
         "-ao; the device's placeholder when omitted, and unused with -c, whose "
-        "COMPUTE ratio converts a copy's seconds instead",
+        "FORWARD or COMPUTE ratio converts a copy's seconds instead",
     )
     parser.add_argument(
         "--host_link_overlap",
@@ -458,8 +474,9 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Cache file with ratios to recalibrate ND scores. With -ao its "
-        "COMPUTE ratio also turns a copy's seconds into the estimate's units; "
-        "with a search config (-s) that is all it does. "
+        "FORWARD ratio, where a round measured the forward on its own, else "
+        "its COMPUTE ratio, also turns a copy's seconds into the estimate's "
+        "units; with a search config (-s) that is all it does. "
         "Will be defaulted to 'None'.",
     )
 

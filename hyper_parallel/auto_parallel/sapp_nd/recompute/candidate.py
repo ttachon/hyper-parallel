@@ -42,15 +42,17 @@ its runtime's mode is stated on every submodule, and the whole model priced
 under each (:func:`mode_ranges`, :func:`whole_modes`).
 
 With a host link, a choice per layer may also offload: a stage's first layers
-run plain and move what they keep per micro-batch to the host after their
-forward, and back before their backward, so that they keep only what they
-hold once. A micro-batch's copies to the host keep pace with its own forward:
-each offloaded layer's, with those of the offloaded layers after it, fit in
-the forward left after it, so that a stage's last layers cannot offload when
-their window is too short. The copies back run in the longer backward, one
-layer ahead, on the same stream, which then has room for them; the stage
-keeps one offloaded layer's worth in transit. Offload is priced at one chunk
-per stage.
+run plain and move what they keep per micro-batch to the host, tensor by
+tensor, and back before their backward, so that they keep only the rest. A
+micro-batch's copies to the host keep pace with its own forward: one stream
+copies what each layer keeps once the layer's forward ends, in the order the
+layers run, and is done when the forward is, in the link's share of the
+forward left. So a stage's first layers move all or part of what they keep,
+and its last layers nothing when their window is too short. The copies back
+run in the longer backward, one layer ahead, while this micro-batch's
+backward has released what the layers after the next one keep; where that
+does not cover them, the stage keeps the largest layer's offloaded bytes in
+transit. Offload is priced at one chunk per stage.
 
 Where a stage's FSDP holds each layer's gradient output until the backward
 ends, and accumulates gradients over several micro-batches, its peak can also
@@ -637,33 +639,42 @@ def _link(link: HostLink, evaluator: EvaluatorV2) -> _Link:
     return _Link(link.seconds_per_byte() * link.units_per_second(evaluator.ccfg.bytes_p), link.overlap)
 
 
-def _offloaded(option: LayerOption) -> LayerOption:
-    """*option* with what it keeps per micro-batch moved to the host, so that it keeps only what it holds once."""
-    return replace(
-        option, memory_per_micro_batch=0.0, excess=(), link_bandwidth=option.memory_per_micro_batch, names=()
-    )
+def _offloaded(option: LayerOption, share: float) -> LayerOption:
+    """*option* with *share* of what it keeps per micro-batch moved to the host, so that it keeps the rest."""
+    return replace(option, memory_per_micro_batch=option.memory_per_micro_batch - share, link_bandwidth=share,
+                   names=())
 
 
-def _offload_limit(stage_layers: Sequence[_Layer], plain: Sequence[LayerOption], link: _Link) -> int:
-    """How many of a stage's first layers can offload running plain, the copies keeping pace with the forward.
+def _offloadable(option: LayerOption, in_flight: int) -> float:
+    """The bytes a layer running *option* keeps per micro-batch, less any the two memories charge beyond them."""
+    return max(0.0, _kept(option, in_flight) - option.memory_once) / in_flight
 
-    Each offloaded layer's copy to the host, with those of the offloaded
-    layers after it, fits in the forward time left after it, of the link's
-    share of it. The layer that ends warm-up, and every layer after it, keep
+
+def _offload_shares(stage_layers: Sequence[_Layer], plain: Sequence[LayerOption], link: _Link) -> List[float]:
+    """The bytes per micro-batch each of a stage's first layers can move to the host running plain.
+
+    One stream copies what each layer keeps once the layer's forward ends, in
+    the order the layers run, and is done when the forward is, in the link's
+    share of the forward left: each layer moves what the window after it
+    leaves, all it keeps or part of it, once the earlier layers' copies take
+    their part. The layer that ends warm-up, and every layer after it, keep
     their activations.
+
+    Returns:
+        A share for each layer before the one that ends warm-up, 0 for one
+        whose window is spent.
     """
     ending = next((position for position, layer in enumerate(stage_layers) if _ENDS_WARM_UP in layer.key),
                   len(stage_layers))
-    count, slack, left = 0, math.inf, sum(option.forward_time for option in plain)
+    after = list(itertools.accumulate((option.forward_time for option in reversed(plain[1:])), initial=0.0))[::-1]
+    shares, room = [], math.inf
     for position in range(ending):
-        copy = plain[position].memory_per_micro_batch * link.per_byte
-        left -= plain[position].forward_time
-        # Every earlier offloaded layer's copies now queue this one too.
-        slack = min(slack, link.overlap * left) - copy
-        if slack < 0:
-            break
-        count = position + 1
-    return count
+        room = min(room, link.overlap * after[position])
+        whole = _offloadable(plain[position], stage_layers[position].in_flight)
+        share = whole if link.per_byte == 0 else min(whole, room / link.per_byte)
+        room = max(0.0, room - share * link.per_byte)
+        shares.append(share)
+    return shares
 
 
 def _backward_can_bind(
@@ -783,30 +794,60 @@ def _offload_budgets(
     stage_layers: Sequence[_Layer],
     stage: Stage,
     peaks: _Peaks,
-    plain: Sequence[LayerOption],
+    offloaded: Sequence[LayerOption],
     fronts: Mapping[Hashable, Tuple[LayerOption, ...]],
     own: Mapping[LayerOption, LayerOption],
-    capacity: float,
+    sizes: Tuple[float, bool],
 ) -> List[float]:
     """For every count of a stage's first layers offloaded, what the other layers may keep as warm-up ends.
 
-    Less what the offloaded layers keep once and in transit. Where the
-    stage's peak can also come as a later micro-batch's backward ends, the
-    other layers keep room for it as though the layer that ends warm-up ran
-    its lightest option there, which fits.
+    Less what the offloaded layers keep on the device and, held in transit,
+    the largest of their offloaded bytes. Where the stage's peak can also
+    come as a later micro-batch's backward ends, the other layers keep room
+    for it as though the layer that ends warm-up ran its lightest option
+    there, which fits.
+
+    Args:
+        offloaded: The options the first layers offload with, as many as
+            may offload.
+        sizes: ``(capacity, in_transit)``: the device's memory in bytes, and
+            whether the offloaded bytes are held in transit.
+
+    Returns:
+        A budget for every count, from none to every layer, negative for a
+        count beyond those that may offload.
     """
+    capacity, in_transit = sizes
     room = math.inf if peaks.backward is None else capacity - peaks.backward
     share = _share(stage_layers[0].in_flight)
     lightest = _lightest_working(stage_layers, fronts)
-    first_working = _first_working(stage_layers[0], _offloaded(plain[0]), fronts, own)
+    first_working = _first_working(stage_layers[0], offloaded[0], fronts, own)
     budgets, held, largest = [stage.budget], 0.0, 0.0
-    for position, layer in enumerate(stage_layers):
-        held += _kept(_offloaded(plain[position]), layer.in_flight)
-        largest = max(largest, plain[position].memory_per_micro_batch)
+    for layer, option in zip(stage_layers, offloaded):
+        held += _kept(option, layer.in_flight)
+        largest = max(largest, option.link_bandwidth if in_transit else 0.0)
         left_back = room - held * share - first_working - largest
         rest_back = left_back / share + lightest if share else (math.inf if left_back >= 0 else -1.0)
         budgets.append(min(stage.budget - held - largest, rest_back))
-    return budgets
+    return budgets + [-1.0] * (len(stage_layers) + 1 - len(budgets))
+
+
+def _returns_fit(stage_layers: Sequence[_Layer], chosen: Mapping[int, LayerOption], count: int) -> bool:
+    """Whether each of a stage's *count* offloaded layers' bytes come back in room the backward has released.
+
+    A layer's bytes come back while the next layer's backward runs, beside
+    the next layer's own when it offloads too, once this micro-batch's
+    backward has released its share of what the layers after the next one
+    keep, *chosen* their options.
+    """
+    released = list(itertools.accumulate(
+        (_kept(chosen[layer.index], layer.in_flight) / layer.in_flight for layer in reversed(stage_layers)),
+        initial=0.0))[::-1]
+    for position in range(count):
+        back = sum(chosen[layer.index].link_bandwidth for layer in stage_layers[position:position + 2])
+        if back > released[min(position + 2, len(stage_layers))]:
+            return False
+    return True
 
 
 def _offload_stage(
@@ -821,9 +862,11 @@ def _offload_stage(
 ) -> Optional[Tuple[Dict[int, LayerOption], float]]:
     """The fastest choice of a stage's layers when its first layers may offload.
 
-    Every count of first layers the link allows is weighed against keeping
+    Every count of first layers the link reaches is weighed against keeping
     them, the rest of the layers choosing their options in what the
-    offloaded ones leave (:func:`_offload_budgets`).
+    offloaded ones leave (:func:`_offload_budgets`): first with nothing in
+    transit, which holds where the backward releases room for every copy
+    back (:func:`_returns_fit`), else with the largest offloaded bytes held.
 
     Returns:
         ``(chosen, transit)``: each layer's option by index, and the memory
@@ -833,25 +876,34 @@ def _offload_stage(
     stay = _choose_stage(stage_layers, stage, peaks, fronts, own, bucket, capacity)
     kept = None if stay is None else (stay, 0.0)
     plain = [_plain(fronts[layer.key]) for layer in stage_layers]
-    most = _offload_limit(stage_layers, plain, link)
+    shares = _offload_shares(stage_layers, plain, link)
+    most = next((position for position, share in enumerate(shares) if share <= 0), len(shares))
     if not most:
         return kept
-    budgets = _offload_budgets(stage_layers, stage, peaks, plain, fronts, own, capacity)
-    rest = suffix_times([Layers(layer.key, 1, layer.in_flight) for layer in stage_layers], fronts, budgets, bucket)
-    offloaded = list(itertools.accumulate((_time(option) for option in plain), initial=0.0))
+    offloaded = [_offloaded(option, share) for option, share in zip(plain, shares[:most])]
+    times = list(itertools.accumulate((_time(option) for option in plain[:most]), initial=0.0))
     # Offload only where it saves time, more than rounding.
-    count, fastest = 0, math.inf if stay is None else sum(_time(option) for option in stay.values()) * (1 - _ROUNDING)
-    for first in range(1, most + 1):
-        if offloaded[first] + rest[first] < fastest:
-            count, fastest = first, offloaded[first] + rest[first]
-    if not count:
-        return kept
-    choice = choose(_groups(stage_layers[count:]), fronts, budgets[count], bucket)
-    if choice is None:
-        return None
-    chosen = {layer.index: _offloaded(plain[position]) for position, layer in enumerate(stage_layers[:count])}
-    chosen.update(_assign(stage_layers[count:], [choice]))
-    return chosen, max(option.memory_per_micro_batch for option in plain[:count])
+    fastest = math.inf if stay is None else sum(_time(option) for option in stay.values()) * (1 - _ROUNDING)
+    for in_transit in (False, True):
+        budgets = _offload_budgets(stage_layers, stage, peaks, offloaded, fronts, own, (capacity, in_transit))
+        rest = suffix_times([Layers(layer.key, 1, layer.in_flight) for layer in stage_layers], fronts, budgets,
+                            bucket)
+        count, best = 0, fastest
+        for first in range(1, most + 1):
+            if times[first] + rest[first] < best:
+                count, best = first, times[first] + rest[first]
+        if not count:
+            return kept
+        choice = choose(_groups(stage_layers[count:]), fronts, budgets[count], bucket)
+        if choice is None:
+            return None
+        chosen = {layer.index: option for layer, option in zip(stage_layers, offloaded[:count])}
+        chosen.update(_assign(stage_layers[count:], [choice]))
+        if in_transit:
+            return chosen, max(option.link_bandwidth for option in offloaded[:count])
+        if _returns_fit(stage_layers, chosen, count):
+            return chosen, 0.0
+    return kept
 
 
 def _stages(
@@ -897,8 +949,9 @@ def choose_recompute(
             layer. Without them, each layer gets its own option from its
             kind's front.
         link: For a choice per layer at one chunk per stage, the host link
-            each stage's first layers may offload over; ``None`` keeps every
-            layer's activations on the device.
+            each stage's first layers may offload all or part of what they
+            keep over; ``None`` keeps every layer's activations on the
+            device.
         selective: With *modes*, the switches the runtime's own selective
             mode sets, 1 to keep an op and 0 to recompute it, where they are
             not the config's, as HyperParallel's trainer runs its policy
@@ -910,9 +963,10 @@ def choose_recompute(
             mode per layer, as HyperParallel's trainer does with
             ``activation_checkpoint.layers``. Each range then names its mode
             (:func:`trainer_plan`). With *link*, and off among *modes*, each
-            stage's first layers may also run off and offload what they keep,
-            reporting the mode off: priced as offload should run, for a
-            runtime that offloads them, which the trainer does not yet.
+            stage's first layers may also run off and offload all or part of
+            what they keep, reporting the mode off: priced as offload should
+            run, for a runtime that offloads them, which the trainer does
+            not yet.
 
     Returns:
         The choice, or ``None`` when there is none to make: a multimodal
@@ -1020,6 +1074,13 @@ def _offload_result(
     return _result(layers, held, chosen, None, fronts, own, modes)
 
 
+def offloaded_share(option: LayerOption) -> float:
+    """The share of what a layer running *option* keeps per micro-batch that it moves to the host; 0 without offload."""
+    if not option.link_bandwidth:
+        return 0.0
+    return option.link_bandwidth / (option.link_bandwidth + max(0.0, option.memory_per_micro_batch))
+
+
 def option_label(option: LayerOption) -> str:
     """How an option reads in the search's output."""
     if option.recompute is None:
@@ -1028,7 +1089,9 @@ def option_label(option: LayerOption) -> str:
         label = "no recompute"
     else:
         label = "recompute " + "+".join(name for name in SWITCHES if name in option.recompute)
-    return label + ", offloaded to the host" if option.link_bandwidth else label
+    if not option.link_bandwidth:
+        return label
+    return f"{label}, {offloaded_share(option):.0%} offloaded to the host"
 
 
 def option_record(option: LayerOption) -> Any:
@@ -1045,7 +1108,8 @@ def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
 
     Returns:
         One ``{"first", "count", "kind", "recompute"}`` per range, in model
-        order, with ``"offload": True`` for a range that offloads and
+        order, with ``"offload": True`` and ``"offloaded_bytes"``, what each
+        of its layers moves per micro-batch, for a range that offloads, and
         ``"mode"`` for one a choice of a mode per layer gave its mode;
         ``kind`` is the kind's name, or ``None``.
     """
@@ -1059,6 +1123,7 @@ def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
         }
         if item.option.link_bandwidth:
             record["offload"] = True
+            record["offloaded_bytes"] = item.option.link_bandwidth
         if item.mode is not None:
             record["mode"] = item.mode
         records.append(record)

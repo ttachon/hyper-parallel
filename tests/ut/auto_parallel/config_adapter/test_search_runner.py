@@ -779,8 +779,8 @@ class TestSearchStrategies(unittest.TestCase):
             every layer searched with offload.
         Expectation: The search offloads over the device's link with the
             stated figures replacing its own, and the result names the
-            offloaded layers beside a plan stating them off; the second is
-            refused.
+            offloaded layers, with the GiB each moves and the share of what
+            it keeps, beside a plan stating them off; the second is refused.
         """
         # pylint: disable=import-outside-toplevel,unused-import
         import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # noqa: F401
@@ -794,9 +794,9 @@ class TestSearchStrategies(unittest.TestCase):
         }
         mock_runner = MagicMock()
         mock_runner.run_generation_to_ordering.return_value = [(mock_dims, 1024.0, 0.05, [])]
-        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=1.0, memory_once=0.0,
+        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=4.0 * 2 ** 30, memory_once=0.0,
                             forward_time=1.0, backward_time=2.0)
-        offloaded = dataclasses.replace(plain, memory_per_micro_batch=0.0, link_bandwidth=1.0)
+        offloaded = dataclasses.replace(plain, memory_per_micro_batch=2 ** 30, link_bandwidth=3.0 * 2 ** 30)
         full = LayerOption(recompute=None, memory_per_micro_batch=0.1, memory_once=0.0,
                            forward_time=1.0, backward_time=3.0)
         choice = RecomputeChoice(ranges=(LayerRange(0, 2, None, offloaded, "off"), LayerRange(2, 2, None, full, "full")),
@@ -815,6 +815,8 @@ class TestSearchStrategies(unittest.TestCase):
         device = sr._build_machine(config).device  # pylint: disable=protected-access
         self.assertEqual(kwargs["host_link"], hw.HostLink.of(device.host_link, figures))
         self.assertEqual(result["offloaded_layers"], ["0-1"])
+        self.assertEqual(result["offloaded_gib"], {"0-1": 3.0})
+        self.assertEqual(result["offloaded_share"], {"0-1": 0.75})
         self.assertEqual(result["activation_checkpoint"], "full")
         self.assertEqual(result["activation_checkpoint_layers"], {"0-1": "off"})
 

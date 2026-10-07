@@ -44,12 +44,16 @@ class HostLink:
             1 where the copies meet nothing, less where the step's compute
             or its collectives share what the copies need. 0.8 is an
             assumption; ``run_nd --host_link_overlap`` states another.
-        ms_per_unit: The milliseconds one unit of the performance estimate
-            stands for, a calibration round's COMPUTE ratio. Stated, it turns
-            a copy's seconds into the estimate's units in place of
-            *sustained_tflops*: the estimate counts a step's matmul FLOPs,
-            a fraction of its work, so a device rate makes every forward
-            look several times shorter than it runs.
+        ms_per_unit: The milliseconds one unit of the forward the
+            performance estimate prices stands for: a calibration round's
+            FORWARD ratio where it measured the forward on its own, else its
+            COMPUTE ratio. Stated, it turns a copy's seconds into the
+            estimate's units in place of *sustained_tflops*: the estimate
+            counts a step's matmul FLOPs, a fraction of its work, so a
+            device rate makes every forward look several times shorter than
+            it runs; and it may split the forward from the backward
+            otherwise than the device does, so that COMPUTE can make the
+            forward the copies hide in look longer.
     """
 
     gib_per_s: float
