@@ -608,6 +608,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "-eee",
+        "--fforce-exhaustive",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help=(
+            "Append N distinct results per requested dimension with degree > 1; "
+            "each added result is reserved for one dimension and this option "
+            "takes precedence over -e/-ee; default: 0"
+        ),
+    )
+    parser.add_argument(
         "-mem",
         "--mem_for_ppb",
         type=str,
@@ -744,12 +756,13 @@ if __name__ == "__main__":
 
     exhaustive_count = args.exhaustive
     force_exhaustive = args.force_exhaustive
-    if (exhaustive_count or force_exhaustive) and (
+    fforce_exhaustive = args.fforce_exhaustive
+    if (exhaustive_count or force_exhaustive or fforce_exhaustive) and (
         args.real_csv is not None or args.search_config or args.verify
     ):
         parser.error(
-            "--exhaustive and --force_exhaustive apply to the standard ND search, "
-            "not --real_csv, --search-config, or --verify"
+            "--exhaustive, --force_exhaustive, and --fforce-exhaustive apply to "
+            "the standard ND search, not --real_csv, --search-config, or --verify"
         )
 
     max_mem = (
@@ -880,6 +893,7 @@ if __name__ == "__main__":
         ranking_csv=args.ranking_csv,
         exhaustive=exhaustive_count,
         force_exhaustive=force_exhaustive,
+        fforce_exhaustive=fforce_exhaustive,
         dimensions=dims,
     )
 
