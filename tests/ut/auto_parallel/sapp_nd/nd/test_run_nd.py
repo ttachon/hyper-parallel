@@ -796,6 +796,33 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.check_and_apply_custom_hook(wrapper)
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
 
+    def test_a_model_takes_the_profile_of_the_family_its_name_opens_with(self) -> None:
+        """
+        Feature: arch_hooks.family_hook and check_and_apply_custom_hook (I8).
+        Description: The golden harness's model names, a name holding two
+            families, one holding cm in the middle, and an unknown family
+            routed twice.
+        Expectation: Each known name takes the profile it took before; the
+            two-family name takes the family it opens with, where list order
+            gave it DeepSeek's; cm in the middle takes nothing; the unknown
+            family takes the default profile and says so once.
+        """
+        hooks = {"deepseekV3": ArchHooks.custom_deepseek3, "cm_llama_moe": ArchHooks.custom_cm,
+                 "Qwen3": ArchHooks.custom_qwen, "llama2_70b": ArchHooks.custom_llama2,
+                 "pangualpha_13b": ArchHooks.custom_pangualpha, "t5_xl": ArchHooks.custom_t5,
+                 "mixtral-8x7b": ArchHooks.custom_mixtral, "qwen3_5_moe": ArchHooks.custom_qwen,
+                 "deepseek_v3": ArchHooks.custom_deepseek3, "llama": None, "gpt_xl": None,
+                 "qwen2_deepseek_distill": ArchHooks.custom_qwen, "acme_lm": None}
+        self.assertEqual({name: ArchHooks.family_hook(name) for name in hooks}, hooks)
+        wrapped_cfg = _FakeCostModelConfig()
+        wrapped_cfg.model_name = "glm4_moe"
+        with patch.object(ArchHooks, "_DEFAULTED_NAMES", set()), patch.object(ArchHooks.logger, "output") as said:
+            for _ in range(2):
+                ArchHooks.check_and_apply_custom_hook(ArchHooks.CWrap(wrapped_cfg))
+        self.assertEqual(said.call_count, 1)
+        self.assertEqual(said.call_args.args[1], "glm4_moe")
+        self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
+
     def test_ep_constraints_valid_in_global_config(self) -> None:
         """
         Feature: TestSappNDRunND.
