@@ -29,17 +29,20 @@ Usage, from the repository root on the control node:
     python examples/training_demo/recompute_plan_tests.py run A
     python examples/training_demo/recompute_plan_tests.py run B
     python examples/training_demo/recompute_plan_tests.py results
+    python examples/training_demo/recompute_plan_tests.py reset     # only after a block was cut off
 """
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parent.parent
@@ -171,6 +174,27 @@ def unit() -> int:
                   OUT / "unit.log")
 
 
+def _stop(signum: int, frame: Any) -> None:
+    """Turn a hangup or a termination into SystemExit, so cleanup still runs."""
+    del frame
+    raise SystemExit(f"stopped by signal {signum}")
+
+
+@contextlib.contextmanager
+def _signals_stop_cleanly() -> Iterator[None]:
+    """Make a lost terminal or a kill end the block through its cleanup, then restore the handlers."""
+    previous = {}
+    for name in ("SIGHUP", "SIGTERM"):
+        if hasattr(signal, name):
+            number = getattr(signal, name)
+            previous[number] = signal.signal(number, _stop)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
 def run_block(block: str, plans: Sequence[str] = ()) -> None:
     """Run a block's plans one after the other, the allocator set as the block needs."""
     plans = tuple(plans) or BLOCKS[block]
@@ -180,19 +204,20 @@ def run_block(block: str, plans: Sequence[str] = ()) -> None:
     missing = [plan_yaml(plan).name for plan in plans if not plan_yaml(plan).exists()]
     if missing:
         raise SystemExit(f"run setup first: {', '.join(missing)} missing")
-    set_allocator(block == "B")
-    try:
-        for index, plan in enumerate(plans, 1):
-            out = OUT / f"{block}_{plan}"
-            if out.exists():
-                out.rename(out.with_name(f"{out.name}.{time.strftime('%Y%m%d_%H%M%S')}"))
-            print(f"\n##### block {block}, test {index} of {len(plans)}: {plan} #####", flush=True)
-            code = stream(sweep_command(block, plan), OUT / f"block_{block}.log")
-            if code:
-                print(f"the sweep exited with {code}; going on with the next test", flush=True)
-    finally:
-        if block == "B":
-            set_allocator(False)
+    with _signals_stop_cleanly():
+        set_allocator(block == "B")
+        try:
+            for index, plan in enumerate(plans, 1):
+                out = OUT / f"{block}_{plan}"
+                if out.exists():
+                    out.rename(out.with_name(f"{out.name}.{time.strftime('%Y%m%d_%H%M%S')}"))
+                print(f"\n##### block {block}, test {index} of {len(plans)}: {plan} #####", flush=True)
+                code = stream(sweep_command(block, plan), OUT / f"block_{block}.log")
+                if code:
+                    print(f"the sweep exited with {code}; going on with the next test", flush=True)
+        finally:
+            if block == "B":
+                set_allocator(False)
 
 
 def read_run(block: str, plan: str) -> Optional[Dict[str, Any]]:
@@ -263,8 +288,11 @@ def results(env: Dict[str, Any]) -> None:
             continue
         print(f"{label}: " + ", ".join(_difference(*runs, key, unit_name) for key, unit_name in (
             ("step_trainer", "ms"), ("max_allocated_gb", "GiB"), ("max_reserved_gb", "GiB"))))
-    print(f"\nallocator setting in {CLUSTER_ENV.name} now: "
-          f"{'ON' if ALLOCATOR in CLUSTER_ENV.read_text(encoding='utf-8') else 'off'}")
+    if ALLOCATOR in CLUSTER_ENV.read_text(encoding="utf-8"):
+        print(f"\nallocator setting in {CLUSTER_ENV.name} now: ON, left by a block that did not finish; "
+              f"take it out with: python {Path(__file__).relative_to(REPO_ROOT).as_posix()} reset")
+    else:
+        print(f"\nallocator setting in {CLUSTER_ENV.name} now: off")
 
 
 def read_cluster_env() -> Dict[str, Any]:
@@ -288,6 +316,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_step.add_argument("block", choices=sorted(BLOCKS))
     run_step.add_argument("plans", nargs="*")
     steps.add_parser("results", help="one line per test, then the comparisons")
+    steps.add_parser("reset", help="take the allocator setting out of the kit config")
     args = parser.parse_args(argv)
     if args.step == "setup":
         setup(args.pool)
@@ -295,6 +324,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sys.exit(unit())
     elif args.step == "run":
         run_block(args.block, args.plans)
+    elif args.step == "reset":
+        set_allocator(False)
     else:
         results(read_cluster_env())
 

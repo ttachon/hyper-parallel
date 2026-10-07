@@ -24,6 +24,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import signal
 import sys
 import tempfile
 import unittest
@@ -155,6 +156,53 @@ class TestRunBlock(unittest.TestCase):
 
             self.assertEqual([on for _, on in seen], [True, True], f"seen={seen}")
             self.assertTrue(seen[0][0].endswith("B_full"), f"seen={seen}")
+            self.assertEqual(env.read_text(encoding="utf-8"), _ENV)
+
+    def test_a_signal_ends_block_b_through_its_cleanup(self):
+        """A hangup or a kill becomes SystemExit, which takes the setting out; the handlers come back."""
+        with self.assertRaisesRegex(SystemExit, "stopped by signal 1"):
+            Runner._stop(1, None)  # pylint: disable=protected-access
+        with tempfile.TemporaryDirectory() as folder:
+            env = Path(folder) / "cluster.env"
+            env.write_text(_ENV, encoding="utf-8")
+            (Path(folder) / "plan.yaml").write_text("{}", encoding="utf-8")
+            before = signal.getsignal(signal.SIGTERM)
+
+            def killed(command: list, log: Path) -> int:
+                """Stand in for a run that a SIGTERM stops, as the runner's handler does."""
+                del command, log
+                self.assertIs(signal.getsignal(signal.SIGTERM), Runner._stop)  # pylint: disable=protected-access
+                raise SystemExit("stopped by signal 15")
+
+            with (
+                patch.object(Runner, "CLUSTER_ENV", env),
+                patch.object(Runner, "OUT", Path(folder) / "out"),
+                patch.object(Runner, "plan_yaml", lambda plan: Path(folder) / "plan.yaml"),
+                patch.object(Runner, "stream", killed),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaisesRegex(SystemExit, "signal 15"):
+                    Runner.run_block("B", ["off2-7"])
+
+            self.assertEqual(env.read_text(encoding="utf-8"), _ENV)
+            self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_reset_takes_a_left_setting_out(self):
+        """After a block that was cut off, reset clears the setting the results warn about."""
+        with tempfile.TemporaryDirectory() as folder:
+            env = Path(folder) / "cluster.env"
+            env.write_text(Runner.with_allocator(_ENV, True), encoding="utf-8")
+            printed = io.StringIO()
+            with (
+                patch.object(Runner, "CLUSTER_ENV", env),
+                patch.object(Runner, "OUT", Path(folder) / "out"),
+                contextlib.redirect_stdout(printed),
+            ):
+                Runner.results({"nodes": [], "log_dir": "/logs", "ssh_user": "root"})
+                Runner.main(["reset"])
+
+            self.assertIn("now: ON, left by a block that did not finish; take it out with: "
+                          "python examples/training_demo/recompute_plan_tests.py reset", printed.getvalue())
             self.assertEqual(env.read_text(encoding="utf-8"), _ENV)
 
     def test_unknown_plan_is_refused_before_anything_runs(self):
