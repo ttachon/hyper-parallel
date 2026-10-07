@@ -112,6 +112,29 @@ class TestSharedExpertDerivation(unittest.TestCase):
             result = resolve_hf_model_spec({"pretrained_model_name_or_path": "x"})
         self.assertEqual(result["num_shared_experts"], 1)
 
+    def test_a_model_stated_by_hand_is_derived_as_a_resolved_one(self) -> None:
+        """
+        Feature: resolve_hf_model_spec on a model its section states by hand (I1).
+        Description: An all-MoE model, experts 256 wide and one shared
+            expert 512 wide, stated in config_overrides with no checkpoint,
+            and the same model whose checkpoint cannot be resolved.
+        Expectation: Both counts the shared expert as two of the routed
+            width and give the model the shared expert's width as its dense
+            one, as the resolved path does; without that, intermediate_size
+            stayed unstated and the shared expert was priced at nothing.
+        """
+        overrides = {
+            "hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000,
+            "num_experts": 16, "num_experts_per_tok": 4, "moe_intermediate_size": 256,
+            "shared_expert_intermediate_size": 512,
+        }
+        stated = resolve_hf_model_spec({"name": "qwen3_5_moe", "config_overrides": dict(overrides)})
+        with patch.object(spec_mod, "_get_hf_config", side_effect=OSError("offline")):
+            fallback = resolve_hf_model_spec({"pretrained_model_name_or_path": "x",
+                                              "config_overrides": dict(overrides)})
+        for spec in (stated, fallback):
+            self.assertEqual((spec["num_shared_experts"], spec["intermediate_size"]), (2, 512))
+
 
 class TestVisualSequenceLength(unittest.TestCase):
     """The encoder sequence length is derived, overridden or defaulted."""
