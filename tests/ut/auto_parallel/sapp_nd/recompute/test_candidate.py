@@ -992,6 +992,70 @@ class TestOffload(unittest.TestCase):
         self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, link=_FAST_LINK),
                          choose_recompute(evaluator, Hard.Device_A2))
 
+    def test_a_mode_per_layer_offloads_its_first_layers_running_off(self):
+        """
+        Feature: choose_recompute with a host link and a mode per layer.
+        Description: PP 1, a device a fifth of the way from all fully
+            recomputed to all plain, off or full for each layer, with and
+            without a link whose copies take no time.
+        Expectation: With the link a run of first layers offloads, each
+            running the plain option and naming the mode off; every range
+            names a mode, the trainer's plan states each offloaded layer
+            off, and the layers save at least as much time as without it.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        modes = ("off", "full")
+        without = choose_recompute(evaluator, Hard.Device_A2, modes=modes, per_layer=True)
+        choice = choose_recompute(evaluator, Hard.Device_A2, modes=modes, per_layer=True, link=_FAST_LINK)
+        offloaded = _offloaded_indices(choice)
+        self.assertGreater(len(offloaded), 0)
+        self.assertEqual(offloaded, list(range(len(offloaded))))
+        self.assertTrue(all(item.mode in modes for item in choice.ranges))
+        self.assertTrue(all(item.mode == "off" and item.option.recompute == frozenset()
+                            for item in choice.ranges if item.option.link_bandwidth))
+        plan = _plan_modes(*trainer_plan(choice), sum(item.count for item in choice.ranges))
+        self.assertEqual([plan[index] for index in offloaded], ["off"] * len(offloaded))
+        self.assertGreaterEqual(sum(choice.stage_savings), sum(without.stage_savings))
+
+    def test_a_mode_per_layer_without_off_does_not_offload(self):
+        """
+        Feature: choose_recompute with a host link and a mode per layer.
+        Description: Full recompute the only mode, chosen per layer, with a
+            link whose copies take no time.
+        Expectation: The choice made without a link: an offloaded layer
+            runs off, which the modes do not offer.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, modes=("full",), per_layer=True,
+                                          link=_FAST_LINK),
+                         choose_recompute(evaluator, Hard.Device_A2, modes=("full",), per_layer=True))
+
+    def test_a_calibrated_link_converts_with_the_compute_ratio(self):
+        """
+        Feature: HostLink.ms_per_unit and HostLink.of.
+        Description: A link priced at its sustained throughput, the same
+            link with a COMPUTE ratio stated, and links built from figures.
+        Expectation: A copy's seconds convert at the throughput times the
+            precision's bytes, or at 1000 over the ratio; a ratio that is
+            not positive is refused, as is a device with no link and no
+            figures; HostLink.of replaces only the figures stated.
+        """
+        # pylint: disable=protected-access
+        evaluator = self._evaluator("pp1", 0.2)
+        link = Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0)
+        seconds = 1.0 / (8.0 * 2 ** 30)
+        plain = Candidate._link(link, evaluator)
+        self.assertAlmostEqual(plain.per_byte / (seconds * 100e12 * evaluator.ccfg.bytes_p), 1.0, places=12)
+        calibrated = Candidate._link(Hard.HostLink.of(link, {"ms_per_unit": 5e-11, "gib_per_s": None}), evaluator)
+        self.assertAlmostEqual(calibrated.per_byte / (seconds * 1000.0 / 5e-11), 1.0, places=12)
+        self.assertEqual(calibrated.overlap, link.overlap)
+        with self.assertRaises(ValueError):
+            Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0, ms_per_unit=0.0)
+        with self.assertRaises(ValueError):
+            Hard.HostLink.of(None, {"gib_per_s": 8.0, "sustained_tflops": None})
+        self.assertEqual(Hard.HostLink.of(None, {"gib_per_s": 8.0, "sustained_tflops": 100.0}), link)
+        self.assertEqual(Hard.HostLink.of(link, {"overlap": 1.0}), Hard.HostLink(8.0, 100.0, overlap=1.0))
+
     def test_an_offloading_choice_reads_so(self):
         """
         Feature: describe and to_records.

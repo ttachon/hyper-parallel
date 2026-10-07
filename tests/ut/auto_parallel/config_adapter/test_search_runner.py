@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for the ND search runner (_search_runner.py)."""
+import dataclasses
 import os
 import tempfile
 import unittest
@@ -762,6 +763,64 @@ class TestSearchStrategies(unittest.TestCase):
         result = sr.search_strategies(config)
         self.assertEqual(result["activation_checkpoint"], "full")
         self.assertNotIn("recompute_per_layer", result)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_offloads_in_a_mode_per_layer(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """
+        Feature: search_strategies with offload.
+        Description: A mode per layer searched with offload figures, the best
+            configuration offloading its first two layers; then one mode for
+            every layer searched with offload.
+        Expectation: The search offloads over the device's link with the
+            stated figures replacing its own, and the result names the
+            offloaded layers beside a plan stating them off; the second is
+            refused.
+        """
+        # pylint: disable=import-outside-toplevel,unused-import
+        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # noqa: F401
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common import hardware as hw
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import LayerRange, RecomputeChoice
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+        mock_dims = MagicMock()
+        mock_dims.dims_val = {
+            _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
+            _MOCK_CP: 1, _MOCK_EP: 1, _MOCK_MBN: 2,
+        }
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [(mock_dims, 1024.0, 0.05, [])]
+        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=1.0, memory_once=0.0,
+                            forward_time=1.0, backward_time=2.0)
+        offloaded = dataclasses.replace(plain, memory_per_micro_batch=0.0, link_bandwidth=1.0)
+        full = LayerOption(recompute=None, memory_per_micro_batch=0.1, memory_once=0.0,
+                           forward_time=1.0, backward_time=3.0)
+        choice = RecomputeChoice(ranges=(LayerRange(0, 2, None, offloaded, "off"), LayerRange(2, 2, None, full, "full")),
+                                 stage_memory=(900.0,), stage_savings=(1.0,))
+        mock_runner.recompute_choices = {mock_dims: choice}
+        mock_runner.recompute_per_layer.return_value = (None, None)
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.estimator["recompute_strategy"] = "per_layer"
+        config.estimator["recompute_modes"] = ["off", "full"]
+        figures = {"gib_per_s": None, "sustained_tflops": None, "overlap": 1.0, "ms_per_unit": 6.4e-11}
+        result = sr.search_strategies(config, offload=figures)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertTrue(kwargs["auto_offload"])
+        device = sr._build_machine(config).device  # pylint: disable=protected-access
+        self.assertEqual(kwargs["host_link"], hw.HostLink.of(device.host_link, figures))
+        self.assertEqual(result["offloaded_layers"], ["0-1"])
+        self.assertEqual(result["activation_checkpoint"], "full")
+        self.assertEqual(result["activation_checkpoint_layers"], {"0-1": "off"})
+
+        config.estimator["recompute_strategy"] = "auto"
+        with self.assertRaises(ValueError):
+            sr.search_strategies(config, offload=figures)
 
         # A train.yaml that states a census prices the trainer's selective
         # mode, its policy, as well.

@@ -928,6 +928,79 @@ class TestSappNDRunND(unittest.TestCase):
                     runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
             self.assertEqual(_FakeParallelize.instances, [])
 
+    def test_run_nd_cli_states_the_overlap_and_calibrates_the_link(self) -> None:
+        """
+        Feature: run_nd --host_link_overlap, and -c with -ao.
+        Description: Ask for offload with an overlap stated and a ratios
+            file, then the overlap without offload, then offload with a
+            ratios file that states no COMPUTE ratio.
+        Expectation: The search gets the device's link with the overlap and
+            the file's COMPUTE ratio replacing its own; the last two command
+            lines are refused before any search is built.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            ratios, other = os.path.join(tmp_dir, "ratios.json"), os.path.join(tmp_dir, "other.json")
+            with open(ratios, "w", encoding="utf-8") as fh:
+                json.dump({"COMPUTE": 6.4e-11}, fh)
+            with open(other, "w", encoding="utf-8") as fh:
+                json.dump({"DP_COMM": 1e-11}, fh)
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-A", "A3"]
+            with patch.object(sys, "argv", argv + ["-ar", "-ao", "--host_link_overlap", "1", "-c", ratios]):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].kwargs["host_link"],
+                             Hard.HostLink.of(Hard.Device_A3.host_link, {"overlap": 1.0, "ms_per_unit": 6.4e-11}))
+            _FakeParallelize.instances = []
+            for extra in (["-ar", "--host_link_overlap", "1"], ["-ar", "-ao", "-c", other]):
+                with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances, [])
+
+    def test_run_nd_cli_hyper_v2_offloads_in_a_mode_per_layer(self) -> None:
+        """
+        Feature: run_nd -ao with a search config.
+        Description: A search config choosing a recompute mode per layer, run
+            with -ao, an overlap and a ratios file; then one choosing one
+            mode for every layer, run with -ao.
+        Expectation: The first search is handed the figures the CLI states,
+            None for those left to the device; the second is refused before
+            it searches.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml, search_yaml, ratios = (os.path.join(tmp_dir, name)
+                                               for name in ("train.yaml", "search.yaml", "ratios.json"))
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+            with open(ratios, "w", encoding="utf-8") as fh:
+                json.dump({"COMPUTE": 6.4e-11}, fh)
+            fake_result = {
+                "dp": 2, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                "micro_batch_num": 1, "memory_estimate_mb": 100.0, "score": 1.0,
+            }
+            outcomes = []
+            for strategy in ("per_layer", "auto"):
+                config = SimpleNamespace(resolved_strategy=None, estimator={"recompute_strategy": strategy},
+                                         cluster_spec={}, constraint={})
+                with patch("hyper_parallel.auto_parallel.config_adapter.read_search_config", return_value=config), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.validate", return_value=[]), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                              return_value=fake_result) as mock_search, \
+                        patch("hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml"):
+                    argv = ["run_nd.py", "-f", "hyper_v2", "-y", train_yaml, "-s", search_yaml, "-o", tmp_dir,
+                            "-v", "0", "-ao", "--host_link_overlap", "1", "-c", ratios]
+                    with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                outcomes.append((exc_info.exception.code, mock_search.call_args))
+        self.assertEqual(outcomes[0][0], 0)
+        self.assertEqual(outcomes[0][1].kwargs["offload"],
+                         {"gib_per_s": None, "sustained_tflops": None, "overlap": 1.0, "ms_per_unit": 6.4e-11})
+        self.assertEqual(outcomes[1], (2, None))
+
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """
         Feature: TestSappNDRunND.

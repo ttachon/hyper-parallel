@@ -629,9 +629,12 @@ class _Link:
 
 
 def _link(link: HostLink, evaluator: EvaluatorV2) -> _Link:
-    """*link* in the estimate's units: FLOPs of forward and backward, times the precision's bytes, per device."""
-    units_per_second = link.flops_per_second() * evaluator.ccfg.bytes_p
-    return _Link(link.seconds_per_byte() * units_per_second, link.overlap)
+    """*link* in the estimate's units: FLOPs of forward and backward, times the precision's bytes, per device.
+
+    A link calibrated with a COMPUTE ratio converts with it instead
+    (:meth:`HostLink.units_per_second`).
+    """
+    return _Link(link.seconds_per_byte() * link.units_per_second(evaluator.ccfg.bytes_p), link.overlap)
 
 
 def _offloaded(option: LayerOption) -> LayerOption:
@@ -906,7 +909,10 @@ def choose_recompute(
             fits rather than one for every layer, for a runtime that runs a
             mode per layer, as HyperParallel's trainer does with
             ``activation_checkpoint.layers``. Each range then names its mode
-            (:func:`trainer_plan`), and no layer offloads, which no mode does.
+            (:func:`trainer_plan`). With *link*, and off among *modes*, each
+            stage's first layers may also run off and offload what they keep,
+            reporting the mode off: priced as offload should run, for a
+            runtime that offloads them, which the trainer does not yet.
 
     Returns:
         The choice, or ``None`` when there is none to make: a multimodal
@@ -931,7 +937,11 @@ def choose_recompute(
     capacity = config.device_capacity.to_mb().size * MEGABYTE
     if by_mode is not None:
         if per_layer:
-            return _each_layer(layers, stages, peaks, fronts, own, (bucket, capacity), _option_modes(by_mode))
+            option_modes = _option_modes(by_mode)
+            if link is not None and config.vp == 1 and "off" in modes:
+                return _offload_result(layers, stages, peaks, fronts, own, _link(link, evaluator), bucket, capacity,
+                                       option_modes)
+            return _each_layer(layers, stages, peaks, fronts, own, (bucket, capacity), option_modes)
         one = _one_mode(layers, peaks, by_mode, modes, fronts, own, capacity)
         return None if one is None else _result(layers, peaks, one[1], one[0], fronts, own)
     if link is not None and config.vp == 1:
@@ -982,8 +992,15 @@ def _offload_result(
     link: _Link,
     bucket: float,
     capacity: float,
+    modes: Optional[Mapping[LayerOption, str]] = None,
 ) -> Optional[RecomputeChoice]:
-    """The choice per layer, each stage's first layers offloading where that is faster."""
+    """The choice per layer, each stage's first layers offloading where that is faster.
+
+    Args:
+        modes: For a choice of a mode per layer, each option's mode. An
+            offloaded layer runs its kind's plain option, and reports that
+            option's mode.
+    """
     chosen: Dict[int, LayerOption] = {}
     held = []
     for stage_layers, stage, stage_peaks in zip(layers, stages, peaks):
@@ -994,7 +1011,13 @@ def _offload_result(
         transit = found[1]
         held.append(_Peaks(stage_peaks.warm_up + transit,
                            None if stage_peaks.backward is None else stage_peaks.backward + transit))
-    return _result(layers, held, chosen, None, fronts, own)
+    if modes is not None:
+        modes = dict(modes)
+        for layer in (layer for stage_layers in layers for layer in stage_layers):
+            if chosen[layer.index].link_bandwidth:
+                plain = _plain(fronts[layer.key])
+                modes[chosen[layer.index]] = modes[own.get(plain, plain)]
+    return _result(layers, held, chosen, None, fronts, own, modes)
 
 
 def option_label(option: LayerOption) -> str:

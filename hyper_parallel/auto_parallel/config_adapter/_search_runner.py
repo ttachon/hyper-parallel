@@ -21,7 +21,7 @@ memory budget, and returns the optimal strategy.
 
 import copy
 import logging
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 from hyper_parallel.auto_parallel._hf_model_spec import EXEC_OVERRIDE_KEYS
 from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
@@ -519,7 +519,9 @@ def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
         ``recompute_per_layer`` also gives each layer's own fastest option of
         its kind's front and the score and memory it would reach: what the
         trainer would gain from running each layer its own way, switch by
-        switch.
+        switch. ``offloaded_layers`` names the layers a choice offloads, as
+        ``"first"`` or ``"first-last"``, where it offloads any: the plan
+        states them off, the trainer running no offload yet.
     """
     # pylint: disable=C0415
     from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import to_records, trainer_plan
@@ -528,6 +530,13 @@ def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
     result: Dict[str, Any] = {"activation_checkpoint": mode}
     if layers:
         result["activation_checkpoint_layers"] = layers
+    # Only a choice per layer offloads; one mode for every layer states no ranges of its own.
+    offloaded = [item for item in getattr(choice, "ranges", ()) if item.option.link_bandwidth]
+    if offloaded:
+        result["offloaded_layers"] = [
+            str(item.first) if item.count == 1 else f"{item.first}-{item.first + item.count - 1}"
+            for item in offloaded
+        ]
     per_layer, score = nd_runner.recompute_per_layer(best_entry[0])
     if per_layer is not None:
         result["recompute_per_layer"] = {
@@ -538,7 +547,7 @@ def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
     return result
 
 
-def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
+def search_strategies(config: NormalizedConfig, offload: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Run the ND strategy search and return the optimal strategy.
 
     This is the main entry point for end-to-end strategy search:
@@ -553,13 +562,19 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     Args:
         config: A fully populated ``NormalizedConfig`` from
             :func:`read_search_config` or :func:`read_hp_yaml_config`.
+        offload: With a choice of a recompute mode per layer, let each
+            stage's first layers run off and offload what they keep, over the
+            device's host link with these of its figures replaced
+            (:meth:`HostLink.of`), ``None`` for one left as the device states
+            it. ``None`` offloads nothing.
 
     Returns:
         A dict with keys ``dp``, ``tp``, ``pp``, ``cp``, ``ep``,
         ``micro_batch_num``, ``memory_estimate_mb``, and ``score``.
 
     Raises:
-        ValueError: If required fields are missing or no strategy is found.
+        ValueError: If required fields are missing or no strategy is found,
+            or for *offload* without a choice of a mode per layer.
     """
     _validate_before_search(config)
 
@@ -585,6 +600,12 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
         "recompute_selective": dict(HYPER_SELECTIVE_REC_OP),
         "recompute_mode_per_layer": strategy == "per_layer",
     }
+    if offload is not None:
+        if strategy != "per_layer":
+            raise ValueError("offload is priced in a choice of a recompute mode per layer: give the search config "
+                             "recompute: per_layer")
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import HostLink  # pylint: disable=C0415
+        trainer.update(auto_offload=True, host_link=HostLink.of(machine.device.host_link, offload))
     nd_runner = _Par.Parallelize(
         "hyper_v2",
         hp_config,
