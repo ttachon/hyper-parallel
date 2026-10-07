@@ -433,6 +433,7 @@ class Plot:
         """Parse test data for plot"""
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
+        include_all = kwargs.get("include_all", False)
         min_e = configs_estimated[0][2]
         i = 0
         for cfg_e in configs_estimated:
@@ -447,21 +448,44 @@ class Plot:
                     real_data.append(tuple(measured_bars(cfg_e[5], plot_idle)))
             except IndexError:
                 score = cfg_e[2]
-                if i >= self.top or (min_e is not None and score > min_e * 20):
+                if not include_all and (
+                    i >= self.top or (min_e is not None and score > min_e * 20)
+                ):
                     self.cell_text.pop()
                     break
                 self.data.append(tuple([cfg_e[0], score] + cfg_e[3]))
                 i += 1
 
 
+def top_plot_configs(configs_estimated: list, max_num: Optional[int] = None) -> list:
+    """Return the configurations the standard ND plot would include."""
+    if not configs_estimated:
+        return []
+    top = max_num if max_num is not None else 20
+    if top <= 0:
+        return []
+    best_score = configs_estimated[0][2]
+    selected = []
+    for config in configs_estimated:
+        if len(selected) >= top or config[2] > best_score * 20:
+            break
+        selected.append(config)
+    return selected
+
+
 def plot_nd(
-    configs_estimated, output_path, debug_parts, title=None, max_num=None
+    configs_estimated,
+    output_path,
+    debug_parts,
+    title=None,
+    max_num=None,
+    include_all=False,
 ):
     """Plot estimation"""
     plot = Plot(
         title, configs_estimated[0][0].keys(), debug_parts, top=max_num
     )
-    plot.parse_data(configs_estimated)
+    plot.parse_data(configs_estimated, include_all=include_all)
 
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "estim"] + plot.dbg_cols)

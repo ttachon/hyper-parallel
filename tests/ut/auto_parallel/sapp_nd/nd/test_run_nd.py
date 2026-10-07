@@ -1659,6 +1659,113 @@ class TestSappNDRunND(unittest.TestCase):
                 plot_idle=True,
             )
 
+    def test_exhaustive_plot_space_precedence_and_top_up(self) -> None:
+        """Test exhaustive counts and numeric force-exhaustive precedence."""
+        values = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        scored_space = [
+            (
+                Dim.Dimensions([(Dim.DP, value)], all_dims=[Dim.DP]),
+                128,
+                float(index),
+                [],
+            )
+            for index, value in enumerate(values, start=1)
+        ]
+        cases = [
+            # (top M, exhaustive, force exhaustive, additions, total qualifying)
+            (3, 5, 2, 3, 5),
+            (3, 2, 2, 2, 4),
+            (3, 2, 4, 4, 6),
+            (8, 5, 2, 2, 9),
+            (3, 4, 0, 2, 4),
+        ]
+
+        for top_num, exhaustive, force_exhaustive, expected_additions, expected_total in cases:
+            with self.subTest(
+                top_num=top_num,
+                exhaustive=exhaustive,
+                force_exhaustive=force_exhaustive,
+            ):
+                normal_plot = Debug.top_plot_configs(scored_space, top_num)
+                plot_space, additions = Par._exhaustive_plot_space(
+                    scored_space,
+                    [Dim.DP],
+                    top_num,
+                    exhaustive,
+                    force_exhaustive,
+                )
+                qualifying_total = sum(
+                    1
+                    for config in plot_space
+                    if config[0].has_dim(Dim.DP) and config[0].val(Dim.DP) > 1
+                )
+
+                self.assertEqual(len(additions), expected_additions)
+                self.assertEqual(qualifying_total, expected_total)
+                self.assertLessEqual(len(normal_plot), top_num)
+
+        multi_dim_space = [
+            (
+                Dim.Dimensions(
+                    [(Dim.DP, dp), (Dim.OP, op)],
+                    all_dims=[Dim.DP, Dim.OP],
+                ),
+                128,
+                float(index),
+                [],
+            )
+            for index, (dp, op) in enumerate(
+                [(1, 1), (2, 1), (1, 2), (2, 2), (4, 1), (1, 4)],
+                start=1,
+            )
+        ]
+        plot_space, additions = Par._exhaustive_plot_space(
+            multi_dim_space,
+            [Dim.DP, Dim.OP],
+            top_num=2,
+            exhaustive=2,
+            force_exhaustive=0,
+        )
+        for dimension in (Dim.DP, Dim.OP):
+            qualifying_total = sum(
+                1
+                for config in plot_space
+                if config[0].has_dim(dimension) and config[0].val(dimension) > 1
+            )
+            self.assertGreaterEqual(qualifying_total, 2)
+        self.assertEqual(len(additions), 2)
+
+    def test_exhaustive_plot_includes_candidates_past_standard_score_cutoff(self) -> None:
+        """Test exhaustive candidates survive the normal 20x score cutoff."""
+        scores = [1.0, 2.0, 3.0, 21.0]
+        values = [1, 2, 4, 8]
+        scored_space = [
+            (
+                Dim.Dimensions([(Dim.DP, value)], all_dims=[Dim.DP]),
+                128,
+                score,
+                [],
+            )
+            for value, score in zip(values, scores)
+        ]
+        plot_space, additions = Par._exhaustive_plot_space(
+            scored_space,
+            [Dim.DP],
+            top_num=10,
+            exhaustive=3,
+            force_exhaustive=0,
+        )
+        debug_parts = [Debug.PerfParts.FW_COMPUTE]
+
+        standard_plot = Debug.Plot("unit", [Dim.DP], debug_parts, top=len(plot_space))
+        standard_plot.parse_data(plot_space)
+        exhaustive_plot = Debug.Plot("unit", [Dim.DP], debug_parts, top=len(plot_space))
+        exhaustive_plot.parse_data(plot_space, include_all=True)
+
+        self.assertEqual(len(additions), 1)
+        self.assertEqual(len(standard_plot.data), 3)
+        self.assertEqual(len(exhaustive_plot.data), 4)
+
     def test_a_comparison_writes_a_plot_without_idle_and_its_estimates(self) -> None:
         """
         Feature: the files run_nd --real_csv writes beside its plot.
@@ -1830,6 +1937,28 @@ class TestSappNDRunND(unittest.TestCase):
             with open(path, newline="", encoding="utf-8") as handle:
                 rows = list(csv.reader(handle))
         self.assertEqual(rows[1][:5], ["1", "8", "4", "100", "2.5"])
+
+    def test_run_nd_cli_passes_exhaustive_options_to_the_search(self) -> None:
+        """Test short and long exhaustive CLI options reach the search runner."""
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            option_forms = [
+                ["-e", "5", "-ee", "2"],
+                ["--exhaustive", "5", "--force_exhaustive", "2"],
+            ]
+            for options in option_forms:
+                _FakeParallelize.instances = []
+                argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"] + options
+                with patch.object(sys, "argv", argv):
+                    runpy.run_module(
+                        "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                        run_name="__main__",
+                    )
+
+                run_kwargs = _FakeParallelize.instances[-1].last_run_kwargs()
+                self.assertEqual(run_kwargs["exhaustive"], 5)
+                self.assertEqual(run_kwargs["force_exhaustive"], 2)
 
     def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
         """
