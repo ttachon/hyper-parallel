@@ -37,6 +37,17 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
 )
 
 
+def _non_negative_int(value: str) -> int:
+    """Parse a non-negative integer command-line value."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
 def _apply_cli_overrides(search_cfg, cli_args):
     """Override the search config's batch, memory budget and devices from the CLI.
 
@@ -333,6 +344,29 @@ if __name__ == "__main__":
         help="Number of top configs to print & plot",
     )
     parser.add_argument(
+        "-e",
+        "--exhaustive",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help=(
+            "Ensure each requested dimension is > 1 in at least N plotted "
+            "results; default: 0"
+        ),
+    )
+    parser.add_argument(
+        "-ee",
+        "--force_exhaustive",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help=(
+            "When N >= --exhaustive, append N further results per requested "
+            "dimension with degree > 1; otherwise append at least N and top up "
+            "to --exhaustive total; default: 0"
+        ),
+    )
+    parser.add_argument(
         "-mem",
         "--mem_for_ppb",
         type=str,
@@ -424,6 +458,16 @@ if __name__ == "__main__":
         parser.error(f"real_csv not found: {args.real_csv}")
     if args.write_ratios is not None and args.real_csv is None:
         parser.error("--write_ratios fits the ratios on a comparison: it needs --real_csv")
+
+    exhaustive_count = args.exhaustive
+    force_exhaustive = args.force_exhaustive
+    if (exhaustive_count or force_exhaustive) and (
+        args.real_csv is not None or args.search_config or args.verify
+    ):
+        parser.error(
+            "--exhaustive and --force_exhaustive apply to the standard ND search, "
+            "not --real_csv, --search-config, or --verify"
+        )
 
     max_mem = (
         Memory.from_string(args.max_mem.strip())
@@ -527,4 +571,7 @@ if __name__ == "__main__":
         top_num=args.top_config_number,
         cache_file=args.cache_file,
         ranking_csv=args.ranking_csv,
+        exhaustive=exhaustive_count,
+        force_exhaustive=force_exhaustive,
+        dimensions=dims,
     )
