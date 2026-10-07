@@ -79,6 +79,19 @@ MOE_DISPATCH = 1040
 # How far a stage's recorded parts may stray from its time: they are its time
 # taken apart, so only by rounding.
 PARTS_REL_TOL = 1e-9
+# The ratio of a ratios file that scales the compute parts and turns ND's
+# units into milliseconds.
+COMPUTE_RATIO = "COMPUTE"
+# Where a ratio a file leaves out is taken from, as ``nd.ratios.fit_ratios``
+# fills a part it cannot fit: the all-reduce from the DP traffic it was split
+# out of, the bubble from P2P time, which measured data cannot tell it from,
+# and any other part from compute's, which leaves it as ND weighs it.
+RATIO_FALLBACKS = {
+    PerfParts.DP_REDUCE.name: PerfParts.DP_COMM.name,
+    PerfParts.BUBBLE.name: PerfParts.PP_COMM.name,
+}
+# The ratios a file was found without, each named once a process.
+_MISSING_RATIOS = set()
 # The parts a communication walk records on the debugger, one value a stage.
 RECORDED_COMM_PARTS = (
     PerfParts.DP_COMM,
@@ -535,11 +548,38 @@ def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
     return p2p
 
 
+def _part_ratio(coeffs, key):
+    """The ratio a ratios file states for *key*, or the one fit_ratios would give it.
+
+    A file ``fit_ratios`` writes states every key, but one edited by hand,
+    or fitted by a tree older than a part, may lack some.  A missing ratio
+    falls back as ``fit_ratios`` fills a part it cannot fit (``RATIO_FALLBACKS``),
+    and each missing key is named once.  Compute's ratio is the unit every
+    other one falls back on, so a file without it is refused.
+
+    Raises:
+        ValueError: When the file states no COMPUTE ratio.
+    """
+    ratio = coeffs.get(key)
+    if ratio is not None:
+        return ratio
+    if key == COMPUTE_RATIO:
+        raise ValueError(
+            "the ratios file states no COMPUTE ratio, the one that turns ND's "
+            "units into milliseconds and that every missing ratio falls back on"
+        )
+    fallback = RATIO_FALLBACKS.get(key, COMPUTE_RATIO)
+    if key not in _MISSING_RATIOS:
+        _MISSING_RATIOS.add(key)
+        nd_logger.error("the ratios file states no %s ratio: that part takes %s's", key, fallback)
+    return _part_ratio(coeffs, fallback)
+
+
 def apply_regression_coefficients(coeffs, debugger, old_perf):
     """
     applies the coefficients present in regression's cache_file
     """
-    compute_ratio = coeffs.get("COMPUTE")
+    compute_ratio = _part_ratio(coeffs, COMPUTE_RATIO)
     for part, raw in list(debugger.info.items()):
         if part in (PerfParts.TOTAL, PerfParts.MEMORY):
             continue
@@ -548,10 +588,7 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
                    PerfParts.RECOMPUTE):
             ratio = compute_ratio
         else:
-            ratio = coeffs.get(part.name)
-            if ratio is None and part == PerfParts.DP_REDUCE:
-                # A file fitted before the all-reduce had a part of its own.
-                ratio = coeffs.get(PerfParts.DP_COMM.name)
+            ratio = _part_ratio(coeffs, part.name)
         new_val = 0.0 if raw == 0.0 else raw * ratio
         debugger.info[part] = new_val
 

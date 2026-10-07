@@ -21,12 +21,14 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 # The memory model loads before the time model, whose modules import each other through it.
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation import estimate_v2  # pylint: disable=unused-import
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd import ratios as Ratios
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import estimate as Estimate
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import apply_regression_coefficients
 
 P = Debug.PerfParts
@@ -136,6 +138,37 @@ class TestRatios(unittest.TestCase):
         pick = [line for line in lines if line.startswith("Corrected, ND ranks")]
         self.assertEqual(len(pick), 1)
         self.assertIn("the fastest, DP 64 EP 2 OP 32, 650.0", pick[0])
+
+    def test_a_file_missing_ratios_takes_what_the_fit_would_give(self):
+        """
+        Feature: estimate.apply_regression_coefficients on a partial ratios file.
+        Description: A file holding COMPUTE and DP_COMM alone, as one edited by
+            hand or fitted before a part existed would, applied twice to a
+            strategy that also has an all-reduce, expert traffic and a bubble;
+            then a file without COMPUTE.
+        Expectation: No crash. The all-reduce takes DP_COMM's ratio, the bubble
+            P2P's, itself compute's, and every other part compute's, as
+            fit_ratios fills a part it cannot fit; each missing key is named
+            once; a file without compute's ratio, the unit every other falls
+            back on, is refused.
+        """
+        parts = {P.FW_COMPUTE: 2.0, P.BW_COMPUTE: 4.0, P.DP_COMM: 0.5, P.DP_REDUCE: 0.1,
+                 P.EP_COMM: 1.0, P.BUBBLE: 0.2}
+        filled = {"COMPUTE": 100.0, "DP_COMM": 80.0, "DP_REDUCE": 80.0, "MP_COMM": 100.0,
+                  "EP_COMM": 100.0, "CP_COMM": 100.0, "PP_COMM": 100.0, "BUBBLE": 100.0}
+        config = _entry(2, 32, 0.0, {}, {})[0]
+        with patch.object(Estimate, "_MISSING_RATIOS", set()), patch.object(Estimate, "nd_logger") as nd_logger:
+            for _ in range(2):
+                debugger = Debug.Debug(config, P, enable=True)
+                for part in Ratios.SCORE_PARTS:
+                    debugger.info[part] = parts.get(part, 0.0)
+                score = apply_regression_coefficients({"COMPUTE": 100.0, "DP_COMM": 80.0}, debugger,
+                                                      sum(parts.values()))
+                self.assertAlmostEqual(score, Ratios.corrected(parts, filled))
+            named = sorted(call.args[1] for call in nd_logger.error.call_args_list)
+            self.assertEqual(named, ["BUBBLE", "CP_COMM", "DP_REDUCE", "EP_COMM", "MP_COMM", "PP_COMM"])
+            with self.assertRaises(ValueError):
+                apply_regression_coefficients({"DP_COMM": 80.0}, debugger, 1.0)
 
     def test_a_round_without_compute_cannot_be_fitted(self):
         """
