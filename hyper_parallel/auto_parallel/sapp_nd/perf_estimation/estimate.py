@@ -79,6 +79,14 @@ MOE_DISPATCH = 1040
 # How far a stage's recorded parts may stray from its time: they are its time
 # taken apart, so only by rounding.
 PARTS_REL_TOL = 1e-9
+# The parts a communication walk records on the debugger, one value a stage.
+RECORDED_COMM_PARTS = (
+    PerfParts.DP_COMM,
+    PerfParts.DP_REDUCE,
+    PerfParts.MP_COMM,
+    PerfParts.EP_COMM,
+    PerfParts.CP_COMM,
+)
 
 
 def op_table(cfg, attn=None):
@@ -673,9 +681,16 @@ def _submodule_parts(cfg, ccfg, device_type, debugger):
     (``combine_partition_multimodal``).  Each is priced on its own
     partitions and under its own family, on a copy, so no submodule leaves
     state for the next.
+
+    Each submodule's walk also records its communication on the debugger,
+    stage by stage, and the record is summed the same way.  Kept as the
+    last walk left it, it held the language model's share alone: a vision
+    tower's collectives went into the bubble, the time less the parts, and
+    the parts a ratio is fitted on missed them.
     """
     partitions = cfg.generate_partitions_vpp()
     totals = None
+    recorded = {}
     for name in cfg.mm_order:
         sub = deepcopy(cfg.mm_ccfgs[name])
         check_and_apply_custom_hook(sub)
@@ -683,7 +698,24 @@ def _submodule_parts(cfg, ccfg, device_type, debugger):
         totals = parts if totals is None else tuple(
             [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
         )
+        if debugger and debugger.is_enabled():
+            _add_recorded_comm(recorded, debugger.info)
+    if recorded:
+        debugger.info.update(recorded)
     return totals
+
+
+def _add_recorded_comm(recorded, info):
+    """Add the communication a walk recorded, one value a stage, to *recorded*."""
+    for part in RECORDED_COMM_PARTS:
+        stages = info.get(part)
+        if not isinstance(stages, list):
+            continue
+        recorded[part] = (
+            [left + right for left, right in zip(recorded[part], stages)]
+            if part in recorded
+            else list(stages)
+        )
 
 
 # performance estimation
