@@ -31,6 +31,27 @@ from scipy.stats import pearsonr
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_recompute_modes
+
+# The column a configuration's activation checkpoint mode goes in, written by a
+# search with a recompute dimension and read from a measured CSV that states it.
+RECOMPUTE_COLUMN = "recompute"
+
+
+def _recompute_of(row: dict) -> Optional[str]:
+    """Take a measured row's activation checkpoint mode out of it, None where the CSV states none."""
+    stated = (row.pop(RECOMPUTE_COLUMN, None) or "").strip()
+    if not stated:
+        return None
+    modes = read_recompute_modes(stated, f"the {RECOMPUTE_COLUMN} column")
+    if len(modes) != 1:
+        raise ValueError(f"the {RECOMPUTE_COLUMN} column: a measured run ran one mode, not {stated!r}")
+    return modes[0]
+
+
+def _has_recompute(entries: list) -> bool:
+    """Whether any entry's configuration states an activation checkpoint mode."""
+    return any(getattr(entry[0], "recompute", None) for entry in entries)
 
 
 # Where the CSVs and the plots go. Defaults to a directory beside this file,
@@ -462,9 +483,10 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
     """Write a search's configurations in ND's order, best first.
 
     One row per configuration that fits memory: its rank, its degrees, the
-    peak memory in MB, the score and the parts the score splits into, which
-    are blank when the search ran without debug output. Scores keep full
-    precision so that a reader can tell a tie from a near miss.
+    activation checkpoint mode where the search had a recompute dimension,
+    the peak memory in MB, the score and the parts the score splits into,
+    which are blank when the search ran without debug output. Scores keep
+    full precision so that a reader can tell a tie from a near miss.
 
     Args:
         scored_space: ``(config, memory, score, parts)`` entries, as
@@ -474,20 +496,24 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
     parts = _score_parts()
     _make_parent(path)
     dims = [str(dim) for dim in scored_space[0][0].keys()] if scored_space else []
+    moded = _has_recompute(scored_space)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["rank"] + dims + ["memory_mb", "score"] + [str(part) for part in parts])
+        writer.writerow(["rank"] + dims + ([RECOMPUTE_COLUMN] if moded else []) + ["memory_mb", "score"]
+                        + [str(part) for part in parts])
         for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
             split = [repr(float(value)) for value in values] if values else [""] * len(parts)
-            writer.writerow([rank] + config.values() + [memory, repr(float(score))] + split)
+            writer.writerow([rank] + config.values() + ([config.recompute] if moded else [])
+                            + [memory, repr(float(score))] + split)
 
 
 def write_estimates_csv(configs_estimated: list, path: str) -> None:
     """Write ND's estimate of every configuration of a classified comparison.
 
     One row per measured configuration, in the comparison's order: its
-    degrees, the measured step, ND's peak memory in MB, its score and the
-    parts of the score. The plots show these only as bars; a sweep needs ND's
+    degrees, the activation checkpoint mode where the measured CSV states
+    one, the measured step, ND's peak memory in MB, its score and the parts
+    of the score. The plots show these only as bars; a sweep needs ND's
     memory as a number, to set it beside the peak the trainer logged.
 
     Args:
@@ -499,12 +525,15 @@ def write_estimates_csv(configs_estimated: list, path: str) -> None:
     parts = _score_parts()
     _make_parent(path)
     dims = [str(dim) for dim in configs_estimated[0][0].keys()] if configs_estimated else []
+    moded = _has_recompute(configs_estimated)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(dims + ["time", "memory_mb", "score"] + [str(part) for part in parts])
+        writer.writerow(dims + ([RECOMPUTE_COLUMN] if moded else []) + ["time", "memory_mb", "score"]
+                        + [str(part) for part in parts])
         for config, memory, step, score, values, _ in configs_estimated:
             split = [repr(float(value)) for value in values[:len(parts)]]
-            writer.writerow(config.values() + [step, memory, repr(float(score))] + split)
+            writer.writerow(config.values() + ([config.recompute] if moded else [])
+                            + [step, memory, repr(float(score))] + split)
 
 
 def busy_time(entry: tuple) -> float:
@@ -620,6 +649,7 @@ def get_real_data(csv_f):
             row_num += 1
             logger.info(row)
             real_time = float(row.pop("time"))
+            recompute = _recompute_of(row)
             config = []
             for dim_str, value in row.items():
                 try:
@@ -628,7 +658,7 @@ def get_real_data(csv_f):
                     config.append((dim, dim.from_str(value)))
                 except ValueError:
                     pass
-            configs.append((Dim.Dimensions(config), real_time))
+            configs.append((Dim.Dimensions(config, recompute=recompute), real_time))
     return configs, row_num
 
 
@@ -655,6 +685,7 @@ def get_comm_classified_data(csv_f, plot_idle=False):
         for row in rows:
             logger.info(row)
             time = float(row.pop("time"))
+            recompute = _recompute_of(row)
             config = []
             comm_wait_time_classified = {}
             total_wait = 0
@@ -685,7 +716,7 @@ def get_comm_classified_data(csv_f, plot_idle=False):
                     total_wait,
                 )
             configs.append(
-                (Dim.Dimensions(config), time, comm_wait_time_classified)
+                (Dim.Dimensions(config, recompute=recompute), time, comm_wait_time_classified)
             )
     return configs
 

@@ -559,6 +559,7 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
+    recompute_modes = config.estimator.get("recompute_modes")
     try:
         nd_runner = _Par.Parallelize(
             "hyper_v2",
@@ -566,6 +567,7 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
             machine,
             global_batch_size=config.constraint.get("global_batch_size", 0),
             dimensions=dims,
+            **({"recompute_modes": tuple(recompute_modes)} if recompute_modes else {}),
         )
         scored_space = nd_runner.run_generation_to_ordering(
             yaml_folder=None,
@@ -592,13 +594,16 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
         )
     best = filtered[0]
     result = _format_result(best, config)
-    # The search prices every candidate fully recomputed, whatever the search
-    # yaml's recompute setting says, so the trainer must run what was priced.
-    result["activation_checkpoint"] = "full"
+    # Without a recompute dimension the search prices every candidate fully
+    # recomputed, whatever the search yaml's recompute setting says; with one,
+    # each candidate under the mode it is ranked with. The trainer must run
+    # what was priced.
+    result["activation_checkpoint"] = best[0].recompute if recompute_modes else "full"
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
         "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
+        "recompute=%(activation_checkpoint)s "
         "mem=%(memory_estimate_mb).0f MB score=%(score).2e",
         result,
     )

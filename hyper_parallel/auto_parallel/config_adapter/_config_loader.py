@@ -34,6 +34,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
 )
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_recompute_modes
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,35 @@ def _describe_parallelism(
     return "; ".join(parts)
 
 
+def _describe_recompute(modes: Tuple[str, ...]) -> str:
+    """Report how a declared recompute dimension was resolved, as :func:`_describe_parallelism` reports a degree."""
+    if len(modes) == 1:
+        return f"recompute=fixed {modes[0]} (declared)"
+    return f"recompute=searched over {list(modes)}"
+
+
+def _stated_recompute_dimension(raw: Dict[str, Any], parallelism_raw: Dict[str, Any]) -> Optional[Tuple[str, ...]]:
+    """Read ``parallelism.recompute``, the recompute dimension, stated as a degree is.
+
+    One mode fixes it, a list of modes is the candidates, and ``auto`` all
+    three; see :mod:`~hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension`.
+
+    Returns:
+        The modes, or None where the search config states no dimension.
+
+    Raises:
+        ValueError: For a value that is not a mode, or when the top-level
+            ``recompute`` states one mode as well.
+    """
+    modes = read_recompute_modes(parallelism_raw.get("recompute"), "parallelism.recompute")
+    if modes is not None and str(raw.get("recompute", "none")).lower() not in ("none", "off", "false"):
+        raise ValueError(
+            "recompute is stated twice: parallelism.recompute searches it as a dimension, and the "
+            "top-level recompute states one mode; keep parallelism.recompute"
+        )
+    return modes
+
+
 def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     """Construct a NormalizedConfig from a parsed Search Config YAML dict.
 
@@ -353,10 +383,12 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         "pipeline_parallel_schedule": pp_raw.get("pipeline_schedule", "1F1B"),
     }
 
+    recompute_modes = _stated_recompute_dimension(raw, parallelism_raw)
     estimator: Dict[str, Any] = {
         "type": "symbolic",
         "recompute_strategy": str(raw.get("recompute", "none")),
         "enable_profiling_calibration": False,
+        **({"recompute_modes": recompute_modes} if recompute_modes is not None else {}),
     }
 
     constraint: Dict[str, Any] = {
@@ -368,6 +400,8 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     summary = _describe_parallelism(
         search_space, auto_dims, parallelism_raw, bool(base_config)
     )
+    if recompute_modes is not None:
+        summary += "; " + _describe_recompute(recompute_modes)
     logger.info("parallelism resolved: %s", summary)
 
     return NormalizedConfig(

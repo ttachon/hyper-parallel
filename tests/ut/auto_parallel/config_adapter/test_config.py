@@ -1454,5 +1454,53 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(summary["cluster"]["total_cards"], 32)
 
 
+
+class TestRecomputeDimension(unittest.TestCase):
+    """parallelism.recompute states the recompute dimension the way a degree is stated."""
+
+    @staticmethod
+    def _read(**replace: Any) -> NormalizedConfig:
+        """Read the dense search config with *replace* applied to its raw YAML."""
+        raw = yaml.safe_load(_dense_search_yaml_content())
+        raw.pop("recompute")
+        for key, value in replace.items():
+            if key == "parallelism_recompute":
+                raw["parallelism"]["recompute"] = value
+            else:
+                raw[key] = value
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "search.yaml")
+            _write_yaml(path, raw)
+            return read_search_config(path)
+
+    def test_one_mode_a_list_or_auto(self) -> None:
+        """Each form reaches the estimator, and the summary says how the dimension resolved."""
+        cases = (
+            ("full", ("full",), "recompute=fixed full (declared)"),
+            (["off", "full"], ("off", "full"), "recompute=searched over ['off', 'full']"),
+            ("auto", ("off", "selective", "full"), "recompute=searched over ['off', 'selective', 'full']"),
+        )
+        for stated, modes, summary in cases:
+            with self.subTest(stated=stated):
+                config = self._read(parallelism_recompute=stated)
+                self.assertEqual(config.estimator["recompute_modes"], modes)
+                self.assertTrue(config.parallelism_summary.endswith(summary), config.parallelism_summary)
+
+    def test_without_it_nothing_changes(self) -> None:
+        """No parallelism.recompute: no modes for the search, and the summary has no recompute part."""
+        config = self._read()
+        self.assertNotIn("recompute_modes", config.estimator)
+        self.assertNotIn("recompute=", config.parallelism_summary)
+
+    def test_refusals(self) -> None:
+        """A value that is no mode, or a second statement of recompute at the top level, is refused."""
+        with self.assertRaisesRegex(ValueError, "parallelism.recompute: 'swap' is not a recompute mode"):
+            self._read(parallelism_recompute="swap")
+        with self.assertRaisesRegex(ValueError, "recompute is stated twice"):
+            self._read(parallelism_recompute=["off", "full"], recompute="selective")
+        self.assertEqual(self._read(parallelism_recompute="full", recompute="none")
+                         .estimator["recompute_modes"], ("full",))
+
+
 if __name__ == "__main__":
     unittest.main()
