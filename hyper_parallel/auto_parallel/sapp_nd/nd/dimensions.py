@@ -169,8 +169,11 @@ ALL_DIMS = [DP, EP, TP, CP, PP, VPP, MBN, MBS, SP, OP]
 class Dimensions:
     """All output dimensions, of a run that *accumulates* gradients over micro-batches or not"""
 
-    def __init__(self, config, all_dims=None, accumulates=False):
+    def __init__(self, config, all_dims=None, accumulates=False, recompute=None):
         self.accumulates = accumulates
+        # The activation checkpoint mode of a search with a recompute
+        # dimension, which is no degree (recompute_dimension); None elsewhere.
+        self.recompute = recompute
         if isinstance(config, list):
             self.all_dims = [d for d, _ in config]
             self.dims_val = dict(config)
@@ -188,7 +191,8 @@ class Dimensions:
             self.all_dims = all_dims
 
     def __str__(self):
-        return str(self.dims_val)
+        mode = getattr(self, "recompute", None)
+        return f"{self.dims_val} recompute={mode}" if mode else str(self.dims_val)
 
     def __repr__(self):
         return str(self)
@@ -211,8 +215,9 @@ class Dimensions:
         return [str(self.dims_val[d]) for d in self.dims_val]
 
     def unique_name(self):
-        """Return all values as a unique string"""
-        return "_".join(self.values())
+        """Return all values as a unique string, the recompute mode last where there is one"""
+        mode = getattr(self, "recompute", None)
+        return "_".join(self.values() + ([mode] if mode else []))
 
     def has_dim(self, d):
         """Check that this dimension has a value in the parallel config"""

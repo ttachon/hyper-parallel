@@ -15,6 +15,7 @@
 """One configuration interface for parallelization"""
 
 import copy
+from typing import Optional
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -107,6 +108,18 @@ class GlobalConfig:
     def adapt_config(self, pp, vpp):
         """Adapt configuration to different parallel config"""
         return self.adapt_config_balancing(pp, vpp)
+
+    def state_recompute(self, full: Optional[bool]) -> None:
+        """Give every candidate *full* as its full recompute, on every config of its pipeline.
+
+        Args:
+            full: The full recompute a recompute dimension's mode states, or
+                None for the recompute each candidate's balancing derives.
+        """
+        self.balancing.stated_recompute = full
+        for _, balancing in self.siblings:
+            if balancing is not None:
+                balancing.stated_recompute = full
 
     def write(self, folder, parallel_config):
         """Dump config into a yaml file"""
