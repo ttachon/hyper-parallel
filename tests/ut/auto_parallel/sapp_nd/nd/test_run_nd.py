@@ -42,6 +42,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import global_config as GC
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHooks
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common import cost_model_preprocess as PreProcess
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
     _CostModelParser,
@@ -1696,6 +1697,38 @@ class TestSappNDRunND(unittest.TestCase):
                     runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
                 self.assertEqual(_FakeParallelize.instances[-1].last_run_kwargs()["ranking_csv"], expected)
 
+    def test_a_field_no_parser_set_is_reported_or_refused(self) -> None:
+        """
+        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict (I9).
+        Description: A config no parser filled, read directly for an op count
+            twice and for its hooks, then through getattr with a default, with
+            and without the strict mode run_nd --strict sets.
+        Expectation: By default each read is 0 and the op count is recorded
+            with its reader and reported once, in one line, the hooks being
+            exempt; under --strict the direct read is refused by name and
+            reader, while getattr gets its stated default; run_nd sets the
+            mode from its flag.
+        """
+        ccfg = object.__new__(CostModelConfig)
+        with patch.object(PreProcess, "UNSET_READS", PreProcess.defaultdict(PreProcess.Counter)), \
+                patch.dict(PreProcess._STRICT, {"on": False}):  # pylint: disable=protected-access
+            self.assertEqual((ccfg.n_gather, ccfg.n_gather, ccfg.hooks_dict), (0, 0, 0))
+            lines = PreProcess.unset_reads_report()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("1 config field(s)", lines[0])
+            self.assertIn("n_gather by test_run_nd.py:test_a_field_no_parser_set_is_reported_or_refused", lines[0])
+            self.assertEqual(PreProcess.unset_reads_report(), [])
+            PreProcess.set_strict(True)
+            with self.assertRaisesRegex(AttributeError, "reads n_gather, which no parser set"):
+                _ = ccfg.n_gather
+            self.assertEqual(getattr(ccfg, "n_gather", 5), 5)
+            for flag, strict in (([], False), (["--strict"], True)):
+                with tempfile.TemporaryDirectory() as tmp_dir, patch.object(Par, "Parallelize", _FakeParallelize), \
+                        patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}), \
+                        patch.object(sys, "argv", ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"] + flag):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(PreProcess._STRICT["on"], strict)  # pylint: disable=protected-access
+
     def test_arch_hook_variants(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -2714,6 +2747,11 @@ class TestSappNDRunND(unittest.TestCase):
                 self.assertEqual(len(lines), said)
                 if said:
                     self.assertIn("priced at 32768 tokens", lines[0])
+        # A field the estimate read unset is named under the table too (I9).
+        reads = PreProcess.defaultdict(PreProcess.Counter, {"n_gather": PreProcess.Counter({"comm.py:tp": 2})})
+        with patch.object(PreProcess, "UNSET_READS", reads), patch.object(Par.logger, "output") as output:
+            runner.run_generation_to_ordering(None)
+        self.assertTrue(any("n_gather by comm.py:tp" in call.args[0] for call in output.call_args_list))
 
     def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
         """

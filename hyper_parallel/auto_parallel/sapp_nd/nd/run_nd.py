@@ -21,6 +21,7 @@ import sys
 import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import set_strict
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -465,8 +466,16 @@ if __name__ == "__main__":
         "either, every candidate keeps the recompute it derives, full unless "
         "-mppb. With --real_csv, the mode of rows that state none.",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Refuse a config field no parser set where the estimate reads it, "
+        "instead of pricing it as 0. Without it, a search names the fields it "
+        "read that way under its ranking.",
+    )
 
     args = parser.parse_args()
+    set_strict(args.strict)
     if args.real_csv is not None and not os.path.isfile(args.real_csv):
         parser.error(f"real_csv not found: {args.real_csv}")
     if args.write_ratios is not None and args.real_csv is None:
