@@ -28,6 +28,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, TYPE_CHECKI
 
 import yaml  # type: ignore[import-untyped]
 
+from hyper_parallel.auto_parallel._hf_model_spec import TEXT_FIELDS
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 
@@ -37,13 +38,64 @@ CONFIG_OVERRIDE_FIELDS = [
     "num_experts", "num_experts_per_tok", "num_shared_experts",
     "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
     "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
-    "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
+    "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim", "capacity_factor", "offset",
     "head_dim", "vision", "attn_output_gate", "qk_norm", "tie_word_embeddings",
+    "qkv_bias", "o_bias", "mlp_bias",
     "layer_types", "linear_num_key_heads", "linear_key_head_dim",
     "linear_num_value_heads", "linear_value_head_dim",
     "linear_conv_kernel_dim", "activations", "output_activations",
     "param_init_type", "compute_dtype", "softmax_compute_type",
 ]
+
+# The canonical model fields the spec resolver names (``TEXT_FIELDS``) that a
+# search does not hand on to the cost model, each with its reason. A field
+# reaches the cost model only where the resolver names it and the search
+# forwards it, so one forgotten here is lost on the way: a Llama's stated
+# attention and MLP biases came back False and a latent attention lost its
+# no-position head width (I10).
+NOT_FORWARDED = {
+    "shared_expert_intermediate_size": (
+        "the resolver turns it into num_shared_experts and intermediate_size, which are forwarded, "
+        "and the cost model reads those"
+    ),
+}
+
+
+def check_forwarded_fields(
+    named: Optional[Tuple[str, ...]] = None,
+    forwarded: Optional[List[str]] = None,
+    exempt: Optional[Dict[str, str]] = None,
+) -> None:
+    """Refuse a canonical model field the search neither forwards nor exempts, or an exemption that is stale.
+
+    Run once at import, so a field added to the resolver without the search
+    stops every search rather than costing a model without it.
+
+    Args:
+        named: The resolver's canonical fields, ``TEXT_FIELDS`` unless given.
+        forwarded: The fields a search forwards, ``CONFIG_OVERRIDE_FIELDS`` unless given.
+        exempt: The fields left out on purpose, ``NOT_FORWARDED`` unless given.
+
+    Raises:
+        RuntimeError: When the lists disagree.
+    """
+    named = set(TEXT_FIELDS if named is None else named)
+    forwarded = set(CONFIG_OVERRIDE_FIELDS if forwarded is None else forwarded)
+    exempt = set(NOT_FORWARDED if exempt is None else exempt)
+    problems = []
+    dropped = sorted(named - forwarded - exempt)
+    if dropped:
+        problems.append(f"the search forwards no {', '.join(dropped)}, which the spec resolver names: forward "
+                        f"each in CONFIG_OVERRIDE_FIELDS or exempt it with its reason in NOT_FORWARDED")
+    stale = sorted(exempt - (named - forwarded))
+    if stale:
+        problems.append(f"NOT_FORWARDED names {', '.join(stale)}, which the search forwards or the resolver "
+                        f"does not name")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+
+
+check_forwarded_fields()
 
 if TYPE_CHECKING:
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par

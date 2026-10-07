@@ -94,6 +94,9 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "linear_value_head_dim": ("linear_value_head_dim",),
     "linear_conv_kernel_dim": ("linear_conv_kernel_dim",),
 }
+# The canonical text-tower fields, which a search hands on to the cost model
+# by these names (``config_adapter._search_runner.CONFIG_OVERRIDE_FIELDS``).
+TEXT_FIELDS: Tuple[str, ...] = tuple(_TEXT_FIELD_ALIASES)
 
 # Vision towers use their own spelling for the shared concepts.
 _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -393,6 +396,24 @@ def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
         logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
 
 
+def _stated_spec(model_raw: Mapping[str, Any], explicit: Dict[str, Any], census_seq_len: int) -> Dict[str, Any]:
+    """The spec of a model its section states by hand, derived and settled as a resolved one is.
+
+    A model no Transformers config describes, every model Transformers
+    cannot build, is stated field by field, and it takes the derivations a
+    resolved spec does: a shared expert stated by its width counts as that
+    many experts, and an all-MoE model's dense width is its shared
+    expert's.  Without them a hand-described all-MoE model kept no
+    ``intermediate_size``, the width its shared expert is priced at, and
+    its shared expert was dropped (I1).
+    """
+    explicit.setdefault("name", model_raw.get("name", "custom"))
+    _derive_shared_experts(explicit)
+    _derive_dense_ffn_width(explicit)
+    _no_census(census_seq_len, explicit)
+    return _settle_facts(explicit)
+
+
 def _census_layers(spec: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
     """The groups of body layers a census tells apart, in model order, or None.
 
@@ -457,9 +478,7 @@ def resolve_hf_model_spec(
 
     if not model_path:
         if explicit:
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len, explicit)
-            return _settle_facts(explicit)
+            return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path, "
             "model.config_path or model.config_overrides for Auto Parallel search"
@@ -473,9 +492,7 @@ def resolve_hf_model_spec(
                 "Transformers config resolution failed (%s); "
                 "falling back to model.config_overrides", exc,
             )
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len, explicit)
-            return _settle_facts(explicit)
+            return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "

@@ -202,10 +202,11 @@ class GlobalConfig:
         for dim in self.dimensions:
             dims.append((dim, kwargs.get(dim.lname())))
 
-        has_mbn_not_in = Dim.MBN not in self.dimensions
-        has_pp_in = Dim.PP in self.dimensions
-        has_dp_or_mbs_in = Dim.DP in self.dimensions or Dim.MBS in self.dimensions
-        if has_mbn_not_in and has_pp_in and has_dp_or_mbs_in:
+        # The micro-batch count is the search's own, the global batch over DP
+        # and MBS, whatever -l names. Kept from the yaml where -l left it out,
+        # every DP but the yaml's own made another batch, so the search
+        # refused every candidate or kept a single DP (M6).
+        if Dim.MBN not in self.dimensions:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)
         return Dim.Dimensions(dims, all_dims=self.dimensions, accumulates=self.accumulates_grads())

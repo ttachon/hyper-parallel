@@ -36,6 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     keeps_param_casts,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
 )
@@ -43,6 +44,9 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model
     CostModelParserHyperV2,
     custom_vision_tower_hook,
 )
+
+# The MindFormers DeepSeek yaml the run_nd tests search.
+_MF_DEEPSEEK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepseek.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +358,21 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             ccfg = _make_ccfg(cfg)
             self.assertEqual(ccfg.s, expected, msg=f"extra={extra}")
 
+    def test_a_length_nobody_stated_is_recorded(self):
+        """
+        Feature: CostModelParserHyperV2 seq_len resolution, the record of a substitution (I11).
+        Description: The dense model with its data.max_seq_len of 2048, then
+            with no training length anywhere and a context limit of 32768.
+        Expectation: The first is stated; the second is costed at the
+            context limit and records that nobody stated it, which a search
+            then prints under its ranking.
+        """
+        stated = _dense_overrides(data={"max_seq_len": 2048})
+        unstated = _dense_overrides(model={"config_overrides": {"max_position_embeddings": 32768}})
+        unstated.pop("data")
+        self.assertEqual([(ccfg.s, ccfg.seq_len_stated) for ccfg in map(_make_ccfg, (stated, unstated))],
+                         [(2048, True), (32768, False)])
+
     def test_overrides_missing_kv_heads_fallback(self):
         """
         Feature: CostModelParserHyperV2 KV-head fallback.
@@ -657,6 +676,32 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             _optimizer_bytes(facts, 4)
             got.append((facts.bytes_os, facts.bytes_optim, facts.bytes_optim_table))
         self.assertEqual(got, [(2, 4, 4), (2, 2, 4), (4, 12, 12)])
+
+    def test_a_config_without_an_optimizer_says_what_it_is_priced_as(self):
+        """
+        Feature: _CostModelParser.state_optimizer, in both parsers (M3, M5).
+        Description: A HyperParallel config stating no optimizer and one
+            stating Muon; the MindFormers DeepSeek yaml without its
+            optimizer section and with Muon as its type.
+        Expectation: Both parsers price a config stating none as AdamW, two
+            states a parameter, and warn that they do; Muon keeps one. The
+            MindFormers parser no longer fails on the missing section.
+        """
+        base = "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser"
+        with self.assertLogs(base, level="WARNING") as said:
+            plain = _make_ccfg(_dense_overrides())
+        self.assertEqual((plain.optimizer, plain.optimizer_states), ("adamw", 2))
+        self.assertTrue(any("states no optimizer" in line for line in said.output))
+        muon = _make_ccfg(_dense_overrides(train={"optimizer": {"_target_": "hyper_parallel.components.optim.Muon"}}))
+        self.assertEqual(muon.optimizer_states, 1)
+        with open(_MF_DEEPSEEK, encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+        raw.pop("optimizer")
+        with self.assertLogs(base, level="WARNING"):
+            stated_none = CostModelConfig(raw, framework="mindformers")
+        self.assertEqual((stated_none.optimizer, stated_none.optimizer_states), ("adamw", 2))
+        raw["optimizer"] = {"type": "Muon"}
+        self.assertEqual(CostModelConfig(raw, framework="mindformers").optimizer_states, 1)
 
     def test_top_level_model_init_dtype_sizes_the_parameters(self):
         """
@@ -1294,6 +1339,30 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             ccfg = _make_ccfg(_auto_models_config())
         self.assertEqual(ccfg.d, 4)
         self.assertTrue(any("device_num" in m for m in captured.output))
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_missing_device_num_takes_the_callers_device_count(self, mock_hf):
+        """
+        Feature: cluster size fallback, the device count a caller states (M6).
+        Description: The same AutoModels config, dp_shard_size 4 at TP 4 and
+            PP 2 with a global batch of 64 and micro-batches of 2, parsed for
+            a caller that states 64 devices, as run_nd -d does; then 60.
+        Expectation: d is the 64 devices over TP x PP x CP, 8, as the runtime
+            derives it from the world size, not dp_shard_size's 4, and the
+            micro-batch count follows it, 4; 60 devices, which TP x PP does
+            not divide, are refused.
+        """
+        mock_hf.return_value = self._hf_config()
+        for devices, want in ((64, (8, 4)), (60, None)):
+            with self.subTest(devices=devices):
+                ccfg = _ParserCostModelConfig(_auto_models_config())
+                ccfg.devices = devices
+                if want is None:
+                    with self.assertRaisesRegex(ValueError, "-d"):
+                        CostModelParserHyperV2(ccfg).parse()
+                    continue
+                CostModelParserHyperV2(ccfg).parse()
+                self.assertEqual((ccfg.d, ccfg.m), want)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_vl_offsets_are_two_dimensional_when_interleaved(self, mock_hf):

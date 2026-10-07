@@ -75,6 +75,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlOb
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_activation_checkpoint_mode
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
@@ -609,6 +610,8 @@ class CostModelParserHyperV2(_CostModelParser):
         """Prefer the Trainer dataset sequence length over the model limit."""
         stated = self._dataset_seq_len()
         seq_len = int(stated or self.ccfg.s or 4096)
+        # The ranking says so beside its table, where a reader looks (I11).
+        self.ccfg.seq_len_stated = bool(stated)
         if not stated:
             # The fallback is the model's context limit, orders of magnitude
             # above any real training length on a long-context model, which
@@ -740,9 +743,19 @@ class CostModelParserHyperV2(_CostModelParser):
         has no replicate field, since the runtime derives it from the world
         size, so without ``context.device_num`` an HSDP run would understate
         the cluster by exactly its replicate factor.
+
+        Without ``context.device_num``, an AutoModels config takes the device
+        count its caller states (``run_nd -d``), as the runtime takes the
+        world size its launcher gives it.  Read from ``dp_shard_size`` alone,
+        a one-node yaml searched on more devices kept its one node's degree,
+        and its micro-batch count with it, in every candidate (M6).
         """
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         device_num = int(self._get_cfg_attr(ctx, "device_num", 0) or 0)
+        source = "context.device_num"
+        if not device_num and is_auto_models_schema(self.config):
+            device_num = int(getattr(self.ccfg, "devices", 0) or 0)
+            source = "the device count (-d)"
         if not device_num:
             if is_auto_models_schema(self.config) and dp_replicate == 1:
                 logger.warning(
@@ -754,7 +767,7 @@ class CostModelParserHyperV2(_CostModelParser):
         denom = self.ccfg.t * self.ccfg.p * self.ccfg.cp
         if denom < 1 or device_num % denom:
             raise ValueError(
-                f"context.device_num={device_num} is not divisible by "
+                f"{source}={device_num} is not divisible by "
                 f"t*p*cp={denom}"
             )
         return max(1, device_num // denom)
@@ -893,18 +906,13 @@ class CostModelParserHyperV2(_CostModelParser):
                     "train.accelerator.context_parallel_algo explicitly "
                     "to 'ulysses_cp' if Ulysses CP is intended."
                 )
-        # Optimizer type — used by GlobalConfig.max_op to detect muon-based
-        # optimizers.  Matches the MF parser's
-        # ``self.ccfg.optimizer = self.config.optimizer.type``.
-        opt_type = (
-            self._get_cfg_attr(optimizer, "_target_", None)
-            or self._get_cfg_attr(optimizer, "type", None)
+        # The optimizer, by its target, which decides the states it keeps
+        # a parameter; the MindFormers parser names it by its type.
+        self.state_optimizer(
+            self.ccfg,
+            self._get_cfg_attr(optimizer, "_target_", None) or self._get_cfg_attr(optimizer, "type", None),
         )
-        # Always a string: GlobalConfig.max_op only bounds OP by the data
-        # parallel degree when this reads as a non-muon optimizer name, and
-        # a train.yaml need not state its optimizer.
-        self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
-        self._init_optimizer_states(optimizer, str(opt_type or ""))
+        self._init_optimizer_states(optimizer)
 
     def _reshards_params(self):
         """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
@@ -918,17 +926,17 @@ class CostModelParserHyperV2(_CostModelParser):
             and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
         )
 
-    def _init_optimizer_states(self, optimizer, target):
-        """State what HyperParallel's optimizer keeps per parameter.
+    def _init_optimizer_states(self, optimizer):
+        """State the width of what HyperParallel's optimizer keeps per parameter.
 
-        Its AdamW keeps two moments and its Muon one momentum per matrix,
-        each ``zeros_like`` the gradient, which FSDP casts to the stored
-        parameter's dtype.  With ``fp32_main_params`` the optimizer keeps an
-        fp32 copy of each narrower parameter, and its states in fp32.
+        Its AdamW keeps two moments and its Muon one momentum per matrix
+        (``state_optimizer`` counts them), each ``zeros_like`` the gradient,
+        which FSDP casts to the stored parameter's dtype.  With
+        ``fp32_main_params`` the optimizer keeps an fp32 copy of each
+        narrower parameter, and its states in fp32.
         """
         stored = self._stored_param_bytes()
         fp32_main = bool(self._get_cfg_attr(optimizer, "fp32_main_params", False))
-        self.ccfg.optimizer_states = 1 if "muon" in target.lower() else 2
         self.ccfg.optimizer_state_bytes = 4 if fp32_main else stored
         self.ccfg.main_param_bytes = 4 if fp32_main and stored < 4 else 0
 
@@ -962,12 +970,14 @@ class CostModelParserHyperV2(_CostModelParser):
         activation_checkpoint = self._get_cfg_attr(
             self.config, "activation_checkpoint", Config({}),
         )
-        ac_mode = str(
-            self._get_cfg_attr(activation_checkpoint, "mode", None)
-            or self._get_cfg_attr(gc, "activation_checkpoint", "none")
-        )
-        if ac_mode == "off":
-            ac_mode = "none"
+        # Read as the trainer reads it: an unquoted off, which YAML reads as
+        # False, is off rather than a fall through to the legacy key, and a
+        # name that is no mode is refused rather than priced as off (I13).
+        stated, where = self._get_cfg_attr(activation_checkpoint, "mode", None), "activation_checkpoint.mode"
+        if stated is None:
+            stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
+            where = "train.gradient_checkpointing.activation_checkpoint"
+        ac_mode = read_activation_checkpoint_mode(stated, where)
 
         if full_rec_override is not None:
             self.ccfg.full_rec = full_rec_override

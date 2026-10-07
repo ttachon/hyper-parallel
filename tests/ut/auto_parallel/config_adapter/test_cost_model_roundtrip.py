@@ -29,8 +29,14 @@ from unittest.mock import patch
 
 import yaml
 
+from hyper_parallel.auto_parallel._hf_model_spec import TEXT_FIELDS
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
-from hyper_parallel.auto_parallel.config_adapter._search_runner import _build_hp_yaml_dict
+from hyper_parallel.auto_parallel.config_adapter._search_runner import (
+    CONFIG_OVERRIDE_FIELDS,
+    NOT_FORWARDED,
+    _build_hp_yaml_dict,
+    check_forwarded_fields,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
@@ -149,6 +155,38 @@ class TestCostModelRoundTrip(unittest.TestCase):
         config.model_spec.update(tie_word_embeddings=True, qk_norm=False)
         ccfg = _parse(_build_hp_yaml_dict(config))
         self.assertEqual((ccfg.tie_emb_out, ccfg.qk_norm), (True, False))
+
+    def test_the_biases_and_the_nope_width_survive_the_round_trip(self) -> None:
+        """
+        Feature: model facts through the search runner (I10).
+        Description: A spec stating Llama's biases on all four attention
+            projections and its MLP, which a llama name alone settles as
+            none, and a latent attention's no-position head width of 96.
+        Expectation: The parser reads them as the spec states them; dropped
+            on the way, the biases came back False and the width unstated.
+        """
+        config = _normalized_config()
+        config.model_spec.update(name="llama", qkv_bias=True, o_bias=True, mlp_bias=True, qk_nope_head_dim=96)
+        ccfg = _parse(_build_hp_yaml_dict(config))
+        self.assertEqual((ccfg.qkv_bias, ccfg.o_bias, ccfg.mlp_bias), (True, True, True))
+        self.assertEqual(ccfg.qk_nope_head_dim, 96)
+
+    def test_every_field_the_resolver_names_is_forwarded_or_exempted(self) -> None:
+        """
+        Feature: _search_runner.check_forwarded_fields, the gate run at import (I10).
+        Description: The search's own lists; the same without qkv_bias; and
+            an exemption for a field the search forwards.
+        Expectation: The search's lists pass; a resolver field neither
+            forwarded nor exempted, and a stale exemption, are each refused
+            by name.
+        """
+        check_forwarded_fields()
+        forwarded = [field for field in CONFIG_OVERRIDE_FIELDS if field != "qkv_bias"]
+        with self.assertRaisesRegex(RuntimeError, "forwards no qkv_bias"):
+            check_forwarded_fields(forwarded=forwarded)
+        with self.assertRaisesRegex(RuntimeError, "NOT_FORWARDED names hidden_size"):
+            check_forwarded_fields(exempt={**NOT_FORWARDED, "hidden_size": "forwarded"})
+        self.assertEqual(set(TEXT_FIELDS) - set(CONFIG_OVERRIDE_FIELDS), set(NOT_FORWARDED))
 
     def test_device_num_reaches_the_parser(self) -> None:
         """

@@ -14,6 +14,7 @@
 # ============================================================================
 """find parallelization"""
 
+from collections import Counter
 from contextlib import nullcontext
 import time
 import copy
@@ -181,6 +182,24 @@ class ParallelizeLayer:
             Dim.TP.set_bound(
                 Hard.highest_power_of_2_divisor(self.config.ccfg.a)
             )
+        self._report_bounds(vpp)
+
+    def _report_bounds(self, vpp: int) -> None:
+        """Name the bound each searched dimension takes, and why.
+
+        A degree over its bound is never generated, so no check refuses it
+        and no estimate drops it: this line is the only trace it leaves.
+        """
+        heads = "KV heads" if self.config.ccfg.n_kv else "attention heads' largest power of two"
+        bounds = (
+            (Dim.PP, f"the machine's {self.machine.pipeline_bound()}, {self.config.total_layer_num()} layers "
+                     f"over VPP {vpp}, a batch of {self.global_batch_size}"),
+            (Dim.EP, "the model's experts"),
+            (Dim.TP, f"the model's {heads}"),
+        )
+        named = [f"{dim} up to {dim.get_bound()} ({why})" for dim, why in bounds if dim in self.config.dimensions]
+        if named:
+            logger.output("The search bounds %s", "; ".join(named))
 
     @staticmethod
     def filtered_out(_: Any) -> bool:
@@ -190,20 +209,25 @@ class ParallelizeLayer:
         #         return True
         return False
 
+    def _refuse(self, reason: str) -> bool:
+        """Count a candidate refused for *reason*, for the search's summary, and return False."""
+        self.__dict__.setdefault("refused", Counter())[reason] += 1
+        return False
+
     def is_valid(self, parallel_config: Any) -> bool:
         """Check configuration validity"""
         if not parallel_config.is_valid():
             logger.warning("configuration %s not valid", str(parallel_config))
-            return False
+            return self._refuse("a degree out of bounds")
         if not self.config.moe_valid(parallel_config):
             logger.warning("expert parallel is higher than expert number")
-            return False
+            return self._refuse("EP over the experts or DP x TP")
         if hasattr(self.config, 'ep_constraints_valid') and not self.config.ep_constraints_valid(parallel_config):
             logger.warning("EP divisibility constraints not satisfied")
-            return False
+            return self._refuse("EP divisibility")
         if self.filtered_out(parallel_config):
             logger.warning("Config manually filtered out")
-            return False
+            return self._refuse("filtered out")
 
         if hasattr(parallel_config, 'dims_val') and Dim.CP in parallel_config.dims_val:
             cp_degree = parallel_config.dims_val[Dim.CP]
@@ -239,7 +263,7 @@ class ParallelizeLayer:
 
                 if not cp_result.is_valid:
                     logger.warning("CP constraints violated: %s", cp_result.error_message)
-                    return False
+                    return self._refuse("CP constraints")
 
                 if cp_result.warning_message:
                     logger.info("CP warning: %s", cp_result.warning_message)
@@ -251,7 +275,7 @@ class ParallelizeLayer:
                 gbs,
                 self.global_batch_size,
             )
-            return False
+            return self._refuse("global batch")
         return True
 
     def priced(self) -> Any:
@@ -279,14 +303,48 @@ class ParallelizeLayer:
             debugger.info[Debug.MemParts.TOTAL] = peak
         return peak
 
+    def _drop(self, config: Any, peak: float) -> None:
+        """Say that the memory budget drops *config*, and by how much its peak misses it."""
+        budget = self.mem_eval.get_max_device_memory()
+        logger.output(
+            "%s dropped: its peak of %.0f MB is over the %.0f MB budget by %.0f MB",
+            config,
+            peak,
+            budget,
+            peak - budget,
+        )
+
+    def _summarise_search(self, size: int, priced: int, fitting: int) -> None:
+        """The search's two counts: what was tested, refused and priced, and what fits."""
+        refused = self.__dict__.get("refused", Counter())
+        reasons = ", ".join(f"{reason} {count}" for reason, count in refused.most_common())
+        logger.output(
+            "%d configurations tested: %d refused%s, %d priced for memory",
+            size,
+            sum(refused.values()),
+            f" ({reasons})" if reasons else "",
+            priced,
+        )
+        logger.output(
+            "%d configuration fitting memory to order, %d dropped over the memory budget",
+            fitting,
+            priced - fitting,
+        )
+
     def generate_search_space(self, folder: Any, threads_num: Any) -> Any:
-        """Return a search space computed with memory estimation"""
+        """Return a search space computed with memory estimation.
+
+        A candidate the memory budget drops is named with its peak, and the
+        summary counts the candidates the checks refused apart from those the
+        budget dropped, each check by name.
+        """
         # With a pool the accumulator holds AsyncResult, which the direct
         # branch's float values hide from static inference.
         # pylint: disable=no-member
         space = ({}, 0)
         configs = []
         results = {}
+        self.refused = Counter()
         if threads_num:
             with proc.Pool(processes=threads_num) as pool:
                 logger.debug("before loops")
@@ -308,6 +366,8 @@ class ParallelizeLayer:
                     logger.debug("peak_mem = %s", str(peak_mem))
                     if self.mem_eval.mem_fit(peak_mem):
                         configs.append((config, peak_mem))
+                    else:
+                        self._drop(config, peak_mem)
                 pool.close()
                 pool.join()
         else:
@@ -317,8 +377,9 @@ class ParallelizeLayer:
                     configs.append((config, peak_mem))
                     if folder:
                         self.config.write(folder, config)
-        logger.output("%d valid configurations generated", size)
-        logger.output("%d configuration fitting memory to order", len(configs))
+                else:
+                    self._drop(config, peak_mem)
+        self._summarise_search(size, len(results), len(configs))
 
         return configs
 
@@ -341,6 +402,39 @@ class ParallelizeLayer:
                         break
                     space = self.batch_loops(space, pool, (dp, tp, pp, cp))
         return space
+
+    def batch_reachable(self) -> bool:
+        """Whether any candidate the loops build makes the global batch; one line says so where none does.
+
+        Each candidate's batch is its DP x MB x MBS, MB the batch over DP and
+        MBS, so a batch that is no whole number of micro-batches of any DP x
+        MBS the loops reach is refused in every candidate, each with an error.
+        The search stops before building one, with this line instead.
+        """
+        number = self.machine.number
+        reached = set()
+        for tp in self.config.space(Dim.TP, number):
+            for pp in self.config.space(Dim.PP, number // tp):
+                for cp in self.config.space(Dim.CP, number // tp // pp):
+                    dp = number // tp // cp // pp
+                    if dp < 1:
+                        break
+                    for mbs in self.config.space(Dim.MBS, self.global_batch_size // pp // dp):
+                        mbn = self.global_batch_size // dp // mbs
+                        candidate = self.config.make_parallel_config((dp, tp, pp, cp), (mbs, mbn), (1, 1, 1, False))
+                        if self.config.global_batch_size(candidate) == self.global_batch_size:
+                            return True
+                        reached.add(self.config.dim_val(Dim.DP, candidate) * mbs)
+        logger.error(
+            "No candidate makes a global batch of %d (the yaml states %d): the candidates the search builds "
+            "have DP x MBS of %s, and %d is no whole number of micro-batches of any. State -b as a multiple "
+            "of one of them, or let DP shrink by naming PP, CP or MP in -l.",
+            self.global_batch_size,
+            self.config.ccfg.gbs,
+            ", ".join(str(batch) for batch in sorted(reached)),
+            self.global_batch_size,
+        )
+        return False
 
     def batch_loops(self, space: Any, pool: Any, dtpc_p: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
@@ -605,6 +699,8 @@ class ParallelizeLayer:
             generation and ordering took.
         """
         scored_space, dbg, generation, ordering = [], [], 0.0, 0.0
+        if not self.batch_reachable():
+            return scored_space, dbg, generation, ordering
         for mode in self.recompute_modes or (None,):
             if mode is not None:
                 logger.output("Search with recompute %s", mode)
@@ -651,6 +747,15 @@ class ParallelizeLayer:
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )
+        priced = self.priced()
+        if not getattr(priced, "seq_len_stated", True):
+            # A warning at parse time scrolls past a search's lines; this one
+            # sits under the table it qualifies (I11).
+            logger.output(
+                "Every number above is priced at %d tokens, the model's context limit: the config states no "
+                "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
+                priced.s,
+            )
         logger.output(
             "Space generation took %.2fs and ordering took %.2fs",
             generation,

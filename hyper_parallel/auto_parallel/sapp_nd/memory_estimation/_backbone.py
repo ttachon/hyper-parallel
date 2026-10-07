@@ -57,6 +57,9 @@ class _Backbone:
         self.framework = kwargs.get("framework", None)
         self.source_code = kwargs.get("source_code", None)
         self.hook_cls, self.config_path = None, None
+        # The machine's device count, as run_nd -d states it, for a config
+        # that cannot state its own: an AutoModels yaml has no world size.
+        self.devices = getattr(kwargs.get("machine"), "number", None) or 0
         if not self._ccfg:
             self.hook_cls = kwargs.get("hook_cls", self.eval_cfg.hook_class)
             if isinstance(self.hook_cls, str):
@@ -128,7 +131,9 @@ class _Backbone:
         if self._ccfg is not None:
             self._ccfg.update_config(new_config, self.hook_cls, self.framework, self.source_code)
         else:
-            self._ccfg = CostModelConfig(new_config, self.hook_cls, self.framework, self.source_code)
+            self._ccfg = CostModelConfig(
+                new_config, self.hook_cls, self.framework, self.source_code, devices=getattr(self, "devices", 0)
+            )
         if isinstance(new_config, str) and not self.config_path:
             logger.info(
                 "%s Process config file: %s",

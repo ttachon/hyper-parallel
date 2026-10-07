@@ -16,12 +16,19 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
+import logging
 import math
 from abc import ABC
 from abc import abstractmethod
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
+
+logger = logging.getLogger(__name__)
+
+# The optimizer a config that states none is priced as, with a warning: the
+# shipped recipes state AdamW and Muon both, so none is assumed silently.
+DEFAULT_OPTIMIZER = "adamw"
 
 # The recompute switches of HyperParallel's selective activation checkpointing
 # (hyper_parallel/distributed/activation_checkpoint.py). It keeps the outputs of
@@ -85,6 +92,24 @@ class _CostModelParser(ABC):
         """
         ccfg.qk_norm = bool(qk_norm)
         ccfg.n_qknorm = 1 if ccfg.qk_norm else 0
+
+    @staticmethod
+    def state_optimizer(ccfg: Any, stated: Any) -> None:
+        """Name the optimizer a config states, and the states it keeps a parameter, which its name decides.
+
+        Muon keeps one momentum a matrix and AdamW two moments a parameter.
+        A config that states no optimizer is priced as AdamW, and the parser
+        says so: the HyperParallel parser named one silently and charged its
+        two states, which a Muon run described without its optimizer does
+        not keep, and the MindFormers parser failed on the missing section
+        (M3). ``ccfg.optimizer`` is what the state count is read from (M5).
+        """
+        if not stated:
+            logger.warning("the config states no optimizer: it is priced as %s, two states a parameter",
+                           DEFAULT_OPTIMIZER)
+            stated = DEFAULT_OPTIMIZER
+        ccfg.optimizer = str(stated)
+        ccfg.optimizer_states = 1 if "muon" in ccfg.optimizer.lower() else 2
 
     @staticmethod
     def optimizer_ranks(ccfg):
