@@ -466,6 +466,52 @@ recompute: per_layer
                 with self.assertRaises(ValueError):
                     read_search_config(path)
 
+    def test_recompute_as_a_parallelism_dimension(self) -> None:
+        """
+        Feature: parallelism.recompute in a search config.
+        Description: Recompute stated as a degree is: a list, one mode, auto,
+            then with a mode per layer; then stated twice, and a mode the
+            trainer does not run.
+        Expectation: The search chooses among the stated modes for each
+            strategy, or each layer under recompute: per_layer, and auto
+            leaves the modes to the search's defaults; the summary says so.
+            Stating recompute a second time, or a mode the trainer does not
+            run, is refused.
+        """
+        model = """
+model:
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
+  vocab_size: 32000
+"""
+        path = os.path.join(self.tmpdir, "recompute_dimension.yaml")
+        cases = (
+            ("parallelism:\n  recompute: [off, full]\n", "auto", ("off", "full"),
+             "recompute=chosen among ['off', 'full']"),
+            ("parallelism:\n  recompute: full\n", "auto", ("full",), "recompute=chosen among ['full']"),
+            ("parallelism:\n  recompute: auto\n", "auto", None, "recompute=chosen among every mode it can price"),
+            ("parallelism:\n  recompute: [off, full]\nrecompute: per_layer\n", "per_layer", ("off", "full"),
+             "recompute=chosen per layer among ['off', 'full']"),
+        )
+        for stated, strategy, modes, summary in cases:
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + stated)
+                config = read_search_config(path)
+                self.assertEqual(config.estimator["recompute_strategy"], strategy)
+                self.assertEqual(config.estimator.get("recompute_modes"), modes)
+                self.assertTrue(config.parallelism_summary.endswith(summary), config.parallelism_summary)
+        refused = (
+            ("parallelism:\n  recompute: [off, full]\nrecompute_modes: [full]\n", "stated twice"),
+            ("parallelism:\n  recompute: [off, full]\nrecompute: selective\n", "fixes selective"),
+            ("parallelism:\n  recompute: [off, swap]\n", "expected some of off, selective and full"),
+        )
+        for stated, message in refused:
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + stated)
+                with self.assertRaisesRegex(ValueError, message):
+                    read_search_config(path)
+
     def test_fsdp_dimension_mapped(self) -> None:
         """fsdp short name maps to data_parallel_shard_degree."""
         content = """

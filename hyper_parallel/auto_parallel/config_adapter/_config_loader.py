@@ -306,6 +306,50 @@ def _stated_recompute_modes(raw: Dict[str, Any]) -> Dict[str, Tuple[str, ...]]:
     return {"recompute_modes": modes}
 
 
+def _stated_recompute(raw: Dict[str, Any], parallelism_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the estimator's recompute entries, from ``parallelism.recompute`` where it is stated.
+
+    ``parallelism.recompute`` states recompute as a degree is stated: one
+    mode, a list of modes, or ``auto`` for every mode the trainer runs that
+    the search can price. The search then chooses among them for each
+    strategy, as ``recompute: auto`` with ``recompute_modes`` does, or for each
+    layer where the top-level ``recompute`` says ``per_layer``. A mode left
+    out is never chosen.
+
+    Returns:
+        ``recompute_strategy``, and ``recompute_modes`` where a list narrows
+        the modes.
+
+    Raises:
+        ValueError: For a mode the trainer does not run, or when recompute
+            is stated twice: the dimension beside ``recompute_modes``, or
+            beside a top-level ``recompute`` that fixes one mode.
+    """
+    stated = parallelism_raw.get("recompute")
+    strategy = str(raw.get("recompute", "none"))
+    if stated is None:
+        return {"recompute_strategy": strategy, **_stated_recompute_modes(raw)}
+    if "recompute_modes" in raw:
+        raise ValueError("recompute modes are stated twice, in parallelism.recompute and recompute_modes: "
+                         "keep parallelism.recompute")
+    if strategy not in ("none", "auto", "per_layer"):
+        raise ValueError("recompute is stated twice: parallelism.recompute searches it as a dimension and the "
+                         f"top-level recompute fixes {strategy}; keep parallelism.recompute, with recompute: "
+                         "per_layer for a mode per layer")
+    chosen = "per_layer" if strategy == "per_layer" else "auto"
+    if not isinstance(stated, (list, tuple)) and str(stated).strip().lower() == "auto":
+        return {"recompute_strategy": chosen}
+    return {"recompute_strategy": chosen, **_stated_recompute_modes({"recompute_modes": stated})}
+
+
+def _describe_recompute(estimator: Dict[str, Any]) -> str:
+    """Report how a recompute dimension was resolved, as :func:`_describe_parallelism` reports a degree."""
+    modes = estimator.get("recompute_modes")
+    among = f"among {list(modes)}" if modes else "among every mode it can price"
+    per_layer = " per layer" if estimator["recompute_strategy"] == "per_layer" else ""
+    return f"recompute=chosen{per_layer} {among}"
+
+
 def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     """Construct a NormalizedConfig from a parsed Search Config YAML dict.
 
@@ -384,9 +428,8 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
 
     estimator: Dict[str, Any] = {
         "type": "symbolic",
-        "recompute_strategy": str(raw.get("recompute", "none")),
+        **_stated_recompute(raw, parallelism_raw),
         "enable_profiling_calibration": False,
-        **_stated_recompute_modes(raw),
     }
 
     constraint: Dict[str, Any] = {
@@ -398,6 +441,8 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     summary = _describe_parallelism(
         search_space, auto_dims, parallelism_raw, bool(base_config)
     )
+    if parallelism_raw.get("recompute") is not None:
+        summary += "; " + _describe_recompute(estimator)
     logger.info("parallelism resolved: %s", summary)
 
     return NormalizedConfig(
