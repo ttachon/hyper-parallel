@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 import yaml
 
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
@@ -42,6 +43,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
 from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
     RECOMPUTE_MODES,
     parsed_recompute,
+    read_activation_checkpoint_mode,
     read_recompute_modes,
     restore_recompute,
     state_recompute_mode,
@@ -116,6 +118,54 @@ class TestReadRecomputeModes(unittest.TestCase):
             with self.subTest(stated=stated):
                 with self.assertRaisesRegex(ValueError, f"parallelism.recompute: {message}"):
                     read_recompute_modes(stated, "parallelism.recompute")
+
+
+class TestReadActivationCheckpointMode(unittest.TestCase):
+    """A train.yaml's one mode, read as the trainer reads it (I13)."""
+
+    def test_the_modes_the_trainer_runs(self):
+        """
+        Feature: read_activation_checkpoint_mode.
+        Description: Nothing stated, YAML's False for an unquoted off, the
+            older none, and each mode.
+        Expectation: Off for the first three, as the trainer's default and
+            its config resolver read them; each mode as itself.
+        """
+        for stated, expected in ((None, "off"), (False, "off"), ("none", "off"), ("off", "off"),
+                                 ("full", "full"), ("selective", "selective")):
+            with self.subTest(stated=stated):
+                self.assertEqual(read_activation_checkpoint_mode(stated, "here"), expected)
+
+    def test_what_the_trainer_would_not_run_is_refused(self):
+        """
+        Feature: read_activation_checkpoint_mode.
+        Description: A typo of full, True, auto and a list.
+        Expectation: Each refused by name and place, where ND used to price
+            the first as no recompute.
+        """
+        for stated in ("fulll", True, "auto", ["full"]):
+            with self.subTest(stated=stated):
+                with self.assertRaisesRegex(ValueError, "activation_checkpoint.mode"):
+                    read_activation_checkpoint_mode(stated, "activation_checkpoint.mode")
+
+    def test_the_parser_prices_the_mode_it_is_given(self):
+        """
+        Feature: the hyper_v2 parser's recompute, on the legacy and the AutoModels key.
+        Description: The small dense model stated full, a typo of it, and an
+            AutoModels mode that YAML reads as False above a legacy full.
+        Expectation: Full recompute; a refusal naming the key; off, where
+            the False used to fall through to the legacy key and price full.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            full = EvaluatorV2(_dense_train_yaml(folder, "full"), framework="hyper_v2", log_level=0).ccfg
+            self.assertEqual((full.full_rec, full.sel_rec), (True, False))
+            with self.assertRaisesRegex(ValueError, "gradient_checkpointing.activation_checkpoint: 'fulll'"):
+                EvaluatorV2(_dense_train_yaml(folder, "fulll"), framework="hyper_v2", log_level=0)
+            with open(_dense_train_yaml(folder, "full"), encoding="utf-8") as handle:
+                raw = yaml.safe_load(handle)
+            raw["activation_checkpoint"] = yaml.safe_load("mode: off")
+            off = EvaluatorV2(raw, framework="hyper_v2", log_level=0).ccfg
+            self.assertEqual((off.full_rec, off.sel_rec), (False, False))
 
 
 class TestStateRecomputeMode(unittest.TestCase):

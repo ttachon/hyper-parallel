@@ -75,6 +75,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlOb
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_activation_checkpoint_mode
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
@@ -972,12 +973,14 @@ class CostModelParserHyperV2(_CostModelParser):
         activation_checkpoint = self._get_cfg_attr(
             self.config, "activation_checkpoint", Config({}),
         )
-        ac_mode = str(
-            self._get_cfg_attr(activation_checkpoint, "mode", None)
-            or self._get_cfg_attr(gc, "activation_checkpoint", "none")
-        )
-        if ac_mode == "off":
-            ac_mode = "none"
+        # Read as the trainer reads it: an unquoted off, which YAML reads as
+        # False, is off rather than a fall through to the legacy key, and a
+        # name that is no mode is refused rather than priced as off (I13).
+        stated, where = self._get_cfg_attr(activation_checkpoint, "mode", None), "activation_checkpoint.mode"
+        if stated is None:
+            stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
+            where = "train.gradient_checkpointing.activation_checkpoint"
+        ac_mode = read_activation_checkpoint_mode(stated, where)
 
         if full_rec_override is not None:
             self.ccfg.full_rec = full_rec_override

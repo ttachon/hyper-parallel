@@ -78,6 +78,35 @@ def read_recompute_modes(stated: Any, where: str) -> Optional[Tuple[str, ...]]:
     return tuple(modes)
 
 
+def read_activation_checkpoint_mode(stated: Any, where: str) -> str:
+    """Read one activation checkpoint mode the way the trainer reads ``activation_checkpoint.mode``.
+
+    Nothing stated is the trainer's default, ``"off"``, as is the older
+    ``"none"``. YAML reads an unquoted ``off`` as False, which the trainer's
+    config resolver turns back into ``"off"``, as here. Anything else that
+    is not one of :data:`RECOMPUTE_MODES` is refused, True included: ND used
+    to price a mode it did not know as no recompute, so a typo of ``full``
+    was costed at the off memory, and a False fell through to the legacy
+    default (I13).
+
+    Args:
+        stated: The mode as the yaml states it.
+        where: Where it was stated, for the error message.
+
+    Returns:
+        One of :data:`RECOMPUTE_MODES`.
+
+    Raises:
+        ValueError: A list, auto, True, or a name that is no mode.
+    """
+    if stated is None:
+        return "off"
+    if isinstance(stated, (list, tuple)) or str(stated).strip().lower() == "auto":
+        raise ValueError(f"{where}: {stated!r} is not one activation checkpoint mode; expected one of "
+                         f"{', '.join(RECOMPUTE_MODES)}")
+    return read_recompute_modes(stated, where)[0]
+
+
 def _mode_configs(ccfg: Any) -> List[Any]:
     """The configs a mode is stated on: the model's, and each submodule's of a multimodal one."""
     configs = [ccfg]
