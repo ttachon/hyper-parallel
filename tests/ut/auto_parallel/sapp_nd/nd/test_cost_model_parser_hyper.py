@@ -36,6 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     keeps_param_casts,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
 )
@@ -43,6 +44,9 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model
     CostModelParserHyperV2,
     custom_vision_tower_hook,
 )
+
+# The MindFormers DeepSeek yaml the run_nd tests search.
+_MF_DEEPSEEK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepseek.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +661,32 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             _optimizer_bytes(facts, 4)
             got.append((facts.bytes_os, facts.bytes_optim, facts.bytes_optim_table))
         self.assertEqual(got, [(2, 4, 4), (2, 2, 4), (4, 12, 12)])
+
+    def test_a_config_without_an_optimizer_says_what_it_is_priced_as(self):
+        """
+        Feature: _CostModelParser.state_optimizer, in both parsers (M3, M5).
+        Description: A HyperParallel config stating no optimizer and one
+            stating Muon; the MindFormers DeepSeek yaml without its
+            optimizer section and with Muon as its type.
+        Expectation: Both parsers price a config stating none as AdamW, two
+            states a parameter, and warn that they do; Muon keeps one. The
+            MindFormers parser no longer fails on the missing section.
+        """
+        base = "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser"
+        with self.assertLogs(base, level="WARNING") as said:
+            plain = _make_ccfg(_dense_overrides())
+        self.assertEqual((plain.optimizer, plain.optimizer_states), ("adamw", 2))
+        self.assertTrue(any("states no optimizer" in line for line in said.output))
+        muon = _make_ccfg(_dense_overrides(train={"optimizer": {"_target_": "hyper_parallel.components.optim.Muon"}}))
+        self.assertEqual(muon.optimizer_states, 1)
+        with open(_MF_DEEPSEEK, encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+        raw.pop("optimizer")
+        with self.assertLogs(base, level="WARNING"):
+            stated_none = CostModelConfig(raw, framework="mindformers")
+        self.assertEqual((stated_none.optimizer, stated_none.optimizer_states), ("adamw", 2))
+        raw["optimizer"] = {"type": "Muon"}
+        self.assertEqual(CostModelConfig(raw, framework="mindformers").optimizer_states, 1)
 
     def test_top_level_model_init_dtype_sizes_the_parameters(self):
         """

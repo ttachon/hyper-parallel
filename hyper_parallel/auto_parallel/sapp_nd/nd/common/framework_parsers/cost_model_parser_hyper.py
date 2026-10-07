@@ -904,18 +904,13 @@ class CostModelParserHyperV2(_CostModelParser):
                     "train.accelerator.context_parallel_algo explicitly "
                     "to 'ulysses_cp' if Ulysses CP is intended."
                 )
-        # Optimizer type — used by GlobalConfig.max_op to detect muon-based
-        # optimizers.  Matches the MF parser's
-        # ``self.ccfg.optimizer = self.config.optimizer.type``.
-        opt_type = (
-            self._get_cfg_attr(optimizer, "_target_", None)
-            or self._get_cfg_attr(optimizer, "type", None)
+        # The optimizer, by its target, which decides the states it keeps
+        # a parameter; the MindFormers parser names it by its type.
+        self.state_optimizer(
+            self.ccfg,
+            self._get_cfg_attr(optimizer, "_target_", None) or self._get_cfg_attr(optimizer, "type", None),
         )
-        # Always a string: GlobalConfig.max_op only bounds OP by the data
-        # parallel degree when this reads as a non-muon optimizer name, and
-        # a train.yaml need not state its optimizer.
-        self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
-        self._init_optimizer_states(optimizer, str(opt_type or ""))
+        self._init_optimizer_states(optimizer)
 
     def _reshards_params(self):
         """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
@@ -929,17 +924,17 @@ class CostModelParserHyperV2(_CostModelParser):
             and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
         )
 
-    def _init_optimizer_states(self, optimizer, target):
-        """State what HyperParallel's optimizer keeps per parameter.
+    def _init_optimizer_states(self, optimizer):
+        """State the width of what HyperParallel's optimizer keeps per parameter.
 
-        Its AdamW keeps two moments and its Muon one momentum per matrix,
-        each ``zeros_like`` the gradient, which FSDP casts to the stored
-        parameter's dtype.  With ``fp32_main_params`` the optimizer keeps an
-        fp32 copy of each narrower parameter, and its states in fp32.
+        Its AdamW keeps two moments and its Muon one momentum per matrix
+        (``state_optimizer`` counts them), each ``zeros_like`` the gradient,
+        which FSDP casts to the stored parameter's dtype.  With
+        ``fp32_main_params`` the optimizer keeps an fp32 copy of each
+        narrower parameter, and its states in fp32.
         """
         stored = self._stored_param_bytes()
         fp32_main = bool(self._get_cfg_attr(optimizer, "fp32_main_params", False))
-        self.ccfg.optimizer_states = 1 if "muon" in target.lower() else 2
         self.ccfg.optimizer_state_bytes = 4 if fp32_main else stored
         self.ccfg.main_param_bytes = 4 if fp32_main and stored < 4 else 0
 
