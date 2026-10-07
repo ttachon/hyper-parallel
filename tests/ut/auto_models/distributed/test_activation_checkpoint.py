@@ -29,9 +29,11 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _find_transformer_block_modules,
     _find_transformer_layer_container_infos,
     _wrap_layer_containers,
+    activation_checkpoint_recomputes,
     apply_submodule_checkpointing,
     normalize_activation_checkpoint_layers,
 )
+from hyper_parallel.models._transformers import model_builder
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -512,6 +514,21 @@ class TestActivationCheckpointLayerPlan(unittest.TestCase):
         calls = _forward_calls_per_layer(model)
         self.assertEqual(calls, [2, 1, 2], f"calls={calls}")
 
+    def test_hf_native_plan_on_mode_off_recomputes_only_the_layers_it_names(self):
+        """On top of mode off, a plan recomputes the layers it runs full and no other."""
+        for mode in ("off", None):
+            with self.subTest(mode=mode):
+                model = _tiny_llama(num_layers=3)
+
+                with self.assertLogs(_ACTIVATION_CHECKPOINT_MODULE, level="INFO") as log_context:
+                    _apply_activation_checkpointing(model, mode, layers={"1": "full"})
+
+                flags = [layer.gradient_checkpointing for layer in model.model.layers]
+                self.assertEqual(flags, [False, True, False], f"mode={mode}, flags={flags}")
+                calls = _forward_calls_per_layer(model)
+                self.assertEqual(calls, [1, 2, 1], f"mode={mode}, calls={calls}")
+                self.assertIn("per layer in model.layers: off 0, 2; full 1", "\n".join(log_context.output))
+
     def test_hf_native_full_without_plan_recomputes_every_layer(self):
         """Without a plan the HF-native path still recomputes every layer."""
         model = _tiny_llama(num_layers=3)
@@ -545,6 +562,8 @@ class TestActivationCheckpointLayerPlan(unittest.TestCase):
             ("full", {1: "selective", "3": "off"}, ["full", "selective", "full", "plain"]),
             ("selective", {"0": "off", "3": "full"}, ["plain", "selective", "selective", "full"]),
             ("selective", {"0-3": "off"}, ["plain", "plain", "plain", "plain"]),
+            ("off", {"1-2": "full", "3": "selective"}, ["plain", "full", "full", "selective"]),
+            (None, {"0": "selective"}, ["selective", "plain", "plain", "plain"]),
         )
         for mode, layers, expected in cases:
             with self.subTest(mode=mode, layers=layers):
@@ -588,12 +607,30 @@ class TestActivationCheckpointLayerPlan(unittest.TestCase):
                 ]
                 self.assertEqual(wrapped, [], "a refused plan must leave the model unwrapped")
 
-    def test_plan_needs_a_mode_that_recomputes(self):
-        """A plan is a set of exceptions to full or selective recompute."""
+    def test_plan_may_name_the_only_layers_recomputed(self):
+        """On top of mode off a plan names the layers to recompute; mode off alone recomputes nothing."""
         for mode in ("off", None):
             with self.subTest(mode=mode):
-                with self.assertRaisesRegex(ValueError, "must then be 'full' or 'selective'"):
-                    normalize_activation_checkpoint_layers(mode, {"0": "full"})
+                normalized = normalize_activation_checkpoint_layers(mode, {"0-1": "full"})
+                self.assertEqual(normalized, {"0-1": "full"}, f"mode={mode}, normalized={normalized}")
+                with self.assertRaisesRegex(ValueError, "must be 'full' or 'selective', but got"):
+                    _apply_activation_checkpointing(_IndexedOwner(), mode)
+        with self.assertRaisesRegex(ValueError, r"must be one of \('off', 'full', 'selective'\) or None"):
+            normalize_activation_checkpoint_layers("swap", {"0": "full"})
+
+    def test_recomputes_reads_the_mode_and_its_plan(self):
+        """A mode that recomputes counts as recomputing; on top of off, only a plan that names a mode does."""
+        cases = (
+            ("full", None, True),
+            ("selective", {"0-3": "off"}, True),
+            ("off", None, False),
+            (None, {"0": "off"}, False),
+            ("off", {"0": "off", "2": "selective"}, True),
+            (None, {"1-2": "full"}, True),
+        )
+        for mode, layers, expected in cases:
+            with self.subTest(mode=mode, layers=layers):
+                self.assertIs(activation_checkpoint_recomputes(mode, layers), expected)
 
     def test_normalized_plan_is_written_one_way(self):
         """Keys become strings in layer order and an unquoted YAML ``off`` becomes ``"off"``."""
@@ -625,3 +662,45 @@ class TestActivationCheckpointLayerPlan(unittest.TestCase):
             with self.subTest(layers=layers):
                 with self.assertRaisesRegex(ValueError, message):
                     normalize_activation_checkpoint_layers("full", layers)
+
+
+class TestActivationFeaturesLayerPlan(unittest.TestCase):
+    """Tests for when the model build applies a per-layer plan and how attention swap reads it."""
+
+    @staticmethod
+    def _features(mode, layers, activation_swap="none"):
+        """Run the build's activation step with checkpointing and attention swap recorded, not applied."""
+        model = nn.Linear(2, 2)
+        with (
+            patch.object(model_builder, "_apply_activation_checkpointing", return_value=model) as checkpoint,
+            patch.object(model_builder, "apply_attention_swap", return_value=model) as attention_swap,
+        ):
+            model_builder._apply_activation_features(  # pylint: disable=protected-access
+                model, mode, activation_swap, False, None, activation_checkpoint_layers=layers,
+            )
+        return checkpoint, attention_swap
+
+    def test_a_plan_is_applied_on_top_of_mode_off(self):
+        """Mode off with a plan reaches the checkpointing step; mode off alone does not."""
+        cases = (
+            ("off", {"0": "full"}, True),
+            (None, {"0-1": "off"}, True),
+            ("off", None, False),
+            ("full", None, True),
+        )
+        for mode, layers, applied in cases:
+            with self.subTest(mode=mode, layers=layers):
+                checkpoint, _ = self._features(mode, layers)
+
+                self.assertEqual(checkpoint.called, applied, f"mode={mode}, layers={layers}")
+                if applied:
+                    self.assertEqual(checkpoint.call_args.kwargs["layers"], layers)
+
+    def test_attention_swap_is_refused_once_a_plan_recomputes(self):
+        """Attention swap cannot run beside recomputation, whether the mode or the plan asks for it."""
+        for mode, layers in (("off", {"1": "selective"}), ("full", None)):
+            with self.subTest(mode=mode, layers=layers):
+                with self.assertRaisesRegex(ValueError, "incompatible with activation checkpointing"):
+                    self._features(mode, layers, activation_swap="attention")
+        _, attention_swap = self._features("off", {"0-1": "off"}, activation_swap="attention")
+        attention_swap.assert_called_once()

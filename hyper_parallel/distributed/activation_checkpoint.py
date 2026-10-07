@@ -819,8 +819,8 @@ def _parse_layer_plan(
     """Read a per-layer plan into ranges ordered by their first block.
 
     Raises:
-        ValueError: The plan is malformed, two of its entries overlap, or it is
-            given with a mode that recomputes nothing.
+        ValueError: The plan is malformed, two of its entries overlap, or the
+            mode every other block runs is not one this module knows.
     """
     if not layers:
         return ()
@@ -829,10 +829,10 @@ def _parse_layer_plan(
             "activation_checkpoint.layers must be a mapping, but got "
             f"{type(layers).__name__}"
         )
-    if activation_checkpoint not in ("full", "selective"):
+    if activation_checkpoint not in (None, *_LAYER_MODES):
         raise ValueError(
             "activation_checkpoint.layers gives some layers another mode than "
-            "activation_checkpoint.mode, which must then be 'full' or 'selective', "
+            f"activation_checkpoint.mode, which must be one of {_LAYER_MODES} or None, "
             f"but got {activation_checkpoint!r}"
         )
     plan = sorted(
@@ -858,11 +858,11 @@ def normalize_activation_checkpoint_layers(
     """Validate a per-layer activation checkpoint plan and write it one way.
 
     The plan gives some transformer blocks another mode than
-    ``activation_checkpoint``, which every block it does not name runs. Each key
-    is a block's index in its repeated-block container, or an inclusive range
-    of indices written ``"first-last"``; each value is ``"off"``, ``"full"`` or
-    ``"selective"``. Whether the indices exist is checked when the plan is
-    applied to a model.
+    ``activation_checkpoint``, which every block it does not name runs, ``None``
+    counting as ``"off"``. Each key is a block's index in its repeated-block
+    container, or an inclusive range of indices written ``"first-last"``; each
+    value is ``"off"``, ``"full"`` or ``"selective"``. Whether the indices exist
+    is checked when the plan is applied to a model.
 
     Args:
         activation_checkpoint: The mode of every block the plan does not name.
@@ -873,21 +873,48 @@ def normalize_activation_checkpoint_layers(
         when there is no plan.
 
     Raises:
-        ValueError: The plan is malformed, two of its entries overlap, or it is
-            given with a mode other than ``"full"`` or ``"selective"``.
+        ValueError: The plan is malformed, two of its entries overlap, or
+            ``activation_checkpoint`` is not a mode.
 
     Example:
         normalize_activation_checkpoint_layers("full", {"6-7": False})
         # {"6-7": "off"}
+        normalize_activation_checkpoint_layers("off", {"0-2": "full"})
+        # {"0-2": "full"}: blocks 0 to 2 are recomputed, the others are not
     """
     plan = _parse_layer_plan(activation_checkpoint, layers)
     return {item.key: item.mode for item in plan} or None
+
+
+def activation_checkpoint_recomputes(
+    activation_checkpoint: Optional[str],
+    layers: Optional[Mapping[Union[int, str], Any]] = None,
+) -> bool:
+    """Whether a mode, with its per-layer plan, recomputes any block.
+
+    A mode that recomputes counts even when the plan leaves every block off,
+    because whether the plan names every block is only known on a model.
+
+    Args:
+        activation_checkpoint: The mode of every block the plan does not name.
+        layers: ``activation_checkpoint.layers``, or ``None``.
+
+    Returns:
+        True when ``activation_checkpoint`` is ``"full"`` or ``"selective"``, or
+        when the plan runs a block in one of them.
+
+    Raises:
+        ValueError: As :func:`normalize_activation_checkpoint_layers`.
+    """
+    plan = _parse_layer_plan(activation_checkpoint, layers)
+    return activation_checkpoint not in (None, "off") or any(item.mode != "off" for item in plan)
 
 
 def _validate_activation_checkpoint_config(
     activation_checkpoint: Optional[str],
     swap_inputs: bool,
     enable_compile: bool,
+    has_plan: bool = False,
 ) -> None:
     """Validate the activation-checkpoint options and warn about ignored ones.
 
@@ -895,11 +922,13 @@ def _validate_activation_checkpoint_config(
         activation_checkpoint: Requested recomputation mode.
         swap_inputs: Whether checkpoint inputs should be offloaded.
         enable_compile: Whether wrapped regions will be compiled.
+        has_plan: Whether a per-layer plan names the blocks to recompute, so
+            that every other block may run ``"off"``.
 
     Raises:
         ValueError: The mode or ``swap_inputs`` has an unsupported value.
     """
-    if activation_checkpoint not in ("full", "selective"):
+    if not has_plan and activation_checkpoint not in ("full", "selective"):
         raise ValueError(
             "activation_checkpoint.mode must be 'full' or 'selective', but got "
             f"{activation_checkpoint!r}"
@@ -1233,16 +1262,19 @@ def _apply_activation_checkpointing(
     mode-specific wrapper. Swap prefetch chains are registered afterwards for
     every configuration that wrapped the layers itself. ``layers`` gives some
     blocks another mode than ``activation_checkpoint``, which every other block
-    runs: see :func:`normalize_activation_checkpoint_layers`.
+    runs: see :func:`normalize_activation_checkpoint_layers`. With a plan,
+    ``activation_checkpoint`` may be ``"off"`` or ``None``, and then only the
+    blocks the plan runs full or selective are recomputed.
     """
+    plan = _parse_layer_plan(activation_checkpoint, layers)
     _validate_activation_checkpoint_config(
         activation_checkpoint,
         swap_inputs,
         enable_compile,
+        has_plan=bool(plan),
     )
-    plan = _parse_layer_plan(activation_checkpoint, layers)
     containers = _resolve_activation_checkpoint_containers(model)
-    modes = _block_modes(containers, plan, activation_checkpoint)
+    modes = _block_modes(containers, plan, activation_checkpoint or "off")
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
     if hasattr(model, "gradient_checkpointing_disable"):

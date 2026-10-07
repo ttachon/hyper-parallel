@@ -42,6 +42,7 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
+    activation_checkpoint_recomputes,
     normalize_activation_checkpoint_layers,
 )
 from hyper_parallel.distributed.attention_swap import (
@@ -361,9 +362,10 @@ def _apply_activation_features(
     activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
-    # A per-layer plan given with recompute off would otherwise be dropped.
-    normalize_activation_checkpoint_layers(activation_checkpoint, activation_checkpoint_layers)
-    if activation_checkpoint not in (None, "off"):
+    # A plan is applied even on top of mode off, which then recomputes only
+    # the blocks the plan names.
+    plan = normalize_activation_checkpoint_layers(activation_checkpoint, activation_checkpoint_layers)
+    if activation_checkpoint not in (None, "off") or plan:
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
@@ -371,9 +373,12 @@ def _apply_activation_features(
             swap_inputs=swap_inputs,
             layers=activation_checkpoint_layers,
         )
+    checkpoint_mode = activation_checkpoint
+    if checkpoint_mode in (None, "off") and activation_checkpoint_recomputes(checkpoint_mode, plan):
+        checkpoint_mode = "per_layer"
     validate_attention_swap(
         activation_swap,
-        activation_checkpoint=activation_checkpoint,
+        activation_checkpoint=checkpoint_mode,
         enable_compile=compile_for_execution,
         pp_size=getattr(mesh, "pp_size", 1),
     )

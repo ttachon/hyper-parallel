@@ -57,15 +57,16 @@ class AcceleratorConfig:
 class ActivationCheckpointConfig:
     """Activation-checkpoint options exposed by the initial YAML schema.
 
-    ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
-    ``"selective"``.
+    ``swap_inputs`` is consumed only when ``mode`` or ``layers`` recomputes a
+    block.
 
     ``layers`` runs some transformer blocks in another mode than ``mode``,
-    which every block it does not name runs and which must then be ``"full"``
-    or ``"selective"``. Its keys are block indices, or inclusive ranges written
-    ``"first-last"``, and its values are ``"off"``, ``"full"`` or
-    ``"selective"``. With ``mode: full`` and ``layers: {6-7: off}``, blocks 6
-    and 7 keep their activations and every other block is recomputed.
+    which every block it does not name runs. Its keys are block indices, or
+    inclusive ranges written ``"first-last"``, and its values are ``"off"``,
+    ``"full"`` or ``"selective"``. With ``mode: full`` and ``layers: {6-7:
+    off}``, blocks 6 and 7 keep their activations and every other block is
+    recomputed; in a model of 8 blocks, ``mode: off`` with ``layers: {0-5:
+    full}`` is the same plan.
     """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
