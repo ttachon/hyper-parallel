@@ -93,6 +93,10 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "linear_num_value_heads": ("linear_num_value_heads",),
     "linear_value_head_dim": ("linear_value_head_dim",),
     "linear_conv_kernel_dim": ("linear_conv_kernel_dim",),
+    # The dtype the checkpoint's weights are saved in, which the runtime
+    # loads them in under its default torch_dtype of auto; newer
+    # Transformers name it dtype.
+    "torch_dtype": ("dtype", "torch_dtype"),
 }
 # The canonical text-tower fields, which a search hands on to the cost model
 # by these names (``config_adapter._search_runner.CONFIG_OVERRIDE_FIELDS``).
@@ -344,15 +348,32 @@ def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     passes the shape it builds as factory arguments beside ``_target_``, such as
     a ``num_hidden_layers`` that crops the released model; those name canonical
     fields, so they are overrides too, and the released config must not win over
-    them. ``config_overrides`` keeps priority where both are present.
+    them. ``config_overrides`` keeps priority where both are present. A
+    value of ``auto``, which ``torch_dtype`` takes to load the checkpoint's
+    own, states nothing over the checkpoint.
     """
     overrides = model_raw.get("config_overrides")
     explicit = dict(overrides) if isinstance(overrides, Mapping) else {}
     for field in _TEXT_FIELD_ALIASES:
         value = model_raw.get(field)
-        if value is not None:
+        if value is not None and value != "auto":
             explicit.setdefault(field, value)
     return explicit
+
+
+# Canonical fields that say how a model is held, not what it is: a section
+# stating only these describes no model.
+_HOLDING_FIELDS = frozenset({"torch_dtype"})
+
+
+def _describes_a_model(explicit: Mapping[str, Any]) -> bool:
+    """Whether the fields a section states describe a model, beyond how it is held."""
+    return any(key not in _HOLDING_FIELDS for key in explicit)
+
+
+def _dtype_name(value: Any) -> Any:
+    """A dtype as its plain name, ``bfloat16`` for ``torch.bfloat16``; anything else as it is."""
+    return str(value).replace("torch.", "") if value is not None else None
 
 
 # The censuses this process has run, by config, layer stack and length: a
@@ -477,7 +498,7 @@ def resolve_hf_model_spec(
     model_path = _model_path(model_raw)
 
     if not model_path:
-        if explicit:
+        if _describes_a_model(explicit):
             return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path, "
@@ -487,7 +508,7 @@ def resolve_hf_model_spec(
     try:
         model_config = _get_hf_config(model_raw)
     except (ImportError, OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
-        if explicit:
+        if _describes_a_model(explicit):
             logger.warning(
                 "Transformers config resolution failed (%s); "
                 "falling back to model.config_overrides", exc,
@@ -500,6 +521,8 @@ def resolve_hf_model_spec(
         ) from exc
 
     spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
+    if "torch_dtype" in spec:
+        spec["torch_dtype"] = _dtype_name(spec["torch_dtype"])
     _derive_shared_experts(spec)
     _derive_dense_ffn_width(spec)
     spec["name"] = str(getattr(model_config, "model_type", None) or model_path)

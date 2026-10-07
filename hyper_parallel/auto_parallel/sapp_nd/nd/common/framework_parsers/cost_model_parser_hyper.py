@@ -259,6 +259,9 @@ class CostModelParserHyperV2(_CostModelParser):
         if self._vision_spec and not self._builds_vision_tower():
             self._vision_spec = None
         self._tie_word_embeddings = bool(spec.get("tie_word_embeddings", False))
+        # The dtype the spec states, the checkpoint's own where the section
+        # states none: the runtime loads the weights in it (_model_dtype).
+        self._spec_dtype = spec.get("torch_dtype")
         self._layer_types = spec.get("layer_types") or []
         self._linear_attn = {
             "n_k": self._spec_int(spec, "linear_num_key_heads"),
@@ -942,11 +945,33 @@ class CostModelParserHyperV2(_CostModelParser):
 
     def _stored_param_bytes(self):
         """The width FSDP stores the parameters in: the model's, whatever FSDP gathers them in."""
-        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         return self._bytes_from_dtype(
             self._get_cfg_attr(self.config, "model_init_dtype", None)
-            or self._get_cfg_attr(model_raw, "torch_dtype", None)
-            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+            or self._model_dtype("param_init_type")
+        )
+
+    def _model_dtype(self, legacy_key: str, cast: Any = None) -> str:
+        """The dtype the runtime loads the model's weights in, by name.
+
+        ``model.torch_dtype`` where the section states one other than
+        ``auto``; else the legacy *legacy_key* (``param_init_type`` for the
+        parameters, ``compute_dtype`` for the compute); else *cast*, a dtype
+        the run casts the weights to before they compute; else the dtype the
+        spec states, which is the checkpoint's own, as the runtime loads the
+        weights under its default ``auto``; else bfloat16 (``_init_bytes``
+        warns).  A model stating none was priced in float32 parameters doing
+        bfloat16 arithmetic, where the runtime loads its checkpoint's, mostly
+        two bytes (I12).
+        """
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        stated = self._get_cfg_attr(model_raw, "torch_dtype", None)
+        if stated and stated != "auto":
+            return str(stated)
+        return str(
+            self._get_cfg_attr(model_raw, legacy_key, None)
+            or cast
+            or getattr(self, "_spec_dtype", None)
+            or "bfloat16"
         )
 
     def _parse_recompute(self):
@@ -996,23 +1021,28 @@ class CostModelParserHyperV2(_CostModelParser):
 
         ``model_init_dtype`` is a top-level AutoModels key applied after the
         weights are loaded, so it outranks ``model.torch_dtype`` for the
-        stored parameters but not an explicit FSDP ``param_dtype``.
+        stored parameters but not an explicit FSDP ``param_dtype``.  Where
+        nothing states a dtype, the checkpoint's own is taken
+        (:meth:`_model_dtype`), and bfloat16 with a warning where there is
+        no checkpoint either.
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
         mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
-        model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
         init_dtype = self._get_cfg_attr(self.config, "model_init_dtype", None)
+        param_dtype = self._get_cfg_attr(mix_precision, "param_dtype", None)
         self.ccfg.bytes_p = self._bytes_from_dtype(
-            self._get_cfg_attr(mix_precision, "param_dtype", None)
+            param_dtype
             or init_dtype
-            or model_dtype
-            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+            or self._model_dtype("param_init_type")
         )
-        self.ccfg.bytes_compute = self._bytes_from_dtype(
-            model_dtype
-            or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")
-        )
+        self.ccfg.bytes_compute = self._bytes_from_dtype(self._model_dtype("compute_dtype", param_dtype))
+        stated = [self._get_cfg_attr(model_raw, key, None) for key in ("torch_dtype", "param_init_type")]
+        if not any(value and value != "auto" for value in stated) and not getattr(self, "_spec_dtype", None):
+            logger.warning(
+                "neither the config nor a checkpoint states the model's dtype: its weights are priced in "
+                "bfloat16; state model.torch_dtype if they are held in another"
+            )
         self.ccfg.bytes_softmax = self._bytes_from_dtype(
             self._get_cfg_attr(model_raw, "softmax_compute_type", "float32"))
         self.ccfg.bytes_grad = 4
