@@ -94,6 +94,9 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "linear_value_head_dim": ("linear_value_head_dim",),
     "linear_conv_kernel_dim": ("linear_conv_kernel_dim",),
 }
+# The canonical text-tower fields, which a search hands on to the cost model
+# by these names (``config_adapter._search_runner.CONFIG_OVERRIDE_FIELDS``).
+TEXT_FIELDS: Tuple[str, ...] = tuple(_TEXT_FIELD_ALIASES)
 
 # Vision towers use their own spelling for the shared concepts.
 _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
