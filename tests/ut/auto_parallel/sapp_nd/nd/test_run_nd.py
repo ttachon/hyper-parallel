@@ -2530,6 +2530,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.mem_eval = SimpleNamespace(
             mem_fit=lambda peak: peak < 100,
             get_strategy=lambda: {},
+            get_max_device_memory=lambda: 100.0,
         )
 
         class _ParallelConfig:
@@ -2561,8 +2562,13 @@ class TestSappNDRunND(unittest.TestCase):
         config_state.global_batch_size = lambda config: 8
 
         runner.device_loops = lambda space, pool: ({"fit": 10, "large": 200}, 2)
-        self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
+        with patch.object(Par.logger, "output") as output:
+            self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
         self.assertEqual(writes, [("out", "fit")])
+        said = [call.args for call in output.call_args_list]
+        self.assertEqual([args[1:] for args in said if "dropped:" in args[0]], [("large", 200, 100.0, 100.0)])
+        self.assertIn((2, 0, "", 2), [args[1:] for args in said])
+        self.assertIn((1, 1), [args[1:] for args in said])
 
         runner.memory_estim = lambda debugger=None: 12
         config_state.make_parallel_config = lambda *dims: "inside"
@@ -2600,6 +2606,38 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(Par.pool_estimate_memory("config"), 7)
         with patch.object(Par, "estimate_performance", return_value=9):
             self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
+
+    def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
+        """
+        Feature: ParallelizeLayer.generate_search_space, what it says it left out.
+        Description: A search whose loops meet a candidate with a degree out of
+            bounds and one of the wrong global batch, and price two, one of
+            them 50 MB over a 100 MB budget.
+        Expectation: The candidate over the budget is named with its peak; the
+            first summary line counts four tested, two refused, each check by
+            name, and two priced; the second, one fitting and one dropped.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.config = SimpleNamespace(moe_valid=lambda config: True, global_batch_size=lambda config: config.batch)
+        runner.global_batch_size = 8
+        runner.filtered_out = lambda config: False
+        runner.mem_eval = SimpleNamespace(mem_fit=lambda peak: peak < 100, get_max_device_memory=lambda: 100.0)
+
+        def loops(*_: Any) -> Any:
+            """Refuse two candidates the way inside_loop_nest checks them, then price two."""
+            for config in (SimpleNamespace(is_valid=lambda: False, batch=8),
+                           SimpleNamespace(is_valid=lambda: True, batch=4)):
+                self.assertFalse(runner.is_valid(config))
+            return {"fit": 10, "large": 150}, 4
+
+        runner.device_loops = loops
+        with patch.object(Par.logger, "output") as output:
+            self.assertEqual(runner.generate_search_space(None, threads_num=None), [("fit", 10)])
+        self.assertEqual([call.args[0] % call.args[1:] for call in output.call_args_list], [
+            "large dropped: its peak of 150 MB is over the 100 MB budget by 50 MB",
+            "4 configurations tested: 2 refused (a degree out of bounds 1, global batch 1), 2 priced for memory",
+            "1 configuration fitting memory to order, 1 dropped over the memory budget",
+        ])
 
     def test_parallelize_profile_ordering_without_estimators(self) -> None:
         """
