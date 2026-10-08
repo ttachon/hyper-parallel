@@ -311,9 +311,9 @@ class CostModelParserMindspeed(_CostModelParser):
         )  # data parallel comm factor
         cc.comm_d_exp = (
             0
-            if ((cc.d_exp == 1) or not cc.has_op)
+            if ((_CostModelParser.expert_dp_ranks(cc) == 1) or not cc.has_op)
             else (2 if not cc.has_grad_shard else 3)
-        )  # data parallel comm factor
+        )  # data parallel comm factor, CP's ranks included (X3)
         cc.comm_t = float(cc.t > 1)  # tensor parallel comm factor
         cc.comm_ep = float(
             cc.ep > 1 or cc.n_exp > 1

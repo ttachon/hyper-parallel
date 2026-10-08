@@ -146,6 +146,19 @@ class _CostModelParser(ABC):
         return int(ccfg.d * ccfg.t * ccfg.cp) // int(expert_tp * ccfg.ep)
 
     @staticmethod
+    def expert_dp_ranks(ccfg: Any) -> int:
+        """How many ranks hold the same slice of a routed expert, so reduce its gradient together.
+
+        The stage's ranks over EP and over the expert's tensor shard
+        ``t_exp``, whose ranks hold different slices: context parallelism's
+        ranks hold the same weights and reduce their gradients with the
+        data-parallel ones, where ``d_exp`` counts the latter alone outside an
+        expert tensor shard, and :meth:`expert_dp_group` counts TP's ranks
+        whatever slice they hold.
+        """
+        return max(1, int(ccfg.d * ccfg.t * ccfg.cp) // (max(1, int(ccfg.t_exp)) * max(1, int(ccfg.ep))))
+
+    @staticmethod
     def routed_expert_shard(ccfg, ranks):
         """How many ranks a routed expert's parameters and optimizer states are sharded over.
 
@@ -243,15 +256,12 @@ class _CostModelParser(ABC):
             if ((ccfg.d == 1) or not ccfg.has_op)
             else (2 if not ccfg.has_grad_shard else 3)
         )  # data parallel comm factor
-        # Left on d_exp on purpose: this factor asks whether a rank shares its
-        # expert shard with another, which is the group's replicas, not the
-        # whole group, and edp_group counts TP's ranks as well.  Under context
-        # parallelism d_exp reads 1 where the group holds several, so the
-        # factor is still wrong there; it needs the replica count, which is
-        # the group over shard_p_os_exp.
+        # Whether another rank holds the same slice of a routed expert, as a
+        # shard or a copy, so that its gradient is reduced: d_exp left CP's
+        # ranks out and read 1 where they reduce it (X3).
         ccfg.comm_d_exp = (
             0
-            if ((ccfg.d_exp == 1) or not ccfg.has_op)
+            if ((_CostModelParser.expert_dp_ranks(ccfg) == 1) or not ccfg.has_op)
             else (2 if not ccfg.has_grad_shard else 3)
         )  # data parallel comm factor
         ccfg.comm_t = float(ccfg.t > 1)  # tensor parallel comm factor

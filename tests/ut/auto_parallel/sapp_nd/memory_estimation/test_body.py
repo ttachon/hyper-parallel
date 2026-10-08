@@ -962,6 +962,24 @@ class TestExpertDataParallelGroup(unittest.TestCase):
         with self.assertRaises(TypeError):
             _CostModelParser.config_dp_tp_exp(None, ccfg)
 
+    def test_context_parallel_ranks_reduce_an_experts_gradient(self):
+        """An expert's gradient is reduced over CP's ranks too (X3).
+
+        On 64 ranks with an optimizer shard: at CP 2, DP 32 and EP 32 leave
+        one DP rank over EP, but the two CP ranks hold the same experts and
+        reduce their gradients, so the expert's DP communication is priced,
+        where it read 0; at CP 1 and EP 64 no other rank holds them; at TP 2
+        without EP the TP ranks hold different slices and reduce nothing.
+        """
+        got = []
+        for d, t, cp, ep in ((32, 1, 2, 32), (64, 1, 1, 64), (1, 2, 1, 1)):
+            ccfg = self._ccfg(d=d, t=t, cp=cp, ep=ep)
+            ccfg.has_op, ccfg.has_grad_shard = True, False
+            _CostModelParser.config_dp_tp_exp(None, ccfg)
+            _CostModelParser.config_comm_flag(None, ccfg)
+            got.append(ccfg.comm_d_exp)
+        self.assertEqual(got, [2, 0, 0])
+
 
 if __name__ == "__main__":
     unittest.main()
