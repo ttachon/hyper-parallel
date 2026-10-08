@@ -35,11 +35,12 @@ comparison with ND belongs off the device.
     of the fallback runs while no device kernel does. It needs no new run.
 
 ``ep16``
-    Test 3. The one hole in the compute model's evidence: every unprofiled
-    measurement is at expert degree 1 to 8, and degree 16 is where the routing
-    carries 4270 ms of a 9411 ms step. It pairs a profiled sweep against an
-    unprofiled one from the SAME round and splits the instrument between the
-    parts and the residual, in the shape of nd_golden/sweeps/b8_rederived_1002.csv.
+    Test 3. The one hole in the compute model's evidence: every honest step time
+    is at expert degree 1 to 8, and degree 16 is where the routing carries
+    4270 ms of a 9411 ms step. It splits the instrument between the parts and
+    the residual, in the shape of nd_golden/sweeps/b8_rederived_1002.csv. One
+    sweep run is enough, because the harness harvests the trainer's own step
+    over the steps after the profiling window, which is a same-run pair.
 
 ``summary``
     One compact block over whatever results exist, ready to paste back, naming
@@ -706,10 +707,26 @@ def _pair_row(prof: Dict[str, str], unprof: Dict[str, str], key: str) -> Optiona
     }
 
 
+def _honest_rows(profiled: Dict[str, Dict[str, str]], unprofiled_path: Optional[str],
+                 profiled_path: str) -> Tuple[Dict[str, Dict[str, str]], str]:
+    """Resolve the rows carrying the honest clock, and say where they came from.
+
+    One sweep run carries both clocks, because the harness harvests the
+    trainer's own step over the steps AFTER the profiling window. That is a
+    same-run pair, which is the only sound kind: the one strategy measured both
+    ways reads 6276.0 against 6275.2 ms, 0.013% apart. A second file is accepted
+    for a round that really was launched twice.
+    """
+    if unprofiled_path:
+        rows = {key: row for row in _read_rows(Path(unprofiled_path)) if (key := _strategy_key(row))}
+        return rows, unprofiled_path
+    return profiled, f"{profiled_path} (its own step_trainer column)"
+
+
 def cmd_ep16(args: argparse.Namespace) -> None:
     """Split the profiler's own cost between the parts and the residual."""
     profiled = {key: row for row in _read_rows(Path(args.profiled)) if (key := _strategy_key(row))}
-    unprofiled = {key: row for row in _read_rows(Path(args.unprofiled)) if (key := _strategy_key(row))}
+    unprofiled, source = _honest_rows(profiled, args.unprofiled, args.profiled)
     shared = sorted((key for key in profiled if key in unprofiled), key=_label)
     if not shared:
         raise SystemExit("no strategy appears in both files: the two sweeps did not cover the same points")
@@ -718,7 +735,7 @@ def cmd_ep16(args: argparse.Namespace) -> None:
     print("Test 3: the instrument's split between the parts and the residual")
     print("=" * 78)
     print(f"\nprofiled:   {args.profiled}")
-    print(f"unprofiled: {args.unprofiled}")
+    print(f"honest:     {source}")
     print(f"{len(shared)} strategy(ies) in both\n")
     print(f"{'strategy':12s} {'profiled':>9s} {'honest':>9s} {'instrument':>10s} "
           f"{'comp':>9s} {'exposed':>9s} {'resid prof':>10s} {'resid honest':>12s}")
@@ -879,8 +896,10 @@ def build_parser() -> argparse.ArgumentParser:
     two.set_defaults(func=cmd_fallback)
 
     three = sub.add_parser("ep16", help="test 3: pair a profiled sweep with an unprofiled one")
-    three.add_argument("--profiled", required=True, help="real_all.csv of the profiled pass")
-    three.add_argument("--unprofiled", required=True, help="real_all.csv of the unprofiled pass")
+    three.add_argument("--profiled", required=True, help="real_all.csv of the sweep's timing pass")
+    three.add_argument("--unprofiled", default=None,
+                       help="real_all.csv of a separate unprofiled round; omit it to take the honest "
+                            "clock from the step_trainer column of the file above")
     three.set_defaults(func=cmd_ep16)
 
     four = sub.add_parser("summary", help="one block over every result that exists")
