@@ -66,6 +66,10 @@ class _CostModVar:
     cp: float = 0
     ep: float = 1
     sp: float = 0
+    # Whether the run shards its sequence over TP, as its parser or a
+    # searched candidate states it; sp follows it at every TP.  None where
+    # nothing stated it, and sp then follows TP, as it always did.
+    seq_parallel: bool = None
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0

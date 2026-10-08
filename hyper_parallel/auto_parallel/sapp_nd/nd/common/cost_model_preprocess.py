@@ -355,7 +355,11 @@ class CostModelConfig(PartitionGenerator):
         off = kwargs.get("offset", None)
         fr = kwargs.get("full_rec", None)
         sr = kwargs.get("sel_rec", None)
+        sp = kwargs.get("sp", None)
         target_ccfg = self.__strategy_target(model_name)
+        if sp is not None:
+            # A search over SP states it for each candidate.
+            target_ccfg.seq_parallel = bool(sp)
 
         for attr, key in (
             ("d", "dp"),
@@ -369,7 +373,12 @@ class CostModelConfig(PartitionGenerator):
             ("b", "mbs"),
         ):
             self.__maybe_set_int(target_ccfg, attr, kwargs.get(key, None))
-        target_ccfg.sp = target_ccfg.t
+        # The sequence is sharded over the new TP only where the run, or the
+        # candidate, shards it at all; this set it to TP for every candidate,
+        # so a run without sequence parallelism had its activations divided
+        # by TP all the same (T1).
+        stated = getattr(target_ccfg, "seq_parallel", None)
+        target_ccfg.sp = target_ccfg.t if stated is None or stated else 1
         if op is not None and isinstance(op, int):
             target_ccfg.os_max_shard = op
             # Sync has_op with os_max_shard: op<=1 means no optimizer sharding

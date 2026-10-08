@@ -781,6 +781,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
         )
+        self.ccfg.seq_parallel = use_sp
         self.ccfg.sp = self.ccfg.t if use_sp else 1
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")

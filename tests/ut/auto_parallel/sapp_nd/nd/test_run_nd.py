@@ -2572,6 +2572,29 @@ class TestSappNDRunND(unittest.TestCase):
         dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
         self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
+    def test_a_strategy_keeps_the_runs_sequence_parallelism(self) -> None:
+        """
+        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor (T1).
+        Description: The DeepSeek MindFormers yaml at TP 4 without sequence
+            parallelism and with it, each moved to TP 2; then a searched
+            candidate at TP 2 stating SP off and on.
+        Expectation: The divisor follows the run's choice at the new TP, 1
+            without and 2 with, where the strategy setter set it to TP for
+            every candidate; a candidate that states SP decides it.
+        """
+        with open(config_path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        got = []
+        for use_sp in (False, True):
+            data["parallel_config"]["use_seq_parallel"] = use_sp
+            cfg = CostModelConfig(copy.deepcopy(data))
+            cfg.set_strategy(mp=2)
+            got.append(cfg.sp)
+            for stated in (False, True):
+                cfg.set_strategy(mp=2, sp=stated)
+                got.append(cfg.sp)
+        self.assertEqual(got, [1, 1, 2, 2, 1, 2])
+
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""
         child = copy.copy(cost_cfg)

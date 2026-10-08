@@ -169,6 +169,8 @@ class CostModelParserHyperparallel(_CostModelParser):
         # nothing is pipelined.
         policy = self.config.parallelism.fsdp_reshard_after_forward or "default"
         self.ccfg.reshards = policy == "always" or (policy == "default" and self.ccfg.p == 1)
+        # Sequence parallel wherever TP is, as this parser has always priced it.
+        self.ccfg.seq_parallel = True
         self.ccfg.sp = self.ccfg.t
         self.ccfg.vp = 1
         self.ccfg.op_weight_shard = self.config.parallelism.data_parallel_shard_degree
