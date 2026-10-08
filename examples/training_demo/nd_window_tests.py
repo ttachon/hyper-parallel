@@ -83,6 +83,14 @@ _COMM_CORE = "comm"
 # The sweep's own dimension columns, which together identify a strategy.
 _KEY = ("DP", "MP", "PP", "CP", "EP", "MB", "MBS", "OP")
 
+# The run roots the runbook tells you to use for test 1, relative to --root.
+# They exist so that reading a finished test is one short command: a line that
+# wraps when it is copied off a page is a line that will be run wrong.
+_LEG_FUSED = "t1_fused"
+_LEG_REFERENCE = "t1_ref"
+_LEG_FUSED_PROFILE = "t1_fp"
+_LEG_REFERENCE_PROFILE = "t1_rp"
+
 # A parsed kernel: start, end, lower-case core, name. Starts and ends are in
 # milliseconds and relative to the first kernel of the table.
 _Span = Tuple[float, float, str, str]
@@ -422,13 +430,50 @@ def _report_slope(fused_parts: Dict[str, Any], ref_parts: Dict[str, Any]) -> Dic
     return added
 
 
+def _indexer_legs(args: argparse.Namespace) -> Tuple[Path, Path, Optional[Path], Optional[Path]]:
+    """Resolve the four directories test 1 reads.
+
+    ``--root`` is the runbook's layout, so the command that reads a finished
+    test is short enough to copy off a page without wrapping. The explicit
+    flags override it one at a time, for a run that was put somewhere else.
+
+    Args:
+        args: The parsed arguments.
+
+    Returns:
+        The fused leg, the reference leg, and the two profiles, which are None
+        when neither given nor present under the root.
+
+    Raises:
+        SystemExit: When neither a root nor both legs are given.
+    """
+    root = Path(args.root) if args.root else None
+    if root is None and not (args.fused and args.reference):
+        raise SystemExit("give --root, or both --fused and --reference")
+
+    def leg(explicit: Optional[str], name: str, required: bool) -> Optional[Path]:
+        """Resolve one directory: the flag if given, else the root's own name."""
+        if explicit:
+            return Path(explicit)
+        candidate = root / name if root else None
+        if candidate is not None and candidate.is_dir():
+            return candidate
+        if required:
+            raise SystemExit(f"no {name} directory under {root}: give --{name.split('_')[1]} instead")
+        return None
+
+    return (leg(args.fused, _LEG_FUSED, True), leg(args.reference, _LEG_REFERENCE, True),
+            leg(args.profile_fused, _LEG_FUSED_PROFILE, False),
+            leg(args.profile_reference, _LEG_REFERENCE_PROFILE, False))
+
+
 def cmd_indexer(args: argparse.Namespace) -> None:
     """Compare the fused and reference indexer legs of one strategy."""
-    fused = _read_repeat_leg(Path(args.fused))
-    reference = _read_repeat_leg(Path(args.reference))
-    fused_parts = _read_profile_parts(Path(args.profile_fused) if args.profile_fused else None, args.steps)
-    ref_parts = _read_profile_parts(Path(args.profile_reference) if args.profile_reference else None,
-                                    args.steps)
+    fused_dir, reference_dir, fused_profile, ref_profile = _indexer_legs(args)
+    fused = _read_repeat_leg(fused_dir)
+    reference = _read_repeat_leg(reference_dir)
+    fused_parts = _read_profile_parts(fused_profile, args.steps)
+    ref_parts = _read_profile_parts(ref_profile, args.steps)
 
     print("=" * 78)
     print("Test 1: the indexer path, one strategy, one environment variable changed")
@@ -815,8 +860,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     one = sub.add_parser("indexer", help="test 1: the fused against the reference indexer")
-    one.add_argument("--fused", required=True, help="RUN_ROOT of the leg with the fused indexer")
-    one.add_argument("--reference", required=True,
+    one.add_argument("--root", default=None,
+                     help=f"directory holding {_LEG_FUSED}, {_LEG_REFERENCE} and, when they exist, "
+                          f"{_LEG_FUSED_PROFILE} and {_LEG_REFERENCE_PROFILE}")
+    one.add_argument("--fused", default=None, help="RUN_ROOT of the leg with the fused indexer")
+    one.add_argument("--reference", default=None,
                      help="RUN_ROOT of the leg with V41_DISABLE_FUSED_INDEXER=1")
     one.add_argument("--profile-fused", default=None, help="a profiled run of the fused leg")
     one.add_argument("--profile-reference", default=None, help="a profiled run of the reference leg")
