@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
@@ -167,10 +167,16 @@ ALL_DIMS = [DP, EP, TP, CP, PP, VPP, MBN, MBS, SP, OP]
 
 
 class Dimensions:
-    """All output dimensions, of a run that *accumulates* gradients over micro-batches or not"""
+    """All output dimensions, of a run that *accumulates* gradients over micro-batches or not.
+
+    Attributes:
+        rank: One-based position in the full memory-fitting search ranking,
+            or None before the configuration has been ranked.
+    """
 
     def __init__(self, config, all_dims=None, accumulates=False):
         self.accumulates = accumulates
+        self.rank: Optional[int] = None
         if isinstance(config, list):
             self.all_dims = [d for d, _ in config]
             self.dims_val = dict(config)
