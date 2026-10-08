@@ -16,6 +16,7 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import patch, MagicMock
 
@@ -28,6 +29,7 @@ from hyper_parallel.auto_parallel.config_adapter import _search_runner as sr
 from hyper_parallel.auto_parallel.config_adapter import read_hp_yaml_config
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -457,23 +459,57 @@ class TestPostFilterMemory(unittest.TestCase):
         self.assertEqual(sr._post_filter(entries, config), [])
 
 
-class TestWriteTempHpYaml(unittest.TestCase):
-    """Tests for _write_temp_hp_yaml."""
+class TestModelSectionIsTheSpec(unittest.TestCase):
+    """The model section a search hands ND is the model IR, serialised."""
 
     def _get_runner(self):
         return sr
 
-    def test_temp_file_created(self):
-        """Temp file is created and contains valid YAML."""
+    def test_config_is_a_mapping_not_a_path(self):
+        """The search passes ND a config, not a temp file to parse back."""
+        runner = self._get_runner()
+        self.assertFalse(hasattr(runner, "_write_temp_hp_yaml"))
+        self.assertFalse(hasattr(runner, "CONFIG_OVERRIDE_FIELDS"))
+        data = runner._build_hp_yaml_dict(_make_full_config())
+        self.assertIsInstance(data, dict)
+        self.assertIn("model", data)
+        self.assertIn("training", data)
+
+    def test_overrides_come_from_the_spec(self):
+        """Every declared field reaches ND without a hand-kept field list."""
+        runner = self._get_runner()
+        data = runner._build_hp_yaml_dict(_make_full_config())
+        overrides = data["model"]["config_overrides"]
+        self.assertEqual(overrides["hidden_size"], 4096)
+        self.assertEqual(overrides["num_key_value_heads"], 8)
+        self.assertNotIn("name", overrides)
+        self.assertEqual(data["model"]["name"], "test-dense")
+
+    def test_a_field_the_old_whitelist_omitted_now_survives(self):
+        """shared_expert_intermediate_size is a spec field, so it carries.
+
+        The hand-kept list did not name it, which is how an all-MoE model
+        reached the cost model with its shared expert unsized.
+        """
         runner = self._get_runner()
         config = _make_full_config()
-        path = runner._write_temp_hp_yaml(config)
-        self.assertTrue(os.path.isfile(path))
-        with open(path, "r", encoding="utf-8") as fh:
-            data = fh.read()
-        self.assertIn("model:", data)
-        self.assertIn("training:", data)
-        os.remove(path)
+        config.model_spec.update(
+            num_experts=256,
+            num_experts_per_tok=8,
+            num_shared_experts=1,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        )
+        overrides = runner._build_hp_yaml_dict(config)["model"]["config_overrides"]
+        self.assertEqual(overrides["shared_expert_intermediate_size"], 512)
+
+    def test_an_incoherent_model_section_raises(self):
+        """A model ND cannot cost is refused here, not priced as a zero."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.model_spec["num_key_value_heads"] = 7
+        with self.assertRaises(ValueError):
+            runner._build_hp_yaml_dict(config)
 
     def test_max_device_memory_follows_memory_limit(self):
         """The yaml carries the memory budget, so ND prunes against it."""
@@ -481,6 +517,14 @@ class TestWriteTempHpYaml(unittest.TestCase):
         config = _make_full_config()
         hp_yaml = runner._build_hp_yaml_dict(config)
         self.assertEqual(hp_yaml["context"]["max_device_memory"], "60.0GB")
+
+    def test_auto_recompute_describes_the_model_fully_recomputed(self):
+        """With recompute "auto" or "per_layer", candidates are kept fully recomputed, so the model is described so."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        for strategy in ("auto", "per_layer"):
+            config.estimator["recompute_strategy"] = strategy
+            self.assertEqual(runner._build_hp_yaml_dict(config)["activation_checkpoint"]["mode"], "full")
 
 
 # The run a train.yaml states beyond the strategy: the model's dtype, FSDP's
@@ -606,6 +650,39 @@ class TestCensusInASearch(unittest.TestCase):
         self.assertEqual(sorted(ccfg.census), ["full_attention", "linear_attention"])
         self.assertEqual(ccfg.output_census.seq_length, 64)
 
+    def test_the_census_spec_reaches_nd(self):
+        """
+        Feature: context.census_spec through the search runner.
+        Description: A train.yaml of a Mixtral of 4 experts asking for the
+            census's spec, whose layers run two norms where the family's
+            profile states five, read as a search reads it, and the yaml
+            the search hands ND.
+        Expectation: The reader states the census's op counts, the option
+            rides in the run, and ND prices the layers' two norms.
+        """
+        from transformers import MixtralConfig  # pylint: disable=C0415
+        text = MixtralConfig(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                             intermediate_size=128, num_local_experts=4, vocab_size=128)
+        train = {
+            "model": {"pretrained_model_name_or_path": "local/mixtral", "torch_dtype": "bfloat16"},
+            "training": {"global_batch_size": 4, "micro_batch_size": 1},
+            "dataset": {"data_transform": {"max_seq_len": 64}},
+            "context": {"census_spec": True},
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(train, handle)
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config", return_value=text):
+                config = read_hp_yaml_config(path)
+            self.assertEqual(config.model_spec["ops"]["decoder"]["normOp"], 2)
+            self.assertEqual(config.run["context"], {"census_spec": True})
+            search_path = os.path.join(folder, "search.yaml")
+            with open(search_path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(_search_yaml(config), handle)
+            ccfg = EvaluatorV2(search_path, framework="hyper_v2", log_level=0).ccfg
+        self.assertEqual(ccfg.n_normOp, 2)
+
 
 class TestSearchStrategies(unittest.TestCase):
     """End-to-end tests for search_strategies with mocked ND."""
@@ -635,10 +712,127 @@ class TestSearchStrategies(unittest.TestCase):
         self.assertIn("tp", result)
         self.assertIn("dp", result)
         self.assertIn("memory_estimate_mb", result)
-        # Every candidate is priced fully recomputed, whatever the search yaml
-        # says, and the result states it.
+        # Without recompute "auto" every candidate is priced fully recomputed,
+        # whatever the search yaml says, and the result states it.
         self.assertEqual(config.estimator["recompute_strategy"], "selective")
         self.assertEqual(result["activation_checkpoint"], "full")
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_chooses_the_trainer_mode(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """With recompute "auto" the search chooses among the trainer's modes and reports each layer's own."""
+        # pylint: disable=import-outside-toplevel,unused-import
+        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # noqa: F401
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import LayerRange, RecomputeChoice
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+        mock_dims = MagicMock()
+        mock_dims.dims_val = {
+            _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
+            _MOCK_CP: 1, _MOCK_EP: 1, _MOCK_MBN: 2,
+        }
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [(mock_dims, 1024.0, 0.05, [])]
+        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=1.0, memory_once=0.0,
+                            forward_time=1.0, backward_time=2.0)
+        per_layer = RecomputeChoice(ranges=(LayerRange(0, 4, None, plain),), stage_memory=(900.0, 950.0),
+                                    stage_savings=(1.0, 1.0))
+        mock_runner.recompute_choices = {mock_dims: SimpleNamespace(mode="off")}
+        mock_runner.recompute_per_layer.return_value = (per_layer, 0.04)
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.estimator["recompute_strategy"] = "auto"
+        result = sr.search_strategies(config)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertTrue(kwargs["auto_recompute"])
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_RECOMPUTE_MODES)
+        self.assertEqual(result["activation_checkpoint"], "off")
+        self.assertEqual(result["recompute_per_layer"], {
+            "score": 0.04, "memory_estimate_mb": 950.0,
+            "ranges": [{"first": 0, "count": 4, "kind": None, "recompute": "none"}],
+        })
+
+        mock_runner.recompute_choices = {}
+        mock_runner.recompute_per_layer.return_value = (None, None)
+        result = sr.search_strategies(config)
+        self.assertEqual(result["activation_checkpoint"], "full")
+        self.assertNotIn("recompute_per_layer", result)
+
+        # A train.yaml that states a census prices the trainer's selective
+        # mode, its policy, as well.
+        census = _make_full_config(run={"context": {"census": True}})
+        census.estimator["recompute_strategy"] = "auto"
+        mock_runner.recompute_choices = {mock_dims: SimpleNamespace(mode="selective")}
+        result = sr.search_strategies(census)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_CENSUS_MODES)
+        self.assertEqual(kwargs["recompute_selective"], HYPER_SELECTIVE_REC_OP)
+        self.assertFalse(kwargs["recompute_mode_per_layer"])
+        self.assertEqual(result["activation_checkpoint"], "selective")
+        self.assertNotIn("activation_checkpoint_layers", result)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_chooses_a_mode_per_layer(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """
+        Feature: search_strategies, recompute "per_layer".
+        Description: A search asking for a mode per layer, its best
+            candidate running full on its first three layers and off on the
+            last five; then the same search with the modes narrowed, and a
+            census stated.
+        Expectation: The search chooses among the trainer's modes for each
+            layer, and the result states the plan as the trainer reads it:
+            its mode, and the layers that run another. The narrowed modes
+            reach the search whatever the census.
+        """
+        # pylint: disable=import-outside-toplevel,unused-import
+        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # noqa: F401
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import LayerRange, RecomputeChoice
+        from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption
+        mock_dims = MagicMock()
+        mock_dims.dims_val = {
+            _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
+            _MOCK_CP: 1, _MOCK_EP: 1, _MOCK_MBN: 2,
+        }
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [(mock_dims, 1024.0, 0.05, [])]
+
+        def option(recompute: Optional[frozenset]) -> LayerOption:
+            """An option recomputing *recompute*, costs aside."""
+            return LayerOption(recompute=recompute, memory_per_micro_batch=1.0, memory_once=0.0,
+                               forward_time=1.0, backward_time=2.0)
+
+        plan = RecomputeChoice(
+            ranges=(LayerRange(0, 3, None, option(None), "full"), LayerRange(3, 5, None, option(frozenset()), "off")),
+            stage_memory=(900.0,), stage_savings=(1.0,))
+        mock_runner.recompute_choices = {mock_dims: plan}
+        mock_runner.recompute_per_layer.return_value = (None, None)
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.estimator["recompute_strategy"] = "per_layer"
+        result = sr.search_strategies(config)
+        kwargs = mock_parallelize_cls.call_args.kwargs
+        self.assertTrue(kwargs["auto_recompute"])
+        self.assertTrue(kwargs["recompute_mode_per_layer"])
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_RECOMPUTE_MODES)
+        self.assertEqual(result["activation_checkpoint"], "full")
+        self.assertEqual(result["activation_checkpoint_layers"], {"3-7": "off"})
+
+        census = _make_full_config(run={"context": {"census": True}})
+        census.estimator.update(recompute_strategy="per_layer", recompute_modes=("off", "full"))
+        sr.search_strategies(census)
+        self.assertEqual(mock_parallelize_cls.call_args.kwargs["recompute_modes"], ("off", "full"))
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
@@ -865,7 +1059,7 @@ class TestTheParserReadsTheStatedRun(unittest.TestCase):
         self.assertEqual(ccfg.bytes_p, 2)
         self.assertEqual(ccfg.optimizer_state_bytes, 4)
         self.assertEqual(ccfg.main_param_bytes, 4)
-        self.assertFalse(ccfg.reshards)
+        self.assertFalse(ccfg.reshard_params)
         self.assertTrue(ccfg.has_clip)
         self.assertEqual(ccfg.cp_algo, "ulysses_cp")
         self.assertEqual(ccfg.optimizer, "hyper_parallel.optim.AdamW")
@@ -881,30 +1075,3 @@ class TestTheParserReadsTheStatedRun(unittest.TestCase):
         self.assertEqual(ccfg.optimizer_state_bytes, 2)
         self.assertEqual(ccfg.main_param_bytes, 0)
         self.assertEqual(ccfg.cp_algo, "colossalai_cp")
-
-
-class TestSearchStrategiesRecomputeDimension(unittest.TestCase):
-    """search_strategies hands the recompute dimension to the search and states the winner's mode."""
-
-    @patch(
-        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
-        return_value=_make_mock_dim_module(),
-    )
-    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
-    def test_modes_reach_the_search_and_the_winner_states_its_own(
-        self, mock_parallelize_cls, mock_get_dim,
-    ):  # pylint: disable=unused-argument
-        """With modes, the search gets them and the result runs the best entry's mode; without, full."""
-        for modes, mode in ((("off", "full"), "off"), (None, "full")):
-            with self.subTest(modes=modes):
-                entry = _make_scored_entry()
-                entry[0].recompute = "off"
-                mock_runner = MagicMock()
-                mock_runner.run_generation_to_ordering.return_value = [entry]
-                mock_parallelize_cls.return_value = mock_runner
-                config = _make_full_config()
-                if modes:
-                    config.estimator["recompute_modes"] = modes
-                result = sr.search_strategies(config)
-                self.assertEqual(mock_parallelize_cls.call_args.kwargs.get("recompute_modes"), modes)
-                self.assertEqual(result["activation_checkpoint"], mode)

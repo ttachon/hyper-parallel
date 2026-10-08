@@ -16,13 +16,17 @@
 import json
 import math
 from copy import deepcopy
-from typing import Any, Callable, NamedTuple, Optional
+from dataclasses import replace
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 import numpy as np
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
+from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, RealParts, estimation_in_real_parts
@@ -37,7 +41,9 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_configs_by_position,
+    get_layer_switches_by_position,
     get_table_quantity,
+    mla_weights,
     selective_shares,
 )
 
@@ -145,7 +151,6 @@ def op_table(cfg, attn=None):
     # against the values, as wide as a head's values.
     d_qk = (getattr(att, "qk_nope_head_dim", None) or d_h) + (getattr(att, "dhr", 0) or 0)
     table["n_attBMM"] = 3 * cfg.b * cfg.s * cfg.s * att.a * (d_qk + d_h)
-    table["n_ffBMM"] = 6 * cfg.b * cfg.s * cfg.s * cfg.hff
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
@@ -160,15 +165,7 @@ def op_table(cfg, attn=None):
         3 * cfg.b * cfg.s * max(cfg.a * cfg.s, 3 * cfg.h * cfg.t / cfg.sp)
     )
     if cfg.dc_kv != 0:  # MLA
-        # The queries' latent and its up-projection, or one projection to
-        # every head; the keys' and values' shared down-projection beside
-        # the rotary key; their up-projections, a head's key at its own
-        # width and its value at the value heads'; the output projection.
-        d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
-        heads = cfg.a * (d_nope + cfg.dhr)
-        query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
-        weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
-                   + cfg.a * cfg.dh * cfg.h)
+        weights, _ = mla_weights(cfg)
         table["n_attMM"] = 6 * cfg.b * cfg.s * weights / (getattr(cfg, "n_attMM", 0) or 4)
     for op in table:
         table[op] *= cfg.bytes_p / cfg.t / cfg.cp
@@ -190,13 +187,11 @@ def _flavour_tables(cfg, attn=None):
     """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
-    group = attn if attn is not None else cfg
-    n_ff = max(getattr(group, "n_ffMM", 0) or 0, getattr(group, "n_ffBMM", 0) or 0) or 3
+    n_ff = getattr(attn if attn is not None else cfg, "n_ffMM", 0) or 3
     gate = 1 if cfg.n_shared_exp and getattr(cfg, "shared_expert_gate", None) else 0
     experts = cfg.hff_exp * (max(1, cfg.n_chosen_exp) * cfg.cap_fact + cfg.n_shared_exp)
     width = experts + (cfg.n_exp + gate) / n_ff
     exp["n_ffMM"] *= width / cfg.hff
-    exp["n_ffBMM"] *= width / cfg.hff
     exp["n_ffAct"] *= experts / cfg.hff
     dispatch = getattr(cfg, "moe_dispatch", 0) or MOE_DISPATCH
     exp["n_dispatch"] = (
@@ -206,8 +201,8 @@ def _flavour_tables(cfg, attn=None):
     return base, exp
 
 
-def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
-    """Price one regular layer with its group's config.
+def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp, switches=None):
+    """Price one regular layer with its group's config, and its own recompute *switches* where it has them.
 
     *tables* holds one table pair per attention flavour and gains one the
     first time a flavour is priced.
@@ -220,7 +215,8 @@ def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp):
         tables[kind][1] if (lcfg.n_exp > 1) else tables[kind][0],
         layer,
         with_recomp,
-        shares=selective_shares(lcfg, layer),
+        shares=selective_shares(lcfg, layer, switches),
+        switches=switches,
     )
     if ccfg.ttype == PerformanceType.TIME:
         flop = estimate_comp_flop_time(lcfg, flop)
@@ -234,6 +230,8 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
     # Full attention prices from the model's own attention dimensions.
     tables = {"full": _flavour_tables(cfg)}
     lccfg_at = get_layer_configs_by_position(cfg, stages)
+    # Each layer's own recompute switches, where the config states several.
+    switches_at = get_layer_switches_by_position(cfg, stages)
 
     flops = []
     for stage_id, stage in enumerate(stages):
@@ -257,8 +255,9 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
                     )
                     continue
 
+                position = (stage_id, chunk_id, lay_id)
                 flops[-1] += _regular_layer_flop(
-                    cfg, ccfg, lccfg_at[(stage_id, chunk_id, lay_id)], tables, layer, with_recomp
+                    cfg, ccfg, lccfg_at[position], tables, layer, with_recomp, switches_at.get(position)
                 )
 
     return flops
@@ -548,6 +547,179 @@ def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
     return p2p
 
 
+def _one_layer_of(stack: Optional[LayerStack], kind: Optional[LayerKind]) -> Optional[LayerStack]:
+    """The model's stack, reduced to one layer of *kind*.
+
+    Its other groups stay, with no layer, so the estimates apply the layer's
+    kind exactly when they would for the whole model: to a copy of the config
+    for the compute, whose op tables come from the model's own config, and in
+    place for the communication. A layer with no kind has no stack.
+    """
+    if kind is None or stack is None:
+        return None
+    return replace(stack, groups=(StackGroup(kind, 1),) + tuple(replace(group, count=0) for group in stack.groups))
+
+
+class PlainTimes(NamedTuple):
+    """What a layer costs before any recompute, the same for every option of its kind.
+
+    Attributes:
+        compute: The compute estimate without recompute.
+        comm: The communication estimate without recompute.
+        config: The config the communication estimate leaves, which the stage
+            estimate reads.
+    """
+
+    compute: float
+    comm: float
+    config: CostModelConfig
+
+
+def _layer_alone(
+    cfg: CostModelConfig, kind: Optional[LayerKind], layer_type: LayerType, switches: Optional[Dict[str, int]]
+) -> Tuple[CostModelConfig, list]:
+    """One *layer_type* layer of *kind*, alone in the first stage of a fresh copy of *cfg*.
+
+    A fresh copy each time: the estimates leave state on the config they are
+    given.
+    """
+    single = deepcopy(cfg)
+    if switches is not None:
+        single.rec_op = Config(dict(switches))
+    # The one layer runs *switches*, else the config's rec_op, whatever
+    # the layers of the model run.
+    single.layer_switches = None
+    single.layer_stack = _one_layer_of(single.layer_stack, kind)
+    single.n = single.d * single.t * single.p
+    stages = [[[] for _ in range(single.vp)] for _ in range(single.p)]
+    stages[0][0] = [layer_type]
+    return single, stages
+
+
+def plain_layer_times(
+    cfg: CostModelConfig,
+    kind: Optional[LayerKind],
+    layer_type: LayerType,
+    device_type: Any,
+    ccfg: Optional[CustomConfig] = None,
+) -> PlainTimes:
+    """The compute and communication of one layer of *kind* alone, without recompute.
+
+    They do not depend on which recompute option the layer runs, so every
+    option of a kind can share them; the embedding and the output layer have
+    their own.
+    """
+    ccfg = ccfg if ccfg is not None else CustomConfig()
+    single, stages = _layer_alone(cfg, kind, layer_type, None)
+    compute = estimate_comp(single, ccfg, stages)[0]
+    grouped, stages = _layer_alone(cfg, kind, layer_type, None)
+    comm = estimate_comm(grouped, ccfg, stages, device_type)[0]
+    return PlainTimes(compute, comm, grouped)
+
+
+def estimate_layer_times(
+    cfg: CostModelConfig,
+    kind: Optional[LayerKind],
+    layer_type: LayerType,
+    device_type: Any,
+    ccfg: Optional[CustomConfig] = None,
+    switches: Optional[Dict[str, int]] = None,
+    plain: Optional[PlainTimes] = None,
+) -> Tuple[float, float]:
+    """Forward and backward time of one layer, priced as a stage prices it.
+
+    Runs the compute, communication and stage estimates of
+    :func:`estimate_performance` on one layer of *kind*, alone in the first
+    stage of a copy of *cfg*. For a stage whose layers are all of one kind,
+    the sum of their times is what the search charges the stage before
+    pipeline bubbles and point-to-point communication. The search prices each
+    layer on a config the previous layers' kinds have been applied to, so a
+    stage that mixes kinds, or holds the embedding or output layer, can
+    differ by a few percent; here every layer is priced on its own kind,
+    wherever it sits.
+
+    Args:
+        cfg: The model's cost-model config, before any layer kind is applied.
+        kind: The layer's kind; ``None`` for the embedding and output, and
+            for a layer priced on the config as it stands.
+        layer_type: How the layer runs: plain, selective or full recompute,
+            embedding or output.
+        device_type: The device the communication is priced on.
+        ccfg: Estimator options; the search's defaults when omitted.
+        switches: The recompute switches a selective layer runs with, 1 to
+            keep an op and 0 to recompute it; the config's own when omitted.
+        plain: The layer's :func:`plain_layer_times`, when already priced.
+
+    Returns:
+        ``(forward, backward)``, *backward* including the layer's recompute.
+    """
+    ccfg = ccfg if ccfg is not None else CustomConfig()
+    if plain is None:
+        plain = plain_layer_times(cfg, kind, layer_type, device_type, ccfg)
+    comp, comm, grouped = plain
+    # A layer that recomputes nothing runs nothing again.
+    recomputes = layer_type in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER)
+    recomp = comp
+    if recomputes and ccfg.retype in {RecType.COMPUTE_ONLY, RecType.WITH}:
+        single, stages = _layer_alone(cfg, kind, layer_type, switches)
+        recomp = estimate_comp(single, ccfg, stages, with_recomp=True)[0]
+    recomm = comm
+    if recomputes and ccfg.retype in {RecType.COMM_ONLY, RecType.WITH}:
+        fresh, fresh_stages = _layer_alone(cfg, kind, layer_type, switches)
+        recomm = estimate_comm(fresh, ccfg, fresh_stages, device_type, with_recomp=True)[0]
+
+    # The stage estimate weighs the config the communication estimate leaves.
+    once = estimate_stage(grouped, ccfg, [comp], [comm], [comp], [comm])[0]
+    total = estimate_stage(grouped, ccfg, [comp], [comm], [recomp], [recomm])[0]
+    forward = once / (1 + BACKWARD_RATIO)
+    return forward, total - forward
+
+
+class LayerTimes:
+    """Prices the layers of a pipeline balancer's layer description.
+
+    The memory backbone calls it for every layer it describes, with the config
+    it walks and the layer's kind. A config is copied the first time it is
+    seen, at its embedding layer, before the walk applies any layer kind to
+    it, and each kind, layer type and set of switches is priced once. What a
+    kind costs without recompute is priced once for all its options.
+    """
+
+    def __init__(self, device_type: Any, ccfg: Optional[CustomConfig] = None) -> None:
+        """Price on *device_type*, with the estimator options *ccfg*."""
+        self._device_type = device_type
+        self._ccfg = ccfg
+        self._base = {}
+        self._times = {}
+        self._plain = {}
+
+    def __call__(
+        self,
+        cfg: CostModelConfig,
+        kind: Optional[LayerKind],
+        layer_type: LayerType,
+        switches: Optional[Dict[str, int]] = None,
+    ) -> Tuple[float, float]:
+        """``(forward, backward)`` of a *layer_type* layer of *kind*, run with *switches*."""
+        if id(cfg) not in self._base:
+            self._base[id(cfg)] = deepcopy(cfg)
+        key = (id(cfg), kind, layer_type, None if switches is None else tuple(sorted(switches.items())))
+        if key not in self._times:
+            # Every body option of a kind shares its plain times; the
+            # embedding and the output layer have their own.
+            role = layer_type if layer_type in (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER) else None
+            plain_key = (id(cfg), kind, role)
+            if plain_key not in self._plain:
+                self._plain[plain_key] = plain_layer_times(
+                    self._base[id(cfg)], kind, layer_type, self._device_type, self._ccfg
+                )
+            self._times[key] = estimate_layer_times(
+                self._base[id(cfg)], kind, layer_type, self._device_type, self._ccfg, switches,
+                plain=self._plain[plain_key],
+            )
+        return self._times[key]
+
+
 def _part_ratio(coeffs, key):
     """The ratio a ratios file states for *key*, or the one fit_ratios would give it.
 
@@ -634,7 +806,7 @@ def _resolve_estimate_args(args, kwargs):
         device_type, memory).
     """
     cfg_input = args[0]
-    # A copy: the estimate applies layer hooks to its config in place, and the
+    # A copy: the estimate applies layer kinds to its config in place, and the
     # caller's config is the one the next estimate starts from.
     cfg = (
         deepcopy(cfg_input)
@@ -652,6 +824,31 @@ def _resolve_estimate_args(args, kwargs):
     )
     memory = kwargs.get("memory", args[6] if len(args) > 6 else None)
     return _EstimateArgs(cfg, stages, extra_custom_func, ccfg, debugger, device_type, memory)
+
+
+def _save_recompute(stage_perfs, savings, debugger):
+    """Stage times less the recompute time each stage saves.
+
+    Args:
+        stage_perfs: Each stage's time, its layers recomputed as the config
+            says.
+        savings: The time each stage's layers save with the recompute
+            options chosen for them instead; ``None`` when none are.
+        debugger: Records the recompute part of each stage, which is where
+            the time is saved.
+
+    Returns:
+        Each stage's time.
+    """
+    if savings is None:
+        return stage_perfs
+    if len(savings) != len(stage_perfs):
+        raise ValueError(f"{len(savings)} stage savings for {len(stage_perfs)} stages")
+    if debugger and debugger.is_enabled():
+        debugger.info[PerfParts.RECOMPUTE] = [
+            recompute - saved for recompute, saved in zip(debugger.info[PerfParts.RECOMPUTE], savings)
+        ]
+    return [perf - saved for perf, saved in zip(stage_perfs, savings)]
 
 
 def _user_hook(cfg: Any) -> Optional[Callable]:
@@ -757,7 +954,12 @@ def _add_recorded_comm(recorded, info):
 
 # performance estimation
 def estimate_performance(*args, **kwargs):
-    """main estimation"""
+    """main estimation
+
+    With ``stage_savings``, each stage's time is lowered by the recompute
+    time its layers save under the options chosen for them, before the
+    pipeline is timed.
+    """
     (
         cfg,
         stages,
@@ -785,8 +987,6 @@ def estimate_performance(*args, **kwargs):
         stages = cfg.generate_partitions_vpp()
 
     cfg.n = cfg.d * cfg.t * cfg.p
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
 
     logger.debug(
         "perf_model: DP = %d, TP = %d, EP = %d, PP = %d, MB = %d",
@@ -823,6 +1023,7 @@ def estimate_performance(*args, **kwargs):
         recomm_perfs,
         debugger=debugger,
     )
+    stage_perfs = _save_recompute(stage_perfs, kwargs.get("stage_savings"), debugger)
     logger.info("PerfEst: stage_perfs %s", stage_perfs)
 
     stage_focused = kwargs.get("stage_focused", None)

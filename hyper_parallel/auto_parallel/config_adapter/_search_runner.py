@@ -14,88 +14,19 @@
 # ============================================================================
 """Search runner -- bridges NormalizedConfig to the ND search engine.
 
-Converts a :class:`NormalizedConfig` into a temporary HyperParallel
-``train.yaml``, runs the ND search via :class:`Parallelize`,
-post-filters by user candidate lists and memory budget, and returns the
-optimal strategy.
+Hands a :class:`NormalizedConfig` to the ND search as the mapping
+``Parallelize`` parses directly, post-filters by user candidate lists and
+memory budget, and returns the optimal strategy.
 """
 
 import copy
 import logging
-import os
-import tempfile
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, TYPE_CHECKING
 
-import yaml  # type: ignore[import-untyped]
-
-from hyper_parallel.auto_parallel._hf_model_spec import TEXT_FIELDS
+from hyper_parallel.auto_parallel._hf_model_spec import EXEC_OVERRIDE_KEYS
+from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
-
-CONFIG_OVERRIDE_FIELDS = [
-    "hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size",
-    "intermediate_size", "num_key_value_heads", "max_position_embeddings",
-    "num_experts", "num_experts_per_tok", "num_shared_experts",
-    "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
-    "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
-    "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim", "capacity_factor", "offset",
-    "head_dim", "vision", "attn_output_gate", "qk_norm", "tie_word_embeddings",
-    "qkv_bias", "o_bias", "mlp_bias", "torch_dtype",
-    "layer_types", "linear_num_key_heads", "linear_key_head_dim",
-    "linear_num_value_heads", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "activations", "output_activations",
-    "param_init_type", "compute_dtype", "softmax_compute_type",
-]
-
-# The canonical model fields the spec resolver names (``TEXT_FIELDS``) that a
-# search does not hand on to the cost model, each with its reason. A field
-# reaches the cost model only where the resolver names it and the search
-# forwards it, so one forgotten here is lost on the way: a Llama's stated
-# attention and MLP biases came back False and a latent attention lost its
-# no-position head width (I10).
-NOT_FORWARDED = {
-    "shared_expert_intermediate_size": (
-        "the resolver turns it into num_shared_experts and intermediate_size, which are forwarded, "
-        "and the cost model reads those"
-    ),
-}
-
-
-def check_forwarded_fields(
-    named: Optional[Tuple[str, ...]] = None,
-    forwarded: Optional[List[str]] = None,
-    exempt: Optional[Dict[str, str]] = None,
-) -> None:
-    """Refuse a canonical model field the search neither forwards nor exempts, or an exemption that is stale.
-
-    Run once at import, so a field added to the resolver without the search
-    stops every search rather than costing a model without it.
-
-    Args:
-        named: The resolver's canonical fields, ``TEXT_FIELDS`` unless given.
-        forwarded: The fields a search forwards, ``CONFIG_OVERRIDE_FIELDS`` unless given.
-        exempt: The fields left out on purpose, ``NOT_FORWARDED`` unless given.
-
-    Raises:
-        RuntimeError: When the lists disagree.
-    """
-    named = set(TEXT_FIELDS if named is None else named)
-    forwarded = set(CONFIG_OVERRIDE_FIELDS if forwarded is None else forwarded)
-    exempt = set(NOT_FORWARDED if exempt is None else exempt)
-    problems = []
-    dropped = sorted(named - forwarded - exempt)
-    if dropped:
-        problems.append(f"the search forwards no {', '.join(dropped)}, which the spec resolver names: forward "
-                        f"each in CONFIG_OVERRIDE_FIELDS or exempt it with its reason in NOT_FORWARDED")
-    stale = sorted(exempt - (named - forwarded))
-    if stale:
-        problems.append(f"NOT_FORWARDED names {', '.join(stale)}, which the search forwards or the resolver "
-                        f"does not name")
-    if problems:
-        raise RuntimeError("; ".join(problems))
-
-
-check_forwarded_fields()
 
 if TYPE_CHECKING:
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
@@ -104,6 +35,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The activation_checkpoint modes HyperParallel's trainer runs every layer
+# with, that recompute "auto" chooses among. Its selective mode recomputes
+# every other matmul, which the cost model's formulas do not price; a census
+# of the layers measures it (IR phase 5), so a run that states one offers it
+# too, where the census priced it.
+TRAINER_RECOMPUTE_MODES = ("off", "full")
+TRAINER_CENSUS_MODES = ("off", "selective", "full")
+# The search config's recompute values that choose among those modes: "auto"
+# one for every layer, "per_layer" one for each layer, which the trainer runs
+# as activation_checkpoint.layers.
+CHOSEN_RECOMPUTE = ("auto", "per_layer")
 
 def _get_dim_module():
     """Lazy-import the sapp_nd dimensions module."""
@@ -134,7 +76,6 @@ def _search_dim_map():
         # so mapping it here is what lets ND search that dimension.
         "data_parallel_shard_degree": dim_mod.OP,
     }
-
 
 def _validate_before_search(config: NormalizedConfig) -> None:
     """Check required model fields are populated (>0) before search.
@@ -167,9 +108,10 @@ def _validate_before_search(config: NormalizedConfig) -> None:
 def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     """Build the ``model`` section of the HP YAML from *model* spec.
 
-    All ``config_overrides`` field names in *model* already match the
-    HP YAML convention, so they are passed through directly without
-    any name mapping.
+    The model's fields go through the model spec, whose names are the HP
+    YAML's, and the run keys the parser reads from ``config_overrides``
+    pass through as they are.  The adapter's own keys, such as the
+    micro-batch size, reach the HP YAML through their own sections.
 
     Args:
         model: The ``model_spec`` dict from :class:`NormalizedConfig`.
@@ -177,17 +119,11 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         A dict suitable for the ``model`` key of a HP ``train.yaml``.
     """
-    model_dict: Dict[str, Any] = {
-        "name": model.get("name", "custom"),
-        "config_overrides": {},
-    }
-    overrides = model_dict["config_overrides"]
-    for key in CONFIG_OVERRIDE_FIELDS:
-        val = model.get(key)
-        if val is not None:
-            overrides[key] = val
-
-    return model_dict
+    spec = ModelSpec.from_dict(model_fields(model))
+    overrides = spec.to_dict()
+    overrides.pop("name", None)
+    overrides.update({key: model[key] for key in EXEC_OVERRIDE_KEYS if key in model})
+    return {"name": spec.name, "config_overrides": overrides}
 
 
 # The strategy, under every name the cost model reads it by, in the sections
@@ -262,10 +198,19 @@ def _pinned_or_first(config: NormalizedConfig, constraint_key: str, space_key: s
     return config.search_space.get(space_key, default)[0]
 
 
-def _build_strategy_dicts(
-    config: NormalizedConfig, run: Dict[str, Any],
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Build the ``accelerator`` and ``fsdp_config`` sections of the HP YAML over *run*'s."""
+def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
+    """Build an AutoModels-shaped cost-model YAML dict from *config*.
+
+    Fixed dimensions (``constraint.fixed_*_degree``) are written directly
+    into the strategy sections. Dimensions with search-space candidates
+    use the first candidate as a placeholder -- the actual search is driven
+    by the ``dimensions`` parameter passed to :class:`Parallelize`.  The
+    strategy goes over the run the train.yaml states, which stays as stated.
+    """
+    model = config.model_spec
+    constraint = config.constraint
+    run = _stated_run(config)
+
     accel: Dict[str, Any] = dict(run.pop("accelerator", None) or {})
     fsdp: Dict[str, Any] = dict(run.pop("fsdp_config", None) or {})
 
@@ -297,28 +242,12 @@ def _build_strategy_dicts(
         accel["context_parallel_algo"] = cp_algo
 
     # Optional accelerator fields that affect memory estimation.
-    owss = config.model_spec.get("optimizer_weight_shard_size")
+    owss = model.get("optimizer_weight_shard_size")
     if owss and owss > 0:
         accel["optimizer_weight_shard_size"] = owss
 
-    use_sp = config.model_spec.get("use_seq_parallel", True)
+    use_sp = model.get("use_seq_parallel", True)
     accel.setdefault("sequence_parallel", bool(use_sp))
-    return accel, fsdp
-
-
-def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
-    """Build an AutoModels-shaped cost-model YAML dict from *config*.
-
-    Fixed dimensions (``constraint.fixed_*_degree``) are written directly
-    into the strategy sections. Dimensions with search-space candidates
-    use the first candidate as a placeholder -- the actual search is driven
-    by the ``dimensions`` parameter passed to :class:`Parallelize`.  The
-    strategy goes over the run the train.yaml states, which stays as stated.
-    """
-    model = config.model_spec
-    constraint = config.constraint
-    run = _stated_run(config)
-    accel, fsdp = _build_strategy_dicts(config, run)
 
     recompute = config.estimator.get("recompute_strategy", "none")
 
@@ -338,7 +267,10 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if visual_seq_len:
         context["visual_seq_len"] = int(visual_seq_len)
 
-    gc_dict: Dict[str, Any] = {"mode": "off" if recompute == "none" else recompute}
+    # Choosing the recompute, the search keeps what fits fully recomputed:
+    # describe it so.
+    stated_mode = "full" if recompute in CHOSEN_RECOMPUTE else {"none": "off"}.get(recompute, recompute)
+    gc_dict: Dict[str, Any] = {"mode": stated_mode}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
         gc_dict["recompute_slice_activation"] = bool(recompute_slice)
@@ -369,16 +301,6 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
 
     return hp_yaml
 
-
-def _write_temp_hp_yaml(config: NormalizedConfig) -> str:
-    """Write a temp ``train.yaml`` and return its absolute path."""
-    data = _build_hp_yaml_dict(config)
-    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="hp_search_")
-    os.close(fd)
-    with open(path, "w", encoding="utf-8") as fh:
-        yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
-    logger.debug("Temp HP YAML written to %s", path)
-    return path
 
 
 # The names a search config may give its devices, and the sapp_nd device
@@ -580,14 +502,50 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
     return result
 
 
+def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
+    """The recompute the search chose for the best configuration, for the result.
+
+    Args:
+        nd_runner: The search, run with recompute "auto" or "per_layer".
+        best_entry: The best scored entry.
+
+    Returns:
+        ``activation_checkpoint``, the mode the trainer runs every layer
+        with: the chosen one, or ``full``, the policy the configuration was
+        scored with when there was nothing to choose. Under "per_layer",
+        ``activation_checkpoint_layers`` gives the layers that run another
+        mode, as the trainer's ``activation_checkpoint.layers`` states them,
+        where there are any. With a choice per layer possible,
+        ``recompute_per_layer`` also gives each layer's own fastest option of
+        its kind's front and the score and memory it would reach: what the
+        trainer would gain from running each layer its own way, switch by
+        switch.
+    """
+    # pylint: disable=C0415
+    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import to_records, trainer_plan
+    choice = nd_runner.recompute_choices.get(best_entry[0])
+    mode, layers = trainer_plan(choice) if choice is not None else ("full", {})
+    result: Dict[str, Any] = {"activation_checkpoint": mode}
+    if layers:
+        result["activation_checkpoint_layers"] = layers
+    per_layer, score = nd_runner.recompute_per_layer(best_entry[0])
+    if per_layer is not None:
+        result["recompute_per_layer"] = {
+            "score": float(score),
+            "memory_estimate_mb": float(per_layer.memory),
+            "ranges": to_records(per_layer),
+        }
+    return result
+
+
 def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     """Run the ND strategy search and return the optimal strategy.
 
     This is the main entry point for end-to-end strategy search:
 
     1. Validates required model fields.
-    2. Converts the ``NormalizedConfig`` to a temporary HyperParallel
-       ``train.yaml`` and writes it to disk.
+    2. Shapes the ``NormalizedConfig`` into the cost-model config ND
+       parses, as a mapping rather than a file.
     3. Launches the ND search engine (:class:`Parallelize`).
     4. Post-filters results against the user's candidate lists.
     5. Returns the best strategy as a flat dictionary.
@@ -602,35 +560,44 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
 
     Raises:
         ValueError: If required fields are missing or no strategy is found.
-        ImportError: If PyYAML is not installed.
     """
     _validate_before_search(config)
 
-    yaml_path = _write_temp_hp_yaml(config)
+    hp_config = _build_hp_yaml_dict(config)
     machine = _build_machine(config)
     dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
-    recompute_modes = config.estimator.get("recompute_modes")
-    try:
-        nd_runner = _Par.Parallelize(
-            "hyper_v2",
-            yaml_path,
-            machine,
-            global_batch_size=config.constraint.get("global_batch_size", 0),
-            dimensions=dims,
-            **({"recompute_modes": tuple(recompute_modes)} if recompute_modes else {}),
-        )
-        scored_space = nd_runner.run_generation_to_ordering(
-            yaml_folder=None,
-            threads_num=None,
-            top_num=None,
-        )
-    finally:
-        try:
-            os.remove(yaml_path)
-        except OSError:
-            pass
+    from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (  # pylint: disable=C0415
+        HYPER_SELECTIVE_REC_OP,
+    )
+    strategy = config.estimator.get("recompute_strategy")
+    auto = strategy in CHOSEN_RECOMPUTE
+    census = bool((hp_config.get("context") or {}).get("census"))
+    trainer = {
+        "auto_recompute": True,
+        # The search config may narrow the modes, as to leave out a mode the
+        # estimate prices faster than the device runs it.
+        "recompute_modes": tuple(config.estimator.get("recompute_modes")
+                                 or (TRAINER_CENSUS_MODES if census else TRAINER_RECOMPUTE_MODES)),
+        # The trainer's selective mode runs its policy, whatever switches
+        # the mode the model is described with sets.
+        "recompute_selective": dict(HYPER_SELECTIVE_REC_OP),
+        "recompute_mode_per_layer": strategy == "per_layer",
+    }
+    nd_runner = _Par.Parallelize(
+        "hyper_v2",
+        hp_config,
+        machine,
+        global_batch_size=config.constraint.get("global_batch_size", 0),
+        dimensions=dims,
+        **(trainer if auto else {}),
+    )
+    scored_space = nd_runner.run_generation_to_ordering(
+        yaml_folder=None,
+        threads_num=None,
+        top_num=None,
+    )
 
     if not scored_space:
         raise ValueError("ND search returned no valid strategies.")
@@ -646,11 +613,12 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
         )
     best = filtered[0]
     result = _format_result(best, config)
-    # Without a recompute dimension the search prices every candidate fully
-    # recomputed, whatever the search yaml's recompute setting says; with one,
-    # each candidate under the mode it is ranked with. The trainer must run
-    # what was priced.
-    result["activation_checkpoint"] = best[0].recompute if recompute_modes else "full"
+    if auto:
+        result.update(_recompute_result(nd_runner, best))
+    else:
+        # Without "auto" the search prices every candidate fully recomputed,
+        # whatever the search yaml says, so the trainer runs what was priced.
+        result["activation_checkpoint"] = "full"
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "

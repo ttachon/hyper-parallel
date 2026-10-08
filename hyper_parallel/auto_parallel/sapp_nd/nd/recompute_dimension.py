@@ -31,7 +31,7 @@ import copy
 from typing import Any, List, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import hyper_rec_op
 
 RECOMPUTE_MODES = ("off", "selective", "full")
 # The parsers whose recompute is HyperParallel's activation checkpoint mode,
@@ -128,7 +128,7 @@ def state_recompute_mode(ccfg: Any, mode: str) -> None:
     for config in _mode_configs(ccfg):
         config.full_rec = mode == "full"
         config.sel_rec = mode == "selective"
-        config.rec_op = Config(_CostModelParser.hyper_rec_op(config.sel_rec))
+        config.rec_op = Config(hyper_rec_op(config.sel_rec))
 
 
 def parsed_recompute(ccfg: Any) -> List[Tuple[Any, Any, Any, Any]]:

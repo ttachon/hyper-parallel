@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the layer census, the records it states, and their pricing."""
+"""Tests for the layer census, the activations it states in the model spec, and their pricing."""
 import functools
+import importlib
 import os
 import sys
 import tempfile
@@ -28,12 +29,6 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
     CensusUnavailable,
-    KindActivations,
-    _matmul_flops,
-    _measure,
-    _RecomputedMatmuls,
-    _selective_contexts,
-    activations_from_dict,
     census_activations,
     census_final_norm,
     census_flops,
@@ -44,13 +39,20 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_saved_ops,
     census_traffic,
     replacement_specs,
+    _matmul_flops,
+    _measure,
+    _RecomputedMatmuls,
+    _selective_contexts,
     tp_config,
+    _ATTENTION_KERNELS,
 )
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
+from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory import sac
-from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import bind_layer_stack
 
 _HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
 _CAUSAL_LM = "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained"
@@ -68,15 +70,6 @@ def _qwen35_text():
         "shared_expert_intermediate_size": 32, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
         "linear_num_value_heads": 4, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
         "vocab_size": 128, "max_position_embeddings": 256, "layer_types": ["linear_attention", "full_attention"],
-    })
-
-
-def _qwen3():
-    """A two-layer dense Qwen3 config, whose layers are one kind."""
-    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config  # pylint: disable=C0415
-    return Qwen3Config.from_dict({
-        "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
-        "head_dim": 16, "intermediate_size": 128, "vocab_size": 128, "max_position_embeddings": 256,
     })
 
 
@@ -108,9 +101,9 @@ def _qwen35(text):
 
 def _train_yaml(folder: str, target: str = _CAUSAL_LM, mode: str = "off", pp: int = 1,
                 plan_overrides: Optional[list] = None, **context) -> str:
-    """A train yaml of the model on two ranks, at DP shard 2 over PP 1 or on two stages."""
+    """A train yaml of the hybrid model on two ranks, at DP shard 2 over PP 1 or on two stages."""
     config = {
-        "model": {"_target_": target, "pretrained_model_name_or_path": "local/model",
+        "model": {"_target_": target, "pretrained_model_name_or_path": "local/qwen3_5_moe",
                   "torch_dtype": "bfloat16"},
         "training": {"global_batch_size": 4, "micro_batch_size": 1},
         "accelerator": {"tp_size": 1, "pp_size": pp, "ep_size": 1, "cp_size": 1},
@@ -132,6 +125,16 @@ def _evaluator(model_config, **train) -> EvaluatorV2:
     with patch(_HF_CONFIG, return_value=model_config):
         with tempfile.TemporaryDirectory() as folder:
             return EvaluatorV2(_train_yaml(folder, **train), framework="hyper_v2", log_level=0)
+
+
+def _spec(**activations) -> dict:
+    """A two-kind hybrid spec stating *activations*."""
+    return {
+        "name": "qwen3_5_moe", "arch": "qwen3_5", "hidden_size": 64, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "vocab_size": 128,
+        "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+        "layers": _STACK, "activations": activations,
+    }
 
 
 class TestLayerCensus(unittest.TestCase):
@@ -233,29 +236,6 @@ class TestLayerCensus(unittest.TestCase):
         with patch.object(sac, "SAC_IGNORED_OPS", ignored):
             self.assertEqual(census_layer(config, 1, 64, selective=True)[0], kept)
 
-    def test_the_census_takes_the_delta_rule_a_run_takes(self):
-        """
-        Feature: census_layer's gated delta rule.
-        Description: A linear-attention layer censused as the runtime's
-            dispatcher runs it, which defaults to Transformers' chunked
-            implementation, and censused with HyperParallel's kernel, whose
-            contract saves the rule's inputs, its cumulated gates, beta and
-            one chunk matrix and nothing more.
-        Expectation: The default is the eager rule, the kernel's contract
-            keeps strictly less, and a backend the runtime does not have is
-            refused.  A full-attention layer, which runs no delta rule, is
-            the same either way.
-        """
-        config = _qwen35_text()
-        eager, _ = census_layer(config, 0, 64)
-        kernel, _ = census_layer(config, 0, 64, gdn_backend="triton")
-        self.assertEqual(census_layer(config, 0, 64, gdn_backend="eager")[0], eager)
-        self.assertLess(kernel, eager)
-        self.assertEqual(census_layer(config, 1, 64, gdn_backend="triton")[0],
-                         census_layer(config, 1, 64)[0])
-        with self.assertRaises(ValueError):
-            census_layer(config, 0, 64, gdn_backend="fla")
-
     def test_a_census_runs_on_transformers_grouped_mm_fallback(self):
         """
         Feature: census_layer where torch has no CPU grouped_mm kernel.
@@ -295,6 +275,29 @@ class TestLayerCensus(unittest.TestCase):
         with patch.object(torch.ops, "aten", _AtenWithoutGroupedMM()):
             self.assertEqual(_matmul_flops(aten.mm.default, (left, right)), 2 * 4 * 8 * 2)
             self.assertEqual(_matmul_flops(aten.add.Tensor, (left, left)), 0)
+
+    def test_the_census_takes_the_delta_rule_a_run_takes(self):
+        """
+        Feature: census_layer's gated delta rule.
+        Description: A linear-attention layer censused as the runtime's
+            dispatcher runs it, which defaults to Transformers' chunked
+            implementation, and censused with HyperParallel's kernel, whose
+            contract saves the rule's inputs, its cumulated gates, beta and
+            one chunk matrix and nothing more.
+        Expectation: The default is the eager rule, the kernel's contract
+            keeps strictly less, and a backend the runtime does not have is
+            refused.  A full-attention layer, which runs no delta rule, is
+            the same either way.
+        """
+        config = _qwen35_text()
+        eager, _ = census_layer(config, 0, 64)
+        kernel, _ = census_layer(config, 0, 64, gdn_backend="triton")
+        self.assertEqual(census_layer(config, 0, 64, gdn_backend="eager")[0], eager)
+        self.assertLess(kernel, eager)
+        self.assertEqual(census_layer(config, 1, 64, gdn_backend="triton")[0],
+                         census_layer(config, 1, 64)[0])
+        with self.assertRaises(ValueError):
+            census_layer(config, 0, 64, gdn_backend="fla")
 
     def test_each_kind_gets_its_record(self):
         """
@@ -466,53 +469,57 @@ class TestLayerCensus(unittest.TestCase):
 
 
 class TestKindActivations(unittest.TestCase):
-    """A spec states a census's records as plain mappings."""
+    """The model spec states a census's records."""
 
     def test_round_trip_through_yaml(self):
         """
-        Feature: KindActivations.to_dict and activations_from_dict.
-        Description: Each kind's record, dumped to YAML and read back.
-        Expectation: The same records.
+        Feature: ModelSpec.activations.
+        Description: A spec stating each kind's record, dumped to YAML and
+            read back.
+        Expectation: The same spec.
         """
-        record = KindActivations(saved=2036.25, saved_tp=3812.5, working=2162.375, working_tp=3812.5,
-                                 seq_length=64)
-        selective = KindActivations(saved=2036.25, saved_tp=3812.5, working=2162.375, working_tp=3812.5,
-                                    seq_length=64, selective=512.0, selective_tp=1024.5,
-                                    selective_attention_mm=0.25, selective_ffn_mm=0.625,
-                                    ops={"attMM": 1000.25, "other": 1036.0}, ops_tp={"attBMM": 3812.5})
-        dumped = yaml.safe_dump({"linear_attention": selective.to_dict(), "full_attention": record.to_dict()})
-        self.assertNotIn("selective", record.to_dict())
-        self.assertEqual(activations_from_dict(yaml.safe_load(dumped)),
-                         {"linear_attention": selective, "full_attention": record})
+        record = {"saved": 2036.25, "saved_tp": 3812.5, "working": 2162.375, "working_tp": 3812.5,
+                  "seq_length": 64}
+        selective = dict(record, selective=512.0, selective_tp=1024.5, selective_attention_mm=0.25,
+                         selective_ffn_mm=0.625, ops={"attMM": 1000.25, "other": 1036.0},
+                         ops_tp={"attBMM": 3812.5})
+        spec = ModelSpec.from_dict(dict(_spec(linear_attention=selective, full_attention=record),
+                                         output_activations=record))
+        self.assertEqual(spec.activations["linear_attention"].to_dict(), selective)
+        self.assertEqual(spec.activations["full_attention"].to_dict(), record)
+        self.assertIsInstance(spec.activations["linear_attention"], KindActivations)
+        self.assertIsInstance(spec.output_activations, KindActivations)
+        self.assertEqual(ModelSpec.from_dict(yaml.safe_load(yaml.safe_dump(spec.to_dict()))), spec)
 
     def test_a_record_is_checked(self):
         """
-        Feature: KindActivations.from_dict and activations_from_dict.
+        Feature: KindActivations.from_dict and ModelSpec.validate.
         Description: A negative size, a missing field, what a layer keeps
             for each op without the part TP splits, an op the op vector
-            lacks, a negative op's size, a record that is no mapping, and
-            activations that map no kinds.
+            lacks, a negative op's size, and a kind no layer of the stack
+            is.
         Expectation: Each raises, naming what is wrong.
         """
         record = {"saved": 1.0, "saved_tp": 1.0, "working": 1.0, "working_tp": 1.0, "seq_length": 64}
-        with self.assertRaisesRegex(ValueError, "negative"):
-            KindActivations.from_dict(dict(record, saved=-1.0))
-        with self.assertRaisesRegex(ValueError, "lacks"):
-            KindActivations.from_dict({"saved": 1.0})
-        with self.assertRaisesRegex(ValueError, "without the other"):
-            KindActivations.from_dict(dict(record, selective=1.0))
-        with self.assertRaisesRegex(ValueError, "exceed 1"):
-            KindActivations.from_dict(dict(record, selective_attention_mm=0.5, selective_ffn_mm=1.5))
-        with self.assertRaisesRegex(ValueError, "without the other"):
-            KindActivations.from_dict(dict(record, ops={"attMM": 1.0}))
-        with self.assertRaisesRegex(ValueError, "must map ops"):
-            KindActivations.from_dict(dict(record, ops={"matmul": 1.0}, ops_tp={}))
-        with self.assertRaisesRegex(ValueError, "negative"):
-            KindActivations.from_dict(dict(record, ops={"attMM": -1.0}, ops_tp={}))
-        with self.assertRaisesRegex(ValueError, "output_activations must map"):
-            KindActivations.from_dict([1.0], "output_activations")
-        with self.assertRaisesRegex(ValueError, "layer kinds"):
-            activations_from_dict([record])
+        with self.assertRaisesRegex(ModelSpecError, "negative"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, saved=-1.0)))
+        with self.assertRaisesRegex(ModelSpecError, "lacks"):
+            ModelSpec.from_dict(_spec(linear_attention={"saved": 1.0}))
+        with self.assertRaisesRegex(ModelSpecError, "without the other"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, selective=1.0)))
+        with self.assertRaisesRegex(ModelSpecError, "exceed 1"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, selective_attention_mm=0.5,
+                                                            selective_ffn_mm=1.5)))
+        with self.assertRaisesRegex(ModelSpecError, "without the other"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, ops={"attMM": 1.0})))
+        with self.assertRaisesRegex(ModelSpecError, "must map ops"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, ops={"matmul": 1.0}, ops_tp={})))
+        with self.assertRaisesRegex(ModelSpecError, "negative"):
+            ModelSpec.from_dict(_spec(linear_attention=dict(record, ops={"attMM": -1.0}, ops_tp={})))
+        with self.assertRaisesRegex(ModelSpecError, "decoder"):
+            ModelSpec.from_dict(_spec(decoder=record))
+        with self.assertRaisesRegex(ModelSpecError, "output_activations must map"):
+            ModelSpec.from_dict(dict(_spec(), output_activations=[1.0]))
 
 
 # The recipe whose plan_overrides install HyperParallel's fused modules on
@@ -670,6 +677,23 @@ class TestModuleReplacements(unittest.TestCase):
         self.assertEqual(priced.estimate_peak(), _evaluator(_qwen35_text()).estimate_peak())
         self.assertIn("a_native_extension", "".join(logs.output))
 
+    def test_the_policy_saves_the_kernel_the_contract_stands_for(self):
+        """
+        Feature: the runtime operators HyperParallel's selective policy saves,
+            beside the census's contracts for them.
+        Description: The census saves what its attention kernels return
+            because the trainer's policy saves the runtime's; this holds the
+            two lists together (F52).
+        Expectation: The policy's compute operators name the fused attention
+            every adapter calls, ``npu.npu_fusion_attention``, and the sdpa
+            the census's flash attention stands in for.
+        """
+        checkpointing = importlib.import_module("hyper_parallel.distributed.activation_checkpoint")
+        names = checkpointing._SELECTIVE_AC_COMPUTE_OP_NAMES  # pylint: disable=protected-access
+        self.assertIn("npu.npu_fusion_attention", names)
+        self.assertIn("aten.scaled_dot_product_attention", names)
+        self.assertEqual(len(_ATTENTION_KERNELS), 2)
+
     def test_the_contracts_stand_in_for_the_kernels(self):
         """
         Feature: npu_contracts.
@@ -717,9 +741,8 @@ class TestCensusPricing(unittest.TestCase):
         Feature: resolve_hf_model_spec's census_seq_len.
         Description: The hybrid model resolved twice with a census at 48
             tokens, and a spec of config_overrides alone.
-        Expectation: The spec states each kind's record and the output
-            layer's at that length, the census runs once; with no
-            checkpoint config there is none.
+        Expectation: The spec states each kind's record at that length, the
+            census runs once; with no checkpoint config there is none.
         """
         model = {"pretrained_model_name_or_path": "local/qwen3_5_moe"}
         with patch(_HF_CONFIG, return_value=_qwen35_text()), patch(
@@ -740,21 +763,19 @@ class TestCensusPricing(unittest.TestCase):
     def test_each_kind_binds_its_record(self):
         """
         Feature: the Hyper parser's context.census.
-        Description: The hybrid model parsed with a census and without, a
-            dense model whose layers are one kind, and the hybrid model's
-            vision-language checkpoint trained with its tower.
+        Description: The hybrid model parsed with a census and without, and
+            its vision-language checkpoint trained with its tower.
         Expectation: With it, the config holds each kind's record and the
-            output layer's at the dataset's length; a stack of one kind
-            binds its record, a hybrid one its groups'; the tower holds
-            none; without it, there is none.
+            output layer's at the dataset's length, and each kind binds its
+            own; the tower holds none; without it, there is none.
         """
         ccfg = _evaluator(_qwen35_text(), census=True).ccfg
         self.assertEqual({record.seq_length for record in ccfg.census.values()}, {4096})
         self.assertEqual(ccfg.output_census.seq_length, 4096)
         self.assertIsNone(ccfg.kind_activations)
-        dense = _evaluator(_qwen3(), census=True).ccfg
-        self.assertEqual(list(dense.census), ["full_attention"])
-        self.assertIs(dense.kind_activations, dense.census["full_attention"])
+        bind_layer_stack(ccfg)
+        for kind, fields in ccfg.layer_binding.items():
+            self.assertIs(fields["kind_activations"], ccfg.census[kind])
         plain = _evaluator(_qwen35_text()).ccfg
         self.assertIsNone(plain.census)
         self.assertIsNone(plain.output_census)

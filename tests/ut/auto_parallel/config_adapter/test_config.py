@@ -436,6 +436,81 @@ recompute: "full"
         _write_yaml(path, content)
         config = read_search_config(path)
         self.assertEqual(config.estimator["recompute_strategy"], "full")
+        self.assertNotIn("recompute_modes", config.estimator)
+
+    def test_recompute_modes_narrow_the_trainers(self) -> None:
+        """
+        Feature: recompute_modes in a search config.
+        Description: A search choosing a mode per layer among off and full,
+            off unquoted as YAML reads it; then a mode the trainer does not
+            run, and no mode at all.
+        Expectation: The modes reach the estimator, off spelled as the
+            trainer spells it; the other two are refused.
+        """
+        model = """
+model:
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
+  vocab_size: 32000
+recompute: per_layer
+"""
+        path = os.path.join(self.tmpdir, "recompute_modes.yaml")
+        _write_yaml(path, model + "recompute_modes: [off, full]\n")
+        config = read_search_config(path)
+        self.assertEqual(config.estimator["recompute_strategy"], "per_layer")
+        self.assertEqual(config.estimator["recompute_modes"], ("off", "full"))
+        for stated in ("[off, sometimes]", "[]"):
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + f"recompute_modes: {stated}\n")
+                with self.assertRaises(ValueError):
+                    read_search_config(path)
+
+    def test_recompute_as_a_parallelism_dimension(self) -> None:
+        """
+        Feature: parallelism.recompute in a search config.
+        Description: Recompute stated as a degree is: a list, one mode, auto,
+            then with a mode per layer; then stated twice, and a mode the
+            trainer does not run.
+        Expectation: The search chooses among the stated modes for each
+            strategy, or each layer under recompute: per_layer, and auto
+            leaves the modes to the search's defaults; the summary says so.
+            Stating recompute a second time, or a mode the trainer does not
+            run, is refused.
+        """
+        model = """
+model:
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
+  vocab_size: 32000
+"""
+        path = os.path.join(self.tmpdir, "recompute_dimension.yaml")
+        cases = (
+            ("parallelism:\n  recompute: [off, full]\n", "auto", ("off", "full"),
+             "recompute=chosen among ['off', 'full']"),
+            ("parallelism:\n  recompute: full\n", "auto", ("full",), "recompute=chosen among ['full']"),
+            ("parallelism:\n  recompute: auto\n", "auto", None, "recompute=chosen among every mode it can price"),
+            ("parallelism:\n  recompute: [off, full]\nrecompute: per_layer\n", "per_layer", ("off", "full"),
+             "recompute=chosen per layer among ['off', 'full']"),
+        )
+        for stated, strategy, modes, summary in cases:
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + stated)
+                config = read_search_config(path)
+                self.assertEqual(config.estimator["recompute_strategy"], strategy)
+                self.assertEqual(config.estimator.get("recompute_modes"), modes)
+                self.assertTrue(config.parallelism_summary.endswith(summary), config.parallelism_summary)
+        refused = (
+            ("parallelism:\n  recompute: [off, full]\nrecompute_modes: [full]\n", "stated twice"),
+            ("parallelism:\n  recompute: [off, full]\nrecompute: selective\n", "fixes selective"),
+            ("parallelism:\n  recompute: [off, swap]\n", "expected some of off, selective and full"),
+        )
+        for stated, message in refused:
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + stated)
+                with self.assertRaisesRegex(ValueError, message):
+                    read_search_config(path)
 
     def test_fsdp_dimension_mapped(self) -> None:
         """fsdp short name maps to data_parallel_shard_degree."""
@@ -504,6 +579,8 @@ data:
                          "inherited pp should be fixed as [2]")
         # GBS inherited from train.yaml
         self.assertEqual(config.constraint["global_batch_size"], 64)
+
+
     def test_train_yaml_run_reaches_the_search(self) -> None:
         """The train.yaml's run rides along, and the search config's model dtype wins."""
         train_yaml = {
@@ -591,6 +668,28 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(config.pp_config["micro_batch_num"], 8)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_reads_an_indexed_dataset_length(self, mock_get_hf_config) -> None:
+        """An Indexed Dataset's data_config.seq_length is the length, below the Online path's."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=32, hidden_size=4096, intermediate_size=11008,
+            num_attention_heads=32, num_key_value_heads=8, vocab_size=128256,
+            max_position_embeddings=262144, num_experts=1,
+        )
+        indexed = _auto_models_hp_yaml_content().replace(
+            "  data_transform:\n    max_seq_len: 2048\n", "  data_config:\n    seq_length: 8192\n")
+        both = _auto_models_hp_yaml_content().replace(
+            "  data_transform:\n", "  data_config:\n    seq_length: 8192\n  data_transform:\n")
+        for name, content, expected in (("indexed", indexed, 8192), ("both", both, 2048)):
+            with self.subTest(dataset=name):
+                path = os.path.join(self.tmpdir, f"auto_models_{name}.yaml")
+                _write_yaml(path, content)
+
+                config = read_hp_yaml_config(path)
+
+                length = config.model_spec["max_position_embeddings"]
+                self.assertEqual(length, expected, f"dataset={name}, length={length}")
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_spec_carries_head_dim_and_mtp(self, mock_get_hf_config) -> None:
         """Loader resolves head_dim and the Transformers MTP spelling."""
         mock_get_hf_config.return_value = SimpleNamespace(
@@ -637,14 +736,20 @@ class TestHpYamlReader(unittest.TestCase):
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_offline_falls_back_to_overrides(self, mock_get_hf_config) -> None:
-        """An unreachable Transformers config falls back to config_overrides."""
+        """An unreachable Transformers config falls back to config_overrides.
+
+        The overrides are the whole spec on this path, with no resolved
+        config to complete them, so they carry every required field.
+        """
         mock_get_hf_config.side_effect = OSError("no network")
         content = _auto_models_hp_yaml_content().replace(
             "  local_files_only: true",
             "  local_files_only: true\n"
             "  config_overrides:\n"
             "    hidden_size: 1024\n"
-            "    num_hidden_layers: 4",
+            "    num_hidden_layers: 4\n"
+            "    num_attention_heads: 16\n"
+            "    vocab_size: 32000",
         )
         path = os.path.join(self.tmpdir, "auto_models_offline.yaml")
         _write_yaml(path, content)
@@ -653,6 +758,28 @@ class TestHpYamlReader(unittest.TestCase):
 
         self.assertEqual(config.model_spec["hidden_size"], 1024)
         self.assertEqual(config.model_spec["num_hidden_layers"], 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_offline_partial_overrides_raise(self, mock_get_hf_config) -> None:
+        """A fallback that cannot supply the model is refused, not carried.
+
+        Without the resolved config there is nothing to complete a partial
+        override set, so letting one through is how a missing dimension
+        reaches the cost model as a zero.
+        """
+        mock_get_hf_config.side_effect = OSError("no network")
+        content = _auto_models_hp_yaml_content().replace(
+            "  local_files_only: true",
+            "  local_files_only: true\n"
+            "  config_overrides:\n"
+            "    hidden_size: 1024\n"
+            "    num_hidden_layers: 4",
+        )
+        path = os.path.join(self.tmpdir, "auto_models_partial_offline.yaml")
+        _write_yaml(path, content)
+
+        with self.assertRaisesRegex(ValueError, "num_attention_heads"):
+            read_hp_yaml_config(path)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_offline_without_overrides_raises(self, mock_get_hf_config) -> None:
@@ -1299,36 +1426,103 @@ class TestWriter(unittest.TestCase):
         self.assertNotIn("train", data)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
-    def test_write_resolved_yaml_states_the_priced_checkpoint_mode(self) -> None:
-        """The mode the search priced replaces the train yaml's, in each schema's spelling."""
+    def test_write_resolved_yaml_sets_the_chosen_checkpoint_mode(self) -> None:
+        """The activation checkpoint mode the search chose reaches both schemas, in their own spelling."""
         legacy = os.path.join(self.tmpdir, "legacy_ac.yaml")
         with open(legacy, "w", encoding="utf-8") as fh:
             yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {},
-                       "gradient_checkpointing": {"activation_checkpoint": "none"}}}, fh)
+                       "gradient_checkpointing": {"activation_checkpoint": "full"}}}, fh)
         auto_models = os.path.join(self.tmpdir, "auto_models_ac.yaml")
         with open(auto_models, "w", encoding="utf-8") as fh:
             yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
                        "accelerator": {}, "fsdp_config": {},
-                       "activation_checkpoint": {"mode": "off", "swap_inputs": True}}, fh)
-        unstated = os.path.join(self.tmpdir, "auto_models_no_ac.yaml")
-        with open(unstated, "w", encoding="utf-8") as fh:
-            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
-                       "accelerator": {}, "fsdp_config": {}}, fh)
+                       "activation_checkpoint": {"mode": "full", "swap_inputs": True}}, fh)
 
         config = _make_full_config()
-        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full"}
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "off"}
         written = {}
-        for name, path, before in (("legacy", legacy, "none"), ("auto_models", auto_models, "off"),
-                                   ("unstated", unstated, "off")):
+        for name, path in (("legacy", legacy), ("auto_models", auto_models)):
             out = os.path.join(self.tmpdir, f"resolved_{name}.yaml")
             with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
                 write_resolved_yaml(config, path, out)
-            self.assertIn(f"{before} in the train yaml, full in the search", " ".join(logs.output))
+            self.assertIn("full in the train yaml, off in the search", " ".join(logs.output))
             with open(out, "r", encoding="utf-8") as fh:
                 written[name] = yaml.safe_load(fh)
-        self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "full")
-        self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "full", "swap_inputs": True})
-        self.assertEqual(written["unstated"]["activation_checkpoint"], {"mode": "full"})
+        self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "none")
+        self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "off", "swap_inputs": True})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_sets_the_chosen_plan_per_layer(self) -> None:
+        """
+        Feature: write_resolved_yaml, activation_checkpoint_layers.
+        Description: A search that chose full recompute with layers 3 to 7
+            off, written over an AutoModels train.yaml stating a plan of its
+            own and over one stating none; then over the older schema; then a
+            search that chose one mode for every layer, written over the
+            train.yaml with a plan.
+        Expectation: The plan is written as activation_checkpoint.layers,
+            replacing the train.yaml's, whose replacement is logged, with
+            the mode and the train.yaml's other options kept; YAML reads it
+            back with off a string. The older schema has no field for it and
+            is refused. One mode for every layer leaves no plan.
+        """
+        with_plan = os.path.join(self.tmpdir, "auto_models_plan.yaml")
+        with open(with_plan, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "full", "swap_inputs": False, "layers": {"6-7": "off"}}}, fh)
+        without = os.path.join(self.tmpdir, "auto_models_no_plan.yaml")
+        with open(without, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}}, fh)
+        legacy = os.path.join(self.tmpdir, "legacy_plan.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {}}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full",
+                                    "activation_checkpoint_layers": {"3-7": "off"}}
+        out = os.path.join(self.tmpdir, "resolved_plan.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            write_resolved_yaml(config, with_plan, out)
+        self.assertIn("activation_checkpoint.layers {'6-7': 'off'} in the train yaml", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"],
+                             {"mode": "full", "swap_inputs": False, "layers": {"3-7": "off"}})
+        write_resolved_yaml(config, without, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "layers": {"3-7": "off"}})
+        with self.assertRaisesRegex(ValueError, "activation_checkpoint.layers"):
+            write_resolved_yaml(config, legacy, out)
+
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full"}
+        write_resolved_yaml(config, with_plan, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "swap_inputs": False})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_leaves_out_the_cost_models_context(self) -> None:
+        """
+        Feature: write_resolved_yaml, context.
+        Description: An AutoModels train.yaml asking the cost model for a
+            census, which the trainer has no section for.
+        Expectation: The resolved yaml leaves the section out, and says so;
+            the train.yaml keeps it.
+        """
+        path = os.path.join(self.tmpdir, "auto_models_census.yaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}, "context": {"census": True}}, fh)
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2}
+        out = os.path.join(self.tmpdir, "resolved_census.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            write_resolved_yaml(config, path, out)
+        self.assertIn("left out of the resolved yaml", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertNotIn("context", yaml.safe_load(fh))
+        with open(path, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["context"], {"census": True})
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
@@ -1473,34 +1667,11 @@ class TestRecomputeDimension(unittest.TestCase):
             _write_yaml(path, raw)
             return read_search_config(path)
 
-    def test_one_mode_a_list_or_auto(self) -> None:
-        """Each form reaches the estimator, and the summary says how the dimension resolved."""
-        cases = (
-            ("full", ("full",), "recompute=fixed full (declared)"),
-            (["off", "full"], ("off", "full"), "recompute=searched over ['off', 'full']"),
-            ("auto", ("off", "selective", "full"), "recompute=searched over ['off', 'selective', 'full']"),
-        )
-        for stated, modes, summary in cases:
-            with self.subTest(stated=stated):
-                config = self._read(parallelism_recompute=stated)
-                self.assertEqual(config.estimator["recompute_modes"], modes)
-                self.assertTrue(config.parallelism_summary.endswith(summary), config.parallelism_summary)
-
     def test_without_it_nothing_changes(self) -> None:
         """No parallelism.recompute: no modes for the search, and the summary has no recompute part."""
         config = self._read()
         self.assertNotIn("recompute_modes", config.estimator)
         self.assertNotIn("recompute=", config.parallelism_summary)
-
-    def test_refusals(self) -> None:
-        """A value that is no mode, or a second statement of recompute at the top level, is refused."""
-        with self.assertRaisesRegex(ValueError, "parallelism.recompute: 'swap' is not a recompute mode"):
-            self._read(parallelism_recompute="swap")
-        with self.assertRaisesRegex(ValueError, "recompute is stated twice"):
-            self._read(parallelism_recompute=["off", "full"], recompute="selective")
-        self.assertEqual(self._read(parallelism_recompute="full", recompute="none")
-                         .estimator["recompute_modes"], ("full",))
-
 
 if __name__ == "__main__":
     unittest.main()

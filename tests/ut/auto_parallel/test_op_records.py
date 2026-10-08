@@ -20,12 +20,14 @@ How to run this:
 import os
 import tempfile
 import unittest
+from dataclasses import fields
 
 import yaml
 
-from hyper_parallel.auto_parallel._op_records import OPS, PARTS, SWITCHES, Expression, load_op_records
+from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
+from hyper_parallel.auto_parallel._op_records import PARTS, SWITCHES, Expression, load_op_records
 
-_OPS = list(OPS)
+_OPS = [field.name for field in fields(OpCounts)]
 
 
 def _records(data):
@@ -49,13 +51,18 @@ class TestTheRecords(unittest.TestCase):
         """
         Feature: load_op_records.
         Description: The records the package ships.
-        Expectation: Every op of a layer has one; each switch drops
-            what the op it names keeps, and gather is communication; every
-            slot counts toward a part of the layer.
+        Expectation: Every op of the op vector has one; each switch drops
+            what the op or the part it names keeps, attUp the part of
+            attMM's saves an MLA layer's up-projections build, and gather is
+            communication; every slot counts toward a part of the layer.
         """
         records = load_op_records()
         self.assertEqual(sorted(records.ops), sorted(_OPS))
-        self.assertEqual(sorted(op.switch for op in records.ops.values() if op.switch), sorted(SWITCHES))
+        named = [record.switch for record in {**records.ops, **records.parts}.values() if record.switch]
+        self.assertEqual(sorted(named), sorted(SWITCHES))
+        self.assertEqual(records.parts["attUp"].part_of, "attMM")
+        self.assertEqual(sorted(records.keeps("attUp")), ["qkv"])
+        self.assertIn("qkv", records.keeps("attMM"))
         self.assertEqual([name for name, op in records.ops.items() if op.comm], ["gather"])
         self.assertTrue(all(slot.part in PARTS for slot in records.slots.values()))
         self.assertEqual(sorted(records.keeps("dropout")), ["proj", "score"])
@@ -78,9 +85,13 @@ class TestTheRecords(unittest.TestCase):
             (_minimal(qkv={"part": "attention", "formula": "total", "ops": {"attMM": "'h'"}}), "not a number"),
             (_minimal(qkv={"part": "attention", "formula": "h", "ops": {"attMM": "h"}}), "total"),
             (_minimal(qkv={"part": "brain", "formula": "total", "ops": {"attMM": "h"}}), "part"),
+            ({**_minimal(), "parts": {"up": {"part_of": "nothing", "switch": "attUp"}}}, "part of"),
+            ({**_minimal(), "parts": {"up": {"part_of": "attMM"}}}, "part of"),
+            ({**_minimal(), "parts": {"attMM": {"part_of": "attMM", "switch": "attUp"}}}, "named as ops"),
+            (_minimal(qkv={"part": "attention", "formula": "total", "ops": {"up": "h"}}), "no record"),
         ]
         for data, message in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+            with self.subTest(message=message), self.assertRaisesRegex(ModelSpecError, message):
                 _records(data)
 
     def test_a_slot_reads_only_its_branch(self):
@@ -101,6 +112,56 @@ class TestTheRecords(unittest.TestCase):
         self.assertEqual(records.evaluate("qkv", value, lambda op: 1), (10 + 3) * 4 / 2)
         self.assertEqual(records.evaluate("qkv", value, lambda op: int(op != "attBMM")), 10 * 4 / 2)
         self.assertEqual(records.evaluate("qkv", value, lambda op: 0, only="attBMM"), 3 * 4 / 2)
+
+    def test_a_part_counts_toward_its_op(self):
+        """
+        Feature: OpRecords parts.
+        Description: A slot whose op keeps some elements and a part of it,
+            under its own switch, keeps others; evaluated whole, with the
+            part dropped, and with the op and the part each priced alone.
+        Expectation: Dropping the part drops its elements alone; the op
+            priced alone keeps its part's too, and the part alone its own.
+        """
+        records = _records({**_minimal(qkv={
+            "part": "attention", "formula": "total * 2", "ops": {"attMM": "h", "up": "w", "attBMM": "3"}}),
+            "parts": {"up": {"part_of": "attMM", "switch": "attUp", "needs": ["attMM"]}}})
+        value = {"h": 10, "w": 7}.__getitem__
+        self.assertEqual(records.evaluate("qkv", value, lambda op: 1), (10 + 7 + 3) * 2)
+        self.assertEqual(records.evaluate("qkv", value, lambda op: int(op != "up")), (10 + 3) * 2)
+        self.assertEqual(records.evaluate("qkv", value, lambda op: 0, only="attMM"), (10 + 7) * 2)
+        self.assertEqual(records.evaluate("qkv", value, lambda op: 0, only="up"), 7 * 2)
+        self.assertEqual(records.record("up").switch, "attUp")
+
+    def test_the_heads_of_an_mla_layer_are_a_part_of_its_projections(self):
+        """
+        Feature: The attUp part of the qkv slot.
+        Description: The qkv slot of an MLA layer with a queries' latent, of
+            one without, and of a layer that compresses nothing, evaluated
+            with every op kept, with attUp dropped, and attMM alone.
+        Expectation: attMM priced alone, its part with it, keeps what the
+            slot kept as one expression; attUp holds the query heads where
+            the queries have a latent and the key and value heads, and
+            nothing where the layer compresses nothing.
+        """
+        records = load_op_records()
+        base = {"n_attMM": 4, "n_attParamCast": 0, "a": 128, "dh": 128, "dhr": 64, "n_kv": 128, "dc_kv": 512,
+                "h": 7168, "cp": 2, "kv_shards": 1, "n_attBMM": 2}
+        formula = {"micro_factor": 1, "s": 4096, "b": 1, "bytes_compute": 2, "t": 1}
+        for dc_q in (1536, 0):
+            names = {**base, **formula, "dc_q": dc_q}
+            whole = (dc_q + 2 * 128 * (128 + 64)) + (64 + 128 * (2 * 128 + 64) + 128 * 128 + 512) * 2 / 1
+            heads = (2 * 128 * (128 + 64) if dc_q else 0) + 128 * (2 * 128 + 64) * 2 / 1
+            scale = 4096 * 2 / (1 * 2)
+            with self.subTest(dc_q=dc_q):
+                self.assertEqual(records.evaluate("qkv", names.__getitem__, lambda op: 0, only="attMM"),
+                                 whole * scale)
+                self.assertEqual(records.evaluate("qkv", names.__getitem__, lambda op: 0, only="attUp"),
+                                 heads * scale)
+                kept = records.evaluate("qkv", names.__getitem__, lambda op: 1)
+                dropped = records.evaluate("qkv", names.__getitem__, lambda op: int(op != "attUp"))
+                self.assertEqual(kept - dropped, heads * scale)
+        names = {**base, **formula, "dc_kv": 0, "dc_q": 0}
+        self.assertEqual(records.evaluate("qkv", names.__getitem__, lambda op: 0, only="attUp"), 0)
 
     def test_an_expression_keeps_python_arithmetic(self):
         """

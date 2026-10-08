@@ -26,7 +26,9 @@ from unittest.mock import patch
 
 import yaml
 
-from hyper_parallel.auto_parallel._layer_census import KindActivations
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
+from hyper_parallel.auto_parallel._model_spec import KindActivations, OpCounts
+from hyper_parallel.auto_parallel._op_profiles import LayerKind
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
@@ -35,9 +37,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils imp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    HYPER_SELECTIVE_REC_OP,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_comp
@@ -46,6 +46,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_model_order,
     get_recomp_factor,
     get_table_quantity,
+    mla_weights,
     selective_shares,
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
@@ -54,26 +55,27 @@ EMB, OUT, LAY = LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER, LayerType.NOT
 FULL, LINEAR = "full_attention", "linear_attention"
 
 
-def _marking(kind: str):
-    """A layer hook that only records which group it belongs to."""
-
-    def hook(cfg: Any) -> None:
-        """Mark *cfg* with the group's kind."""
-        cfg.kind = kind
-
-    return hook
+# Kinds A, B and C, told apart by how many gathers a layer runs.
+_KINDS = {
+    name: LayerKind(name, OpCounts.from_dict({
+        "attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1, "dropout": 0, "normOp": 2,
+        "gather": gather, "headCast": 1, "ffAct": 1, "linrec": 0,
+    }))
+    for gather, name in enumerate("ABC", start=1)
+}
 
 
 def _config(groups, p: int = 1, vp: int = 1, sched: str = "1f1b") -> SimpleNamespace:
-    """A bare config with *groups* as its layer_custom_config."""
-    return SimpleNamespace(p=p, vp=vp, pp_sched=sched, n_lay=0, kind=None,
-                           layer_custom_config=[(count, _marking(kind)) for count, kind in groups])
+    """A bare config whose stack runs *groups*, ``(count, kind name)`` pairs."""
+    stack = LayerStack("unit", tuple(StackGroup(_KINDS[name], count) for count, name in groups))
+    return SimpleNamespace(p=p, vp=vp, pp_sched=sched, n_lay=sum(count for count, _ in groups),
+                           n_mtp=0, has_op=False, n_gather=0, layer_stack=stack)
 
 
 def _kinds_in_model_order(cfg, stages):
-    """The group each regular layer is priced with, in model order."""
+    """The kind each regular layer is priced with, in model order."""
     by_position = get_layer_configs_by_position(cfg, stages)
-    return [by_position[position].kind for position in get_model_order(cfg, stages)]
+    return ["ABC"[by_position[position].n_gather - 1] for position in get_model_order(cfg, stages)]
 
 
 def _hybrid_config(folder: str, layer_types: List[str], pp: int = 1, vp: int = 1,
@@ -166,8 +168,8 @@ class TestGroupBoundaries(unittest.TestCase):
         stages = [[[EMB, LAY], [LAY]], [[LAY], [LAY, OUT]]]
         cfg = _config([(2, "A"), (2, "B")], p=2, vp=2)
         by_position = get_layer_configs_by_position(cfg, stages)
-        self.assertEqual(by_position[(1, 0, 0)].kind, "A")
-        self.assertEqual(by_position[(0, 1, 0)].kind, "B")
+        self.assertEqual(by_position[(1, 0, 0)].n_gather, 1)
+        self.assertEqual(by_position[(0, 1, 0)].n_gather, 2)
 
     def test_layers_past_the_groups_keep_the_last(self):
         """
@@ -246,8 +248,8 @@ class TestPerformanceAgreesWithMemory(unittest.TestCase):
     def test_comm_path_follows_model_order(self):
         """
         Feature: one layer order for every estimator.
-        Description: The communication estimate applies each layer's group
-            hook as it walks the stages one at a time.  Record the kind each
+        Description: The communication estimate applies each layer's kind
+            as it walks the stages one at a time.  Record the kind each
             layer's DP term sees, in that walk: under FSDP, the parts its
             traffic reads.
         Expectation: Stage 0 holds model layers 0-1 and 4-5, both full
@@ -412,6 +414,48 @@ class TestSelectiveRecompute(unittest.TestCase):
         self.assertEqual(selective_shares(lccfg, LayerType.FULL_REC_LAYER), {})
         lccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP, ffAct=1))
         self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER), {})
+
+    def test_an_mla_layer_recomputing_its_up_projections_runs_their_share_again(self):
+        """
+        A selective MLA layer whose attUp switch is 0, its config's or its
+        own, prices its up-projections' share of its projections' FLOPs
+        again: the queries' from their latent and the keys' and values' from
+        theirs.  Kept, in a full layer, or in a layer that compresses
+        nothing, it prices none.
+        """
+        lccfg = SimpleNamespace(dh=128, dhr=64, qk_nope_head_dim=128, a=128, n_kv=128, h=7168, dc_q=1536,
+                                dc_kv=512, n_attMM=1, rec_op=Config({"attUp": 0}), kind_activations=None)
+        heads = 128 * (128 + 64)
+        up = 1536 * heads + 512 * 128 * (128 + 128)
+        weights = 1536 * (7168 + heads) + 7168 * (512 + 64) + 512 * 128 * (128 + 128) + 128 * 128 * 7168
+        self.assertEqual(mla_weights(lccfg), (weights, up))
+        shares = selective_shares(lccfg, LayerType.SEL_REC_LAYER)
+        self.assertEqual(shares, {"attMM": up / weights})
+        table = {"n_attMM": 1000.0}
+        once = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, False, shares=shares)
+        again = get_table_quantity(lccfg, table, LayerType.SEL_REC_LAYER, True, shares=shares)
+        self.assertAlmostEqual(again - once, 1000.0 * up / weights, places=9)
+        self.assertEqual(selective_shares(lccfg, LayerType.FULL_REC_LAYER), {})
+        lccfg.rec_op = Config({"attUp": 1})
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER), {})
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER, {"attUp": 0}), {"attMM": up / weights})
+        lccfg.dc_q = 0
+        self.assertEqual(mla_weights(lccfg)[1], 512 * 128 * (128 + 128))
+        lccfg.dc_kv = 0
+        self.assertEqual(selective_shares(lccfg, LayerType.SEL_REC_LAYER, {"attUp": 0}), {})
+
+    def test_a_switch_a_setting_leaves_out_keeps_its_op(self):
+        """
+        A setting stated before attUp existed, in a config's rec_op, whose
+        Config answers 0 for a switch it lacks, or in a mapping: memory
+        keeps the op and time runs it once, as for a switch at 1.
+        """
+        for rec_op in (Config(_SWITCHES), dict(_SWITCHES)):
+            ccfg = SimpleNamespace(rec_op=rec_op)
+            self.assertEqual(EvalUtils.switch(ccfg, SimpleNamespace(switches=None), "attUp"), 1, rec_op)
+            self.assertEqual(EvalUtils.switch(ccfg, SimpleNamespace(switches=None), "softmax"), 0, rec_op)
+        self.assertEqual(EvalUtils.switch(SimpleNamespace(rec_op=None), SimpleNamespace(switches={}), "attUp"), 1)
+        self.assertEqual(_factor(Config(_SWITCHES), "attUp"), 0)
 
 
 if __name__ == "__main__":

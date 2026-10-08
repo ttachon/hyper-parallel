@@ -182,7 +182,6 @@ class TestRatios(unittest.TestCase):
         self.assertIn("the trainer's own on 1 of 3 strategies", mixed[-1])
         self.assertIn("the fastest, DP 64 EP 2, 600.0",
                       [line for line in mixed if line.startswith("Corrected, ND ranks")][0])
-
     def test_a_file_missing_ratios_takes_what_the_fit_would_give(self):
         """
         Feature: estimate.apply_regression_coefficients on a partial ratios file.

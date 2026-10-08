@@ -30,8 +30,9 @@ from typing import Any
 from unittest.mock import patch
 
 import matplotlib.pyplot as plt
-import yaml
 
+from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
+from hyper_parallel.auto_parallel._op_profiles import load_op_profile
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook, hook_runner
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
@@ -43,10 +44,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHoo
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import cost_model_preprocess as PreProcess
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    HYPER_SELECTIVE_REC_OP,
-    _CostModelParser,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive_comm_flags
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
     CostModelParserHyperparallel,
 )
@@ -193,6 +191,7 @@ class _FakeParallelize:
         self.kwargs = kwargs
         self.run_args = None
         self.run_kwargs = None
+        self.to_ppb_calls = []
         self.compare_args = None
         self.__class__.instances.append(self)
 
@@ -202,6 +201,9 @@ class _FakeParallelize:
         self.run_kwargs = kwargs
         return [("parallel-config", 128.0, 1.0, {})]
 
+    def to_ppb(self, *args: Any) -> None:
+        """Record which configuration the CLI hands to pipeline balancing."""
+        self.to_ppb_calls.append(args)
     def compare_with_csv(self, csv_f: str, output_path: Any = None, plot_idle: bool = False) -> tuple:
         """Return one measured configuration and its metrics without estimating."""
         self.compare_args = (csv_f, output_path, plot_idle)
@@ -279,7 +281,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "comm_ep": 1.0,
         "comm_dp_overlap": 0.9,
         "comm_tp_overlap": 0.5,
-        "layer_custom_config": [(2, None)],
         "n_lay": 2,
         "n_mtp": 1,
         "gbs": 8,
@@ -290,7 +291,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "n_attMM": 1,
         "n_ffMM": 1,
         "n_attBMM": 1,
-        "n_ffBMM": 1,
         "n_softmax": 1,
         "n_headCast": 1,
         "n_gather": 1,
@@ -301,7 +301,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
             attMM=1,
             ffMM=1,
             attBMM=1,
-            ffBMM=1,
             softmax=1,
             headCast=1,
             gather=1,
@@ -315,7 +314,7 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
 
 
 def _make_arch_cfg(**kwargs: Any) -> SimpleNamespace:
-    """Build a tiny config for arch hook functions."""
+    """Build a tiny config to apply a family to."""
     defaults = {
         "model_name": "deepseek-unit",
         "has_op": False,
@@ -797,33 +796,6 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.check_and_apply_custom_hook(wrapper)
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
 
-    def test_a_model_takes_the_profile_of_the_family_its_name_opens_with(self) -> None:
-        """
-        Feature: arch_hooks.family_hook and check_and_apply_custom_hook (I8).
-        Description: The golden harness's model names, a name holding two
-            families, one holding cm in the middle, and an unknown family
-            routed twice.
-        Expectation: Each known name takes the profile it took before; the
-            two-family name takes the family it opens with, where list order
-            gave it DeepSeek's; cm in the middle takes nothing; the unknown
-            family takes the default profile and says so once.
-        """
-        hooks = {"deepseekV3": ArchHooks.custom_deepseek3, "cm_llama_moe": ArchHooks.custom_cm,
-                 "Qwen3": ArchHooks.custom_qwen, "llama2_70b": ArchHooks.custom_llama2,
-                 "pangualpha_13b": ArchHooks.custom_pangualpha, "t5_xl": ArchHooks.custom_t5,
-                 "mixtral-8x7b": ArchHooks.custom_mixtral, "qwen3_5_moe": ArchHooks.custom_qwen,
-                 "deepseek_v3": ArchHooks.custom_deepseek3, "llama": None, "gpt_xl": None,
-                 "qwen2_deepseek_distill": ArchHooks.custom_qwen, "acme_lm": None}
-        self.assertEqual({name: ArchHooks.family_hook(name) for name in hooks}, hooks)
-        wrapped_cfg = _FakeCostModelConfig()
-        wrapped_cfg.model_name = "glm4_moe"
-        with patch.object(ArchHooks, "_DEFAULTED_NAMES", set()), patch.object(ArchHooks.logger, "output") as said:
-            for _ in range(2):
-                ArchHooks.check_and_apply_custom_hook(ArchHooks.CWrap(wrapped_cfg))
-        self.assertEqual(said.call_count, 1)
-        self.assertEqual(said.call_args.args[1], "glm4_moe")
-        self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
-
     def test_ep_constraints_valid_in_global_config(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -898,6 +870,87 @@ class TestSappNDRunND(unittest.TestCase):
             (2, 5, 1, 1), (4, 1), (4, 1, 2, False)
         )
         self.assertTrue(gc_etp.ep_constraints_valid(pc_etp))
+
+    def test_run_nd_cli_writes_the_ppb_description_of_rank_k(self) -> None:
+        """
+        Feature: run_nd -k/--ppb_k.
+        Description: Rank the space, then ask for the pipeline balancer's
+            description of rank 0, then of a rank the space does not have.
+        Expectation: Rank 0 is handed to to_ppb under the yaml's name; the
+            missing rank is refused before anything is written.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-k", "0"]
+            with patch.object(sys, "argv", argv):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].to_ppb_calls,
+                             [([("parallel-config", 128.0, 1.0, {})], 0, "deepseek")])
+
+            argv[-1] = "1"
+            with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].to_ppb_calls, [])
+
+    def test_run_nd_cli_asks_for_auto_recompute(self) -> None:
+        """
+        Feature: run_nd -ar/--auto_recompute.
+        Description: Ask for auto recompute alone, then with the yaml's
+            recompute, then with a search config.
+        Expectation: Alone, the search is built with it; with the yaml's
+            recompute, the command line is refused before any search is
+            built; a search config is told to choose its recompute.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-ar"]
+            with patch.object(sys, "argv", argv):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertTrue(_FakeParallelize.instances[-1].kwargs["auto_recompute"])
+            _FakeParallelize.instances = []
+            with patch.object(sys, "argv", argv + ["-mppb"]), self.assertRaises(SystemExit):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances, [])
+        run_nd = runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="run_nd")
+        search_cfg = SimpleNamespace(constraint={}, cluster_spec={}, estimator={"recompute_strategy": "full"})
+        cli = SimpleNamespace(global_batch_size=None, max_mem=None, devices=None, device_type=None, auto_recompute=True)
+        run_nd["_apply_cli_overrides"](search_cfg, cli)
+        self.assertEqual(search_cfg.estimator["recompute_strategy"], "auto")
+
+    def test_run_nd_cli_asks_for_auto_offload(self) -> None:
+        """
+        Feature: run_nd -ao/--auto_offload.
+        Description: Ask for offload with auto recompute, then with the
+            link's figures stated, then without auto recompute, then the
+            figures without offload, then with a search config.
+        Expectation: The search gets the device's link, then one with the
+            stated figures; the last three command lines are refused before
+            any search is built.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-A", "A3"]
+            with patch.object(sys, "argv", argv + ["-ar", "-ao"]):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            kwargs = _FakeParallelize.instances[-1].kwargs
+            self.assertTrue(kwargs["auto_offload"])
+            self.assertEqual(kwargs["host_link"], Hard.Device_A3.host_link)
+            with patch.object(sys, "argv", argv + ["-ar", "-ao", "--host_link_gibps", "32",
+                                                   "--sustained_tflops", "200"]):
+                runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances[-1].kwargs["host_link"],
+                             Hard.HostLink(gib_per_s=32.0, sustained_tflops=200.0))
+            _FakeParallelize.instances = []
+            for extra in (["-ao"], ["-ar", "--host_link_gibps", "32"], ["-ar", "-ao", "-s", config_path]):
+                with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances, [])
 
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """
@@ -1662,6 +1715,7 @@ class TestSappNDRunND(unittest.TestCase):
         dims = Dim.Dimensions([(Dim.DP, 8), (Dim.OP, 4)], all_dims=[Dim.DP, Dim.OP])
         runner = object.__new__(Par.ParallelizeLayer)
         runner.enable_debug = True
+        runner.auto_recompute = False
         runner.model_name = "unit"
         runner.global_batch_size = 8
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
@@ -1732,82 +1786,56 @@ class TestSappNDRunND(unittest.TestCase):
     def test_arch_hook_variants(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover predefined architecture hooks using tiny fake configs.
-        Expectation: Hooks update model-specific attributes and layer custom hooks.
+        Description: Apply each family to tiny fake configs.
+        Expectation: Each family's profile sets its fields, and each stack kind applies per layer.
         """
-        cfg = _make_arch_cfg(model_name="llama2")
-        ArchHooks.custom_default_transformer(cfg)
+        cfg = _make_arch_cfg(arch="default")
+        ArchHooks.apply_family(cfg)
         self.assertEqual(cfg.n_attMM, 4)
-        ArchHooks.custom_llama2(cfg)
+        cfg.arch = "llama2"
+        ArchHooks.apply_family(cfg)
         self.assertEqual(cfg.bytes_grad, 2)
-        ArchHooks.custom_mixtral(cfg)
-        self.assertEqual(cfg.hff, cfg.hff_exp)
-        self.assertEqual((cfg.n_ffMM, cfg.n_ffBMM, cfg.n_ffParamCast), (3, 0, 3))
-        self.assertEqual((cfg.n_softmax, cfg.n_normOp), (1, 2))
-        ArchHooks.custom_pangualpha(cfg)
-        self.assertEqual(cfg.n_normOp, 4)
-        ArchHooks.custom_qwen(cfg)
-        self.assertEqual(cfg.shard_recompute_input, cfg.t)
+        cfg.arch = "mixtral"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.bytes_grad, cfg.hff), (2, 32))
+        cfg.arch = "pangualpha"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.n_normOp, cfg.bytes_dropout), (4, 1))
+        cfg.arch = "qwen"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.shard_recompute_input, cfg.shard_output_activ), (cfg.t, cfg.t))
 
-        t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
-        ArchHooks.custom_t5(t5_cfg)
-        self.assertEqual(len(t5_cfg.layer_custom_config), 2)
-        # The model takes the widths its layers take, for the embedding and the output layer.
-        widths = (t5_cfg.bytes_grad, t5_cfg.bytes_os, t5_cfg.bytes_dropout, t5_cfg.bytes_norm)
-        self.assertEqual(widths, (4, 4, 1, 4))
+        t5_cfg = _make_arch_cfg(arch="t5", n_lay=4, n_mtp=0)
+        t5_cfg.layer_stack = resolve_layers("t5", derive_layers(load_op_profile("t5"), 4))
+        ArchHooks.apply_family(t5_cfg)
+        ArchHooks.bind_layer_stack(t5_cfg)
+        t5_groups = ArchHooks.layer_groups(t5_cfg)
+        self.assertEqual(len(t5_groups), 2)
         t5_wrap = ArchHooks.CWrap(t5_cfg)
-        t5_cfg.layer_custom_config[0][1](t5_wrap)
+        ArchHooks.apply_layer_kind(t5_wrap, t5_groups[0][0])
         self.assertEqual(t5_cfg.n_attBMM, 1)
-        t5_cfg.layer_custom_config[1][1](t5_wrap)
+        ArchHooks.apply_layer_kind(t5_wrap, t5_groups[1][0])
         self.assertEqual(t5_cfg.n_attMM, 8)
 
-        deepseek_cfg = _make_arch_cfg(model_name="deepseek")
-        ArchHooks.custom_deepseek3(deepseek_cfg)
-        self.assertEqual(len(deepseek_cfg.layer_custom_config), 3)
+        deepseek_cfg = _make_arch_cfg(arch="deepseek")
+        deepseek_cfg.layer_stack = resolve_layers(
+            "deepseek", derive_layers(load_op_profile("deepseek"), 4, 1, first_k_dense=2)
+        )
+        ArchHooks.apply_family(deepseek_cfg)
+        self.assertEqual(deepseek_cfg.dh, 128)
+        ArchHooks.bind_layer_stack(deepseek_cfg)
+        deepseek_groups = ArchHooks.layer_groups(deepseek_cfg)
+        self.assertEqual(len(deepseek_groups), 3)
         deepseek_wrap = ArchHooks.CWrap(deepseek_cfg)
-        deepseek_cfg.layer_custom_config[0][1](deepseek_wrap)
+        ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[0][0])
         self.assertEqual(deepseek_cfg.n_exp, 1)
-        deepseek_cfg.layer_custom_config[1][1](deepseek_wrap)
+        ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[1][0])
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
-        # A dense layer runs the parser's feed-forward width in every format:
-        # MindFormers and hyper_v2 (yaml), MindSpeed (json) and TorchTitan
-        # (toml), none of which sets ffn_hidden_size.
-        for config_format in ("yaml", "json", "toml"):
-            with self.subTest(config_format=config_format):
-                dense_cfg = _make_arch_cfg(model_name="deepseek", config_format=config_format,
-                                           ffn_hidden_size=0, specs=SimpleNamespace(inter_dim=64, hidden_dim=0))
-                ArchHooks.custom_deepseek3(dense_cfg)
-                dense_cfg.layer_custom_config[0][1](ArchHooks.CWrap(dense_cfg))
-                self.assertEqual((dense_cfg.hff, dense_cfg.n_exp), (32, 1))
-
-        cm_cfg = _make_arch_cfg(model_name="cm")
-        ArchHooks.custom_cm(cm_cfg)
-        self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
-        self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
-
-    def test_an_fsdp_run_keeps_gradients_as_its_parameters(self) -> None:
-        """
-        Feature: TestSappNDRunND.
-        Description: A family hook applied to a run whose FSDP holds each gradient as its
-            parameter, without pipeline parallelism, and to one that does not.
-        Expectation: The first keeps gradients in the parameters' width at PP 1; the second keeps
-            none, but llama2's two-byte ones.
-        """
-        for hook, grads_as_params, want in (
-            (ArchHooks.custom_default_transformer, True, 2),
-            (ArchHooks.custom_llama2, True, 2),
-            (ArchHooks.custom_default_transformer, False, 0),
-            (ArchHooks.custom_llama2, False, 2),
-        ):
-            with self.subTest(hook=hook.__name__, grads_as_params=grads_as_params):
-                cfg = _make_arch_cfg(p=1, bytes_p=2, grads_as_params=grads_as_params)
-                hook(cfg)
-                self.assertEqual(cfg.bytes_grad, want)
-        fp32 = _make_arch_cfg(p=1, bytes_p=4, grads_as_params=True)
-        ArchHooks.custom_llama2(fp32)
-        self.assertEqual(fp32.bytes_grad, 4)
-        self.assertTrue(fp32.accumulates_grads)
+        cm_cfg = _make_arch_cfg(arch="cm")
+        ArchHooks.apply_family(cm_cfg)
+        self.assertEqual(cm_cfg.layer_fields,
+                         {"shard_p_os_exp": 2, "shard_p_os_non_exp_partial": 2, "shard_embed": 2})
 
     def test_the_pipeline_takes_the_all_reduce_out_of_dp(self) -> None:
         """
@@ -1830,7 +1858,8 @@ class TestSappNDRunND(unittest.TestCase):
                 debugger.info[Debug.PerfParts.DP_REDUCE] = reduces
             time = PerfEstimate.estimate_pipeline(cfg, [12.0, 18.0], debugger=debugger)
             runs.append((time, dict(debugger.info)))
-        (plain_time, plain), (split_time, split) = runs
+        plain_time, plain = runs[0]
+        split_time, split = runs[1]
         self.assertEqual(split_time, plain_time)
         self.assertEqual(split[Debug.PerfParts.BUBBLE], plain[Debug.PerfParts.BUBBLE])
         self.assertEqual(plain[Debug.PerfParts.DP_REDUCE], 0)
@@ -2032,10 +2061,8 @@ class TestSappNDRunND(unittest.TestCase):
             path counts them, and the layer's DP term carries them.
         """
         ccfg = CostModelConfig(config_path)
-        ArchHooks.check_and_apply_custom_hook(ccfg)
-        # DeepSeek's layer groups are its dense layers, its MoE layers and its MTP layer.
-        _, hook_moe = ccfg.layer_custom_config[1]
-        hook_moe(ccfg)
+        moe = next(kind for kind in ArchHooks.layer_kinds(ccfg) if kind is not None and kind.name == "moe")
+        ArchHooks.apply_layer_kind(ccfg, moe)
         ctx = CommTime.prepare_context()
         ctx.current_node = LayerType.NOT_REC_LAYER
         _, routed, shared = CommTime.EvalBody.num_params_layer(ccfg, ctx)
@@ -2157,17 +2184,13 @@ class TestSappNDRunND(unittest.TestCase):
         Feature: TestSappNDRunND.
         Description: Verify the transitional comm overlap fields
             (comm_dp_overlap, comm_tp_overlap) are populated by the real
-            framework parsers via config_comm_flag — the mechanism that
+            framework parsers through derive, which is what
             estimate_from_mem_comm reads on the search (FLOP) path.
         Expectation: After parsing, both overlap fields hold the documented
-            defaults (0.9 and 0.5).  CostModelParserHyperparallel and
-            CostModelParserMindformers both call the base config_comm_flag,
-            so the hyperparallel path covers both.  CostModelParserMindspeed
-            has an inline copy (see cost_model_parser_mindspeed.py:293-294)
-            but is not tested here per project priority.
+            defaults (0.9 and 0.5).  Every parser calls derive, so the
+            hyperparallel path covers them all.
         """
-        # --- Hyperparallel path: calls base config_comm_flag ---
-        # (same base method is also called by CostModelParserMindformers)
+        # --- Hyperparallel path: calls derive ---
         with tempfile.TemporaryDirectory() as tmp_dir:
             source_path = os.path.join(tmp_dir, "__init__.py")
             with open(source_path, "w", encoding="utf-8") as source_file:
@@ -2207,8 +2230,7 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.comm_dp_overlap, 0.9)
             self.assertEqual(hp_ccfg.comm_tp_overlap, 0.5)
 
-        # --- Direct test of base _CostModelParser.config_comm_flag ---
-        # Covers the shared method used by mindformers and hyper parsers.
+        # --- Direct test of derive_comm_flags ---
         ccfg_direct = _ParserCostModelConfig()
         ccfg_direct.d = 2
         ccfg_direct.t = 2
@@ -2217,14 +2239,7 @@ class TestSappNDRunND(unittest.TestCase):
         ccfg_direct.has_op = True
         ccfg_direct.has_grad_shard = True
         ccfg_direct.n_exp = 1
-
-        class _ConcreteParser(_CostModelParser):
-            """Concrete subclass for testing the abstract base."""
-
-            def parse(self) -> None:
-                """No-op parse; only config_comm_flag is under test."""
-                return None
-        _ConcreteParser(ccfg_direct).config_comm_flag(ccfg_direct)
+        derive_comm_flags(ccfg_direct)
         self.assertEqual(ccfg_direct.comm_dp_overlap, 0.9)
         self.assertEqual(ccfg_direct.comm_tp_overlap, 0.5)
 
@@ -2331,7 +2346,7 @@ class TestSappNDRunND(unittest.TestCase):
             CostModelParserHyperparallel(hp_ccfg).parse()
             self.assertEqual(hp_ccfg.model_name, "llama-unit")
             self.assertEqual(hp_ccfg.vp, 2)
-            self.assertEqual(hp_ccfg.layer_custom_config, [(2, None)])
+            self.assertEqual(ArchHooks.layer_groups(hp_ccfg), [(None, 2)])
             self.assertEqual(vars(hp_ccfg.rec_op), dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1))
 
             hp_config.activation_checkpoint.mode = "selective"
@@ -2416,22 +2431,17 @@ class TestSappNDRunND(unittest.TestCase):
         })
         ms_ccfg.hooks_dict = {"vit": None, "qwen3": None}
         CostModelParserMindspeed(ms_ccfg).parse()
-        self.assertEqual(ms_ccfg.mm_ccfgs["qwen3"].layer_custom_config, [(5, None)])
-        self.assertEqual(ms_ccfg.mm_ccfgs["vit"].layer_custom_config, [(2, None)])
+        self.assertEqual(ArchHooks.layer_groups(ms_ccfg.mm_ccfgs["qwen3"]), [(None, 5)])
+        self.assertEqual(ArchHooks.layer_groups(ms_ccfg.mm_ccfgs["vit"]), [(None, 2)])
 
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover cost-model copying, validation and strategy mutation with fake parser hooks.
-        Expectation: Strategy fields update consistently without parsing a model config.
+        Description: Cover cost-model copying, validation and strategy mutation without a parser.
+        Expectation: Strategy fields update consistently without parsing a model config, and the
+            fields derived from them follow.
         """
-        parser_calls = []
-        parser = SimpleNamespace(
-            config_shard_emb=lambda cfg: parser_calls.append(("embed", cfg.d, cfg.t)),
-            config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
-            config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
-            config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
-        )
+        parser = SimpleNamespace()
         cost_cfg = object.__new__(CostModelConfig)
         cost_cfg.__dict__.update(
             model_name="unit",
@@ -2462,7 +2472,8 @@ class TestSappNDRunND(unittest.TestCase):
             shard_embed=1,
             shard_output_activ=1,
             shard_recompute_input=1,
-            layer_custom_config=[],
+            n_exp=1,
+            hff_exp=8,
         )
 
         self.assertIn("model_name", str(cost_cfg))
@@ -2499,8 +2510,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        # The refresh reaches the config the strategy changed, with its new degrees.
-        self.assertIn(("embed", 4, 2), parser_calls)
+        self.assertEqual(cost_cfg.shard_embed, 8, f"shard_embed={cost_cfg.shard_embed}, want d * t = 8")
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):
@@ -2509,26 +2519,7 @@ class TestSappNDRunND(unittest.TestCase):
 
         self._test_multimodal_strategy(cost_cfg)
 
-        hook_calls = []
-
-        def original_hook(target: Any) -> None:
-            """Record execution of the original layer hook."""
-            hook_calls.append(("original", target))
-
-        def custom_hook(target: Any) -> None:
-            """Record execution of the injected cost-model hook."""
-            hook_calls.append(("custom", target))
-
-        cost_cfg.layer_custom_config = [(1, original_hook)]
-        cost_cfg.layer_custom_config_callback(custom_hook)
-        wrapped_hook = cost_cfg.layer_custom_config[0][1]
-        wrapped_hook(cost_cfg)
-        evaluator = SimpleNamespace(set_ccfg=lambda hook: hook_calls.append(("set_ccfg", hook)))
-        wrapped_hook(evaluator)
-        self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
-        self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
-
-    def test_strategy_change_refreshes_mindformers_fields(self) -> None:
+    def test_strategy_change_derives_mindformers_fields(self) -> None:
         """
         Feature: TestSappNDRunND.
         Description: The DeepSeek MindFormers yaml keeps its recompute input sliced at TP 4
@@ -2541,15 +2532,11 @@ class TestSappNDRunND(unittest.TestCase):
         cfg.set_strategy(mp=1)
         self.assertEqual(cfg.shard_recompute_input, 1, f"at TP 1 shard_recompute_input={cfg.shard_recompute_input}")
 
-        with open(config_path, encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
-        data["recompute_config"]["select_recompute"] = True
-        selective = CostModelConfig(data)
-        selective.set_strategy(mp=2)
-        dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
+        cfg.set_strategy(mp=2, sel_rec=True)
+        dropped = sorted(op for op, keep in vars(cfg.rec_op).items() if not keep)
         self.assertEqual(dropped, ["ffAct", "headCast", "normOp"], f"recomputed at TP 2: {dropped}")
-        selective.set_strategy(mp=1)
-        dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
+        cfg.set_strategy(mp=1, sel_rec=True)
+        dropped = sorted(op for op, keep in vars(cfg.rec_op).items() if not keep)
         self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
@@ -2589,6 +2576,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.global_batch_size = 8
         runner.model_name = "unit"
         runner.enable_debug = False
+        runner.auto_recompute = False
         runner.mem_eval = SimpleNamespace(
             mem_fit=lambda peak: peak < 100,
             get_strategy=lambda: {},

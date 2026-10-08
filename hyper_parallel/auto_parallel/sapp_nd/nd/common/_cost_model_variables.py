@@ -39,16 +39,31 @@ class _CostModVar:
     config_format: str = None
     multimodal: bool = False
     model_name: str = None
+    # Op profile the model is priced with, and its op counts per layer kind;
+    # both settled by the parser, never matched from model_name.
+    arch: str = None
+    op_counts: dict = None
+    # A vision tower's arch is the vision profile; this is its language
+    # model's family, whose activation sharding it takes.
+    inherited_arch: str = None
     device_capacity: Memory = Memory.zero()  # float = 0
     mm_ccfgs: any = None
     mm_order: list = None
-    layer_custom_config: list = None
-    # What a layer of each kind keeps and holds per token, as a census states
-    # it (an auto_parallel KindActivations per layer type), the record of the
-    # kind of the layer priced, which the Hyper parser binds, and the output
-    # layer's; with none, the formulas price them.
+    # The layer stack the parser settled (an auto_parallel LayerStack), and
+    # the fields each of its kinds assigns, bound per candidate by the arch
+    # hook from the config it is applied to.
+    layer_stack: any = None
+    layer_binding: dict = None
+    # Fields the family gives every layer of the stack on top of its kind's,
+    # such as cm's sharding (derive).
+    layer_fields: dict = None
+    # What a layer of each kind keeps and holds per token, as the model
+    # spec's census states it (an auto_parallel KindActivations per kind
+    # name), and the record of the kind of the layer priced, which the
+    # parser or the arch hook binds; with none, the formulas price it.
     census: dict = None
     kind_activations: any = None
+    # The output layer's record, as the census states it.
     output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
@@ -65,6 +80,16 @@ class _CostModVar:
     p: float = 0
     cp: float = 0
     ep: float = 1
+    # Whether activations are split along the sequence over the TP group;
+    # derive sets the factor sp from it.
+    sequence_parallel: bool = False
+    # Whether TP shards the activations between layers and the output
+    # layer's; None takes the family's (derive).
+    shard_activations: bool = None
+    # Whether the loss runs on logits sharded over the vocabulary, as stated,
+    # None taking its family's; and as derive gives it.
+    loss_parallel: bool = None
+    shards_logits: bool = True
     sp: float = 0
     vp: float = 0
     os_max_shard: float = 0
@@ -80,10 +105,26 @@ class _CostModVar:
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
+    # MindFormers' select_comm_recompute, which its selective recompute reads.
+    sel_comm_rec: Union[list, bool] = None
+    # The framework whose selective recompute rec_op follows, "hyperparallel"
+    # or "mindformers".
+    sel_rec_rule: str = "hyperparallel"
+    # Whether a recomputed layer keeps its input sliced over tensor parallelism.
+    recompute_slice_activation: bool = False
+    # How each layer recomputes, as ranges over the layers in model order
+    # (ExecSpec.recompute), when a spec states them; they replace full_rec
+    # and sel_rec, and the partition generator places them.
+    recompute_ranges: tuple = None
     pp_sched: str = None
     n_s_split: float = 0
     cp_algo: str = "colossalai_cp"
     rec_op: any = None
+    # Each layer's own recompute switches in model order, None for a layer
+    # that is not selective, where the recompute ranges state several
+    # selective settings; None where rec_op holds the one every selective
+    # layer runs (derive).
+    layer_switches: tuple = None
     pp_partition: list = None
 
     # hyperparameters
@@ -96,9 +137,9 @@ class _CostModVar:
     n_lay: float = 0
     n_kv: float = 0
     dh: float = 0
-    # An MLA model's value-head width, at which its family prices dh, and its
-    # non-rotary key-head width, the value heads' unless stated.
+    # An MLA model's value-head width, at which its family prices dh (derive).
     v_head_dim: float = None
+    # An MLA model's non-rotary key-head width, its value heads' unless stated.
     qk_nope_head_dim: float = None
     dc_kv: float = 0
     dc_q: float = 0
@@ -121,15 +162,12 @@ class _CostModVar:
     lin_n_v: float = 0
     lin_d_v: float = 0
     lin_conv: float = 0
-    # Recurrent-state update and readout, the linear-attention op the
-    # arch hooks have no counterpart for. Zero for every other flavour.
+    # Recurrent-state update and readout, the linear-attention op. Zero for
+    # every other flavour.
     n_linrec: float = 0
     # The QK-norm a layer runs: 1 where the model normalizes each head's
-    # queries and keys (qk_norm), 0 on a linear-attention layer.
+    # queries and keys (derive, from qk_norm), 0 on a linear-attention layer.
     n_qknorm: float = 0
-    # The attention fields a linear group displaced, kept so a later full
-    # group can put them back when hooks run in place, layer after layer.
-    full_attn: dict = None
     n_mtp: float = 0
     is_mtp_in_offset: bool = True
     multiple_of: float = 0
@@ -199,6 +237,8 @@ class _CostModVar:
     # feature flag
     has_op: bool = False
     has_grad_shard: bool = False
+    # Whether each gradient is sharded as its parameter is, as FSDP holds it.
+    grad_shard_as_params: bool = False
     freeze: bool = False
     has_fa: bool = False
     attn_output_gate: bool = False
@@ -208,6 +248,8 @@ class _CostModVar:
     has_clip: bool = False
     gmm: bool = False
     vocab_emb_dp: float = 0
+    # Whether the embedding table is sharded over data parallelism too.
+    emb_dp_sharded: bool = True
     tie_emb_out: bool = False
     emb_out_in_offset: bool = False
 
@@ -222,10 +264,6 @@ class _CostModVar:
     # gathers it to compute with it.
     gather_embed: float = 1
     shard_output_activ: float = 0
-    # Whether the loss runs on logits sharded over the vocabulary, as the
-    # run states it, None taking its family's; and as the families read it.
-    loss_parallel: bool = None
-    shards_logits: bool = True
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
 
@@ -233,41 +271,46 @@ class _CostModVar:
     bytes_p: float = 0
     bytes_compute: float = 0
     bytes_softmax: float = 0
-    # Whether each gradient is held as its parameter is: in its width and
-    # sharding, at any pipeline degree, as FSDP holds it.
-    grads_as_params: bool = False
-    # Whether the run accumulates gradients over micro-batches without
-    # pipeline parallelism, holding them between micro-batches: a search
-    # then gives PP 1 several micro-batches.
-    accumulates_grads: bool = False
-    bytes_grad: float = 0
-    bytes_os: float = 0
-    # What the run's optimizer keeps, None taking the family's: a state's
-    # width, its states per layer parameter (2 for AdamW, 1 for Muon) and
-    # the width of its copy of the parameters; and, from them, its bytes
-    # per parameter of a layer and of the embedding and output tables,
-    # which the family hooks set.
+    # The widths the run states, None taking its family's, and whether its
+    # gradients take memory without pipeline parallelism; derive gives the
+    # estimators bytes_grad, bytes_os, bytes_norm and bytes_dropout from them.
+    grad_bytes: float = None
     optimizer_state_bytes: float = None
     optimizer_states: float = None
     main_param_bytes: float = None
-    bytes_optim: float = 0
-    bytes_optim_table: float = 0
-    # Whether FSDP frees a layer's gathered parameters once it has run, and
-    # gathers them again when it runs next; MindSpore's optimizer
-    # parallelism keeps its gathered weights.
+    norm_bytes: float = None
+    dropout_bytes: float = None
+    grad_accumulation: bool = None
+    # Whether the run accumulates gradients over micro-batches without
+    # pipeline parallelism, as derive gives it from grad_accumulation: a
+    # search then gives PP 1 several micro-batches.
+    accumulates_grads: bool = False
+    # Whether FSDP frees a layer's gathered parameters once it has run, as
+    # the run states it, None taking its family's; and as derive gives it.
+    reshard_params: bool = None
     reshards: bool = False
     # Whether FSDP holds each layer's reduce-scatter output until the
-    # backward ends, adding it to the accumulated gradient only then, as
-    # HyperParallel's does; PyTorch's FSDP2 adds it as soon as it is reduced.
+    # backward ends, as stated, None taking its family's; and as derive
+    # gives it.
+    deferred_grad_accumulation: bool = None
     defers_grads: bool = False
     # Whether FSDP holds a layer's whole gradients while the next layer's
-    # backward runs, and the root's until the backward ends.
+    # backward runs, and the root's until the backward ends, as stated,
+    # None taking its family's; and as derive gives it.
+    overlapped_grad_reduce: bool = None
     overlaps_grad_reduce: bool = False
-    # Whether a layer keeps the weight casts the formulas price beside its
-    # matmuls; None where no parser says, then where the optimizer does not
-    # shard.
+    # Whether a layer keeps the weight casts the formulas price, as stated,
+    # None where the optimizer does not shard; and as derive gives it.
+    param_casts: bool = None
     keeps_param_casts: bool = None
+    bytes_grad: float = 0
+    bytes_os: float = 0
+    # What the optimizer keeps per parameter: a layer's, and the embedding
+    # and output tables', which keep AdamW's two states (derive).
+    bytes_optim: float = 0
+    bytes_optim_table: float = 0
     bytes_norm: float = 0
+    bytes_dropout: float = 0
 
     def __init__(
         self,
@@ -359,8 +402,9 @@ class _CostModVar:
             raise TypeError(
                 f"Expecting path string, dict or Config object for {input_config}"
             )
-        # An in-memory config names its framework the same way a file does:
-        # the framework selects the parser whatever form the config takes.
+        # An in-memory config names its framework the same way a file does,
+        # so a caller that already holds the config need not write it to disk
+        # for the naive path sniffer to find the parser.
         if framework:
             logger.debug("Find parser module based on input framework name")
             parser_cls = self.get_framework_parser(framework.lower())

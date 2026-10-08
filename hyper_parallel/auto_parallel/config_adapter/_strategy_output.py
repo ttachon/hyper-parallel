@@ -22,7 +22,7 @@ configuration stub.
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml  # type: ignore[import-untyped]
 
@@ -153,14 +153,21 @@ def _check_batch_derivation(data: Dict[str, Any], resolved: Dict[str, Any]) -> N
         )
 
 
-def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
-    """Set the activation checkpoint mode the search priced every layer with.
+def _inject_activation_checkpoint(data: Dict[str, Any], mode: str,
+                                  layers: Optional[Dict[str, str]] = None) -> None:
+    """Set the activation checkpoint mode the search chose for every layer.
 
     The AutoModels schema states it as ``activation_checkpoint.mode``
     (``off``, ``full`` or ``selective``), the older one as
     ``train.gradient_checkpointing.activation_checkpoint``, where ``off``
-    is spelled ``none``. A mode the train yaml states otherwise is replaced,
-    and the replacement is logged.
+    is spelled ``none``. The layers *layers* names run another mode, which
+    the AutoModels schema states as ``activation_checkpoint.layers``; a plan
+    the train yaml states gives way to the search's, which it was not priced
+    with.
+
+    Raises:
+        ValueError: For *layers* in the older schema, which has no field
+            for them.
     """
     if is_auto_models_schema(data):
         section = data.get("activation_checkpoint")
@@ -168,7 +175,18 @@ def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
             section = data["activation_checkpoint"] = {}
         before = section.get("mode", "off")
         section["mode"] = mode
+        stated = section.pop("layers", None)
+        if layers:
+            section["layers"] = dict(layers)
+        if stated and stated != layers:
+            logger.info("activation_checkpoint.layers %s in the train yaml, %s in the search: writing the search's",
+                        stated, layers or "none")
     else:
+        if layers:
+            raise ValueError(
+                "the search chose a mode per layer, which only the AutoModels schema's activation_checkpoint.layers "
+                "states; the train yaml uses train.gradient_checkpointing"
+            )
         checkpointing = data["train"].get("gradient_checkpointing")
         if not isinstance(checkpointing, dict):
             checkpointing = data["train"]["gradient_checkpointing"] = {}
@@ -181,10 +199,23 @@ def _inject_activation_checkpoint(data: Dict[str, Any], mode: str) -> None:
         )
 
 
+def _drop_cost_model_context(data: Dict[str, Any]) -> None:
+    """Leave out the cost model's own ``context`` section, which the trainer's AutoModels schema refuses.
+
+    A train.yaml the search reads states its pricing options there, such as
+    ``context.census``; the trainer has no such section and refuses the
+    whole file over it.
+    """
+    if is_auto_models_schema(data) and data.pop("context", None) is not None:
+        logger.info("context states how the cost model prices the run, and the trainer refuses it: "
+                    "left out of the resolved yaml")
+
+
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
     if resolved.get("activation_checkpoint"):
-        _inject_activation_checkpoint(data, resolved["activation_checkpoint"])
+        _inject_activation_checkpoint(data, resolved["activation_checkpoint"],
+                                      resolved.get("activation_checkpoint_layers"))
     if is_auto_models_schema(data):
         accelerator = data["accelerator"]
         for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
@@ -433,12 +464,16 @@ def write_resolved_yaml(
 
     Copies the original ``train.yaml`` and replaces the parallel
     dimension fields with the resolved strategy values.  This produces
-    a complete, immediately launchable training configuration.
+    a complete, immediately launchable training configuration: an
+    AutoModels one leaves out the cost model's ``context`` section, which
+    the trainer refuses.
 
     The resolved strategy is read from ``config.resolved_strategy``.
     Supported keys: ``dp_shard``, ``dp_replicate``, ``tp_degree``,
     ``pipeline_parallel_degree``, ``context_parallel_degree``,
-    ``expert_parallel_degree``, ``global_batch_size``.
+    ``expert_parallel_degree``, ``global_batch_size``,
+    ``activation_checkpoint``, the mode every layer runs but those
+    ``activation_checkpoint_layers`` gives another.
 
     Args:
         config: NormalizedConfig with ``resolved_strategy`` set.
@@ -453,6 +488,7 @@ def write_resolved_yaml(
     """
     _validate_strategy_and_yaml(config, original_yaml_path)
     data = _load_yaml_to_inject(original_yaml_path)
+    _drop_cost_model_context(data)
     _apply_searched_batch_size(data, config)
     _inject_resolved_strategy(data, config.resolved_strategy)
     _write_output_yaml(data, output_path, overwrite, original_yaml_path)

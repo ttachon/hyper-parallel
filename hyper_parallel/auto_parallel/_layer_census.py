@@ -43,8 +43,7 @@ The output layer's census runs the final norm, the output projection and
 Transformers' causal-LM loss, which casts the logits to fp32, as
 HyperParallel's trainer runs them by default, dropping the model's logits
 before the backward as the trainer does; half the vocabulary tells the
-bytes a vocabulary-parallel loss splits.  A model spec states a census as
-:class:`KindActivations` records.
+bytes a vocabulary-parallel loss splits.
 
 Where a train.yaml replaces Transformers' modules with HyperParallel's
 fused ones (``plan_overrides`` with ``replace_module``: its RMSNorm, its
@@ -81,7 +80,6 @@ import importlib
 import inspect
 import logging
 import weakref
-from dataclasses import dataclass, fields
 from typing import (
     Any,
     Callable,
@@ -102,8 +100,8 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode  # pylint: 
 from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
 from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
-from hyper_parallel.auto_parallel._op_records import OPS
 from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
@@ -128,107 +126,6 @@ class LayerTraffic(NamedTuple):
     moved: Dict[str, float]
     parameter: Dict[str, float]
     launches: Dict[str, int]
-
-
-# The fields a census record states in pairs: what a layer keeps under
-# HyperParallel's selective activation checkpointing, the shares of its
-# matmul FLOPs that recomputes, and what it keeps for each op.
-_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"), ("ops", "ops_tp"))
-
-# The census record's fields that map ops to bytes per token.
-_BY_OP = ("ops", "ops_tp")
-
-
-@dataclass(frozen=True)
-class KindActivations:
-    """What one layer of a kind keeps for its backward, and the most its backward holds, per token.
-
-    Bytes per token at micro-batch 1, as the census measures them on one
-    layer at ``seq_length`` tokens under the runtime's kernels: the part no
-    tensor-parallel rank splits, and the part it splits, of which a layer at
-    TP 2 holds half.  The backward's working set leaves out the parameters
-    and their gradients, which the memory model counts on its own.
-    ``selective`` and ``selective_tp`` are what the layer keeps under
-    HyperParallel's selective activation checkpointing, whose backward
-    recomputes the rest and holds the same working set, and
-    ``selective_attention_mm`` and ``selective_ffn_mm`` the shares of the
-    FLOPs of its attention's projections and of the rest of its matmuls
-    that recomputes.  ``ops`` and ``ops_tp`` are what it keeps for each op
-    of :data:`~hyper_parallel.auto_parallel._op_records.OPS`, the two parts
-    of ``saved`` and ``saved_tp``, and ``other`` for its own code: the op
-    records of shared decision S1, as the census fills them.  A record
-    states each pair whole or not at all.
-    """
-
-    saved: float
-    saved_tp: float
-    working: float
-    working_tp: float
-    seq_length: int
-    selective: Optional[float] = None
-    selective_tp: Optional[float] = None
-    selective_attention_mm: Optional[float] = None
-    selective_ffn_mm: Optional[float] = None
-    ops: Optional[Mapping[str, float]] = None
-    ops_tp: Optional[Mapping[str, float]] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Return the record as a plain mapping, the selective part and the ops only when stated."""
-        out = {record_field.name: getattr(self, record_field.name) for record_field in fields(self)
-               if getattr(self, record_field.name) is not None}
-        for name in _BY_OP:
-            if name in out:
-                out[name] = dict(out[name])
-        return out
-
-    @staticmethod
-    def _check_keys(data: Mapping[str, Any], names: Sequence[str], where: str) -> None:
-        """Raise unless *data* states the fields of *names*, each of :data:`_PAIRED` whole or not at all."""
-        unknown = sorted(set(data) - set(names))
-        missing = [name for name in names if name not in data and all(name not in pair for pair in _PAIRED)]
-        if unknown or missing:
-            raise ValueError(f"{where} has unknown keys {unknown} and lacks {missing}")
-        for pair in _PAIRED:
-            if len({data.get(name) is None for name in pair}) > 1:
-                raise ValueError(f"{where} states one of {list(pair)} without the other")
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
-        """Build a record, refusing a key it does not know, a missing one, a negative size or a share above 1."""
-        if not isinstance(data, Mapping):
-            raise ValueError(f"{where} must map the record's fields to their values, got {data!r}")
-        names = [record_field.name for record_field in fields(cls)]
-        cls._check_keys(data, names, where)
-        sizes = {name: float(data[name]) for name in names
-                 if name != "seq_length" and name not in _BY_OP and data.get(name) is not None}
-        if any(size < 0 for size in sizes.values()):
-            raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
-        if any(sizes.get(name, 0) > 1 for name in _PAIRED[1]):
-            raise ValueError(f"{where}: a share of FLOPs cannot exceed 1, got {sizes}")
-        seq_length = int(data["seq_length"])
-        if seq_length <= 0:
-            raise ValueError(f"{where}.seq_length must be positive, got {seq_length}")
-        by_op = {name: _op_bytes(data[name], f"{where}.{name}") for name in _BY_OP if data.get(name) is not None}
-        return cls(seq_length=seq_length, **sizes, **by_op)
-
-
-def _op_bytes(data: Any, where: str) -> Dict[str, float]:
-    """Parse ``{op: bytes per token}``, the ops of :data:`OPS` and ``other``, refusing a negative size."""
-    known = [*OPS, "other"]
-    if not isinstance(data, Mapping) or any(op not in known for op in data):
-        raise ValueError(f"{where} must map ops of {known} to bytes per token, got {data!r}")
-    sizes = {str(op): float(size) for op, size in data.items()}
-    if any(size < 0 for size in sizes.values()):
-        raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
-    return sizes
-
-
-def activations_from_dict(data: Any) -> Dict[str, KindActivations]:
-    """Parse a spec's ``activations``, a mapping of layer kind to its :class:`KindActivations`."""
-    if not isinstance(data, Mapping):
-        raise ValueError(f"activations must map layer kinds to their records, got {data!r}")
-    return {str(kind): KindActivations.from_dict(record, f"activations.{kind}") for kind, record in data.items()}
-
 
 # The Transformers attention implementation the census registers its flash
 # attention under: a name Transformers does not take for a flash
@@ -1197,6 +1094,9 @@ def census_output(config: Any, seq_length: int, replacements: Sequence[Any] = ()
     Args:
         config: The language model's Transformers config.
         seq_length: Tokens of the micro-batch of one sequence it runs.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`), of which the final norm's is the
+            one that reaches the output layer.
 
     Returns:
         As :func:`census_layer`: the final norm's input included, the
@@ -1235,6 +1135,8 @@ def census_output_activations(config: Any, seq_length: int = 4096,
     Args:
         config: The language model's Transformers config.
         seq_length: The tokens the census runs the layer at.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
 
     Returns:
         The layer's :class:`KindActivations`, whose TP part is the part a

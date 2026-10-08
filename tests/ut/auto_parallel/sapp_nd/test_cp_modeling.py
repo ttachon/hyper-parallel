@@ -56,7 +56,6 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import (
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import (
     EvalAttn,
@@ -83,7 +82,7 @@ def _make_ccfg(**overrides):
         "bw_intra": 400.0, "bw_inter": 25.0, "cp_algo": "colossalai_cp",
         "comm_cp": 1, "comm_t": 1, "comm_ep": 1,
         "n_softmax": 4, "n_attBMM": 4, "n_attMM": 4, "n_attParamCast": 0,
-        "n_ffMM": 4, "n_ffBMM": 4, "n_ffParamCast": 0, "n_normOp": 2,
+        "n_ffMM": 4, "n_ffParamCast": 0, "n_normOp": 2,
         "n_dropout": 1, "n_exp": 1, "n_shared_exp": 0, "n_chosen_exp": 1,
         "cap_fact": 1.0, "gmm": False, "hff": 28672,
         "bytes_compute": 2, "bytes_softmax": 2, "bytes_dropout": 2,
@@ -482,13 +481,11 @@ class TestAttentionTypeDetection(unittest.TestCase):
         """
         Feature: Attention type detection on a parsed config
         Description: The MindFormers DeepSeek-V3 yaml, which states its latent
-            as kv_lora_rank 512, with 128 heads at TP 4, once its family hook
-            has given it DeepSeek's 128-wide heads, as the estimates apply it
+            as kv_lora_rank 512, with 128 heads at TP 4
         Expectation: MLA, and CP exchanges its heads' K and V: 128 heads of a
             128 + 64 wide key and a 128 wide value, a quarter per TP rank
         """
         ccfg = CostModelConfig(DEEPSEEK_YAML)
-        check_and_apply_custom_hook(ccfg)
         self.assertEqual((detect_attention_type(ccfg), compute_kv_dim(ccfg)),
                          (AttentionType.MLA, 128 * (2 * 128 + 64) / 2 / 4))
 

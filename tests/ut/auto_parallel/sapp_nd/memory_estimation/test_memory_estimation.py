@@ -22,9 +22,12 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import patch
 
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
+from hyper_parallel.auto_parallel._model_spec import OpCounts
+from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
     Context,
     MemType,
@@ -45,7 +48,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.score import mape, r
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory, Unit
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_group_configs,
     get_recomp_factor,
     get_table_quantity,
 )
@@ -71,9 +74,15 @@ def _micro_factor(ccfg: Any, ctx: Context) -> int:
     return ccfg.m + ctx.current_stage_id + ctx.current_chunk_id
 
 
-def _mark_custom_config(cfg: Any) -> None:
-    """Mark a copied custom config so deepcopy behavior can be asserted."""
-    cfg.marker = "custom"
+def _two_kind_stack() -> LayerStack:
+    """Two layers of a kind with one gather, then one with two."""
+    counts = {
+        "attMM": 4, "attBMM": 2, "ffMM": 3, "softmax": 1, "dropout": 0, "normOp": 2,
+        "gather": 1, "headCast": 1, "ffAct": 1, "linrec": 0,
+    }
+    first = LayerKind("first", OpCounts.from_dict(counts))
+    second = LayerKind("second", OpCounts.from_dict(dict(counts, gather=2)))
+    return LayerStack("unit", (StackGroup(first, 2), StackGroup(second, 1)))
 
 
 def _trace_sample(value: int, holder: Any) -> int:
@@ -154,7 +163,7 @@ class _CountingRaiser:
 
 
 class TestPPBExceptionRecovery(unittest.TestCase):
-    """Verify that lay_ppb and lay_ppb_new restore shared state on exception."""
+    """Verify that lay_ppb restores shared state on exception."""
 
     def _make_body_ppb(self, raise_on: int) -> tuple:
         """Create a _PPB with a _CountingRaiser and minimal ccfg/ctx for BODY path."""
@@ -214,33 +223,50 @@ class TestPPBExceptionRecovery(unittest.TestCase):
         self.assertFalse(ctx.enable_node_log,
                          "enable_node_log should be restored to False, not hard-coded True")
 
-    def test_lay_ppb_new_restores_rec_op_on_exception(self) -> None:
-        """
-        Feature: TestPPBExceptionRecovery.
-        Description: _inner_dynamic_mem raises during BODY path in lay_ppb_new.
-        Expectation: ccfg.rec_op attributes are restored to their original values.
-        """
-        ppb, ccfg, ctx, _ = self._make_body_ppb(raise_on=2)
-        original_vals = {k: getattr(ccfg.rec_op, k) for k in
-                         ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'gather', 'ffAct']}
-        with self.assertRaises(RuntimeError):
-            ppb.lay_ppb_new(ccfg, ctx, 4 * MEGABYTE)
-        for key, val in original_vals.items():
-            self.assertEqual(getattr(ccfg.rec_op, key), val,
-                             f"rec_op.{key} not restored: expected {val}, got {getattr(ccfg.rec_op, key)}")
+    @staticmethod
+    def _timed_ppb_failing_under_comm(ccfg: SimpleNamespace, ctx: Context) -> _PPB:
+        """A timed _PPB whose _inner_dynamic_mem raises once the gathers are recomputed, as COMM's switches say."""
 
-    def test_lay_ppb_new_restores_enable_node_log_on_exception(self) -> None:
+        def _inner(**_kwargs: Any) -> tuple:
+            """Raise under recomputed gathers, return a valid result otherwise."""
+            stated = EvalUtils.switches(ccfg, ctx)
+            if not (stated.get("gather", 1) if isinstance(stated, Mapping) else getattr(stated, "gather", 1)):
+                raise RuntimeError("injected failure")
+            return (2 * MEGABYTE, 3 * MEGABYTE)
+
+        ppb = _PPB(SimpleNamespace(ppb_combined=[]), _inner)
+        ppb.layer_times = lambda *_args: (1.0, 1.0)
+        return ppb
+
+    def test_timed_lay_ppb_leaves_rec_op_and_clears_the_switches_on_exception(self) -> None:
         """
         Feature: TestPPBExceptionRecovery.
-        Description: ctx.enable_node_log is False before call; _inner_dynamic_mem raises in lay_ppb_new.
-        Expectation: ctx.enable_node_log is restored to its original value (False), not hard-coded True.
+        Description: With a pricer, _inner_dynamic_mem raises while lay_ppb
+            sizes COMM, the first option whose switches the context carries.
+        Expectation: ccfg.rec_op keeps its values, and the context carries no
+            switches once lay_ppb has raised.
         """
-        ppb, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
-        ctx.enable_node_log = False
+        _, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
+        original_vals = dict(vars(ccfg.rec_op))
         with self.assertRaises(RuntimeError):
-            ppb.lay_ppb_new(ccfg, ctx, 4 * MEGABYTE)
-        self.assertFalse(ctx.enable_node_log,
-                         "enable_node_log should be restored to False, not hard-coded True")
+            self._timed_ppb_failing_under_comm(ccfg, ctx).lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+        self.assertEqual(vars(ccfg.rec_op), original_vals)
+        self.assertIsNone(ctx.switches)
+
+    def test_timed_lay_ppb_sets_no_switch_on_the_config_on_exception(self) -> None:
+        """
+        Feature: TestPPBExceptionRecovery.
+        Description: The config sets a single switch; with a pricer,
+            _inner_dynamic_mem raises while lay_ppb sizes COMM.
+        Expectation: The config keeps its single switch, none added, and
+            the context carries no switches once lay_ppb has raised.
+        """
+        _, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
+        ccfg.rec_op = SimpleNamespace(softmax=0)
+        with self.assertRaises(RuntimeError):
+            self._timed_ppb_failing_under_comm(ccfg, ctx).lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+        self.assertEqual(vars(ccfg.rec_op), {"softmax": 0})
+        self.assertIsNone(ctx.switches)
 
 
 class TestSappNDMemoryEstimation(unittest.TestCase):
@@ -340,14 +366,14 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         )
         self.assertIn("RatioType.STATIC", str(custom))
 
-        cfg = SimpleNamespace(layer_custom_config=None, n_lay=3)
-        self.assertEqual(get_layer_custom_configs(cfg), [(cfg, 3)])
+        cfg = SimpleNamespace(layer_stack=None, n_lay=3, n_mtp=0)
+        self.assertEqual(get_layer_group_configs(cfg), [(cfg, 3)])
 
-        cfg_with_hooks = SimpleNamespace(layer_custom_config=[(2, _mark_custom_config)], n_lay=3)
-        custom_layers = get_layer_custom_configs(cfg_with_hooks)
-        self.assertEqual(custom_layers[0][1], 2)
-        self.assertEqual(custom_layers[0][0].marker, "custom")
-        self.assertFalse(hasattr(cfg_with_hooks, "marker"))
+        cfg_with_kinds = SimpleNamespace(layer_stack=_two_kind_stack(), n_lay=3, n_mtp=0, has_op=False, n_gather=0)
+        custom_layers = get_layer_group_configs(cfg_with_kinds)
+        self.assertEqual([count for _, count in custom_layers], [2, 1])
+        self.assertEqual([layer.n_gather for layer, _ in custom_layers], [1, 2])
+        self.assertEqual(cfg_with_kinds.n_gather, 0)
 
         lccfg = SimpleNamespace(opfoo=5, rec_op=SimpleNamespace(foo=0, bar=1))
         self.assertEqual(get_recomp_factor(lccfg, LayerType.FULL_REC_LAYER, "foo"), 1)
@@ -504,7 +530,6 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
             vp=2,
             m=3,
             pp_sched="1f1b",
-            layer_custom_config=None,
             get_strategy=lambda: {"dp": 2, "tp": 1},
             print_stages=lambda stages, spec_stage_id=-1: (stages, spec_stage_id),
         )
@@ -517,10 +542,6 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertEqual(utils.get_strategy(), {"dp": 2, "tp": 1})
         self.assertEqual(utils.get_max_device_memory(), 2048)
         self.assertEqual(utils.get_num_layers(), 5)
-        utils.set_layer_custom()
-        self.assertEqual(fake_cfg.layer_custom_config, [(4, None)])
-        utils.set_layer_custom([(1, _mark_custom_config)])
-        self.assertEqual(fake_cfg.layer_custom_config[0][0], 1)
         utils.all_stage_micro_factors()
         self.assertEqual(utils.print_node_eval(), {})
         self.assertIsNone(utils.print_stages([[LayerType.NOT_REC_LAYER]], 0))
@@ -644,39 +665,9 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertEqual(descriptions[0]["model_name"], "combined_model-a_model-b")
         self.assertEqual(descriptions[0]["memory_parameter"], 3)
 
-        ctx.current_node = "head"
-        head_new = ppb.lay_ppb_new(ccfg, ctx, 4 * MEGABYTE)
-        ctx.current_node = LayerType.NOT_REC_LAYER
-        body_new = ppb.lay_ppb_new(ccfg, ctx, 4 * MEGABYTE)
-        self.assertEqual(head_new["options"], ["NONE", "FULL"])
-        self.assertEqual(body_new["memory_activation"]["FULL"], 2)
-
-        descriptions_new = [
-            {
-                "model_name": "model-a",
-                "type": "BODY",
-                "name": "A",
-                "memory_parameter": 1,
-                "memory_activation": {"NONE": 2, "FULL": 3},
-                "nb_layer": 1,
-            },
-            {
-                "model_name": "model-b",
-                "type": "BODY",
-                "name": "B",
-                "memory_parameter": 4,
-                "memory_activation": {"NONE": 5, "FULL": 6},
-                "nb_layer": 1,
-            },
-        ]
-        ppb.ppb_combine_bodies_new(descriptions_new)
-        self.assertEqual(descriptions_new[0]["memory_parameter"], 5)
-        self.assertEqual(descriptions_new[0]["memory_activation"]["FULL"], 9)
-
         disabled_ppb = _PPB(SimpleNamespace(ppb_combined=[]), _dynamic_mem_for_ppb)
         disabled_descriptions = [{"model_name": "model-a", "type": "BODY"}]
         self.assertIsNone(disabled_ppb.ppb_combine_bodies(disabled_descriptions))
-        self.assertIsNone(disabled_ppb.ppb_combine_bodies_new(disabled_descriptions))
 
     def test_backward_overhead_helpers(self) -> None:
         """
@@ -685,13 +676,13 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         Expectation: 1F1B and ZBV schedules produce deterministic overhead values.
         """
         ctx = Context()
-        backbone = SimpleNamespace(apply_hook=lambda hook, ccfg=None, ctx=None: hook(backbone))
+        backbone = SimpleNamespace(apply_kind=lambda kind, ccfg=None, ctx=None: None)
         ccfg = SimpleNamespace(pp_sched="1f1b", vp=1, m=4, p=2, n_mtp=1)
         overhead = _BackwardOverhead(backbone, ccfg, ctx, _dynamic_mem_for_overhead)
         stages = [[[LayerType.FULL_REC_LAYER, LayerType.OUTPUT_LAYER]]]
         record = {
-            (0, 0, 0): (ccfg, ctx, lambda _: None),
-            (0, 0, 1): (ccfg, ctx, lambda _: None),
+            (0, 0, 0): (ccfg, ctx, None, None),
+            (0, 0, 1): (ccfg, ctx, None, None),
         }
 
         self.assertEqual(overhead.estimate(stages, 0, record), 48)
@@ -707,8 +698,8 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         ccfg.vp = 2
         stages_zbv = [[[LayerType.NOT_REC_LAYER], [LayerType.FULL_REC_LAYER]]]
         record_zbv = {
-            (0, 0, 0): (ccfg, ctx, lambda _: None),
-            (0, 1, 0): (ccfg, ctx, lambda _: None),
+            (0, 0, 0): (ccfg, ctx, None, None),
+            (0, 1, 0): (ccfg, ctx, None, None),
         }
         self.assertEqual(overhead.estimate(stages_zbv, 0, record_zbv), 48)
 
@@ -783,7 +774,7 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertEqual(evaluator.static_mem_layer(LayerType.NOT_REC_LAYER, 0), 4)
         self.assertEqual(evaluator.dynamic_mem_layer(LayerType.NOT_REC_LAYER, 0), 6)
 
-        self.assertEqual(evaluator.estimate_layer_memory(ppb_format=2), {"layers": ["unit"]})
+        self.assertEqual(evaluator.estimate_layer_memory(), {"layers": ["unit"]})
         calls_after_first_ppb = len(backbone_calls)
         self.assertEqual(evaluator.estimate_layer_memory(), {"layers": ["unit"]})
         self.assertEqual(len(backbone_calls), calls_after_first_ppb)

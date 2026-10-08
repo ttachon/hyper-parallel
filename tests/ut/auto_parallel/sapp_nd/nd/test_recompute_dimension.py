@@ -36,9 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
 from hyper_parallel.auto_parallel.sapp_nd.nd import run_nd as RunND
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    HYPER_SELECTIVE_REC_OP,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
 from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
     RECOMPUTE_MODES,
@@ -214,7 +212,7 @@ class TestSearchWithRecomputeDimension(unittest.TestCase):
     def test_full_pass_is_the_search_without_a_dimension(self):
         """Its full entries are, in order, exactly what the search ranks without a recompute dimension."""
         _, plain = _search(self.path)
-        _, every = _search(self.path, recompute_modes=RECOMPUTE_MODES)
+        _, every = _search(self.path, recompute_dimension=RECOMPUTE_MODES)
 
         self.assertTrue(plain, "the small model must fit somewhere")
         self.assertEqual([row[1] for row in _rows(plain)], [None] * len(plain))
@@ -224,7 +222,7 @@ class TestSearchWithRecomputeDimension(unittest.TestCase):
 
     def test_modes_order_memory_one_way_and_time_the_other(self):
         """For one strategy: off keeps most and runs fastest, full keeps least and runs slowest."""
-        _, every = _search(self.path, recompute_modes=RECOMPUTE_MODES)
+        _, every = _search(self.path, recompute_dimension=RECOMPUTE_MODES)
         by_strategy: Dict[tuple, Dict[str, Tuple[float, float]]] = {}
         for degrees, mode, memory, score in _rows(every):
             by_strategy.setdefault(degrees, {})[mode] = (memory, score)
@@ -240,8 +238,8 @@ class TestSearchWithRecomputeDimension(unittest.TestCase):
 
     def test_a_mode_left_out_is_never_proposed(self):
         """Without selective, the other pairs are the same as with it, and no selective pair is left."""
-        _, every = _search(self.path, recompute_modes=RECOMPUTE_MODES)
-        runner, runnable = _search(self.path, recompute_modes=("off", "full"))
+        _, every = _search(self.path, recompute_dimension=RECOMPUTE_MODES)
+        runner, runnable = _search(self.path, recompute_dimension=("off", "full"))
 
         self.assertNotIn("selective", {row[1] for row in _rows(runnable)})
         self.assertEqual(_rows(runnable), [row for row in _rows(every) if row[1] != "selective"])
@@ -252,9 +250,9 @@ class TestSearchWithRecomputeDimension(unittest.TestCase):
     def test_the_dimension_needs_the_hyperparallel_parsers_and_no_mppb(self):
         """Another framework's recompute, or recompute taken from the config, cannot take the dimension."""
         with self.assertRaisesRegex(ValueError, "the mindformers parser states its own recompute"):
-            Par.Parallelize("mindformers", "unused.yaml", Hard.Machine(8, "A2"), recompute_modes=("full",))
+            Par.Parallelize("mindformers", "unused.yaml", Hard.Machine(8, "A2"), recompute_dimension=("full",))
         with self.assertRaisesRegex(ValueError, "mppb takes the recompute from the config"):
-            _search(self.path, recompute_modes=("full",), mppb=True)
+            _search(self.path, recompute_dimension=("full",), mppb=True)
 
 
 class TestRecomputeColumns(unittest.TestCase):
@@ -339,7 +337,7 @@ class TestRunNdRecompute(unittest.TestCase):
         self.assertEqual(search_cfg.estimator["recompute_modes"], ("off", "full"))
 
     def test_cli_passes_the_modes_to_the_search_only_when_stated(self):
-        """The search gets recompute_modes from --recompute, and no such argument without it."""
+        """The search gets recompute_dimension from --recompute, and no such argument without it."""
         with tempfile.TemporaryDirectory() as folder:
             path = _dense_train_yaml(folder)
             for extra, expected in (([], None), (["--recompute", "off", "full"], ("off", "full"))):
@@ -350,7 +348,7 @@ class TestRunNdRecompute(unittest.TestCase):
                     argv = ["run_nd.py", "-f", "hyper_v2", "-y", path, "-d", "8", "-v", "0", "-o", folder] + extra
                     with patch.object(sys, "argv", argv):
                         runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
-                    self.assertEqual(_RecordingParallelize.calls[-1].get("recompute_modes"), expected)
+                    self.assertEqual(_RecordingParallelize.calls[-1].get("recompute_dimension"), expected)
 
 
 if __name__ == "__main__":

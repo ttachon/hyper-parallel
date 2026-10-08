@@ -73,7 +73,6 @@ def _make_ccfg(
     n_gather=2,
     n_attMM=2,  # pylint: disable=invalid-name
     n_ffMM=1,  # pylint: disable=invalid-name
-    n_ffBMM=0,  # pylint: disable=invalid-name
     rec_op=None,
     cp_algo="colossalai_cp",
     tokens_per_expert=None,
@@ -102,7 +101,6 @@ def _make_ccfg(
     ccfg.n_gather = n_gather
     ccfg.n_attMM = n_attMM
     ccfg.n_ffMM = n_ffMM
-    ccfg.n_ffBMM = n_ffBMM
     ccfg.cp_algo = cp_algo
     ccfg.comm_cp = comm_cp
     ccfg.tokens_per_expert = tokens_per_expert

@@ -87,6 +87,22 @@ class TestSearchState(unittest.TestCase):
             peaks.append(search.memory_estim())
         self.assertEqual(peaks, [peaks[0]] * 3)
 
+    def test_the_search_owns_its_config(self):
+        """
+        Feature: the strategy guard.
+        Description: Build a search, write a degree on its config directly,
+            then set and estimate a candidate the way the search does.
+        Expectation: The direct write is refused, and the candidate is set
+            and priced.
+        """
+        search = self._search([Dim.DP, Dim.TP, Dim.PP, Dim.EP, Dim.OP])
+        with self.assertRaises(AttributeError):
+            search.mem_eval.ccfg.t = 1
+        candidate = search.config.make_parallel_config_args(dp=16, mp=1, pp=1, ep=1, op=1, mb=1)
+        self.assertTrue(search.config.set_parallel_config(candidate))
+        self.assertEqual(search.mem_eval.ccfg.t, 1, f"t={search.mem_eval.ccfg.t}")
+        self.assertGreater(search.memory_estim(), 0)
+
     def test_an_interleaved_search_runs(self):
         """
         Feature: search over the interleave degree.

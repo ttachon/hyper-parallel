@@ -27,6 +27,12 @@ from PIL import Image
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    apply_layer_kind,
+    check_and_apply_custom_hook,
+    layer_kinds,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import layer_switches
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -39,7 +45,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, Tuple
+    from typing import Any, Dict, List, Optional, Tuple
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 EVAL_YML = os.path.join(current_dir, "configs_eval/default.yaml")
@@ -54,6 +60,9 @@ class _Backbone:
         self.eval_cfg = Config(kwargs.get("eval_yml", EVAL_YML))
         self._ctx = kwargs.get("ctx", Context())
         self._ccfg = kwargs.get("ccfg", None)
+        # During a walk, the regular layers' own recompute switches still to
+        # visit, where the config states several (derive's layer_switches).
+        self._switch_order = None
         self.framework = kwargs.get("framework", None)
         self.source_code = kwargs.get("source_code", None)
         self.hook_cls, self.config_path = None, None
@@ -80,6 +89,11 @@ class _Backbone:
         # or None for a model of one module (F54).
         self.main_module = None
         self.ppb = None
+        # Each stage's dynamic memory, in MB, at the two points of the last
+        # stage estimate where its peak can come: as warm-up ends, and as a
+        # later micro-batch's backward ends (0 where that is no candidate).
+        # The stage's Dynamic insight is the larger.
+        self.peak_points: List[Tuple[int, int]] = []
         self._overhead_obj = _BackwardOverhead(
             self, self._ccfg, self._ctx, self._inner_dynamic_mem
         )
@@ -140,8 +154,8 @@ class _Backbone:
                 "=" * 30,
                 new_config.split("/")[-1],
             )
-        # Kept whatever its form, so reset_config() can parse a config handed
-        # over in memory again rather than read one from a path.
+        # Kept whatever its form, so reset_config() can re-parse a config
+        # handed over in memory rather than read from a path.
         self.config_path = new_config
         self.evaluator_instances = None
         self.ppb = None
@@ -394,11 +408,20 @@ class _Backbone:
             val = self._ctx.accu_mem_type[mem_type]
             stage_logs[stage_id].accu_mem_type[mem_type] += val
 
-    def __preprocess_layer_custom_config_list(self, stages: list) -> list:
-        """flatten layer_custom_config for backbone estimation"""
-        flatten = sum(
-            [[f[1]] * f[0] for f in self._ccfg.layer_custom_config], []
-        )
+    def __order_layer_switches(self, stages: list) -> Optional[list]:
+        """Each regular layer's own recompute switches, in the order the kinds take; None where rec_op holds them."""
+        per_layer = layer_switches(self._ccfg)
+        if per_layer is None:
+            return None
+        order = list(per_layer)
+        if self._ccfg.pp_sched == "zero_bubble_v":
+            first = sum(len(s[0]) for s in stages) - 1
+            order = order[:first] + order[first:][::-1]
+        return order
+
+    def __order_layer_kinds(self, stages: list, kinds: list) -> list:
+        """Check the layers' kinds against the partition, in the order the stages visit them."""
+        flatten = list(kinds)
         total_n_lay = self._ccfg.n_lay + self._ccfg.n_mtp
         total_n_lay_stages = self._ccfg.count_layers(stages)
         if not self._ccfg.multimodal and total_n_lay != total_n_lay_stages:
@@ -409,7 +432,7 @@ class _Backbone:
             ))
         if self._ccfg.n_lay > 0 and len(flatten) != total_n_lay:
             raise AttributeError(
-                f"layer_custom_config occurrences ({len(flatten)})"
+                f"layer kinds ({len(flatten)})"
                 f" != num_layers ({total_n_lay})"
             )
         if self._ccfg.pp_sched == "zero_bubble_v":
@@ -437,13 +460,13 @@ class _Backbone:
         self.__name_main_module(self._ccfg)
         if not self._ccfg.multimodal:
             return self.__estimate_stages_backbone(
-                stages, args[1], args[2], spec_stage_id, args[4]
+                stages, args[1], args[2], spec_stage_id, args[4], layer_kinds(self._ccfg)
             )
         res = []
         original_ccfg = self._ccfg
-        common_lc = []
+        kinds = []
         self.evaluator_instances = []
-        # Build common layer_custom_config + Build temporary evaluators
+        # Build the layers' kinds, submodule after submodule + Build temporary evaluators
         for m in self._ccfg.mm_order:
             self._ccfg.mm_ccfgs[m].config = original_ccfg.config
             if not self._child_cls:
@@ -459,7 +482,12 @@ class _Backbone:
             strategy = tmp_evaluator.get_strategy()
             full_rec = strategy["full_rec"]
             offset = strategy["offset"]
-            self._ccfg.hooks_dict[m](tmp_evaluator)
+            # A user hook class names one hook per submodule; built-in
+            # submodules are dispatched by their arch.
+            if self._ccfg.hooks_dict:
+                self._ccfg.hooks_dict[m](tmp_evaluator)
+            else:
+                check_and_apply_custom_hook(tmp_evaluator)
             strategy = tmp_evaluator.get_strategy()
             if (
                 tmp_evaluator.get_num_layers() != num_layer
@@ -470,19 +498,19 @@ class _Backbone:
                 stages[m] = (
                     tmp_evaluator.ccfg.generate_partitions_vpp_unimodal()
                 )
-                tmp_evaluator.set_layer_custom(None)
-            common_lc += self._ccfg.mm_ccfgs[m].layer_custom_config
+                # Its layers are priced plain, as the hook left them.
+                tmp_evaluator.ccfg.layer_stack = None
+            kinds += layer_kinds(self._ccfg.mm_ccfgs[m])
             self.evaluator_instances += [tmp_evaluator]
             if args[1]:
                 logger.info("Submodule %s", self._ccfg.mm_ccfgs[m].model_name)
                 tmp_evaluator.print_ctx()
                 self.print_stages(stages[m])
-        self.set_layer_custom(common_lc)
         if args[1]:
             logger.info(
-                "Combined layer_custom_config for %s\n%s",
+                "Combined layer kinds for %s\n%s",
                 self._ccfg.model_name,
-                pprint.pformat(self._ccfg.layer_custom_config, compact=True),
+                pprint.pformat([kind.name if kind else None for kind in kinds], compact=True),
             )
             logger.info(
                 "Sub evaluator instances for  %s\n%s",
@@ -496,6 +524,7 @@ class _Backbone:
             args[2],
             spec_stage_id,
             args[4],
+            kinds,
         )
         self._ccfg = original_ccfg
         return res
@@ -529,12 +558,14 @@ class _Backbone:
             self._ccfg.print_stages(stages, spec_stage_id)
         insights = []
         # Compute peak memory
-        flatten = self.__preprocess_layer_custom_config_list(stages)
+        flatten = self.__order_layer_kinds(stages, args[5])
+        self._switch_order = self.__order_layer_switches(stages)
+        self._ctx.switches = None
         if verbose:
             logger.info(
-                "Flatten layer_custom_config\n%s",
+                "Layer kinds in stage order\n%s",
                 pprint.pformat(
-                    [f if not f else f.__name__ for f in flatten], compact=True
+                    [kind.name if kind else None for kind in flatten], compact=True
                 ),
             )
 
@@ -561,14 +592,15 @@ class _Backbone:
         )
         # PPB Input
         ppb_input = None
-        if compute_ppb == 1:
+        if compute_ppb:
+            self._ppb_obj.ppb_withdraw_dominated(ppb_lay_desc)
+            self._ppb_obj.ppb_scale_times(ppb_lay_desc)
             self._ppb_obj.ppb_combine_bodies(ppb_lay_desc)
             ppb_input = {"layers_description": ppb_lay_desc}
-        elif compute_ppb == 2:
-            self._ppb_obj.ppb_combine_bodies_new(ppb_lay_desc)
-            ppb_input = {"layers_description_new": ppb_lay_desc}
         if args[4]:  # Plot
             self.__plot_stages(stages, stage_misc["stat"], stage_misc["dyn"])
+        self._switch_order = None
+        self._ctx.switches = None
         return insights, ppb_input
 
     def __update_evaluator(self, node, verbose):
@@ -583,35 +615,30 @@ class _Backbone:
                     self._ccfg.model_name,
                 )
 
-    def __update_next_layer_custom_function(self, *args):
-        """Apply the next layer custom hook before evaluating a layer."""
+    def __apply_next_layer_kind(self, *args):
+        """Give the next regular layer its kind before evaluating it."""
         flatten, verbose = args[0], args[1]
         record_lay_types = args[2]
         stage_id, chunk_id, lay_id = args[3], args[4], args[5]
         node = args[6]
+        kind = None
         if self.is_regular_layer(node) and flatten:
-            hook = flatten.pop(0)
-            if hook:
-                if verbose:
-                    logger.info("Apply hook %s", hook.__name__)
-                record_lay_types[(stage_id, chunk_id, lay_id)] = (
-                    self._ccfg,
-                    self._ctx,
-                    hook,
-                )
-                hook(self)
-            else:
-                record_lay_types[(stage_id, chunk_id, lay_id)] = (
-                    self._ccfg,
-                    self._ctx,
-                    lambda _: None,
-                )
-        else:
-            record_lay_types[(stage_id, chunk_id, lay_id)] = (
-                self._ccfg,
-                self._ctx,
-                lambda _: None,
-            )
+            kind = flatten.pop(0)
+        # The layer's own recompute switches, which its context carries.
+        switches = None
+        if self.is_regular_layer(node) and self._switch_order:
+            switches = self._switch_order.pop(0)
+        self._ctx.switches = switches
+        record_lay_types[(stage_id, chunk_id, lay_id)] = (
+            self._ccfg,
+            self._ctx,
+            kind,
+            switches,
+        )
+        if kind is not None:
+            if verbose:
+                logger.info("Apply layer kind %s", kind.name)
+            apply_layer_kind(self, kind)
         if verbose:
             logger.info(
                 "stage_id=%s, chunk_id=%s, lay_id=%s, node=%s",
@@ -643,8 +670,8 @@ class _Backbone:
                         self._ctx.real_lay_ids[chunk_id][stage_id] += [""]
                     # Update evaluator (multimodal)
                     self.__update_evaluator(node, verbose)
-                    # Update next layer custom function
-                    self.__update_next_layer_custom_function(
+                    # Give the next layer its kind
+                    self.__apply_next_layer_kind(
                         flatten,
                         verbose,
                         record_lay_types,
@@ -657,8 +684,7 @@ class _Backbone:
                     self._ctx.current_chunk_id = chunk_id
                     self._ctx.current_lay_id = lay_id
                     self._ctx.current_node = node
-                    static_mem = self._inner_static_mem()
-                    sm["stat"][stage_id][chunk_id][lay_id] = static_mem
+                    sm["stat"][stage_id][chunk_id][lay_id] = self._inner_static_mem()
                     activation, comm = self._inner_dynamic_mem()
                     sm["dyn"][stage_id][chunk_id][lay_id] = activation + comm
                     sm["comm"][stage_id][chunk_id][lay_id] = comm
@@ -670,18 +696,12 @@ class _Backbone:
                     if verbose:
                         logger.info("pp micro factor for dynamic: %s",self._ctx.micro_factor)
                     # PPB Purpose
-                    if compute_ppb == 1:
+                    if compute_ppb:
                         desc = self._ppb_obj.lay_ppb(
                             self._ccfg,
                             self._ctx,
                             sm["stat"][stage_id][chunk_id][lay_id],
-                        )
-                        self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
-                    elif compute_ppb == 2:
-                        desc = self._ppb_obj.lay_ppb_new(
-                            self._ccfg,
-                            self._ctx,
-                            sm["stat"][stage_id][chunk_id][lay_id],
+                            record_lay_types[(stage_id, chunk_id, lay_id)][2],
                         )
                         self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
                 self.__update_stage_logs(sm["logs"], stage_id)
@@ -764,6 +784,7 @@ class _Backbone:
         sm = args[2]
         verbose, spec_stage_id = args[3], args[4]
         insights = args[5]
+        points = []
         for stage_id in range(self._ccfg.p):
             ins = {}  # Mem Insights purpose
             ins["Static"] = sum(
@@ -782,7 +803,10 @@ class _Backbone:
             safety_buffer = 1024 * 1024 * 1024  # 1 GB
             if ins["Dynamic"] > 0:
                 ins["Dynamic"] += safety_buffer
+                points.append((self.mb(ins["Dynamic"]), self.mb(backward_end + safety_buffer) if backward_end else 0))
                 ins["Dynamic"] = max(ins["Dynamic"], backward_end + safety_buffer)
+            else:
+                points.append((self.mb(ins["Dynamic"]), 0))
             stage_accu = sm["logs"][stage_id].accu_mem_type
             ins["ModelParameters"] = self.mb(stage_accu[MemType.MODEL_PARAM])
             ins["OptimizerStates"] = self.mb(stage_accu[MemType.OPTIM_STATE])
@@ -810,6 +834,7 @@ class _Backbone:
             ins["Static"] = self.mb(ins["Static"])
             ins["Dynamic"] = self.mb(ins["Dynamic"])
             insights += [ins]
+        self.peak_points = points
 
     def __verbose_insights(self, *args):
         """logging purpose"""
@@ -863,15 +888,12 @@ class _Backbone:
             pprint.pformat(ins["Node Log"], width=300),
         )
 
-    def apply_hook(self, hook, ccfg=None, ctx=None):
-        """apply hook on evaluator"""
+    def apply_kind(self, kind, ccfg=None, ctx=None):
+        """Evaluate with a recorded layer's config and context, giving it its kind again."""
         self._ccfg = ccfg if ccfg else self._ccfg
         self._ctx = ctx if ctx else self._ctx
-        hook(self)
-
-    def set_layer_custom(self, _):
-        """child implement"""
-        pass  # pylint: disable=unnecessary-pass
+        if kind is not None:
+            apply_layer_kind(self, kind)
 
     def is_regular_layer(self, _):
         """child implement"""

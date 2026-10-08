@@ -30,13 +30,19 @@ of each matmul entry, which prices the backward as twice the forward.  The
 table's feed-forward entry covers the whole feed-forward, its experts,
 shared expert and router included.
 
-It then sets what each kind keeps for its backward for each op, per
-token of the whole layer, as the op records price it (shared decision S1,
+It sets what each kind keeps for its backward for each op, per token of
+the whole layer, as the op records price it (shared decision S1,
 :class:`~hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block.EvalRecords`)
 beside what the census measures each op saving
 (:func:`~hyper_parallel.auto_parallel._layer_census.census_saved_ops`).
 
-Last, it sets the bytes each kind's forward moves
+Last, it sets the model spec the resolver reads from the checkpoint's
+config beside the one the census measures on the layers Transformers
+builds of it (:func:`~hyper_parallel.auto_parallel._spec_census.census_model_spec`),
+field by field as ND prices each (:func:`verify_spec`), and prices the run
+with each (:func:`verify_estimate`).
+
+It also sets the bytes each kind's forward moves
 (:func:`~hyper_parallel.auto_parallel._layer_census.census_traffic`) beside
 the FLOPs the op table prices of the same forward.  The time model counts
 the FLOPs and nothing else, and the cluster's kernel tables put those at
@@ -48,12 +54,18 @@ each against the time it took.
 from __future__ import annotations
 
 import copy
+import os
+import tempfile
 from types import SimpleNamespace
-from typing import Any, Dict, List, NamedTuple, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Tuple
 
 import yaml
 
-from hyper_parallel.auto_parallel._hf_model_spec import checkpoint_configs, is_auto_models_schema
+from hyper_parallel.auto_parallel._hf_model_spec import (
+    checkpoint_configs,
+    is_auto_models_schema,
+    resolve_hf_model_spec,
+)
 from hyper_parallel.auto_parallel._layer_census import (
     census_final_norm,
     census_flops,
@@ -61,22 +73,39 @@ from hyper_parallel.auto_parallel._layer_census import (
     census_saved_ops,
     census_traffic,
 )
+from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel._op_profiles import family_profile, resolve_ops
 from hyper_parallel.auto_parallel._op_records import load_op_records
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalRecords
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook, layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import device_map
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import prepare_context
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import BACKWARD_RATIO, _flavour_tables
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_custom_configs
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
+    BACKWARD_RATIO,
+    _flavour_tables,
+    estimate_performance,
+)
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_layer_group_configs
 
 # The time model's matmul entries, and the part of a layer each prices.
 _FLOP_PARTS = (("n_attMM", "attention"), ("n_attBMM", "scores"), ("n_linrec", "linrec"), ("n_ffMM", "ffn"))
 
 # The census's parts of a feed-forward, which the time model prices as one.
 _FFN_PARTS = ("ffn", "routed", "shared", "router")
+
+# The model facts a spec states as true or false.
+_FLAGS = ("attn_output_gate", "tie_word_embeddings", "qk_norm", "qkv_bias", "o_bias", "mlp_bias", "norm_bias",
+          "shared_expert_gate")
+
+# What a spec states that verify mode does not compare: its name, what the
+# AutoModels parser drops (MTP layers, which Transformers does not build),
+# the census records, and the vision tower, which the census does not walk.
+_NOT_COMPARED = ("name", "mtp_depth", "layer_types", "activations", "output_activations", "vision", "ops", "layers")
 
 
 class VerifyRow(NamedTuple):
@@ -87,6 +116,14 @@ class VerifyRow(NamedTuple):
     nd: float
     census: float
     count: int = 1
+
+
+class SpecRow(NamedTuple):
+    """One field of the model spec, as ND prices it: the resolver's value and the census's."""
+
+    field: str
+    resolved: Any
+    census: Any
 
 
 class TrafficRow(NamedTuple):
@@ -111,21 +148,6 @@ def nd_parameters(lccfg: Any, ctx: Any) -> Dict[str, float]:
         parts["shared"] = ctx.ffn_shared_num_p(lccfg, ctx)
         parts["router"] = ctx.ffn_router_num_p(lccfg, ctx)
     return parts
-
-
-def _groups(ccfg: Any) -> List[Any]:
-    """``(kind, count, config)`` per group of *ccfg*'s layers, in model order, the kinds as its hooks name them.
-
-    A hybrid stack's hook states its kind; a family's hook is named for
-    it (DeepSeek's ``hook_dense`` and ``hook_moe``).  A group of no layer
-    is left out.
-    """
-    hooks = ccfg.layer_custom_config or [(ccfg.n_lay, None)]
-    configs = get_layer_custom_configs(ccfg)
-    if len(configs) != len(hooks):
-        hooks = [(count, None) for _, count in configs]
-    return [(getattr(hook, "kind", None) or getattr(hook, "__name__", "hook_decoder").removeprefix("hook_"),
-             count, lccfg) for (_, hook), (lccfg, count) in zip(hooks, configs) if count]
 
 
 def nd_flops(ccfg: Any, lccfg: Any) -> Dict[str, float]:
@@ -170,11 +192,7 @@ def _priced(yaml_path: str) -> Tuple[Any, Any, Any]:
     Raises:
         ValueError: The train.yaml names no Transformers checkpoint.
     """
-    with open(yaml_path, encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
-    if not isinstance(raw, dict) or not is_auto_models_schema(raw) or not isinstance(raw.get("model"), dict):
-        raise ValueError(f"{yaml_path}: verify mode needs an AutoModels train.yaml naming a Transformers checkpoint")
-    config, text = checkpoint_configs(raw["model"])
+    config, text = checkpoint_configs(_train_yaml(yaml_path)["model"])
     ccfg = copy.deepcopy(_text_model(CostModelConfig(yaml_path, framework="hyper_v2")))
     check_and_apply_custom_hook(ccfg)
     return config, text, ccfg
@@ -184,7 +202,8 @@ def _kinds(ccfg: Any) -> Dict[str, List[Any]]:
     """Each layer kind of *ccfg*'s stack: its first layer, how many layers it has, and their config."""
     kinds: Dict[str, List[Any]] = {}
     first = 0
-    for name, count, lccfg in _groups(ccfg):
+    for (kind, count), (lccfg, _) in zip(layer_groups(ccfg), get_layer_group_configs(ccfg)):
+        name = kind.name if kind is not None else "decoder"
         kinds.setdefault(name, [first, 0, lccfg])[1] += count
         first += count
     return kinds
@@ -278,6 +297,163 @@ def verify_flops(yaml_path: str) -> List[VerifyRow]:
     return rows
 
 
+def spec_as_priced(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """The fields of the model spec *data*, each as ND prices it.
+
+    A field left unstated is compared as the value ND prices for it: a head
+    as wide as derive prices it, an MLA family's at its value heads' width;
+    a flag as false; the routed and shared experts' widths as the spec
+    resolves them; each kind's op counts as its profile states them, one
+    field per op.  The layer stack is its body, the groups in model order:
+    the AutoModels parser prices no MTP layer.
+
+    Args:
+        data: A model spec, as a resolver states it.
+
+    Returns:
+        ``{field: value}``, ``ops.<kind>.<op>`` for each op count.
+    """
+    spec = ModelSpec.from_dict(data)
+    out = {key: value for key, value in spec.to_dict().items() if key not in _NOT_COMPARED}
+    value_width = family_profile(spec.arch).model.get("v_head_dim")
+    out["head_dim"] = (spec.v_head_dim or value_width) if value_width is not None else spec.effective_head_dim
+    out.update({flag: bool(getattr(spec, flag)) for flag in _FLAGS})
+    if spec.is_moe:
+        out["moe_intermediate_size"] = spec.routed_expert_width
+    if spec.num_shared_experts:
+        out["shared_expert_intermediate_size"] = spec.shared_expert_width
+    for kind, counts in resolve_ops(spec.arch, spec.ops).items():
+        out.update({f"ops.{kind}.{op}": count for op, count in counts.to_dict().items()})
+    out["layers"] = tuple((group.kind, group.count) for group in spec.layers or () if not group.mtp)
+    return out
+
+
+def _train_yaml(yaml_path: str) -> Dict[str, Any]:
+    """The AutoModels train.yaml at *yaml_path*, whose model names a Transformers checkpoint.
+
+    Raises:
+        ValueError: The yaml is not one.
+    """
+    with open(yaml_path, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    if not isinstance(raw, dict) or not is_auto_models_schema(raw) or not isinstance(raw.get("model"), dict):
+        raise ValueError(f"{yaml_path}: verify mode needs an AutoModels train.yaml naming a Transformers checkpoint")
+    return raw
+
+
+def verify_spec(yaml_path: str) -> List[SpecRow]:
+    """The model spec the resolver reads of the model a train.yaml trains, beside the census's, field by field.
+
+    Args:
+        yaml_path: An AutoModels train.yaml, whose model names a Transformers
+            checkpoint.
+
+    Returns:
+        A row per field either spec states, each as ND prices it
+        (:func:`spec_as_priced`), in the order of the fields' names.
+
+    Raises:
+        ValueError: The train.yaml names no Transformers checkpoint.
+    """
+    model = _train_yaml(yaml_path)["model"]
+    resolved = spec_as_priced(resolve_hf_model_spec(model))
+    census = spec_as_priced(resolve_hf_model_spec(model, census_spec=True))
+    return [SpecRow(field, resolved.get(field), census.get(field)) for field in sorted(set(resolved) | set(census))]
+
+
+def census_spec_yaml(yaml_path: str, folder: str) -> str:
+    """Write the census's spec of the model a train.yaml trains to *folder*, as the run would price it.
+
+    The spec carries the census records of the layers' activations where
+    the train.yaml states ``context.census``, measured at its dataset's
+    length, else at 4096 tokens; a train.yaml's ``model.config_overrides``
+    takes it as it is.
+
+    Returns:
+        The path written, ``model_spec.yaml`` in *folder*.
+    """
+    raw = _train_yaml(yaml_path)
+    seq_len = 0
+    if (raw.get("context") or {}).get("census"):
+        seq_len = int(((raw.get("dataset") or {}).get("data_transform") or {}).get("max_seq_len") or 4096)
+    spec = resolve_hf_model_spec(raw["model"], census_seq_len=seq_len, census_spec=True)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "model_spec.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(spec, handle, sort_keys=False)
+    return path
+
+
+def _estimate(yaml_path: str, device_type: str) -> Tuple[float, float]:
+    """The peak memory, in MB, and the step's time score ND prices the run of a train.yaml at."""
+    ccfg = CostModelConfig(yaml_path, framework="hyper_v2")
+    peak = EvaluatorV2(yaml_path, framework="hyper_v2", log_level=0).estimate_peak()
+    return float(peak), float(estimate_performance(_text_model(ccfg), device_type=device_map[device_type]))
+
+
+def verify_estimate(yaml_path: str, device_type: str = "A2") -> List[VerifyRow]:
+    """The run a train.yaml states, priced with the resolver's model spec and with the census's.
+
+    Args:
+        yaml_path: An AutoModels train.yaml, whose model names a Transformers
+            checkpoint, and whose run is priced as it states it.
+        device_type: The device to price the step's time on.
+
+    Returns:
+        The peak memory and the step's time score, with the resolver's spec
+        in the ND column and the census's in the census column.
+
+    Raises:
+        ValueError: The train.yaml names no Transformers checkpoint.
+    """
+    raw = _train_yaml(yaml_path)
+    resolved = _estimate(yaml_path, device_type)
+    raw.setdefault("context", {})["census_spec"] = True
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, os.path.basename(yaml_path))
+        with open(path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(raw, handle)
+        census = _estimate(path, device_type)
+    return [VerifyRow("estimate", "peak MB", resolved[0], census[0]),
+            VerifyRow("estimate", "time score", resolved[1], census[1])]
+
+
+def _spec_value(value: Any) -> str:
+    """One field's value as a spec report shows it: a layer stack by its kinds' layers and groups."""
+    if isinstance(value, tuple):
+        layers: Dict[str, int] = {}
+        for kind, count in value:
+            layers[kind] = layers.get(kind, 0) + count
+        return f"{len(value)} groups: " + ", ".join(f"{kind} x{count}" for kind, count in layers.items())
+    return "unstated" if value is None else str(value)
+
+
+def report_spec(rows: List[SpecRow]) -> List[str]:
+    """The lines of a spec report: each field's two values, the fields that differ marked."""
+    shown = [(row.field, _spec_value(row.resolved), _spec_value(row.census), row.resolved != row.census)
+             for row in rows]
+    widths = [max([len(title)] + [len(line[column]) for line in shown])
+              for column, title in enumerate(("field", "resolver", "census"))]
+    lines = [f"{'field':{widths[0]}s}  {'resolver':>{widths[1]}s}  {'census':>{widths[2]}s}"]
+    for field, resolved, census, differs in shown:
+        mark = "  <- differs" if differs else ""
+        lines.append(f"{field:{widths[0]}s}  {resolved:>{widths[1]}s}  {census:>{widths[2]}s}{mark}")
+    differ = sum(line[3] for line in shown)
+    lines.append(f"{len(rows) - differ} fields agree, {differ} differ")
+    return lines
+
+
+def report(rows: List[VerifyRow]) -> List[str]:
+    """The lines of a verify report: each part's two counts, their difference and its share of the census's."""
+    lines = [f"{'where':26s} {'part':12s} {'ND':>17s} {'census':>17s} {'ND - census':>15s} {'%':>9s}"]
+    for row in rows:
+        difference = row.nd - row.census
+        share = f"{100 * difference / row.census:+8.3f}%" if row.census else ""
+        lines.append(f"{row.where:26s} {row.part:12s} {row.nd:17,.0f} {row.census:17,.0f} "
+                     f"{difference:+15,.0f} {share}")
+    return lines
+
+
 def verify_traffic(yaml_path: str) -> List[TrafficRow]:
     """The bytes each kind of the model a train.yaml trains moves in a forward, beside the FLOPs ND prices.
 
@@ -331,15 +507,4 @@ def traffic_report(rows: List[TrafficRow]) -> List[str]:
         ratio = f"{row.moved / row.flops:11.4f}" if row.flops else f"{'':>11s}"
         lines.append(f"{row.where:26s} {row.part:12s} {row.moved:17,.0f} {row.parameter:15,.0f} "
                      f"{row.launches:8,d} {row.flops:17,.0f} {ratio}")
-    return lines
-
-
-def report(rows: List[VerifyRow]) -> List[str]:
-    """The lines of a verify report: each part's two counts, their difference and its share of the census's."""
-    lines = [f"{'where':26s} {'part':12s} {'ND':>17s} {'census':>17s} {'ND - census':>15s} {'%':>9s}"]
-    for row in rows:
-        difference = row.nd - row.census
-        share = f"{100 * difference / row.census:+8.3f}%" if row.census else ""
-        lines.append(f"{row.where:26s} {row.part:12s} {row.nd:17,.0f} {row.census:17,.0f} "
-                     f"{difference:+15,.0f} {share}")
     return lines

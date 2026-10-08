@@ -18,6 +18,7 @@ loads it prices.
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/perf_estimation/test_estimate.py -v
 """
+import copy
 import math
 import os
 import tempfile
@@ -33,16 +34,30 @@ import yaml
 # settles; perf_estimation.estimate cannot be the first module a process loads.
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
-from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
+import hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate as Estimate
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    check_and_apply_custom_hook,
+    layer_groups,
+    layer_kinds,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import estimate as estimate_module
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
+    LayerTimes,
     MOE_DISPATCH,
     _flavour_tables,
+    estimate_comp,
+    estimate_layer_times,
     estimate_performance,
+    estimate_stage,
     op_table,
 )
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import get_model_order
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
 DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
@@ -80,7 +95,7 @@ def _vision_language_yaml() -> Dict[str, Any]:
 
 
 def _plain_values(ccfg: CostModelConfig) -> Dict[str, Any]:
-    """The config's plain fields, the ones layer hooks overwrite."""
+    """The config's plain fields, the ones layer kinds overwrite."""
     return {name: value for name, value in vars(ccfg).items()
             if isinstance(value, (bool, int, float, str))}
 
@@ -108,6 +123,41 @@ class TestEstimatePerformance(unittest.TestCase):
         self.assertEqual(_plain_values(ccfg), before)
         self.assertEqual(estimate_performance(ccfg, device_type=Hard.Device_A2), first)
 
+    @staticmethod
+    def _debugged(ccfg: CostModelConfig, **kwargs: Any) -> tuple:
+        """The score and its parts."""
+        debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, ccfg.d)], all_dims=[Dim.DP]), info_type=Debug.PerfParts,
+                               enable=True)
+        score = estimate_performance(ccfg, debugger=debugger, device_type=Hard.Device_A2, **kwargs)
+        return score, debugger.info
+
+    def test_stage_savings_come_off_the_recompute(self):
+        """
+        Feature: estimate_performance stage_savings.
+        Description: DeepSeek-V3 over 16 stages and 32 micro-batches,
+            saving nothing, then the same time on every stage.
+        Expectation: Saving nothing changes nothing. Saving the same time
+            everywhere lowers the score, and the recompute part of the
+            slowest stage by that time for each micro-batch.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        score, parts = self._debugged(ccfg)
+        self.assertEqual(self._debugged(ccfg, stage_savings=[0.0] * ccfg.p)[0], score)
+        saved = parts[Debug.PerfParts.RECOMPUTE] / ccfg.m / 4
+        lower, lower_parts = self._debugged(ccfg, stage_savings=[saved] * ccfg.p)
+        self.assertLess(lower, score)
+        self.assertAlmostEqual(lower_parts[Debug.PerfParts.RECOMPUTE] / (parts[Debug.PerfParts.RECOMPUTE]
+                                                                           - saved * ccfg.m), 1.0, places=12)
+
+    def test_stage_savings_need_one_per_stage(self):
+        """
+        Feature: estimate_performance stage_savings.
+        Description: Savings for fewer stages than the pipeline has.
+        Expectation: Refused.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        with self.assertRaises(ValueError):
+            estimate_performance(ccfg, device_type=Hard.Device_A2, stage_savings=[0.0] * (ccfg.p - 1))
     def test_a_vision_language_model_records_every_towers_communication(self):
         """
         Feature: estimate_performance on a multimodal model, its recorded parts.
@@ -128,7 +178,7 @@ class TestEstimatePerformance(unittest.TestCase):
             self.assertTrue(ccfg.multimodal)
             for device in (Hard.Device_A2, Hard.Device_A3):
                 debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, ccfg.d)], all_dims=[Dim.DP]), Debug.PerfParts)
-                with patch.object(estimate_module, "nd_logger") as nd_logger:
+                with patch.object(Estimate, "nd_logger") as nd_logger:
                     total = estimate_performance(deepcopy(ccfg), debugger=debugger, device_type=device)
                 self.assertEqual(nd_logger.error.call_count, 0)
                 self.assertGreater(debugger.info[Debug.PerfParts.MP_COMM], 0)
@@ -155,7 +205,6 @@ class TestOpTable(unittest.TestCase):
         normed = SimpleNamespace(**vars(_cfg(128)), n_qknorm=1)
         self.assertEqual((op_table(normed)["n_qknorm"], "n_qknorm" in op_table(_cfg(128))),
                          (30 * 128 * (8 + 8) * 64 * 2 / 2, False))
-
 
     def test_scores_run_at_the_heads_widths(self):
         """
@@ -246,6 +295,162 @@ class TestOpTable(unittest.TestCase):
         cfg = SimpleNamespace(**{**vars(_cfg(128)), "lin_n_v": 32, "lin_d_k": 128, "lin_d_v": 128})
         self.assertEqual(op_table(cfg)["n_linrec"],
                          3 * 128 * 32 * (2 * 64 * (3 * 128 + 2 * 128) + 6 * 128 * 128) * 2 / 2)
+
+
+_SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
+
+
+class TestLayerTimes(unittest.TestCase):
+    """One layer priced alone, as the pipeline balancer is given it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """DeepSeek: a dense prefix, then MoE layers, on sixteen stages."""
+        cls.ccfg = CostModelConfig(DEEPSEEK_YAML)
+        check_and_apply_custom_hook(cls.ccfg)
+        cls.stages = cls.ccfg.generate_partitions_vpp()
+        cls.kinds = dict(zip(get_model_order(cls.ccfg, cls.stages), layer_kinds(cls.ccfg)))
+        # The kinds of the stack's groups: dense, MoE, and the MTP layer's MoE.
+        cls.groups = [kind for kind, _ in layer_groups(cls.ccfg)]
+
+    def _times(self, layer_type: LayerType, **switches: int):
+        """``(forward, backward)`` of a MoE layer, with these recompute switches."""
+        cfg = copy.deepcopy(self.ccfg)
+        cfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), **switches))
+        return estimate_layer_times(cfg, self.groups[1], layer_type, Hard.Device_A2)
+
+    def test_a_stage_of_one_group_is_the_sum_of_its_layers(self):
+        """
+        Feature: estimate_layer_times.
+        Description: Price every layer alone, and every stage as the search does.
+        Expectation: A stage whose layers all belong to one group costs the
+            sum of its layers.
+        """
+        custom = CustomConfig()
+        comp = estimate_comp(copy.deepcopy(self.ccfg), custom, self.stages)
+        recomp = estimate_comp(copy.deepcopy(self.ccfg), custom, self.stages, with_recomp=True)
+        walked = copy.deepcopy(self.ccfg)
+        comm = estimate_comm(walked, custom, self.stages, Hard.Device_A2)
+        recomm = estimate_comm(copy.deepcopy(self.ccfg), custom, self.stages, Hard.Device_A2, with_recomp=True)
+        search = estimate_stage(walked, custom, comp, comm, recomp, recomm)
+        times = LayerTimes(Hard.Device_A2)
+        checked = 0
+        for s, stage in enumerate(self.stages):
+            positions = [(s, c, i) for c, chunk in enumerate(stage) for i, _ in enumerate(chunk)]
+            if len({self.kinds.get(position) for position in positions} - {None}) != 1 or any(
+                    position not in self.kinds for position in positions):
+                continue
+            total = sum(sum(times(self.ccfg, self.kinds[p], stage[p[1]][p[2]])) for p in positions)
+            self.assertAlmostEqual(total / search[s], 1.0, places=12, msg=f"stage {s}: {total} vs {search[s]}")
+            checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_full_recompute_costs_backward_time_only(self):
+        """
+        Feature: estimate_layer_times.
+        Description: The same layer, without and with full recompute.
+        Expectation: The forward time is the same; the backward time grows.
+        """
+        plain, full = self._times(LayerType.NOT_REC_LAYER), self._times(LayerType.FULL_REC_LAYER)
+        self.assertEqual(full[0], plain[0])
+        self.assertGreater(full[1], plain[1])
+
+    def test_selective_recompute_costs_what_its_switches_recompute(self):
+        """
+        Feature: estimate_layer_times.
+        Description: A selective layer that keeps every op, then one that
+            recomputes its softmax.
+        Expectation: Keeping every op costs what the plain layer costs;
+            recomputing the softmax costs more.
+        """
+        plain = self._times(LayerType.NOT_REC_LAYER)
+        self.assertEqual(self._times(LayerType.SEL_REC_LAYER), plain)
+        self.assertGreater(self._times(LayerType.SEL_REC_LAYER, softmax=0)[1], plain[1])
+
+    def test_switches_price_a_selective_layer_as_a_config_that_sets_them(self):
+        """
+        Feature: estimate_layer_times switches.
+        Description: Price a selective MoE layer of a config that keeps every
+            op, with switches that recompute its softmax.
+        Expectation: It costs what the layer of a config that recomputes its
+            softmax costs, and the config keeps its own switches.
+        """
+        cfg = copy.deepcopy(self.ccfg)
+        cfg.rec_op = Config(dict.fromkeys(_SWITCHES, 1))
+        switched = estimate_layer_times(cfg, self.groups[1], LayerType.SEL_REC_LAYER, Hard.Device_A2,
+                                        switches=dict(dict.fromkeys(_SWITCHES, 1), softmax=0))
+        self.assertEqual(switched, self._times(LayerType.SEL_REC_LAYER, softmax=0))
+        self.assertEqual(vars(cfg.rec_op), dict.fromkeys(_SWITCHES, 1))
+
+    def test_pricing_leaves_the_config_alone(self):
+        """
+        Feature: estimate_layer_times.
+        Description: Price a MoE layer on the config.
+        Expectation: The caller's config comes back unchanged.
+        """
+        cfg = copy.deepcopy(self.ccfg)
+        before = _plain_values(cfg)
+        estimate_layer_times(cfg, self.groups[1], LayerType.FULL_REC_LAYER, Hard.Device_A2)
+        self.assertEqual(_plain_values(cfg), before)
+
+    def test_a_config_is_copied_once_and_each_layer_priced_once(self):
+        """
+        Feature: LayerTimes.
+        Description: Price a layer, change the config the way a kind would,
+            then price the same layer and another type.
+        Expectation: The change is not seen, and the repeated layer is not
+            priced again.
+        """
+        cfg = copy.deepcopy(self.ccfg)
+        times = LayerTimes(Hard.Device_A2)
+        first = times(cfg, self.groups[1], LayerType.NOT_REC_LAYER)
+        cfg.s *= 2  # a field no layer kind sets
+        with patch.object(Estimate, "estimate_layer_times", wraps=Estimate.estimate_layer_times) as spy:
+            self.assertEqual(times(cfg, self.groups[1], LayerType.NOT_REC_LAYER), first)
+            full = times(cfg, self.groups[1], LayerType.FULL_REC_LAYER)
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(full, LayerTimes(Hard.Device_A2)(self.ccfg, self.groups[1], LayerType.FULL_REC_LAYER))
+
+    def test_each_set_of_switches_is_priced_once(self):
+        """
+        Feature: LayerTimes switches.
+        Description: Price a selective layer with the same switches twice,
+            listed in another order the second time, then with other ones.
+        Expectation: Two estimates; the switches decide the time.
+        """
+        times = LayerTimes(Hard.Device_A2)
+        softmax = dict(dict.fromkeys(_SWITCHES, 1), softmax=0)
+        with patch.object(Estimate, "estimate_layer_times", wraps=Estimate.estimate_layer_times) as spy:
+            first = times(self.ccfg, self.groups[1], LayerType.SEL_REC_LAYER, softmax)
+            again = times(self.ccfg, self.groups[1], LayerType.SEL_REC_LAYER, dict(reversed(list(softmax.items()))))
+            gather = times(self.ccfg, self.groups[1], LayerType.SEL_REC_LAYER,
+                           dict(dict.fromkeys(_SWITCHES, 1), gather=0))
+        self.assertEqual(spy.call_count, 2)
+        self.assertEqual(again, first)
+        self.assertNotEqual(gather, first)
+
+    def test_a_kinds_options_share_their_plain_times(self):
+        """
+        Feature: LayerTimes plain times.
+        Description: Price a MoE layer plain, fully recomputed and with two
+            sets of switches, then the embedding.
+        Expectation: The MoE options share one plain pricing, the embedding
+            has its own, and each option's time is what pricing it alone
+            gives.
+        """
+        times = LayerTimes(Hard.Device_A2)
+        options = ((LayerType.NOT_REC_LAYER, None), (LayerType.FULL_REC_LAYER, None),
+                   (LayerType.SEL_REC_LAYER, dict(dict.fromkeys(_SWITCHES, 1), softmax=0)),
+                   (LayerType.SEL_REC_LAYER, dict(dict.fromkeys(_SWITCHES, 1), gather=0, ffAct=0)))
+        with patch.object(Estimate, "plain_layer_times", wraps=Estimate.plain_layer_times) as spy:
+            priced = [times(self.ccfg, self.groups[1], layer_type, switches) for layer_type, switches in options]
+            times(self.ccfg, None, LayerType.EMBEDDING_LAYER)
+        self.assertEqual(spy.call_count, 2)
+        for (layer_type, switches), both in zip(options, priced):
+            alone = estimate_layer_times(copy.deepcopy(self.ccfg), self.groups[1], layer_type, Hard.Device_A2,
+                                         switches=switches)
+            self.assertEqual(both, alone)
+
 
 if __name__ == "__main__":
     unittest.main()

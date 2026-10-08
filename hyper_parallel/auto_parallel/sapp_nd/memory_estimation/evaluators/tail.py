@@ -15,7 +15,7 @@
 """Tail submodule"""
 from __future__ import annotations
 from typing import TYPE_CHECKING
-from hyper_parallel.auto_parallel._layer_census import KindActivations
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 

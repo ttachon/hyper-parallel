@@ -1,12 +1,15 @@
 # Op records (shared decision S1): what each op of a layer keeps for its
 # backward, as the memory model prices it.
 #
-# ops: every op of a layer kind, as the op table names them, a feed-forward's
-# batched matmuls counted among its projections (ffMM).  An op a recompute
+# ops: every op of a layer kind, the op vector's names.  An op a recompute
 # switch drops names it as its switch; one that names none is kept by every
 # selective layer and dropped only by full recompute.  needs names the ops
 # whose outputs recomputing it takes; comm marks an op that is
 # communication rather than compute.
+#
+# parts: what of an op's saves a switch of its own drops, apart from the op,
+# which keeps the rest: part_of names the op.  What a part keeps counts
+# toward its op wherever an op is priced alone.
 #
 # slots: the memory model's activation formulas.  A slot's formula prices
 # what a layer keeps in it, one rank's share of a micro-batch, in bytes,
@@ -49,9 +52,21 @@ ops:
     needs: [ffMM]
   linrec:
     needs: [attMM]
+parts:
+  # The query heads and the key and value heads an MLA layer's
+  # up-projections build from the latents it keeps: recomputing the
+  # up-projections builds them again.  The queries' only where they have a
+  # latent of their own; without one, a projection builds them from the
+  # layer's input.
+  attUp:
+    part_of: attMM
+    switch: attUp
+    needs: [attMM]
 slots:
   # The projections' inputs, and the keys and values an attention keeps: an
-  # MLA layer's latents and heads where it compresses them.
+  # MLA layer's latents, and its heads, which its up-projections build.
+  # Every term counts elements, so the two entries sum to what one
+  # expression summed, to the bit.
   qkv:
     part: attention
     formula: micro_factor * (s * b * bytes_compute * total) / (t * cp)
@@ -60,9 +75,13 @@ slots:
         0.25 * (n_attMM + n_attParamCast) * h
         + 0.5 * (n_attMM + n_attParamCast) * dh * n_kv * cp / kv_shards
         if dc_kv == 0 else
-        0.25 * (n_attMM + n_attParamCast) * (dc_q + 2 * a * (dh + dhr))
-        + (0.25 * (n_attMM + n_attParamCast) * (dhr + n_kv * (2 * dh + dhr))
+        0.25 * (n_attMM + n_attParamCast) * (dc_q + (0 if dc_q else 2 * a * (dh + dhr)))
+        + (0.25 * (n_attMM + n_attParamCast) * dhr
            + 0.25 * (n_attMM + n_attParamCast) * (n_kv * dh + dc_kv)) * cp / kv_shards
+      attUp: >-
+        0 if dc_kv == 0 else
+        0.25 * (n_attMM + n_attParamCast) * (2 * a * (dh + dhr) if dc_q else 0)
+        + 0.25 * (n_attMM + n_attParamCast) * n_kv * (2 * dh + dhr) * cp / kv_shards
       attBMM: n_attBMM * dh
   # The scores' softmax, its dropout mask and the scores' cast, per head.
   score:
@@ -87,8 +106,7 @@ slots:
     formula: micro_factor * (s * b) * total / (t * cp)
     ops:
       ffMM: >-
-        (0.5 * h + 0.5 * hff if max(n_ffMM, n_ffBMM) % 2 == 0 else 1 / 3 * h + 2 / 3 * hff)
-        * (bytes_compute * max(n_ffMM, n_ffBMM))
+        (0.5 * h + 0.5 * hff if n_ffMM % 2 == 0 else 1 / 3 * h + 2 / 3 * hff) * (bytes_compute * n_ffMM)
         + bytes_compute * hff * n_ffParamCast
       ffAct: bytes_compute * hff
   # A MoE layer's routed experts, each as wide as the model states them,
@@ -102,8 +120,7 @@ slots:
          else s * b * n_chosen_exp / n_exp * n_exp * dropless_tok_factor)
     ops:
       ffMM: >-
-        (0.5 * h + 0.5 * hff_exp if max(n_ffMM, n_ffBMM) % 2 == 0 else 1 / 3 * h + 2 / 3 * hff_exp)
-        * (bytes_compute * max(n_ffMM, n_ffBMM))
+        (0.5 * h + 0.5 * hff_exp if n_ffMM % 2 == 0 else 1 / 3 * h + 2 / 3 * hff_exp) * (bytes_compute * n_ffMM)
         + bytes_compute * hff_exp * n_ffParamCast
       ffAct: bytes_compute * hff_exp
   # A MoE layer's shared experts, each as wide as a routed one.
@@ -113,8 +130,7 @@ slots:
     formula: n_shared_exp * (micro_factor * (s * b) * total / (t * cp))
     ops:
       ffMM: >-
-        (0.5 * h + 0.5 * hff_exp if max(n_ffMM, n_ffBMM) % 2 == 0 else 1 / 3 * h + 2 / 3 * hff_exp)
-        * (bytes_compute * max(n_ffMM, n_ffBMM))
+        (0.5 * h + 0.5 * hff_exp if n_ffMM % 2 == 0 else 1 / 3 * h + 2 / 3 * hff_exp) * (bytes_compute * n_ffMM)
         + bytes_compute * hff_exp * n_ffParamCast
       ffAct: bytes_compute * hff_exp
   # A MoE layer's router, its logits, probabilities and choices, and the

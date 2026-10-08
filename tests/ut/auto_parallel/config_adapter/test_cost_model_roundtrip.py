@@ -29,14 +29,8 @@ from unittest.mock import patch
 
 import yaml
 
-from hyper_parallel.auto_parallel._hf_model_spec import TEXT_FIELDS
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
-from hyper_parallel.auto_parallel.config_adapter._search_runner import (
-    CONFIG_OVERRIDE_FIELDS,
-    NOT_FORWARDED,
-    _build_hp_yaml_dict,
-    check_forwarded_fields,
-)
+from hyper_parallel.auto_parallel.config_adapter._search_runner import _build_hp_yaml_dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
@@ -143,18 +137,21 @@ class TestCostModelRoundTrip(unittest.TestCase):
         self.assertEqual(yaml_dict["model"]["config_overrides"]["head_dim"], 128)
         self.assertEqual(_parse(yaml_dict).dh, 128)
 
-    def test_the_tie_and_the_qk_norm_survive_the_round_trip(self) -> None:
+    def test_run_keys_reach_the_parser_and_the_adapter_keys_stay_out(self) -> None:
         """
-        Feature: model facts through the search runner.
-        Description: A qwen3_moe spec stating tied embeddings and no QK-norm,
-            which its name alone would infer.
-        Expectation: The parser prices one table for both ends and no
-            QK-norm, as the spec states.
+        Feature: config_overrides of the generated YAML.
+        Description: The model section states a capacity factor, a run key the
+            parser reads from config_overrides, beside the adapter's own keys.
+        Expectation: The capacity factor reaches the parser; the adapter's
+            keys stay out of config_overrides.
         """
         config = _normalized_config()
-        config.model_spec.update(tie_word_embeddings=True, qk_norm=False)
-        ccfg = _parse(_build_hp_yaml_dict(config))
-        self.assertEqual((ccfg.tie_emb_out, ccfg.qk_norm), (True, False))
+        config.model_spec["capacity_factor"] = 1.5
+        yaml_dict = _build_hp_yaml_dict(config)
+        overrides = yaml_dict["model"]["config_overrides"]
+        for key in ("local_batch_size", "compute_dtype", "moe_enabled"):
+            self.assertNotIn(key, overrides, f"{key} rode into config_overrides")
+        self.assertEqual(_parse(yaml_dict).cap_fact, 1.5)
 
     def test_the_biases_and_the_nope_width_survive_the_round_trip(self) -> None:
         """
@@ -170,23 +167,6 @@ class TestCostModelRoundTrip(unittest.TestCase):
         ccfg = _parse(_build_hp_yaml_dict(config))
         self.assertEqual((ccfg.qkv_bias, ccfg.o_bias, ccfg.mlp_bias), (True, True, True))
         self.assertEqual(ccfg.qk_nope_head_dim, 96)
-
-    def test_every_field_the_resolver_names_is_forwarded_or_exempted(self) -> None:
-        """
-        Feature: _search_runner.check_forwarded_fields, the gate run at import (I10).
-        Description: The search's own lists; the same without qkv_bias; and
-            an exemption for a field the search forwards.
-        Expectation: The search's lists pass; a resolver field neither
-            forwarded nor exempted, and a stale exemption, are each refused
-            by name.
-        """
-        check_forwarded_fields()
-        forwarded = [field for field in CONFIG_OVERRIDE_FIELDS if field != "qkv_bias"]
-        with self.assertRaisesRegex(RuntimeError, "forwards no qkv_bias"):
-            check_forwarded_fields(forwarded=forwarded)
-        with self.assertRaisesRegex(RuntimeError, "NOT_FORWARDED names hidden_size"):
-            check_forwarded_fields(exempt={**NOT_FORWARDED, "hidden_size": "forwarded"})
-        self.assertEqual(set(TEXT_FIELDS) - set(CONFIG_OVERRIDE_FIELDS), set(NOT_FORWARDED))
 
     def test_device_num_reaches_the_parser(self) -> None:
         """
@@ -236,8 +216,13 @@ class TestCostModelRoundTrip(unittest.TestCase):
         self.assertEqual(ccfg.shard_recompute_input, ccfg.t)
 
 
-class TestInMemoryConfig(unittest.TestCase):
-    """A config handed over in memory is parsed as the same config on disk."""
+class TestNoDiskRoundTrip(unittest.TestCase):
+    """The config ND parses is the one the adapter built, not a copy of it.
+
+    The search used to write this mapping to a temporary yaml so the parser
+    could read it back, which is the model interface being simulated through
+    the filesystem. These tests pin that the detour changed nothing.
+    """
 
     @staticmethod
     def _cost_model_config():
@@ -256,28 +241,18 @@ class TestInMemoryConfig(unittest.TestCase):
             if isinstance(value, (int, float, str, bool)) and not name.startswith("_")
         }
 
-    def test_framework_is_honoured_without_a_path(self) -> None:
-        """
-        Feature: parser selection for an in-memory config.
-        Description: A mapping used to fall through to the MindFormers
-            parser whatever framework the caller named, because only a path
-            string reached the framework lookup.
-        Expectation: The named framework selects the parser.
-        """
-        cost_model_config = self._cost_model_config()
-        ccfg = cost_model_config(_build_hp_yaml_dict(_normalized_config()), None, "hyper_v2", None)
-        self.assertIsInstance(ccfg.parser, CostModelParserHyperV2)
-
-    def test_in_memory_config_matches_the_same_file(self) -> None:
+    def test_in_memory_config_matches_the_temp_file(self) -> None:
         """
         Feature: the cost-model config as a mapping rather than a file.
-        Description: Parse the same generated config from a yaml file and
-            from memory.
+        Description: Parse the same generated config twice, once from a temp
+            yaml the way the search used to, once in memory the way it does
+            now.
         Expectation: Both select CostModelParserHyperV2 and populate every
             scalar field identically.
         """
         cost_model_config = self._cost_model_config()
         yaml_dict = _build_hp_yaml_dict(_normalized_config())
+
         handle, path = tempfile.mkstemp(suffix=".yaml", prefix="roundtrip_")
         os.close(handle)
         try:
@@ -287,9 +262,22 @@ class TestInMemoryConfig(unittest.TestCase):
         finally:
             os.remove(path)
         via_memory = cost_model_config(yaml_dict, None, "hyper_v2", None)
+
         self.assertIs(type(via_memory.parser), type(via_disk.parser))
         self.assertEqual(self._scalars(via_memory), self._scalars(via_disk))
 
+    def test_framework_is_honoured_without_a_path(self) -> None:
+        """
+        Feature: parser selection for an in-memory config.
+        Description: A mapping used to fall through to the MindFormers
+            parser whatever framework the caller named, because only a path
+            string reached the framework lookup.
+        Expectation: The named framework selects the parser either way.
+        """
+        cost_model_config = self._cost_model_config()
+        ccfg = cost_model_config(_build_hp_yaml_dict(_normalized_config()),
+                                 None, "hyper_v2", None)
+        self.assertIsInstance(ccfg.parser, CostModelParserHyperV2)
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,12 +28,15 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    apply_layer_kind,
+    check_and_apply_custom_hook,
+    layer_groups,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import (
-    cp_comm_layer_detailed,
     _recomputed_comm,
     estimate_comm,
     prepare_context,
@@ -52,17 +55,15 @@ class TestRecomputedComm(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """The fixture's config, its layer hooks applied."""
+        """The fixture's config, its family hook applied, and the kinds of its layers."""
         cls.ccfg = CostModelConfig(DEEPSEEK_YAML)
         check_and_apply_custom_hook(cls.ccfg)
-        # In a list, not a class attribute: a function read through ``self``
-        # would come back as a method bound to the test case.
-        cls.groups = [hook for _, hook in cls.ccfg.layer_custom_config]
+        cls.groups = [kind for kind, _ in layer_groups(cls.ccfg)]
 
     def _moe_layer(self, **switches: int) -> CostModelConfig:
         """A MoE layer's config, every op kept but for *switches*."""
         cfg = copy.deepcopy(self.ccfg)
-        self.groups[1](cfg)
+        apply_layer_kind(cfg, self.groups[1])
         cfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), **switches))
         return cfg
 
@@ -105,25 +106,6 @@ class TestRecomputedComm(unittest.TestCase):
         again = _recomputed_comm(cfg, prepare_context(), LayerType.FULL_REC_LAYER)
         self.assertGreater(again[1], 0)
         self.assertEqual(again, self._plain(cfg))
-
-    def test_a_recompute_resends_the_forward_half_of_cp(self):
-        """
-        Feature: _recomputed_comm, under context parallelism.
-        Description: The MoE layer at CP 4, fully recomputed, and selective
-            with its gathers recomputed and kept.
-        Expectation: A recompute runs the forward's K and V exchange again,
-            half the layer's CP traffic; a selective layer only where its
-            gather switch recomputes.
-        """
-        cfg = self._moe_layer()
-        cfg.cp, cfg.comm_cp = 4, 1
-        forward = cp_comm_layer_detailed(cfg, prepare_context()).comm_volume / 2
-        self.assertGreater(forward, 0)
-        self.assertEqual(_recomputed_comm(cfg, prepare_context(), LayerType.FULL_REC_LAYER)[2], forward)
-        cfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), gather=0))
-        self.assertEqual(_recomputed_comm(cfg, prepare_context(), LayerType.SEL_REC_LAYER)[2], forward)
-        cfg.rec_op = Config(dict.fromkeys(_SWITCHES, 1))
-        self.assertEqual(_recomputed_comm(cfg, prepare_context(), LayerType.SEL_REC_LAYER)[2], 0)
 
     def test_only_recomputed_layers_add_communication(self):
         """

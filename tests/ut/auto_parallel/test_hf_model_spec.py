@@ -28,9 +28,11 @@ import torch
 
 from hyper_parallel.auto_parallel import _hf_model_spec as spec_mod
 from hyper_parallel.auto_parallel._hf_model_spec import (
+    exec_overrides,
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
+from hyper_parallel.auto_parallel._model_spec import ModelSpecError
 
 _REGISTRY = "hyper_parallel.models._transformers.config_resolver"
 
@@ -180,6 +182,7 @@ class TestVisualSequenceLength(unittest.TestCase):
         with _stub_registry(recorder):
             result = resolve_hf_model_spec({"pretrained_model_name_or_path": "x"})
         self.assertEqual(result["vision"]["max_position_embeddings"], 576)
+        self.assertEqual(result["vision"]["layers"], [{"kind": "encoder", "count": 27}])
 
     def test_override_wins(self) -> None:
         """context.visual_seq_len replaces the derived bound."""
@@ -245,66 +248,26 @@ class TestTransformersEntryPoint(unittest.TestCase):
         self.assertEqual(result["hidden_size"], 2048)
 
 
-class TestFromConfigRecipe(unittest.TestCase):
-    """A from_config recipe names its model directory and its own shape."""
+class TestOverridesOfTheRun(unittest.TestCase):
+    """config_overrides states the model, and a few keys of the run."""
 
-    @staticmethod
-    def _released_config() -> SimpleNamespace:
-        """The released Qwen3.5-MoE shape, before any crop."""
-        return SimpleNamespace(
-            model_type="qwen3_5_moe", hidden_size=2048, num_hidden_layers=40,
-            num_attention_heads=16, num_key_value_heads=2, head_dim=256,
-            num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512,
-            vocab_size=248320, max_position_embeddings=262144,
-        )
+    _MODEL = {"hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8,
+              "vocab_size": 32000}
 
-    def test_config_path_names_the_model_directory(self) -> None:
-        """A factory recipe carries config_path instead of a pretrained path."""
-        recorder = _Recorder(self._released_config())
-        with _stub_registry(recorder):
-            result = resolve_hf_model_spec({
-                "_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
-                "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base",
-            })
-        self.assertEqual(recorder.calls[0][0], "/home/tt/models/Qwen3.5-35B-A3B-Base")
-        self.assertEqual(result["name"], "qwen3_5_moe")
-        self.assertEqual(result["num_hidden_layers"], 40)
+    def test_the_run_keys_leave_the_model_spec(self) -> None:
+        """The offset, the recompute and the capacity factor are not the model's."""
+        run = {"offset": [1, -1], "full_rec": [2, 1], "sel_rec": False, "capacity_factor": 1.5}
+        model_raw = {"name": "toy", "config_overrides": dict(self._MODEL, **run)}
+        resolved = resolve_hf_model_spec(model_raw)
+        self.assertEqual(sorted(set(run) & set(resolved)), [], f"resolved={resolved}")
+        self.assertEqual(exec_overrides(model_raw), run)
 
-    def test_factory_arguments_crop_the_released_config(self) -> None:
-        """The layer and expert counts the recipe builds beat the released ones."""
-        recorder = _Recorder(self._released_config())
-        with _stub_registry(recorder):
-            result = resolve_hf_model_spec({
-                "_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
-                "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base",
-                "num_hidden_layers": 8,
-                "num_experts": 64,
-                "torch_dtype": "bfloat16",
-            })
-        self.assertEqual(result["num_hidden_layers"], 8)
-        self.assertEqual(result["num_experts"], 64)
-        # Everything the recipe does not restate still comes from the released config.
-        self.assertEqual(result["hidden_size"], 2048)
-        self.assertEqual(result["num_experts_per_tok"], 8)
+    def test_an_unknown_key_is_refused(self) -> None:
+        """A misspelt model field fails by name instead of pricing nothing."""
+        model_raw = {"name": "toy", "config_overrides": dict(self._MODEL, hidden_sise=2048)}
+        with self.assertRaisesRegex(ModelSpecError, "hidden_sise"):
+            resolve_hf_model_spec(model_raw)
 
-    def test_config_overrides_still_beat_factory_arguments(self) -> None:
-        """The declared override form stays the last word."""
-        recorder = _Recorder(self._released_config())
-        with _stub_registry(recorder):
-            result = resolve_hf_model_spec({
-                "config_path": "/models/qwen",
-                "num_hidden_layers": 8,
-                "config_overrides": {"num_hidden_layers": 2},
-            })
-        self.assertEqual(result["num_hidden_layers"], 2)
-
-    def test_error_names_every_accepted_key(self) -> None:
-        """A model section with no shape at all says what would satisfy it."""
-        with self.assertRaises(ValueError) as raised:
-            resolve_hf_model_spec({"_target_": "some.factory", "torch_dtype": "bfloat16"})
-        message = str(raised.exception)
-        for key in ("pretrained_model_name_or_path", "config_path", "config_overrides"):
-            self.assertIn(key, message)
 
 
 class TestQkNorm(unittest.TestCase):
@@ -366,6 +329,68 @@ class TestVectors(unittest.TestCase):
         self.assertEqual(self._facts("qwen2_moe")[0::5], (True, True))
         self.assertEqual(self._facts("qwen3_5_moe")[0::5], (False, True))
         self.assertEqual(self._facts("mixtral"), (False, False, False, False, 2, False))
+
+
+class TestFromConfigRecipe(unittest.TestCase):
+    """A from_config recipe names its model directory and its own shape."""
+
+    @staticmethod
+    def _released_config() -> SimpleNamespace:
+        """The released Qwen3.5-MoE shape, before any crop."""
+        return SimpleNamespace(
+            model_type="qwen3_5_moe", hidden_size=2048, num_hidden_layers=40,
+            num_attention_heads=16, num_key_value_heads=2, head_dim=256,
+            num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512,
+            vocab_size=248320, max_position_embeddings=262144,
+        )
+
+    def test_config_path_names_the_model_directory(self) -> None:
+        """A factory recipe carries config_path instead of a pretrained path."""
+        recorder = _Recorder(self._released_config())
+        with _stub_registry(recorder):
+            result = resolve_hf_model_spec({
+                "_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
+                "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base",
+            })
+        self.assertEqual(recorder.calls[0][0], "/home/tt/models/Qwen3.5-35B-A3B-Base")
+        self.assertEqual(result["name"], "qwen3_5_moe")
+        self.assertEqual(result["num_hidden_layers"], 40)
+
+    def test_factory_arguments_crop_the_released_config(self) -> None:
+        """The layer and expert counts the recipe builds beat the released ones."""
+        recorder = _Recorder(self._released_config())
+        with _stub_registry(recorder):
+            result = resolve_hf_model_spec({
+                "_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
+                "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base",
+                "num_hidden_layers": 8,
+                "num_experts": 64,
+                "torch_dtype": "bfloat16",
+            })
+        self.assertEqual(result["num_hidden_layers"], 8)
+        self.assertEqual(result["num_experts"], 64)
+        # Everything the recipe does not restate still comes from the released config.
+        self.assertEqual(result["hidden_size"], 2048)
+        self.assertEqual(result["num_experts_per_tok"], 8)
+
+    def test_config_overrides_still_beat_factory_arguments(self) -> None:
+        """The declared override form stays the last word."""
+        recorder = _Recorder(self._released_config())
+        with _stub_registry(recorder):
+            result = resolve_hf_model_spec({
+                "config_path": "/models/qwen",
+                "num_hidden_layers": 8,
+                "config_overrides": {"num_hidden_layers": 2},
+            })
+        self.assertEqual(result["num_hidden_layers"], 2)
+
+    def test_error_names_every_accepted_key(self) -> None:
+        """A model section with no shape at all says what would satisfy it."""
+        with self.assertRaises(ValueError) as raised:
+            resolve_hf_model_spec({"_target_": "some.factory", "torch_dtype": "bfloat16"})
+        message = str(raised.exception)
+        for key in ("pretrained_model_name_or_path", "config_path", "config_overrides"):
+            self.assertIn(key, message)
 
 
 if __name__ == "__main__":

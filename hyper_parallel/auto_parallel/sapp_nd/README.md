@@ -60,11 +60,48 @@ constraint:
 recompute: "full"
 ```
 
+`recompute` sets how the search treats activation checkpointing. `auto`
+chooses one of the trainer's modes for every layer of each candidate.
+`per_layer` chooses one for each layer, and `resolved.yaml` states that
+plan as `activation_checkpoint.mode` and `activation_checkpoint.layers`
+(`{mode: full, layers: {3-7: off}}`). Either way the search chooses among
+off and full, plus the trainer's selective policy where the train.yaml asks
+for a census; `recompute_modes: [off, full]` narrows that list. Any other
+value prices every layer fully recomputed. The choice fills
+`memory_limit_gb`, which is compared with the memory ND estimates a run
+allocates. A run also holds what its allocator reserves beyond that, 7 to
+16 GiB a rank on the Qwen3.5-MoE crop at 8192 tokens, so set the limit below
+what the device leaves by that much.
+
 Both are run the same way:
 
 ```bash
 python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd     -y train.yaml -s search.yaml -f hyper_v2     -d 64 -b 128 -A A3 -M 58GB -o out
 ```
+
+### The model spec and the run spec
+
+Whatever the input format, ND prices a model from two typed specs:
+
+- The model spec (`auto_parallel/_model_spec.py`, `ModelSpec`) states the
+  model under any strategy: its dimensions, its experts, its layer stack
+  (`layers`), its family (`arch`) and, where they differ from the family's,
+  its op counts per layer kind (`ops`). A Transformers config resolves into
+  one, and `model.config_overrides` states its fields offline.
+- The run spec (`auto_parallel/_exec_spec.py`, `ExecSpec`) states how the
+  model is trained: the parallel degrees, the pipeline layout, the batch,
+  the optimizer and gradient sharding, the recompute, the precisions, the
+  kernels, the sequence length and the device memory. A HyperParallel
+  configuration states it in the train.yaml; `offset`, `full_rec`,
+  `sel_rec`, `capacity_factor`, `use_gmm` and `seq_length` in
+  `config_overrides` belong to it.
+
+Every other field is derived from the two. What neither states comes from
+the model's family, in its op profile (`auto_parallel/op_profiles/<arch>.yaml`):
+its op counts per layer kind, and defaults such as its byte widths. A run
+spec states recompute as ranges of layers in model order, the body layers
+first and the MTP layers last, so a search can give each layer its own
+option; `{option: full}` alone recomputes every layer.
 
 ## Workflow
 
@@ -123,6 +160,10 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-v VERBOSITY]
     [-A DEVICE_TYPE]
     [-mppb | --manual_pipeline_balance]
+    [-ar | --auto_recompute]
+    [-ao | --auto_offload]
+    [--host_link_gibps GIB_PER_S]
+    [--sustained_tflops TFLOPS]
     [-t TOP_CONFIG_NUMBER]
     [-mem MEM_FOR_PPB]
     [--real_csv REAL_CSV [-o OUTPUT_DIR]]
@@ -137,6 +178,15 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-v`, `--verbosity`: verbosity in range `[0, 6]`.
 - `-A`, `--device_type`: device type, such as `A2` or `A3`.
 - `-mppb`, `--manual_pipeline_balance`: read offset and recompute from yaml.
+- `-ar`, `--auto_recompute`: give every layer of each configuration the
+  fastest recompute option that fits, instead of scoring it fully recomputed.
+- `-ao`, `--auto_offload`: with `-ar`, let each pipeline stage's first layers
+  offload their activations to the host instead of recomputing them, over the
+  device's host link (see Hardware). Priced at one chunk per stage; not with a
+  search config, whose trainer runs no offload.
+- `--host_link_gibps`, `--sustained_tflops`: the host link's copy bandwidth
+  and the device's sustained throughput `-ao` prices with, replacing the
+  device's placeholders.
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
 - `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plots and its estimates are written there.
@@ -225,6 +275,17 @@ sapp_nd/
 - Ascend A2.
 - Ascend A3.
 - Other Ascend variants and GPU support are future work.
+
+Offload (`-ao`) prices each copy to the host with two figures per device,
+`HostLink` in `nd/common/hardware.py`: the copy bandwidth to pinned host
+memory, in GiB/s, and the sustained dense throughput, in TFLOP/s, which turns
+a copy's seconds into the estimate's units. The figures there are
+placeholders, not measurements: 16 GiB/s is hyper_offload's own default
+before it profiles the link, and the throughputs are about half of each
+device's dense peak. Measure the link on the target with hyper_offload's
+`profile_transfer_bandwidth`, and the throughput from a profiled training
+step, or take the vendor's figures; then state them in `hardware.py` or pass
+`--host_link_gibps` and `--sustained_tflops`.
 
 ### Parallel Dimensions
 

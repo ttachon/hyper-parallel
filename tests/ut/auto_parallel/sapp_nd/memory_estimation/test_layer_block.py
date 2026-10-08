@@ -118,8 +118,8 @@ class TestMlaParameters(unittest.TestCase):
 def _vectors(**stated) -> SimpleNamespace:
     """A layer of width 64, 4 query and 2 key heads 16 wide, gated experts 32 wide, a vocabulary of 100."""
     return SimpleNamespace(**{"h": 64, "a": 4, "n_kv": 2, "dh": 16, "dc_kv": 0, "n_attMM": 4, "attn_output_gate": False,
-                              "attn_extra_p": 0, "n_ffMM": 3, "n_ffBMM": 0, "hff": 128, "hff_exp": 32, "etp": 1,
-                              "n_exp": 4, "n_shared_exp": 1, "n_normOp": 2, "n_qknorm": 0, "v": 100, "qkv_bias": None,
+                              "attn_extra_p": 0, "n_ffMM": 3, "hff": 128, "hff_exp": 32, "etp": 1, "n_exp": 4,
+                              "n_shared_exp": 1, "n_normOp": 2, "n_qknorm": 0, "v": 100, "qkv_bias": None,
                               "o_bias": None, "mlp_bias": None, "norm_bias": None, "layer_norms": None,
                               "shared_expert_gate": None, **stated})
 
@@ -171,9 +171,9 @@ class TestVectors(unittest.TestCase):
 
 def _experts(hff: int) -> SimpleNamespace:
     """A MoE layer of width 64 over 16 tokens: 4 experts 32 wide, 2 chosen, one shared, the dense width *hff*."""
-    return SimpleNamespace(s=16, b=1, h=64, hff=hff, hff_exp=32, n_ffMM=3, n_ffBMM=0, n_ffParamCast=0,
-                           bytes_compute=2, t=1, cp=1, n_exp=4, n_chosen_exp=2, n_shared_exp=1, gmm=True, cap_fact=1,
-                           mlp_bias=None, shared_expert_gate=None, rec_op=Config({"ffAct": 1}))
+    return SimpleNamespace(s=16, b=1, h=64, hff=hff, hff_exp=32, n_ffMM=3, n_ffParamCast=0, bytes_compute=2, t=1,
+                           cp=1, n_exp=4, n_chosen_exp=2, n_shared_exp=1, gmm=True, cap_fact=1, mlp_bias=None,
+                           shared_expert_gate=None, rec_op=Config({"ffAct": 1}))
 
 
 class TestExpertWidth(unittest.TestCase):
@@ -206,9 +206,9 @@ def _layer(n_exp: int) -> SimpleNamespace:
     """A layer of width 64 over 16 tokens, 4 query and 2 key heads 16 wide; dense 128 wide or 4 experts 32 wide."""
     return SimpleNamespace(
         s=16, b=1, h=64, a=4, n_kv=2, dh=16, dc_kv=0, s_fa=16, t=2, cp=1, sp=2, cp_algo="colossalai_cp",
-        n_attMM=4, n_attParamCast=0, n_attBMM=2, n_softmax=1, n_dropout=1, n_ffMM=3, n_ffBMM=0, n_ffParamCast=0,
-        n_normOp=2, n_qknorm=1, n_linrec=0, hff=128, hff_exp=32, n_exp=n_exp, n_chosen_exp=2, n_shared_exp=1,
-        gmm=True, cap_fact=1, bytes_compute=2, bytes_softmax=4, bytes_dropout=1, bytes_norm=4,
+        n_attMM=4, n_attParamCast=0, n_attBMM=2, n_softmax=1, n_dropout=1, n_ffMM=3, n_ffParamCast=0, n_normOp=2,
+        n_qknorm=1, n_linrec=0, hff=128, hff_exp=32, n_exp=n_exp, n_chosen_exp=2, n_shared_exp=1, gmm=True,
+        cap_fact=1, bytes_compute=2, bytes_softmax=4, bytes_dropout=1, bytes_norm=4,
         rec_op=Config({name: 1 for name in _ACTIVATION_SWITCHES + ("gather",)}))
 
 

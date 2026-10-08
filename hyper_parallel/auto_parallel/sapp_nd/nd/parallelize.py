@@ -22,10 +22,20 @@ import multiprocessing as proc
 import json
 import os
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+from hyper_parallel.auto_parallel._exec_spec import ExecSpec
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
+    MODES,
+    RecomputeChoice,
+    choose_recompute,
+    describe,
+    mode_ranges,
+    trainer_plan,
+    whole_modes,
+)
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -33,8 +43,10 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     CostModelConfig,
+    arm_strategy_guard,
     detect_attention_type,
     unset_reads_report,
 )
@@ -53,10 +65,12 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
 class ParallelizeLayer:
     """Parallelize one layer type"""
 
-    # No recompute dimension and no mode stated, also for an instance a test
-    # builds without __init__.
+    # No recompute dimension, no mode stated and no recompute chosen per
+    # candidate, also for an instance a test builds without __init__.
     recompute_modes = None
+    recompute_dimension = None
     _stated_mode = None
+    auto_recompute = False
 
     def __init__(
         self,
@@ -73,20 +87,26 @@ class ParallelizeLayer:
             manual_ppb = extra_config.pop("mppb")
         else:
             manual_ppb = False
+        self._take_recompute_options(extra_config, manual_ppb)
         # A recompute dimension: the activation checkpoint modes every
         # candidate is priced under, each pair ranked on its own; None prices
         # each candidate with the recompute it derives, as without one.
-        self.recompute_modes = extra_config.pop("recompute_modes", None)
-        if self.recompute_modes is not None:
-            unknown = sorted(set(self.recompute_modes) - set(RECOMPUTE_MODES))
-            if unknown or not self.recompute_modes:
-                raise ValueError(f"recompute_modes {list(self.recompute_modes)}: expected some of "
+        self.recompute_dimension = extra_config.pop("recompute_dimension", None)
+        if self.recompute_dimension is not None:
+            unknown = sorted(set(self.recompute_dimension) - set(RECOMPUTE_MODES))
+            if unknown or not self.recompute_dimension:
+                raise ValueError(f"recompute_dimension {list(self.recompute_dimension)}: expected some of "
                                  f"{', '.join(RECOMPUTE_MODES)}")
             if manual_ppb:
-                raise ValueError("recompute_modes prices every candidate under each mode, and mppb takes the "
-                                 "recompute from the config: give one of them")
+                raise ValueError("recompute_dimension prices every candidate under each mode, and mppb takes "
+                                 "the recompute from the config: give one of them")
+            if self.auto_recompute:
+                raise ValueError("recompute_dimension ranks every candidate under each mode, and "
+                                 "auto_recompute chooses one for each: give one of them")
 
         self.mem_eval = evaluator
+        # The options chosen for each configuration the ordering scored.
+        self.recompute_choices = {}
 
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
@@ -138,6 +158,52 @@ class ParallelizeLayer:
             self.global_batch_size = self.config.ccfg.gbs
 
         self.bound_space()
+        # From here on the configs this search owns take a strategy only
+        # through set_strategy; an estimator's copy of one starts unarmed.
+        arm_strategy_guard(self.mem_eval.ccfg)
+
+    def _take_recompute_options(self, extra_config: Dict[str, Any], manual_ppb: bool) -> None:
+        """Take the recompute and offload options out of *extra_config*, refusing those that do not go together."""
+        auto_recompute = extra_config.pop("auto_recompute", False)
+        if auto_recompute and manual_ppb:
+            raise ValueError(
+                "auto_recompute chooses every layer's recompute, so it cannot also take it from the config (mppb)"
+            )
+        # Choose every layer's recompute option for each candidate, rather
+        # than score it fully recomputed. A multimodal model, whose
+        # candidates are priced on every submodule (F2), gets one mode for
+        # every layer, priced whole, and no option per layer: the options are
+        # built for one submodule's layers, whose budgets would leave the
+        # others out.
+        self.auto_recompute = bool(auto_recompute)
+        # With auto_recompute, the modes a runtime that runs every layer one
+        # way offers, of recompute.candidate.MODES; without them, each layer
+        # gets its own option.
+        self.recompute_modes = extra_config.pop("recompute_modes", None)
+        unknown = sorted(set(self.recompute_modes or ()) - set(MODES))
+        if unknown:
+            raise ValueError(f"unknown recompute modes {unknown}; expected some of {', '.join(MODES)}")
+        # The switches such a runtime's selective mode sets, where they are
+        # not the config's; see recompute.candidate.choose_recompute.
+        self.recompute_selective = extra_config.pop("recompute_selective", None)
+        # With recompute_modes, each layer gets the fastest of them that fits
+        # rather than one for every layer: a runtime that runs a mode per
+        # layer, as HyperParallel's trainer does with activation_checkpoint.layers.
+        self.recompute_mode_per_layer = bool(extra_config.pop("recompute_mode_per_layer", False))
+        if self.recompute_mode_per_layer and not (auto_recompute and self.recompute_modes):
+            raise ValueError("recompute_mode_per_layer gives each layer one of the recompute_modes auto_recompute "
+                             "chooses among; give both")
+        # With auto_offload, a choice per layer may offload each stage's first
+        # layers over the host link: host_link, else the device's own.
+        auto_offload = extra_config.pop("auto_offload", False)
+        host_link = extra_config.pop("host_link", None)
+        self.offload_link = None
+        if auto_offload:
+            if not auto_recompute:
+                raise ValueError("auto_offload offloads in the choice per layer that auto_recompute makes")
+            self.offload_link = host_link or self.machine.device.host_link
+            if self.offload_link is None:
+                raise ValueError(f"device {self.machine.device} states no host link to offload over; give host_link")
 
     def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""
@@ -288,6 +354,10 @@ class ParallelizeLayer:
         compute count toward the stage that holds them (F2).
         """
         return self.mem_eval.ccfg
+
+    def _priced_on_submodules(self) -> bool:
+        """Whether a candidate is priced on several submodules, the one the search drives among them."""
+        return bool(getattr(self.priced(), "multimodal", False))
 
     def memory_estim(self, debugger: Any = None) -> Any:
         """Whether the config fits memory"""
@@ -525,22 +595,32 @@ class ParallelizeLayer:
             multiproc = True
         scored_space = []
         debug_parts = []
+        self.recompute_choices = {}
         with (
             proc.Pool(processes=threads_num)
             if multiproc
             else nullcontext()
         ) as pool:
-            for config, mem in space:
+            for config, peak in space:
                 self.config.set_parallel_config(config)
                 values = []
+                mem, savings = peak, None
+                choice = self.choose_recompute(config)
+                priced = self.priced()
+                if choice is not None:
+                    mem, savings = int(round(choice.memory)), choice.stage_savings
+                    if choice.score is not None:
+                        # The whole model, with every submodule running the mode.
+                        priced, savings = self.priced_with_mode(choice.mode), None
                 if multiproc:
                     score = pool.apply_async(
                         pool_estimate_performance,
                         args=(
-                            copy.deepcopy(self.priced()),
+                            copy.deepcopy(priced),
                             self.machine.device,
                             mem,
                             cache_file,
+                            savings,
                         ),
                     )
                 else:
@@ -551,11 +631,12 @@ class ParallelizeLayer:
                             enable=self.enable_debug,
                         )
                         score = estimate_performance(
-                            self.priced(),
+                            priced,
                             debugger=debugger,
                             device_type=self.machine.device,
                             memory=mem,
                             cache_file=cache_file,
+                            stage_savings=savings,
                         )
                         debugger.write()
                         debug_parts = list(debugger.info.keys())
@@ -564,9 +645,10 @@ class ParallelizeLayer:
                         del debug_parts[-2:]
                     else:
                         score = estimate_performance(
-                            self.priced(),
+                            priced,
                             device_type=self.machine.device,
                             memory=mem,
+                            stage_savings=savings,
                         )
                 scored_space.append((config, mem, score, values))
 
@@ -586,6 +668,114 @@ class ParallelizeLayer:
             else:
                 new_scored_space = scored_space
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
+
+    def choose_recompute(self, parallel_config: Any) -> Optional[RecomputeChoice]:
+        """Every layer's recompute option for the configuration just set, with auto_recompute.
+
+        The options are the fastest that fit the device, and are kept in
+        ``recompute_choices`` under *parallel_config*.
+
+        Args:
+            parallel_config: The configuration the config was just set to.
+
+        Returns:
+            The choice; ``None`` without auto_recompute, or when there is
+            none to make and the configuration keeps its own recompute.
+        """
+        if not self.auto_recompute:
+            return None
+        if self._priced_on_submodules():
+            choice = self._one_mode_whole()
+        else:
+            self.mem_eval.set_config(self.config.ccfg)
+            choice = choose_recompute(self.mem_eval, self.machine.device, modes=self.recompute_modes,
+                                      link=self.offload_link, selective=self.recompute_selective,
+                                      per_layer=self.recompute_mode_per_layer)
+        if choice is not None:
+            self.recompute_choices[parallel_config] = choice
+        return choice
+
+    def _one_mode_whole(self) -> Optional[RecomputeChoice]:
+        """The fastest mode that fits, for every layer, each mode priced on the whole model.
+
+        A model priced on several submodules runs its runtime's mode on every
+        submodule's layers, a vision tower's as well as its language
+        model's, and a choice per layer, whose budgets are built for one
+        submodule's layers, would leave the others out. So each mode is
+        stated on every submodule's config, and the whole model priced under
+        it: its stages' memory by the memory model, its score by the
+        performance estimate. Without a runtime's modes, every one of
+        :data:`MODES` is weighed, selective with each submodule's switches.
+
+        Returns:
+            The fastest mode that fits, with the stage memory and the score
+            the whole model has under it; ``None`` when none fits.
+        """
+        whole = self.priced()
+        modes = whole_modes([whole.mm_ccfgs[name] for name in whole.mm_order], self.recompute_modes or MODES,
+                            self.recompute_selective)
+        best = None
+        try:
+            for mode in modes:
+                # Each mode on a copy of the whole model, which the evaluator holds between them.
+                self.mem_eval.set_config(whole)
+                priced = self.priced_with_mode(mode)
+                self.mem_eval.set_config(priced)
+                stage_memory = tuple(insight["Static"] + insight["Dynamic"]
+                                     for insight in self.mem_eval.estimate_peak_insight())
+                if not self.mem_eval.mem_fit(max(stage_memory)):
+                    continue
+                score = estimate_performance(priced, device_type=self.machine.device,
+                                             memory=int(round(max(stage_memory))))
+                if best is None or score < best.score:
+                    best = RecomputeChoice((), stage_memory, (), mode=mode, score=score)
+        finally:
+            self.mem_eval.set_config(whole)
+        return best
+
+    def priced_with_mode(self, mode: str) -> Any:
+        """A copy of the config a candidate is priced on, every submodule's layers running *mode*.
+
+        Args:
+            mode: One of the runtime's modes; its selective mode sets the
+                runtime's own switches, where it states them, else each
+                submodule's.
+        """
+        priced = copy.deepcopy(self.priced())
+        for name in priced.mm_order:
+            config = priced.mm_ccfgs[name]
+            rec_op = getattr(config, "rec_op", None)
+            switches = self.recompute_selective or (vars(rec_op) if rec_op is not None else {})
+            apply_exec(config, ExecSpec(recompute=mode_ranges(mode, switches)))
+        return priced
+
+    def recompute_per_layer(self, parallel_config: Any) -> Tuple[Optional[RecomputeChoice], Optional[float]]:
+        """Each layer's own fastest option for one configuration, and the score it gives.
+
+        What the configuration gains when every layer may run its own way,
+        for a search that chose one mode for all of them.
+
+        Args:
+            parallel_config: The configuration.
+
+        Returns:
+            ``(choice, score)``, or ``(None, None)`` when there is no choice
+            to make, a multimodal model's among them.
+        """
+        if self._priced_on_submodules():
+            return None, None
+        self.config.set_parallel_config(parallel_config)
+        self.mem_eval.set_config(self.config.ccfg)
+        choice = choose_recompute(self.mem_eval, self.machine.device, link=self.offload_link)
+        if choice is None:
+            return None, None
+        score = estimate_performance(
+            self.config.ccfg,
+            device_type=self.machine.device,
+            memory=int(round(choice.memory)),
+            stage_savings=choice.stage_savings,
+        )
+        return choice, score
 
     def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
         """Order the given space with performance estimation.
@@ -684,8 +874,8 @@ class ParallelizeLayer:
     def _measured_mode(self, config: Any) -> Optional[str]:
         """The mode a measured configuration ran: its own, else the dimension's only one, else None."""
         mode = getattr(config, "recompute", None)
-        if mode is None and self.recompute_modes is not None and len(self.recompute_modes) == 1:
-            mode = self.recompute_modes[0]
+        if mode is None and self.recompute_dimension is not None and len(self.recompute_dimension) == 1:
+            mode = self.recompute_dimension[0]
         return mode
 
     def _search_and_order(self, yaml_folder: Any, threads_num: Any, cache_file: Any) -> Tuple[list, list, float, float]:
@@ -702,7 +892,7 @@ class ParallelizeLayer:
         scored_space, dbg, generation, ordering = [], [], 0.0, 0.0
         if not self.batch_reachable():
             return scored_space, dbg, generation, ordering
-        for mode in self.recompute_modes or (None,):
+        for mode in self.recompute_dimension or (None,):
             if mode is not None:
                 logger.output("Search with recompute %s", mode)
                 self.set_recompute_mode(mode)
@@ -716,7 +906,7 @@ class ParallelizeLayer:
             for entry in scored:
                 entry[0].recompute = mode
             scored_space += scored
-        if self.recompute_modes is not None:
+        if self.recompute_dimension is not None:
             self.set_recompute_mode(None)
             scored_space.sort(key=lambda entry: entry[2])
         return scored_space, dbg, generation, ordering
@@ -764,7 +954,7 @@ class ParallelizeLayer:
             generation,
             ordering,
         )
-        if self.recompute_modes is None:
+        if self.recompute_dimension is None:
             is_not = " NOT" if not self.config.balancing.from_config else ""
             logger.output(
                 "Offset & Recompute were%s computed from config info", is_not
@@ -772,8 +962,10 @@ class ParallelizeLayer:
         else:
             logger.output(
                 "Offset was NOT computed from config info; recompute was searched over %s",
-                ", ".join(self.recompute_modes),
+                ", ".join(self.recompute_dimension),
             )
+        if self.auto_recompute:
+            self._log_recompute(scored_space)
         logger.output(
             "Device number is %d, global batch size is %d, dimensions are %s",
             self.machine.number,
@@ -792,44 +984,64 @@ class ParallelizeLayer:
                 )
         return scored_space
 
-    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any) -> None:
-        """Create an input file for pipeline balancing"""
+    def _log_recompute(self, scored_space: Any) -> None:
+        """Log how the recompute was chosen, and the best configuration's, as the trainer states it where it can."""
+        if self.recompute_modes is None:
+            how = "per layer"
+        else:
+            how = ("per layer among " if self.recompute_mode_per_layer else "among ") + ", ".join(self.recompute_modes)
+        logger.output("Recompute was chosen %s for %d of %d configurations", how, len(self.recompute_choices),
+                      len(scored_space))
+        best = self.recompute_choices.get(scored_space[0][0]) if scored_space else None
+        if best is None:
+            return
+        logger.output("Recompute of the best configuration:\n%s", describe(best))
+        if self.recompute_mode_per_layer and best.mode is None:
+            mode, layers = trainer_plan(best)
+            logger.output("As the trainer runs it: activation_checkpoint mode %s, layers %s", mode, layers)
+
+    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any, folder: Optional[str] = None) -> str:
+        """Write the pipeline balancer's layer description of the k-th configuration.
+
+        Every layer carries its forward time and the backward time of each of
+        its recompute options, priced by the estimate the search scores with,
+        in units of the forward time of a plain layer of the first body.
+
+        Args:
+            scored_space: The ordered search space.
+            k: Rank of the configuration to describe.
+            cfg_name: Prefix of the model name the balancer is given.
+            folder: Where to write; ND's output directory by default.
+
+        Returns:
+            The path of the file written.
+        """
         parallel_config = scored_space[k][0]
         self.set_recompute_mode(getattr(parallel_config, "recompute", None))
         self.config.set_parallel_config(parallel_config)
-        self.mem_eval.update_config(self.config)
-        m = cfg_name + "_nd_to_ppb_" + str(k)
-        s = self.config.dim_val(Dim.PP, parallel_config)
-        mb = self.config.dim_val(Dim.MBN, parallel_config)
-        i = self.config.dim_val(Dim.VPP, parallel_config)
-        mem = str(self.config.ccfg.device_capacity.to_mb)
-        filename = (
-            os.path.dirname(os.path.realpath(__file__))
-            + "/../pipeline_balance/layers/"
-            + m
-            + ".json"
+        self.mem_eval.set_config(self.config.ccfg)
+        name = f"{cfg_name}_nd_to_ppb_{k}"
+        folder = os.path.abspath(folder or Debug.output_dir())
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name + ".json")
+        description = self.mem_eval.estimate_layer_memory(
+            device_type=self.machine.device,
+            layer_times=LayerTimes(self.machine.device),
         )
-        with open(filename, "w+", encoding="utf-8") as fp:
-            json.dump(
-                self.mem_eval.estimate_layer_memory(
-                    device_type=self.machine.device
-                ),
-                fp,
-                indent=4,
-            )
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(description, fp, indent=4)
         logger.output(
             "To run pipeline balancing on configuration %s:"
-            "\npython run_pipeline_balance.py "
-            "-m %d -s %d -mb %d -i %d -mem %d",
+            "\npython run_pipeline_balance.py -lf %s -m %s -s %s -mb %s -i %s -mem %s",
             parallel_config,
-            m,
-            s,
-            mb,
-            i,
-            mem,
+            folder,
+            name,
+            self.config.dim_val(Dim.PP, parallel_config),
+            self.config.dim_val(Dim.MBN, parallel_config),
+            self.config.dim_val(Dim.VPP, parallel_config),
+            int(self.config.ccfg.device_capacity.to_mb().size),
         )
-        logger.output("Warning: currently select_recompute_memory \
-                should be removed & layer time need to be added")
+        return path
 
     def test_from_csv(self, csv_f, output_path=None):
         """Run estimation tests against a real run profiling in csv format"""
@@ -941,9 +1153,9 @@ class Parallelize:  # pylint: disable=R0903
 
     def __init__(self, framework: Any, config: Any, machine: Any, **extra_config: Any) -> None:
         """Dispatch to the unimodal or multimodal search driver."""
-        if extra_config.get("recompute_modes") is not None and framework not in HYPER_FRAMEWORKS:
+        if extra_config.get("recompute_dimension") is not None and framework not in HYPER_FRAMEWORKS:
             raise ValueError(
-                f"recompute_modes are HyperParallel's activation checkpoint modes, and the {framework} "
+                f"recompute_dimension states HyperParallel's activation checkpoint modes, and the {framework} "
                 f"parser states its own recompute: use one of {', '.join(HYPER_FRAMEWORKS)}"
             )
         logger.debug("before evaluator init")
@@ -1046,6 +1258,7 @@ def pool_estimate_performance(
     device: Hard.Type,
     memory: Optional[float] = None,
     cache_file: Optional[str] = None,
+    stage_savings: Optional[Tuple[float, ...]] = None,
 ) -> float:
     """Calls performance estimation for multiprocessing"""
     return estimate_performance(
@@ -1053,4 +1266,5 @@ def pool_estimate_performance(
         device_type=device,
         memory=memory,
         cache_file=cache_file,
+        stage_savings=stage_savings,
     )

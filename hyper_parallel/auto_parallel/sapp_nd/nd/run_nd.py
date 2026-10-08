@@ -24,19 +24,48 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import set_strict
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.ratios as Ratios
 from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_recompute_modes
 from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    census_spec_yaml,
     report,
+    report_spec,
     traffic_report,
     verify_activations,
+    verify_estimate,
     verify_flops,
     verify_parameters,
+    verify_spec,
     verify_traffic,
 )
+
+
+def _host_link(cli_parser, cli_args, device):
+    """The host link -ao offloads over: the device's, with what the CLI states replacing its placeholders.
+
+    Args:
+        cli_parser: The parser, to report a device with no link to offload over.
+        cli_args: The parsed CLI namespace.
+        device: The device type the search prices.
+
+    Returns:
+        The link, or ``None`` without -ao.
+    """
+    if not cli_args.auto_offload:
+        return None
+    link = device.host_link
+    if link is None and (cli_args.host_link_gibps is None or cli_args.sustained_tflops is None):
+        cli_parser.error(
+            f"device {device} states no host link; give both --host_link_gibps and --sustained_tflops for -ao"
+        )
+    return Hard.HostLink(
+        gib_per_s=cli_args.host_link_gibps if cli_args.host_link_gibps is not None else link.gib_per_s,
+        sustained_tflops=cli_args.sustained_tflops if cli_args.sustained_tflops is not None else link.sustained_tflops,
+        overlap=link.overlap if link is not None else Hard.HostLink.overlap,
+    )
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -52,6 +81,8 @@ def _apply_cli_overrides(search_cfg, cli_args):
         search_cfg.cluster_spec["device_type"] = cli_args.device_type
     if cli_args.global_batch_size is not None:
         search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
+    if getattr(cli_args, "auto_recompute", False):
+        search_cfg.estimator["recompute_strategy"] = "auto"
     if cli_args.max_mem is not None:
         # -M sets the device budget the search checks against, exactly as it
         # does on the CLI path, instead of being silently ignored here.
@@ -80,17 +111,26 @@ def _apply_cli_overrides(search_cfg, cli_args):
             )
         search_cfg.cluster_spec["num_nodes"] \
             = max(1, cli_args.devices // cards_per_node)
-    if cli_args.recompute is not None:
-        # --recompute states the recompute dimension over the search config's
-        # parallelism.recompute, as the other flags state their settings.
-        search_cfg.estimator["recompute_modes"] = read_recompute_modes(cli_args.recompute, "--recompute")
+    if getattr(cli_args, "recompute", None) is not None:
+        # --recompute states the search config's parallelism.recompute, as the
+        # other flags state their settings: the modes the search chooses
+        # among for each strategy, or for each layer where the search config's
+        # recompute says per_layer, and auto every mode it can price.
+        modes = read_recompute_modes(cli_args.recompute, "--recompute")
+        if search_cfg.estimator.get("recompute_strategy") != "per_layer":
+            search_cfg.estimator["recompute_strategy"] = "auto"
+        if [str(value).strip().lower() for value in cli_args.recompute] == ["auto"]:
+            search_cfg.estimator.pop("recompute_modes", None)
+        else:
+            search_cfg.estimator["recompute_modes"] = modes
 
 
 def _recompute_modes(cli_args):
     """The recompute dimension of a search: --recompute, else a hyper_v2 yaml's context.recompute.
 
-    A search config states its own in ``parallelism.recompute``, which
-    :func:`_apply_cli_overrides` lets --recompute override.
+    A search config's ``parallelism.recompute`` is not a dimension: there the
+    search chooses a mode for each strategy, and --recompute states it
+    (:func:`_apply_cli_overrides`).
 
     Args:
         cli_args: The parsed CLI namespace.
@@ -112,31 +152,6 @@ def _recompute_modes(cli_args):
     context = raw.get("context") if isinstance(raw, dict) else None
     stated = context.get("recompute") if isinstance(context, dict) else None
     return read_recompute_modes(stated, f"{cli_args.yaml_config}: context.recompute")
-
-
-def _compare_with_real_csv(runner, cli_args):
-    """Print ND's estimate next to the configurations measured in a classified CSV.
-
-    Args:
-        runner: The ND runner built from the CLI arguments.
-        cli_args: The parsed CLI namespace. Requires ``real_csv``; ND's
-            real-versus-estimate plot goes to ``output_dir`` when it is set.
-    """
-    if cli_args.output_dir is not None:
-        os.makedirs(cli_args.output_dir, exist_ok=True)
-    # Keep debug.csv beside the plot rather than inside the installed package.
-    Debug.set_output_dir(cli_args.output_dir)
-    configs_estimated, metrics = runner.compare_with_csv(
-        cli_args.real_csv, output_path=cli_args.output_dir, plot_idle=True
-    )
-    logger.output("%s", Debug.format_classified_comparison(configs_estimated))
-    Debug.print_correlations_classified([metrics])
-    if cli_args.write_ratios is not None:
-        ratios = Ratios.fit_ratios(configs_estimated)
-        Ratios.write_ratios(cli_args.write_ratios, ratios, configs_estimated, cli_args.real_csv)
-        for text in Ratios.report(configs_estimated, ratios):
-            logger.output("%s", text)
-        logger.output("Ratios written to %s; run_nd -c reads them", cli_args.write_ratios)
 
 
 def _priced_train_yaml(search_config: str) -> str:
@@ -172,6 +187,31 @@ def _check_train_yaml(cli_parser: argparse.ArgumentParser, cli_args: argparse.Na
             f"-y names {cli_args.yaml_config}, but the search config prices its train_yaml, {priced}: "
             "pass the same file"
         )
+
+
+def _compare_with_real_csv(runner, cli_args):
+    """Print ND's estimate next to the configurations measured in a classified CSV.
+
+    Args:
+        runner: The ND runner built from the CLI arguments.
+        cli_args: The parsed CLI namespace. Requires ``real_csv``; ND's
+            real-versus-estimate plot goes to ``output_dir`` when it is set.
+    """
+    if cli_args.output_dir is not None:
+        os.makedirs(cli_args.output_dir, exist_ok=True)
+    # Keep debug.csv beside the plot rather than inside the installed package.
+    Debug.set_output_dir(cli_args.output_dir)
+    configs_estimated, metrics = runner.compare_with_csv(
+        cli_args.real_csv, output_path=cli_args.output_dir, plot_idle=True
+    )
+    logger.output("%s", Debug.format_classified_comparison(configs_estimated))
+    Debug.print_correlations_classified([metrics])
+    if cli_args.write_ratios is not None:
+        ratios = Ratios.fit_ratios(configs_estimated)
+        Ratios.write_ratios(cli_args.write_ratios, ratios, configs_estimated, cli_args.real_csv)
+        for text in Ratios.report(configs_estimated, ratios):
+            logger.output("%s", text)
+        logger.output("Ratios written to %s; run_nd -c reads them", cli_args.write_ratios)
 
 
 def _run_hyper_v2_search(cli_parser, cli_args):
@@ -235,6 +275,8 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     resolve_path = os.path.join(output_dir, "resolved.yaml")
     write_resolved_yaml(search_cfg, cli_args.yaml_config, resolve_path)
     logger.output("Resolved strategy written to %s", resolve_path)
+    if "activation_checkpoint" in result:
+        _log_activation_checkpoint(result)
     logger.output(
         "Optimal strategy: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
         "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
@@ -242,6 +284,25 @@ def _run_hyper_v2_search(cli_parser, cli_args):
         "mem=%(memory_estimate_mb).0f MB score=%(score).2e",
         result,
     )
+
+
+def _log_activation_checkpoint(result):
+    """Log the activation checkpointing a search chose: its mode, the layers that run another, and each layer's own.
+
+    Args:
+        result: The search's result, which states ``activation_checkpoint``.
+    """
+    if result.get("activation_checkpoint_layers"):
+        logger.output("Activation checkpoint mode %s, and per layer: %s", result["activation_checkpoint"],
+                      result["activation_checkpoint_layers"])
+    else:
+        logger.output("Activation checkpoint mode for every layer: %s", result["activation_checkpoint"])
+    per_layer = result.get("recompute_per_layer")
+    if per_layer:
+        logger.output(
+            "With each layer run its own way, the score would be %.2e at %.0f MB: %s",
+            per_layer["score"], per_layer["memory_estimate_mb"], per_layer["ranges"],
+        )
 
 
 if __name__ == "__main__":
@@ -326,13 +387,15 @@ if __name__ == "__main__":
         "0 being no output and 6 being debug level output. "
         "Plot and debug csv are generated from 2",
     )
-    # parser.add_argument(
-    #     "-k",
-    #     "--ppb_k",
-    #     type=int,
-    #     default=None,
-    #     help="choose configuration number k for ppb",
-    # )
+    parser.add_argument(
+        "-k",
+        "--ppb_k",
+        type=int,
+        default=None,
+        help="Write the pipeline balancer's layer description, with per-layer "
+        "times for every recompute option, of the k-th ranked configuration "
+        "(0 is the best) to the output directory.",
+    )
     parser.add_argument(
         "-A",
         "--device_type",
@@ -359,6 +422,38 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Takes offset and recompute from yaml",
+    )
+    parser.add_argument(
+        "-ar",
+        "--auto_recompute",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Give every layer of each configuration the fastest recompute "
+        "option that fits, instead of scoring it fully recomputed",
+    )
+    parser.add_argument(
+        "-ao",
+        "--auto_offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With -ar, let each pipeline stage's first layers offload their "
+        "activations to the host instead of recomputing them, over the "
+        "device's host link",
+    )
+    parser.add_argument(
+        "--host_link_gibps",
+        type=float,
+        default=None,
+        help="The host link's sustained copy bandwidth in GiB/s, for -ao, as "
+        "hyper_offload's profile_transfer_bandwidth measures it; the device's "
+        "placeholder when omitted",
+    )
+    parser.add_argument(
+        "--sustained_tflops",
+        type=float,
+        default=None,
+        help="The device's sustained TFLOP/s at the training precision, for "
+        "-ao; the device's placeholder when omitted",
     )
     parser.add_argument(
         "-t",
@@ -417,9 +512,11 @@ if __name__ == "__main__":
         "-V",
         "--verify",
         action="store_true",
-        help="Verify mode (hyper_v2 only): set the parameters ND prices of each "
-        "part of the model -y trains beside those of the Transformers layers "
-        "its checkpoint builds, and exit.",
+        help="Verify mode (hyper_v2 only): set the parameters and FLOPs ND prices "
+        "of each part of the model -y trains beside those of the Transformers "
+        "layers its checkpoint builds, and the model spec the resolver reads "
+        "beside the one the census measures, with the run priced with each; "
+        "with -o, write the census's spec there; and exit.",
     )
     parser.add_argument(
         "-o",
@@ -500,6 +597,15 @@ if __name__ == "__main__":
             )
             args.cache_file = None
 
+    if args.auto_recompute and args.mppb:
+        parser.error("-ar/--auto_recompute chooses the recompute, so it cannot take it from the yaml (-mppb)")
+    if args.auto_offload and not args.auto_recompute:
+        parser.error("-ao/--auto_offload offloads in the choice per layer -ar/--auto_recompute makes")
+    if args.auto_offload and args.search_config:
+        parser.error("-ao/--auto_offload prices a choice per layer; a search config (-s) chooses one mode for the "
+                     "trainer, which runs no offload")
+    if not args.auto_offload and (args.host_link_gibps is not None or args.sustained_tflops is not None):
+        parser.error("--host_link_gibps and --sustained_tflops price offload, which needs -ao/--auto_offload")
     if args.verify:
         if args.framework != "hyper_v2":
             parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
@@ -513,6 +619,14 @@ if __name__ == "__main__":
         logger.output("Activations a layer keeps for its backward, bytes a token by op: the records' and the census's")
         for line in report(verify_activations(args.yaml_config)):
             logger.output(line)
+        logger.output("Model spec as ND prices it: read from the checkpoint's config, and measured by the census")
+        for line in report_spec(verify_spec(args.yaml_config)):
+            logger.output(line)
+        logger.output("The run priced with each spec: the resolver's in the ND column, the census's beside it")
+        for line in report(verify_estimate(args.yaml_config, args.device_type or "A2")):
+            logger.output(line)
+        if args.output_dir:
+            logger.output(f"census spec written to {census_spec_yaml(args.yaml_config, args.output_dir)}")
         logger.output("Bytes a forward of one sequence moves, the whole layer, beside the FLOPs the time model "
                       "prices of it")
         for line in traffic_report(verify_traffic(args.yaml_config)):
@@ -539,6 +653,7 @@ if __name__ == "__main__":
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
     machine = Hard.Machine(args.devices, args.device_type or "A2")
+    host_link = _host_link(parser, args, machine.device)
 
     if args.framework == "hyperparallel2":
         if args.yaml_config is None or args.train_yaml is None or args.accelerate_yaml is None:
@@ -567,12 +682,15 @@ if __name__ == "__main__":
         dimensions=dims,
         swap_os=args.swap_opt_state,
         mppb=args.mppb,
+        auto_recompute=args.auto_recompute,
+        auto_offload=args.auto_offload,
+        host_link=host_link,
         model=args.model,
         # model="Telecom",  # args.model ====ONLY FOR XINYU BRANCH====
         max_mem=max_mem,
         mem_for_ppb=Memory.from_string(args.mem_for_ppb.strip()),
         # vpp_less_mem=args.less_memory,
-        **({"recompute_modes": recompute_modes} if recompute_modes is not None else {}),
+        **({"recompute_dimension": recompute_modes} if recompute_modes is not None else {}),
     )
 
     if args.real_csv is not None:
@@ -589,3 +707,9 @@ if __name__ == "__main__":
         cache_file=args.cache_file,
         ranking_csv=args.ranking_csv,
     )
+
+    if args.ppb_k is not None:
+        if not 0 <= args.ppb_k < len(space):
+            parser.error(f"-k/--ppb_k: {len(space)} configurations were ranked, got {args.ppb_k}")
+        yaml_name = os.path.splitext(os.path.basename(str(args.yaml_config)))[0]
+        nd_runner.to_ppb(space, args.ppb_k, yaml_name)

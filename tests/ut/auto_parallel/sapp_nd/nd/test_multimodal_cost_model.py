@@ -179,11 +179,23 @@ class TestMultimodalCostModel(unittest.TestCase):
         self.assertEqual(ccfg.mm_ccfgs["vision"].t, 2)
         self.assertEqual(ccfg.mm_ccfgs["text"].t, 2)
 
-    def test_strategy_update_refreshes_each_submodule(self) -> None:
+    def test_the_search_arms_every_submodule(self) -> None:
+        """
+        Feature: the strategy guard.
+        Description: The search owns the multimodal config and each of its
+            submodules.
+        Expectation: A direct degree write is refused on each.
+        """
+        ccfg = self._build().instance.mem_eval.ccfg
+        for name, sub in [("parent", ccfg)] + list(ccfg.mm_ccfgs.items()):
+            with self.assertRaises(AttributeError, msg=f"{name} took t"):
+                sub.t = 2
+
+    def test_strategy_update_derives_each_submodule(self) -> None:
         """
         Feature: multimodal strategy fan-out.
         Description: A submodule shares its parent's parser, so a refresh
-            through the parser used to land on the parent.
+            through the parser lands on the parent.
         Expectation: The language model's embedding sharding follows its own
             new degrees.
         """
