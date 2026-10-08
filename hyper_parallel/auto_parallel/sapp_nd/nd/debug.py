@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -453,14 +453,25 @@ def top_plot_configs(configs_estimated: list, max_num: Optional[int] = None) -> 
 
 
 def plot_nd(
-    configs_estimated,
-    output_path,
-    debug_parts,
-    title=None,
-    max_num=None,
-    include_all=False,
-):
-    """Plot estimation"""
+    configs_estimated: list,
+    output_path: str,
+    debug_parts: list,
+    title: Optional[str] = None,
+    max_num: Optional[int] = None,
+    include_all: bool = False,
+    top_result_count: Optional[int] = None,
+) -> None:
+    """Plot estimation with a divider before any additional configurations.
+
+    Args:
+        configs_estimated: Ranked configurations with memory, score and its parts.
+        output_path: Directory in which to save results.pdf.
+        debug_parts: Performance components to plot.
+        title: Optional plot title.
+        max_num: Maximum number of configurations in the normal plot.
+        include_all: Include every supplied configuration without normal plot limits.
+        top_result_count: Number of normal results preceding the additions.
+    """
     plot = Plot(
         title, configs_estimated[0][0].keys(), debug_parts, top=max_num
     )
@@ -474,6 +485,8 @@ def plot_nd(
     )
     axis.set_ylim(ymin=1)
     axis.legend(loc="upper left", bbox_to_anchor=(1, 1))
+    if top_result_count is not None and 0 < top_result_count < len(plot.data):
+        axis.axvline(top_result_count - 0.5, color="black", linewidth=1.5)
 
     plot.make_table()
     plot.close(output_path, "results")

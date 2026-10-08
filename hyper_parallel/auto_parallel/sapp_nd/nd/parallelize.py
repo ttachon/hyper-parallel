@@ -649,6 +649,10 @@ class ParallelizeLayer:
                         len(plot_space) if has_exhaustive else top_num
                     ),
                     include_all=has_exhaustive,
+                    top_result_count=(
+                        len(plot_space) - len(exhaustive_additions)
+                        if exhaustive_additions else None
+                    ),
                 )
         return scored_space
 
