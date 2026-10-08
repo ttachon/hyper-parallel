@@ -15,6 +15,7 @@
 """One configuration interface for parallelization"""
 
 import copy
+from typing import Optional
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -108,6 +109,18 @@ class GlobalConfig:
         """Adapt configuration to different parallel config"""
         return self.adapt_config_balancing(pp, vpp)
 
+    def state_recompute(self, full: Optional[bool]) -> None:
+        """Give every candidate *full* as its full recompute, on every config of its pipeline.
+
+        Args:
+            full: The full recompute a recompute dimension's mode states, or
+                None for the recompute each candidate's balancing derives.
+        """
+        self.balancing.stated_recompute = full
+        for _, balancing in self.siblings:
+            if balancing is not None:
+                balancing.stated_recompute = full
+
     def write(self, folder, parallel_config):
         """Dump config into a yaml file"""
         if folder:
@@ -189,10 +202,11 @@ class GlobalConfig:
         for dim in self.dimensions:
             dims.append((dim, kwargs.get(dim.lname())))
 
-        has_mbn_not_in = Dim.MBN not in self.dimensions
-        has_pp_in = Dim.PP in self.dimensions
-        has_dp_or_mbs_in = Dim.DP in self.dimensions or Dim.MBS in self.dimensions
-        if has_mbn_not_in and has_pp_in and has_dp_or_mbs_in:
+        # The micro-batch count is the search's own, the global batch over DP
+        # and MBS, whatever -l names. Kept from the yaml where -l left it out,
+        # every DP but the yaml's own made another batch, so the search
+        # refused every candidate or kept a single DP (M6).
+        if Dim.MBN not in self.dimensions:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)
         return Dim.Dimensions(dims, all_dims=self.dimensions, accumulates=self.accumulates_grads())

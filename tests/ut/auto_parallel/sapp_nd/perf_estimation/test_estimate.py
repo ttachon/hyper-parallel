@@ -18,16 +18,25 @@ loads it prices.
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/perf_estimation/test_estimate.py -v
 """
+import math
 import os
+import tempfile
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Dict
+from unittest.mock import patch
+
+import yaml
 
 # The package has an import cycle that only the memory estimator's import order
 # settles; perf_estimation.estimate cannot be the first module a process loads.
-import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import estimate as estimate_module
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
     MOE_DISPATCH,
     _flavour_tables,
@@ -38,6 +47,36 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
 DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
 )
+_HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
+
+
+def _vision_language() -> SimpleNamespace:
+    """A small Qwen3-VL-MoE Transformers config: a MoE language model and a vision tower."""
+    return SimpleNamespace(
+        model_type="qwen3_vl_moe",
+        text_config=SimpleNamespace(
+            hidden_size=2048, num_hidden_layers=8, num_attention_heads=16, num_key_value_heads=8,
+            intermediate_size=5632, vocab_size=32000, max_position_embeddings=8192, head_dim=128,
+            num_experts=16, num_experts_per_tok=4, moe_intermediate_size=768,
+        ),
+        vision_config=SimpleNamespace(
+            hidden_size=1152, depth=6, num_heads=16, intermediate_size=4304, out_hidden_size=3584,
+            patch_size=16, spatial_merge_size=2, num_position_embeddings=2304,
+        ),
+    )
+
+
+def _vision_language_yaml() -> Dict[str, Any]:
+    """A trainer yaml for that model on 8 devices, TP 2, without pipeline parallelism."""
+    return {
+        "model": {"pretrained_model_name_or_path": "local/qwen3_vl_moe", "torch_dtype": "bfloat16"},
+        "training": {"global_batch_size": 16, "micro_batch_size": 1, "max_grad_norm": 1.0},
+        "accelerator": {"tp_size": 2, "pp_size": 1, "cp_size": 1, "ep_size": 1},
+        "fsdp_config": {"dp_shard_size": 4},
+        "activation_checkpoint": {"mode": "full"},
+        "dataset": {"data_transform": {"max_seq_len": 4096}},
+        "context": {"max_device_memory": "64GB", "device_num": 8},
+    }
 
 
 def _plain_values(ccfg: CostModelConfig) -> Dict[str, Any]:
@@ -68,6 +107,32 @@ class TestEstimatePerformance(unittest.TestCase):
         first = estimate_performance(ccfg, device_type=Hard.Device_A2)
         self.assertEqual(_plain_values(ccfg), before)
         self.assertEqual(estimate_performance(ccfg, device_type=Hard.Device_A2), first)
+
+    def test_a_vision_language_model_records_every_towers_communication(self):
+        """
+        Feature: estimate_performance on a multimodal model, its recorded parts.
+        Description: A Qwen3-VL-MoE at TP 2 and no pipeline parallelism, so
+            its vision tower and its language model share the one stage and
+            both communicate there, priced with a debugger on A2 and A3.
+        Expectation: The recorded parts add up to the stage's time, so a run
+            without pipeline parallelism shows no bubble and the check of
+            the straggler's parts stays silent; kept as the last tower's
+            alone, the parts missed the vision tower's collectives and the
+            bubble took them.
+        """
+        with tempfile.TemporaryDirectory() as folder, patch(_HF_CONFIG, return_value=_vision_language()):
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as stream:
+                yaml.safe_dump(_vision_language_yaml(), stream)
+            ccfg = EvaluatorV2(path, framework="hyper_v2", log_level=0).ccfg
+            self.assertTrue(ccfg.multimodal)
+            for device in (Hard.Device_A2, Hard.Device_A3):
+                debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, ccfg.d)], all_dims=[Dim.DP]), Debug.PerfParts)
+                with patch.object(estimate_module, "nd_logger") as nd_logger:
+                    total = estimate_performance(deepcopy(ccfg), debugger=debugger, device_type=device)
+                self.assertEqual(nd_logger.error.call_count, 0)
+                self.assertGreater(debugger.info[Debug.PerfParts.MP_COMM], 0)
+                self.assertTrue(math.isclose(debugger.info[Debug.PerfParts.BUBBLE], 0.0, abs_tol=1e-12 * total))
 
 
 class TestOpTable(unittest.TestCase):

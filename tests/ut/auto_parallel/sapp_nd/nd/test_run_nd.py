@@ -42,6 +42,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import global_config as GC
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHooks
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common import cost_model_preprocess as PreProcess
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
     _CostModelParser,
@@ -794,6 +795,33 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(wrapper.get_strategy()["dp"], 3)
         self.assertIsNone(wrapper.unknown_method())
         ArchHooks.check_and_apply_custom_hook(wrapper)
+        self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
+
+    def test_a_model_takes_the_profile_of_the_family_its_name_opens_with(self) -> None:
+        """
+        Feature: arch_hooks.family_hook and check_and_apply_custom_hook (I8).
+        Description: The golden harness's model names, a name holding two
+            families, one holding cm in the middle, and an unknown family
+            routed twice.
+        Expectation: Each known name takes the profile it took before; the
+            two-family name takes the family it opens with, where list order
+            gave it DeepSeek's; cm in the middle takes nothing; the unknown
+            family takes the default profile and says so once.
+        """
+        hooks = {"deepseekV3": ArchHooks.custom_deepseek3, "cm_llama_moe": ArchHooks.custom_cm,
+                 "Qwen3": ArchHooks.custom_qwen, "llama2_70b": ArchHooks.custom_llama2,
+                 "pangualpha_13b": ArchHooks.custom_pangualpha, "t5_xl": ArchHooks.custom_t5,
+                 "mixtral-8x7b": ArchHooks.custom_mixtral, "qwen3_5_moe": ArchHooks.custom_qwen,
+                 "deepseek_v3": ArchHooks.custom_deepseek3, "llama": None, "gpt_xl": None,
+                 "qwen2_deepseek_distill": ArchHooks.custom_qwen, "acme_lm": None}
+        self.assertEqual({name: ArchHooks.family_hook(name) for name in hooks}, hooks)
+        wrapped_cfg = _FakeCostModelConfig()
+        wrapped_cfg.model_name = "glm4_moe"
+        with patch.object(ArchHooks, "_DEFAULTED_NAMES", set()), patch.object(ArchHooks.logger, "output") as said:
+            for _ in range(2):
+                ArchHooks.check_and_apply_custom_hook(ArchHooks.CWrap(wrapped_cfg))
+        self.assertEqual(said.call_count, 1)
+        self.assertEqual(said.call_args.args[1], "glm4_moe")
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
 
     def test_ep_constraints_valid_in_global_config(self) -> None:
@@ -1639,6 +1667,8 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False),
                                         dimensions=[Dim.DP, Dim.OP])
+        runner.batch_reachable = lambda: True
+        runner.priced = SimpleNamespace
         runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
         runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
         with tempfile.TemporaryDirectory() as tmp_dir, \
@@ -1666,6 +1696,38 @@ class TestSappNDRunND(unittest.TestCase):
                 with patch.object(sys, "argv", argv + extra):
                     runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
                 self.assertEqual(_FakeParallelize.instances[-1].last_run_kwargs()["ranking_csv"], expected)
+
+    def test_a_field_no_parser_set_is_reported_or_refused(self) -> None:
+        """
+        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict (I9).
+        Description: A config no parser filled, read directly for an op count
+            twice and for its hooks, then through getattr with a default, with
+            and without the strict mode run_nd --strict sets.
+        Expectation: By default each read is 0 and the op count is recorded
+            with its reader and reported once, in one line, the hooks being
+            exempt; under --strict the direct read is refused by name and
+            reader, while getattr gets its stated default; run_nd sets the
+            mode from its flag.
+        """
+        ccfg = object.__new__(CostModelConfig)
+        with patch.object(PreProcess, "UNSET_READS", PreProcess.defaultdict(PreProcess.Counter)), \
+                patch.dict(PreProcess._STRICT, {"on": False}):  # pylint: disable=protected-access
+            self.assertEqual((ccfg.n_gather, ccfg.n_gather, ccfg.hooks_dict), (0, 0, 0))
+            lines = PreProcess.unset_reads_report()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("1 config field(s)", lines[0])
+            self.assertIn("n_gather by test_run_nd.py:test_a_field_no_parser_set_is_reported_or_refused", lines[0])
+            self.assertEqual(PreProcess.unset_reads_report(), [])
+            PreProcess.set_strict(True)
+            with self.assertRaisesRegex(AttributeError, "reads n_gather, which no parser set"):
+                _ = ccfg.n_gather
+            self.assertEqual(getattr(ccfg, "n_gather", 5), 5)
+            for flag, strict in (([], False), (["--strict"], True)):
+                with tempfile.TemporaryDirectory() as tmp_dir, patch.object(Par, "Parallelize", _FakeParallelize), \
+                        patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}), \
+                        patch.object(sys, "argv", ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"] + flag):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(PreProcess._STRICT["on"], strict)  # pylint: disable=protected-access
 
     def test_arch_hook_variants(self) -> None:
         """
@@ -1775,6 +1837,34 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(split[Debug.PerfParts.DP_REDUCE], 10.0)
         self.assertEqual(split[Debug.PerfParts.DP_COMM] + split[Debug.PerfParts.DP_REDUCE],
                          plain[Debug.PerfParts.DP_COMM])
+
+    def test_the_straggler_check_speaks_when_its_parts_miss_its_time(self) -> None:
+        """
+        Feature: estimate_pipeline, the check of the straggler stage's parts.
+        Description: Two stages of 12 and 18 whose recorded parts add up to
+            their times, then the same with the straggler's DP part 3 short.
+        Expectation: Nothing said when they agree; one error naming the
+            straggler stage when they do not, and either way the bubble is the
+            pipeline's time less the parts, so the parts and the bubble still
+            add up to the time.
+        """
+        cfg = _make_perf_cfg(p=2, vp=1, m=2)
+        timed = (Debug.PerfParts.FW_COMPUTE, Debug.PerfParts.BW_COMPUTE, Debug.PerfParts.RECOMPUTE,
+                 Debug.PerfParts.MP_COMM, Debug.PerfParts.EP_COMM, Debug.PerfParts.CP_COMM)
+        for short, errors in ((0.0, 0), (3.0, 1)):
+            with self.subTest(short=short):
+                debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, 2)], all_dims=[Dim.DP]), Debug.PerfParts)
+                for part in timed:
+                    debugger.info[part] = [1.0, 2.0]
+                debugger.info[Debug.PerfParts.DP_COMM] = [6.0, 6.0 - short]
+                with patch.object(PerfEstimate, "nd_logger") as nd_logger:
+                    time = PerfEstimate.estimate_pipeline(cfg, [12.0, 18.0], debugger=debugger)
+                self.assertEqual(nd_logger.error.call_count, errors)
+                if errors:
+                    self.assertEqual(nd_logger.error.call_args[0][1], 1)
+                parts = sum(debugger.info[part] for part in timed + (Debug.PerfParts.DP_COMM,))
+                self.assertEqual(parts, 2 * (18.0 - short))
+                self.assertEqual(debugger.info[Debug.PerfParts.BUBBLE] + parts, time)
 
     def test_performance_formula_helpers(self) -> None:
         """
@@ -2502,6 +2592,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.mem_eval = SimpleNamespace(
             mem_fit=lambda peak: peak < 100,
             get_strategy=lambda: {},
+            get_max_device_memory=lambda: 100.0,
         )
 
         class _ParallelConfig:
@@ -2533,8 +2624,13 @@ class TestSappNDRunND(unittest.TestCase):
         config_state.global_batch_size = lambda config: 8
 
         runner.device_loops = lambda space, pool: ({"fit": 10, "large": 200}, 2)
-        self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
+        with patch.object(Par.logger, "output") as output:
+            self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
         self.assertEqual(writes, [("out", "fit")])
+        said = [call.args for call in output.call_args_list]
+        self.assertEqual([args[1:] for args in said if "dropped:" in args[0]], [("large", 200, 100.0, 100.0)])
+        self.assertIn((2, 0, "", 2), [args[1:] for args in said])
+        self.assertIn((1, 1), [args[1:] for args in said])
 
         runner.memory_estim = lambda debugger=None: 12
         config_state.make_parallel_config = lambda *dims: "inside"
@@ -2553,6 +2649,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(debug_parts, [])
         self.assertEqual(runner.order_search_space([], None, None), ([], []))
 
+        runner.batch_reachable = lambda: True
         runner.generate_search_space = lambda folder, threads_num: [(_ParallelConfig(), 10)]
         runner.order_search_space = (
             lambda space, threads_num, cache_file: ([(space[0][0], 10, 2.0, [])], [])
@@ -2572,6 +2669,121 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(Par.pool_estimate_memory("config"), 7)
         with patch.object(Par, "estimate_performance", return_value=9):
             self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
+
+    def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
+        """
+        Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
+        Description: A config at DP 2, PP 2, micro-batches of 4 and two of
+            them, searched over EP and OP alone, so -l names neither MB nor PP,
+            given a candidate whose loop counted four micro-batches.
+        Expectation: The candidate carries the loop's four and its batch is
+            DP x MB x MBS with them, 32; kept from the config, the two made
+            another batch, 16.
+        """
+        fake_ccfg = _FakeCostModelConfig()
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = fake_ccfg
+        global_config.dimensions = [Dim.EP, Dim.OP]
+        candidate = global_config.make_parallel_config((2, 2, 2, 1), (4, 4), (1, 1, 2, False))
+        self.assertEqual(candidate.val(Dim.MBN), 4)
+        self.assertEqual(global_config.global_batch_size(candidate), 32)
+        self.assertIn(Dim.MBN, global_config.dimensions)
+
+    def test_a_search_no_candidate_of_which_makes_the_batch_stops_with_one_line(self) -> None:
+        """
+        Feature: ParallelizeLayer.batch_reachable (M6).
+        Description: 64 devices searched over EP and OP alone, so every
+            candidate is DP 64 with micro-batches of 1, for a batch of 16, then
+            of 128.
+        Expectation: No candidate makes 16, so the search stops before
+            building one, with one error naming the batch, the yaml's and DP x
+            MBS, 64; 128 is two micro-batches of it, and nothing is said.
+        """
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        fake_ccfg = _FakeCostModelConfig()
+        fake_ccfg.d, fake_ccfg.t, fake_ccfg.p, fake_ccfg.b, fake_ccfg.m = 64, 1, 1, 1, 1
+        fake_ccfg.accumulates_grads = True
+        fake_ccfg.gbs = 16
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = fake_ccfg
+        global_config.dimensions = [Dim.EP, Dim.OP]
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.config = global_config
+        runner.machine = SimpleNamespace(number=64)
+        for batch, reachable in ((16, False), (128, True)):
+            with self.subTest(batch=batch), patch.object(Par.logger, "error") as error:
+                runner.global_batch_size = batch
+                self.assertEqual(runner.batch_reachable(), reachable)
+                self.assertEqual(error.call_count, 0 if reachable else 1)
+                if not reachable:
+                    self.assertEqual(error.call_args.args[1:4], (16, 16, "64"))
+
+    def test_a_ranking_priced_at_a_length_nobody_stated_says_so_under_its_table(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length (I11).
+        Description: A search over one configuration of a model whose config
+            states no training length, so the parser costed its context
+            limit of 32768; then the same model with a stated length.
+        Expectation: The line under the table names the 32768 tokens and why;
+            with a stated length nothing is said.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False), dimensions=[Dim.DP])
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        for stated, said in ((False, 1), (True, 0)):
+            with self.subTest(stated=stated), patch.object(Par.logger, "output") as output:
+                runner.priced = lambda stated=stated: SimpleNamespace(seq_len_stated=stated, s=32768)
+                runner.run_generation_to_ordering(None)
+                lines = [call.args[0] % call.args[1:] for call in output.call_args_list
+                         if "context limit" in call.args[0]]
+                self.assertEqual(len(lines), said)
+                if said:
+                    self.assertIn("priced at 32768 tokens", lines[0])
+        # A field the estimate read unset is named under the table too (I9).
+        reads = PreProcess.defaultdict(PreProcess.Counter, {"n_gather": PreProcess.Counter({"comm.py:tp": 2})})
+        with patch.object(PreProcess, "UNSET_READS", reads), patch.object(Par.logger, "output") as output:
+            runner.run_generation_to_ordering(None)
+        self.assertTrue(any("n_gather by comm.py:tp" in call.args[0] for call in output.call_args_list))
+
+    def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
+        """
+        Feature: ParallelizeLayer.generate_search_space, what it says it left out.
+        Description: A search whose loops meet a candidate with a degree out of
+            bounds and one of the wrong global batch, and price two, one of
+            them 50 MB over a 100 MB budget.
+        Expectation: The candidate over the budget is named with its peak; the
+            first summary line counts four tested, two refused, each check by
+            name, and two priced; the second, one fitting and one dropped.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.config = SimpleNamespace(moe_valid=lambda config: True, global_batch_size=lambda config: config.batch)
+        runner.global_batch_size = 8
+        runner.filtered_out = lambda config: False
+        runner.mem_eval = SimpleNamespace(mem_fit=lambda peak: peak < 100, get_max_device_memory=lambda: 100.0)
+
+        def loops(*_: Any) -> Any:
+            """Refuse two candidates the way inside_loop_nest checks them, then price two."""
+            for config in (SimpleNamespace(is_valid=lambda: False, batch=8),
+                           SimpleNamespace(is_valid=lambda: True, batch=4)):
+                self.assertFalse(runner.is_valid(config))
+            return {"fit": 10, "large": 150}, 4
+
+        runner.device_loops = loops
+        with patch.object(Par.logger, "output") as output:
+            self.assertEqual(runner.generate_search_space(None, threads_num=None), [("fit", 10)])
+        self.assertEqual([call.args[0] % call.args[1:] for call in output.call_args_list], [
+            "large dropped: its peak of 150 MB is over the 100 MB budget by 50 MB",
+            "4 configurations tested: 2 refused (a degree out of bounds 1, global batch 1), 2 priced for memory",
+            "1 configuration fitting memory to order, 1 dropped over the memory budget",
+        ])
 
     def test_parallelize_profile_ordering_without_estimators(self) -> None:
         """

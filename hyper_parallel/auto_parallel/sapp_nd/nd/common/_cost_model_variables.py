@@ -52,6 +52,12 @@ class _CostModVar:
     output_census: any = None
     overwrite_eval_functions: dict = None
     parser: any = None
+    # The device count a caller states, as run_nd -d does, which a parser
+    # takes where its config cannot state one; 0 where none is stated.
+    devices: int = 0
+    # False where the config states no training sequence length and the
+    # parser costs the model's context limit in its place.
+    seq_len_stated: bool = True
 
     # Strategy
     d: float = 0
@@ -263,9 +269,17 @@ class _CostModVar:
     keeps_param_casts: bool = None
     bytes_norm: float = 0
 
-    def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
-        """Initialise from a config path and optional hooks/framework/source."""
+    def __init__(
+        self,
+        input_config: Any,
+        hook_cls: Any,
+        framework: Optional[str],
+        source_code: Optional[str],
+        devices: int = 0,
+    ) -> None:
+        """Initialise from a config path and optional hooks/framework/source, and the devices a caller states."""
         super().__init__()
+        self.devices = devices or 0
         if input_config:
             self.update_config(input_config, hook_cls, framework, source_code)
 

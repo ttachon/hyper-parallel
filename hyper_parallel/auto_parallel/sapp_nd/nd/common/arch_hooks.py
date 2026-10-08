@@ -14,9 +14,10 @@
 # ============================================================================
 """Custom variables per model (expert knowledge)"""
 import math
+from typing import Any, Callable, Optional
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 
 
 def _grad_bytes(ccfg, width, without_pp=False):
@@ -323,24 +324,47 @@ def custom_cm(ccfg):
     ccfg.overwrite_eval_functions["num_params_norm"] = num_params_norm_cm
 
 
+# Each family's op profile, by the name a family's models open with.
+FAMILY_HOOKS = {
+    "llama2": custom_llama2,
+    "mixtral": custom_mixtral,
+    "t5": custom_t5,
+    "pangualpha": custom_pangualpha,
+    "deepseek": custom_deepseek3,
+    "qwen": custom_qwen,
+    "cm": custom_cm,
+}
+# The names the default profile was taken for, each said once a process.
+_DEFAULTED_NAMES = set()
+
+
+def family_hook(name: Any) -> Optional[Callable[[Any], None]]:
+    """The op profile of the family a model's *name* opens with, or None.
+
+    The name has to open with the family, the longest family first, so the
+    order the families are listed in decides nothing.  Matched anywhere in
+    the name, as it was, ``cm`` took any name containing those two letters
+    and a family listed earlier won over the one the name opens with (I8).
+    """
+    lowered = str(name).lower()
+    for family in sorted(FAMILY_HOOKS, key=len, reverse=True):
+        if lowered.startswith(family):
+            return FAMILY_HOOKS[family]
+    return None
+
+
 def check_and_apply_custom_hook(e):
     """routing hooks"""
     if isinstance(e, CostModelConfig):
         e = CWrap(e)
-    map_modelname_custom = {
-        "llama2": custom_llama2,
-        "mixtral": custom_mixtral,
-        "t5": custom_t5,
-        "pangualpha": custom_pangualpha,
-        "deepseek": custom_deepseek3,
-        "qwen": custom_qwen,
-        "cm": custom_cm,
-    }
-    for k, v in map_modelname_custom.items():
-        if k in e.get_model_name().lower():
-            e.set_ccfg(v)
-            return
-    logger.warning(
-        "Hook not defined for: %s. Default one is chosen", e.get_model_name()
-    )
-    e.set_ccfg(custom_default_transformer)
+    name = e.get_model_name()
+    hook = family_hook(name)
+    if hook is None:
+        hook = custom_default_transformer
+        if name not in _DEFAULTED_NAMES:
+            # Said where a run's output says it, once: the hook runs for
+            # every candidate a search prices.
+            _DEFAULTED_NAMES.add(name)
+            logger.output("No op profile names the family of %s: it is priced with the default transformer's",
+                             name)
+    e.set_ccfg(hook)

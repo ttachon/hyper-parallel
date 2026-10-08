@@ -28,6 +28,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _SWEEP = (Path(__file__).resolve().parents[4]
           / "examples" / "training_demo" / "sweep_qwen3_5_moe.py")
@@ -216,6 +217,134 @@ class TestMergeAndRank(unittest.TestCase):
         self.assertEqual(Sweep.load_step_times(_Out(self.out)), {"ep1_op64": 6276.0})
         os.remove(self.out / "run_states.json")
         self.assertEqual(Sweep.load_step_times(_Out(self.out)), {})
+
+
+
+_ENV = {"nodes": ["n0", "n1", "n2", "n3"], "nproc": 16, "repo_dir": "/repo", "ssh_user": "root",
+        "log_dir": "/logs"}
+
+
+def _ranking_row(rank, ep, op, mode, score):
+    """One row of ND's ranking at DP 64 with a recompute column."""
+    return {"rank": str(rank), "DP": "64", "MP": "1", "PP": "1", "CP": "1", "EP": str(ep), "MB": "1",
+            "MBS": "1", "OP": str(op), "recompute": mode, "memory_mb": "30000", "score": score}
+
+
+class TestRecomputeDimension(unittest.TestCase):
+    """Recompute is a sweep dimension: each strategy runs in each mode, which ND ranks and prices."""
+
+    def test_modes_are_one_a_list_or_auto(self):
+        """
+        Feature: sweep_qwen3_5_moe.ac_modes.
+        Description: The forms --activation-checkpoint takes.
+        Expectation: One mode, a list in its order without repeats, all three for auto, and a
+            refusal naming the flag for anything else.
+        """
+        cases = (("full", ("full",)), ("off,full", ("off", "full")), (" off , off ", ("off",)),
+                 ("AUTO", ("off", "selective", "full")))
+        for stated, expected in cases:
+            with self.subTest(stated=stated):
+                self.assertEqual(Sweep.ac_modes(Sweep.parse_args(["--activation-checkpoint", stated])),
+                                 expected)
+        with self.assertRaisesRegex(SystemExit, "--activation-checkpoint off,swap: expected some of"):
+            Sweep.ac_modes(Sweep.parse_args(["--activation-checkpoint", "off,swap"]))
+
+    def test_the_grid_runs_each_strategy_in_each_mode(self):
+        """
+        Feature: sweep_qwen3_5_moe.expand.
+        Description: Two EP degrees under two modes, then under one.
+        Expectation: Four points named by their mode under two modes; two points named as
+            before under one, so a sweep of one mode keeps its earlier names.
+        """
+        both = Sweep.expand(Sweep.parse_args(["--ep", "1,2", "--activation-checkpoint", "off,full"]), 64)
+        self.assertEqual([point.tag for point in both],
+                         ["ep1_cp1_op64_tp1_pp1_ac-off", "ep1_cp1_op64_tp1_pp1_ac-full",
+                          "ep2_cp1_op64_tp1_pp1_ac-off", "ep2_cp1_op64_tp1_pp1_ac-full"])
+        one = Sweep.expand(Sweep.parse_args(["--ep", "1,2", "--activation-checkpoint", "off"]), 64)
+        self.assertEqual([point.tag for point in one], ["ep1_cp1_op64_tp1_pp1", "ep2_cp1_op64_tp1_pp1"])
+
+    def test_nds_picks_carry_their_mode(self):
+        """
+        Feature: sweep_qwen3_5_moe.pick_nd_top.
+        Description: ND's ranking of one strategy in two modes, then the same ranking read by a
+            sweep of one mode.
+        Expectation: Under two modes each pick runs in the mode ND ranked it with; under one,
+            the picks are named as before.
+        """
+        rows = [_ranking_row(1, 2, 32, "off", "1.0"), _ranking_row(2, 2, 32, "full", "2.0")]
+        args = Sweep.parse_args(["--activation-checkpoint", "off,full"])
+        picks, _ = Sweep.pick_nd_top(rows, args, 64, 2)
+        self.assertEqual([(pick.point.ac, pick.point.tag) for pick in picks],
+                         [("off", "ep2_cp1_op32_tp1_pp1_ac-off"), ("full", "ep2_cp1_op32_tp1_pp1_ac-full")])
+        picks, _ = Sweep.pick_nd_top(rows[1:], Sweep.parse_args(["--activation-checkpoint", "full"]), 64, 1)
+        self.assertEqual([pick.point.tag for pick in picks], ["ep2_cp1_op32_tp1_pp1"])
+
+    def test_keys_and_names_follow_the_mode_only_with_several(self):
+        """
+        Feature: sweep_qwen3_5_moe._strategy_key and _tag_of.
+        Description: One row read by a sweep of several modes and by one of a single mode.
+        Expectation: The mode is part of the key and of the name only with several.
+        """
+        row = _ranking_row(1, 2, 32, "off", "1.0")
+        self.assertEqual(Sweep._tag_of(Sweep._strategy_key(row, True)), "ep2_cp1_op32_tp1_pp1_ac-off")
+        self.assertEqual(Sweep._tag_of(Sweep._strategy_key(row)), "ep2_cp1_op32_tp1_pp1")
+
+    def test_csvs_record_each_runs_mode(self):
+        """
+        Feature: sweep_qwen3_5_moe.merge_csv and write_peaks_csv.
+        Description: Two classified runs merged with their modes, and the run stage's record.
+        Expectation: The merged CSV and memory.csv carry the mode each run ran, which ND reads
+            to price each measured run in its own mode.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            parts = []
+            for tag in ("a_ac-off", "a_ac-full"):
+                part = out / f"real_{tag}.csv"
+                part.write_text("DP,EP,time,comp\n64,2,6000,5000\n", encoding="utf-8")
+                parts.append((tag, part))
+            Sweep.merge_csv(parts, out / "real_all.csv", {}, {"a_ac-off": "off", "a_ac-full": "full"})
+            Sweep.write_peaks_csv({"a_ac-off": {"DP": 64, "recompute": "off", "max_allocated_gb": 50.0,
+                                                "max_reserved_gb": 55.0}}, out / "memory.csv")
+            with open(out / "real_all.csv", newline="", encoding="utf-8") as handle:
+                merged = list(csv.DictReader(handle))
+            with open(out / "memory.csv", newline="", encoding="utf-8") as handle:
+                memory = list(csv.DictReader(handle))
+        self.assertEqual([row["recompute"] for row in merged], ["off", "full"])
+        self.assertEqual(memory[0]["recompute"], "off")
+
+    def test_runs_and_nd_get_the_modes(self):
+        """
+        Feature: sweep_qwen3_5_moe.launch, stage_rank and stage_compare.
+        Description: A sweep of two modes launches a point of each, ranks and compares.
+        Expectation: Each run states its own mode to the trainer, and ND is asked to price
+            and rank both modes, in the ranking and in the comparison.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            args = Sweep.parse_args(["--activation-checkpoint", "off,full", "--out", folder])
+            sweep = Sweep.Sweep(args=args, env=_ENV)
+            commands = []
+
+            def record(command: list, capture: bool = False, check: bool = True) -> str:
+                """Keep the command; a launch's output names its run id."""
+                del check
+                commands.append(list(command))
+                return "run id : r1" if capture else ""
+
+            (Path(folder) / "real_all.csv").write_text("DP\n64\n", encoding="utf-8")
+            with patch.object(Sweep, "_run", record), patch.object(Sweep, "require_importable"), \
+                    patch.object(Sweep, "load_ranking", return_value=([], "")):
+                for point in Sweep.expand(args, 64):
+                    Sweep.launch(sweep, point)
+                Sweep.stage_rank(sweep)
+                Sweep.stage_compare(sweep)
+        modes = [part for command in commands for part in command
+                 if part.startswith("--activation_checkpoint.mode=")]
+        self.assertEqual(modes, ["--activation_checkpoint.mode=off", "--activation_checkpoint.mode=full"])
+        nd_calls = [command for command in commands if Sweep.RUN_ND in command]
+        self.assertEqual(len(nd_calls), 2)
+        for command in nd_calls:
+            self.assertEqual(command[command.index("--recompute") + 1:][:2], ["off", "full"])
 
 
 if __name__ == "__main__":

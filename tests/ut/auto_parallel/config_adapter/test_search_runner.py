@@ -680,6 +680,8 @@ def _write_minimal_hp_yaml(cp_algo=None, cp_degree=2):
     content = {
         "model": {
             "name": "test-tiny",
+            # Stated, so the parser has no dtype to warn about (I12).
+            "param_init_type": "float32",
             "config_overrides": {
                 "hidden_size": 256,
                 "num_hidden_layers": 2,
@@ -869,9 +871,40 @@ class TestTheParserReadsTheStatedRun(unittest.TestCase):
         self.assertEqual(ccfg.optimizer, "hyper_parallel.optim.AdamW")
 
     def test_no_stated_run_takes_the_defaults(self):
-        """A config read from no train.yaml keeps the parser's defaults."""
+        """A config read from no train.yaml keeps the parser's defaults.
+
+        It states no dtype and no checkpoint does, so its weights, and the
+        optimizer states that follow them, are bfloat16 (I12).
+        """
         ccfg = self._parse(_make_full_config())
-        self.assertEqual(ccfg.bytes_p, 4)
-        self.assertEqual(ccfg.optimizer_state_bytes, 4)
+        self.assertEqual(ccfg.bytes_p, 2)
+        self.assertEqual(ccfg.optimizer_state_bytes, 2)
         self.assertEqual(ccfg.main_param_bytes, 0)
         self.assertEqual(ccfg.cp_algo, "colossalai_cp")
+
+
+class TestSearchStrategiesRecomputeDimension(unittest.TestCase):
+    """search_strategies hands the recompute dimension to the search and states the winner's mode."""
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_modes_reach_the_search_and_the_winner_states_its_own(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """With modes, the search gets them and the result runs the best entry's mode; without, full."""
+        for modes, mode in ((("off", "full"), "off"), (None, "full")):
+            with self.subTest(modes=modes):
+                entry = _make_scored_entry()
+                entry[0].recompute = "off"
+                mock_runner = MagicMock()
+                mock_runner.run_generation_to_ordering.return_value = [entry]
+                mock_parallelize_cls.return_value = mock_runner
+                config = _make_full_config()
+                if modes:
+                    config.estimator["recompute_modes"] = modes
+                result = sr.search_strategies(config)
+                self.assertEqual(mock_parallelize_cls.call_args.kwargs.get("recompute_modes"), modes)
+                self.assertEqual(result["activation_checkpoint"], mode)

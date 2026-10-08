@@ -14,7 +14,9 @@
 # ============================================================================
 """parse config for cost model"""
 import inspect
-from typing import Any
+import os
+from collections import Counter, defaultdict
+from typing import Any, DefaultDict, List
 import re
 import weakref
 from copy import deepcopy
@@ -88,6 +90,47 @@ def compute_kv_dim(ccfg: Any) -> float:
     return ccfg.h / t
 
 
+# Each read of a config field no parser set, by field and by the function
+# that read it. The config hands such a field over as 0, so a model feature
+# nobody parsed costs nothing unless its reader has a fallback of its own, and
+# the estimate stays plausible; a search says which were read, under its
+# ranking (I9). A reader with a fallback, such as _flavour_tables' three
+# feed-forward matmuls, is named too: the record cannot tell it apart.
+UNSET_READS: DefaultDict[str, Counter] = defaultdict(Counter)
+# The fields whose absence means there is nothing to price: a submodule
+# copied without its parent's hooks takes the predefined ones.
+ABSENT_MEANS_NOTHING = frozenset({"hooks_dict"})
+# Whether such a read is refused rather than priced as 0 (run_nd --strict).
+_STRICT = {"on": False}
+
+
+def set_strict(strict: bool) -> None:
+    """Refuse, rather than price as 0, a config field no parser set where the estimate reads it.
+
+    Under it a read such as ``ccfg.n_gather`` raises AttributeError naming
+    the field and its reader, while ``getattr(ccfg, name, default)``, which
+    states what absence means, gets its default.
+
+    Args:
+        strict: True to refuse; False to price an unset field as 0, as by default.
+    """
+    _STRICT["on"] = bool(strict)
+
+
+def unset_reads_report() -> List[str]:
+    """What the config fields no parser set were read by, one line, and forget them; none where none was read."""
+    if not UNSET_READS:
+        return []
+    count = len(UNSET_READS)
+    fields = "; ".join(
+        f"{attr} by {', '.join(reader for reader, _ in readers.most_common())}"
+        for attr, readers in sorted(UNSET_READS.items())
+    )
+    UNSET_READS.clear()
+    return [f"The estimate read {count} config field(s) no parser set, each handed over as 0, which a reader "
+            f"without a fallback of its own prices as 0 (run_nd --strict refuses them): {fields}"]
+
+
 # class CostModelConfig(Config) :
 # What ``model_name`` says to target the config a strategy is set on
 # itself, which for a multimodal parent is neither of its submodules.
@@ -103,9 +146,10 @@ class CostModelConfig(PartitionGenerator):
         hook_cls: Any = None,
         framework: Any = None,
         source_code: Any = None,
+        devices: int = 0,
     ) -> None:
-        """Initialise the cost model from a config, hooks and framework name."""
-        super().__init__(input_config, hook_cls, framework, source_code)
+        """Initialise the cost model from a config, hooks and framework name, and the devices a caller states."""
+        super().__init__(input_config, hook_cls, framework, source_code, devices)
         logger.debug(
             "parser = %s for %s", str(self.parser), str(self.model_name)
         )
@@ -123,6 +167,15 @@ class CostModelConfig(PartitionGenerator):
     def __getattr__(self, attr):
         call_source = inspect.currentframe().f_back.f_code.co_name
         if attr not in self.__dict__:
+            if not attr.startswith("_") and attr not in ABSENT_MEANS_NOTHING:
+                frame = inspect.currentframe().f_back
+                reader = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_code.co_name}"
+                UNSET_READS[attr][reader] += 1
+                if _STRICT["on"]:
+                    raise AttributeError(
+                        f"{reader} reads {attr}, which no parser set: run_nd --strict refuses it rather than "
+                        f"pricing it as 0"
+                    )
             logger.warning(
                 "[%s] Attribute %s does not exist. "
                 "Value '0' will be assigned.",

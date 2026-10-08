@@ -14,10 +14,12 @@
 # ============================================================================
 """performance estimation"""
 import json
+import math
 from copy import deepcopy
 from typing import Any, Callable, NamedTuple, Optional
 import numpy as np
 
+from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_config import CostModelConfig
@@ -74,6 +76,30 @@ GDN_CHUNK = 64
 # measured its own says so with ``context.moe_dispatch``, as it states the
 # ratios of the parts in a file.
 MOE_DISPATCH = 1040
+# How far a stage's recorded parts may stray from its time: they are its time
+# taken apart, so only by rounding.
+PARTS_REL_TOL = 1e-9
+# The ratio of a ratios file that scales the compute parts and turns ND's
+# units into milliseconds.
+COMPUTE_RATIO = "COMPUTE"
+# Where a ratio a file leaves out is taken from, as ``nd.ratios.fit_ratios``
+# fills a part it cannot fit: the all-reduce from the DP traffic it was split
+# out of, the bubble from P2P time, which measured data cannot tell it from,
+# and any other part from compute's, which leaves it as ND weighs it.
+RATIO_FALLBACKS = {
+    PerfParts.DP_REDUCE.name: PerfParts.DP_COMM.name,
+    PerfParts.BUBBLE.name: PerfParts.PP_COMM.name,
+}
+# The ratios a file was found without, each named once a process.
+_MISSING_RATIOS = set()
+# The parts a communication walk records on the debugger, one value a stage.
+RECORDED_COMM_PARTS = (
+    PerfParts.DP_COMM,
+    PerfParts.DP_REDUCE,
+    PerfParts.MP_COMM,
+    PerfParts.EP_COMM,
+    PerfParts.CP_COMM,
+)
 
 
 def op_table(cfg, attn=None):
@@ -345,6 +371,26 @@ def estimate_stage(*args, **kwargs):
     #return stage
 
 
+def _check_stage_parts(time_sum, stage_time, stage):
+    """Say so when the parts recorded for a stage do not add up to its time.
+
+    The parts are the stage's time taken apart, so they agree with it to
+    rounding.  A gap means a walk recorded less, or more, than the time
+    counts, and the bubble, what is left of the pipeline's time once the
+    parts are taken out, silently takes the difference.
+    """
+    if math.isclose(time_sum, stage_time, rel_tol=PARTS_REL_TOL, abs_tol=PARTS_REL_TOL):
+        return
+    nd_logger.error(
+        "the parts recorded for stage %d sum to %.6E where its time is %.6E (%+.3f%%), "
+        "and the bubble takes the difference",
+        stage,
+        time_sum,
+        stage_time,
+        100 * (time_sum - stage_time) / stage_time if stage_time else 0.0,
+    )
+
+
 def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
     """pipeline level estimation"""
     logger.info("stage_perfs = %s", stage_perfs)
@@ -423,9 +469,9 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
             )
             time_sum += debugger.info[k]
 
-        if abs(time_sum - straggler_time * cfg.m) < 1e-9:
-            logger.warning("Inconsistency found in straggler time calculation")
-            time_sum = straggler_time * cfg.m
+        # The bubble stays the pipeline's time less the parts, so the parts
+        # and the bubble still sum to the total the ratios are fitted on.
+        _check_stage_parts(time_sum, stage_perfs[last_straggler_idx] * cfg.m, last_straggler_idx)
         logger.info(
             "straggler time = %.2E. %s x stragglers = %.2E",
             straggler_time,
@@ -502,11 +548,38 @@ def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
     return p2p
 
 
+def _part_ratio(coeffs, key):
+    """The ratio a ratios file states for *key*, or the one fit_ratios would give it.
+
+    A file ``fit_ratios`` writes states every key, but one edited by hand,
+    or fitted by a tree older than a part, may lack some.  A missing ratio
+    falls back as ``fit_ratios`` fills a part it cannot fit (``RATIO_FALLBACKS``),
+    and each missing key is named once.  Compute's ratio is the unit every
+    other one falls back on, so a file without it is refused.
+
+    Raises:
+        ValueError: When the file states no COMPUTE ratio.
+    """
+    ratio = coeffs.get(key)
+    if ratio is not None:
+        return ratio
+    if key == COMPUTE_RATIO:
+        raise ValueError(
+            "the ratios file states no COMPUTE ratio, the one that turns ND's "
+            "units into milliseconds and that every missing ratio falls back on"
+        )
+    fallback = RATIO_FALLBACKS.get(key, COMPUTE_RATIO)
+    if key not in _MISSING_RATIOS:
+        _MISSING_RATIOS.add(key)
+        nd_logger.error("the ratios file states no %s ratio: that part takes %s's", key, fallback)
+    return _part_ratio(coeffs, fallback)
+
+
 def apply_regression_coefficients(coeffs, debugger, old_perf):
     """
     applies the coefficients present in regression's cache_file
     """
-    compute_ratio = coeffs.get("COMPUTE")
+    compute_ratio = _part_ratio(coeffs, COMPUTE_RATIO)
     for part, raw in list(debugger.info.items()):
         if part in (PerfParts.TOTAL, PerfParts.MEMORY):
             continue
@@ -515,10 +588,7 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
                    PerfParts.RECOMPUTE):
             ratio = compute_ratio
         else:
-            ratio = coeffs.get(part.name)
-            if ratio is None and part == PerfParts.DP_REDUCE:
-                # A file fitted before the all-reduce had a part of its own.
-                ratio = coeffs.get(PerfParts.DP_COMM.name)
+            ratio = _part_ratio(coeffs, part.name)
         new_val = 0.0 if raw == 0.0 else raw * ratio
         debugger.info[part] = new_val
 
@@ -648,9 +718,16 @@ def _submodule_parts(cfg, ccfg, device_type, debugger):
     (``combine_partition_multimodal``).  Each is priced on its own
     partitions and under its own family, on a copy, so no submodule leaves
     state for the next.
+
+    Each submodule's walk also records its communication on the debugger,
+    stage by stage, and the record is summed the same way.  Kept as the
+    last walk left it, it held the language model's share alone: a vision
+    tower's collectives went into the bubble, the time less the parts, and
+    the parts a ratio is fitted on missed them.
     """
     partitions = cfg.generate_partitions_vpp()
     totals = None
+    recorded = {}
     for name in cfg.mm_order:
         sub = deepcopy(cfg.mm_ccfgs[name])
         check_and_apply_custom_hook(sub)
@@ -658,7 +735,24 @@ def _submodule_parts(cfg, ccfg, device_type, debugger):
         totals = parts if totals is None else tuple(
             [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
         )
+        if debugger and debugger.is_enabled():
+            _add_recorded_comm(recorded, debugger.info)
+    if recorded:
+        debugger.info.update(recorded)
     return totals
+
+
+def _add_recorded_comm(recorded, info):
+    """Add the communication a walk recorded, one value a stage, to *recorded*."""
+    for part in RECORDED_COMM_PARTS:
+        stages = info.get(part)
+        if not isinstance(stages, list):
+            continue
+        recorded[part] = (
+            [left + right for left, right in zip(recorded[part], stages)]
+            if part in recorded
+            else list(stages)
+        )
 
 
 # performance estimation

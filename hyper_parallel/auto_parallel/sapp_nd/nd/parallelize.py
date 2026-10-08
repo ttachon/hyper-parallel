@@ -14,6 +14,7 @@
 # ============================================================================
 """find parallelization"""
 
+from collections import Counter
 from contextlib import nullcontext
 import time
 import copy
@@ -35,6 +36,14 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_const
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     CostModelConfig,
     detect_attention_type,
+    unset_reads_report,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
+    HYPER_FRAMEWORKS,
+    RECOMPUTE_MODES,
+    parsed_recompute,
+    restore_recompute,
+    state_recompute_mode,
 )
 
 # logger = proc.log_to_stderr()
@@ -43,6 +52,11 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
 
 class ParallelizeLayer:
     """Parallelize one layer type"""
+
+    # No recompute dimension and no mode stated, also for an instance a test
+    # builds without __init__.
+    recompute_modes = None
+    _stated_mode = None
 
     def __init__(
         self,
@@ -59,6 +73,18 @@ class ParallelizeLayer:
             manual_ppb = extra_config.pop("mppb")
         else:
             manual_ppb = False
+        # A recompute dimension: the activation checkpoint modes every
+        # candidate is priced under, each pair ranked on its own; None prices
+        # each candidate with the recompute it derives, as without one.
+        self.recompute_modes = extra_config.pop("recompute_modes", None)
+        if self.recompute_modes is not None:
+            unknown = sorted(set(self.recompute_modes) - set(RECOMPUTE_MODES))
+            if unknown or not self.recompute_modes:
+                raise ValueError(f"recompute_modes {list(self.recompute_modes)}: expected some of "
+                                 f"{', '.join(RECOMPUTE_MODES)}")
+            if manual_ppb:
+                raise ValueError("recompute_modes prices every candidate under each mode, and mppb takes the "
+                                 "recompute from the config: give one of them")
 
         self.mem_eval = evaluator
 
@@ -97,6 +123,10 @@ class ParallelizeLayer:
             )
 
         self.mem_eval.set_passes(**extra_config)
+        # What a mode of the recompute dimension replaces, for when no mode is
+        # stated, and the mode stated now: None until one is.
+        self._parsed_recompute = parsed_recompute(self.mem_eval.ccfg)
+        self._stated_mode = None
 
         self.machine.update_num_if_none(
             self.config.ccfg.strategy_num_devices()
@@ -153,6 +183,24 @@ class ParallelizeLayer:
             Dim.TP.set_bound(
                 Hard.highest_power_of_2_divisor(self.config.ccfg.a)
             )
+        self._report_bounds(vpp)
+
+    def _report_bounds(self, vpp: int) -> None:
+        """Name the bound each searched dimension takes, and why.
+
+        A degree over its bound is never generated, so no check refuses it
+        and no estimate drops it: this line is the only trace it leaves.
+        """
+        heads = "KV heads" if self.config.ccfg.n_kv else "attention heads' largest power of two"
+        bounds = (
+            (Dim.PP, f"the machine's {self.machine.pipeline_bound()}, {self.config.total_layer_num()} layers "
+                     f"over VPP {vpp}, a batch of {self.global_batch_size}"),
+            (Dim.EP, "the model's experts"),
+            (Dim.TP, f"the model's {heads}"),
+        )
+        named = [f"{dim} up to {dim.get_bound()} ({why})" for dim, why in bounds if dim in self.config.dimensions]
+        if named:
+            logger.output("The search bounds %s", "; ".join(named))
 
     @staticmethod
     def filtered_out(_: Any) -> bool:
@@ -162,20 +210,25 @@ class ParallelizeLayer:
         #         return True
         return False
 
+    def _refuse(self, reason: str) -> bool:
+        """Count a candidate refused for *reason*, for the search's summary, and return False."""
+        self.__dict__.setdefault("refused", Counter())[reason] += 1
+        return False
+
     def is_valid(self, parallel_config: Any) -> bool:
         """Check configuration validity"""
         if not parallel_config.is_valid():
             logger.warning("configuration %s not valid", str(parallel_config))
-            return False
+            return self._refuse("a degree out of bounds")
         if not self.config.moe_valid(parallel_config):
             logger.warning("expert parallel is higher than expert number")
-            return False
+            return self._refuse("EP over the experts or DP x TP")
         if hasattr(self.config, 'ep_constraints_valid') and not self.config.ep_constraints_valid(parallel_config):
             logger.warning("EP divisibility constraints not satisfied")
-            return False
+            return self._refuse("EP divisibility")
         if self.filtered_out(parallel_config):
             logger.warning("Config manually filtered out")
-            return False
+            return self._refuse("filtered out")
 
         if hasattr(parallel_config, 'dims_val') and Dim.CP in parallel_config.dims_val:
             cp_degree = parallel_config.dims_val[Dim.CP]
@@ -211,7 +264,7 @@ class ParallelizeLayer:
 
                 if not cp_result.is_valid:
                     logger.warning("CP constraints violated: %s", cp_result.error_message)
-                    return False
+                    return self._refuse("CP constraints")
 
                 if cp_result.warning_message:
                     logger.info("CP warning: %s", cp_result.warning_message)
@@ -223,7 +276,7 @@ class ParallelizeLayer:
                 gbs,
                 self.global_batch_size,
             )
-            return False
+            return self._refuse("global batch")
         return True
 
     def priced(self) -> Any:
@@ -251,14 +304,48 @@ class ParallelizeLayer:
             debugger.info[Debug.MemParts.TOTAL] = peak
         return peak
 
+    def _drop(self, config: Any, peak: float) -> None:
+        """Say that the memory budget drops *config*, and by how much its peak misses it."""
+        budget = self.mem_eval.get_max_device_memory()
+        logger.output(
+            "%s dropped: its peak of %.0f MB is over the %.0f MB budget by %.0f MB",
+            config,
+            peak,
+            budget,
+            peak - budget,
+        )
+
+    def _summarise_search(self, size: int, priced: int, fitting: int) -> None:
+        """The search's two counts: what was tested, refused and priced, and what fits."""
+        refused = self.__dict__.get("refused", Counter())
+        reasons = ", ".join(f"{reason} {count}" for reason, count in refused.most_common())
+        logger.output(
+            "%d configurations tested: %d refused%s, %d priced for memory",
+            size,
+            sum(refused.values()),
+            f" ({reasons})" if reasons else "",
+            priced,
+        )
+        logger.output(
+            "%d configuration fitting memory to order, %d dropped over the memory budget",
+            fitting,
+            priced - fitting,
+        )
+
     def generate_search_space(self, folder: Any, threads_num: Any) -> Any:
-        """Return a search space computed with memory estimation"""
+        """Return a search space computed with memory estimation.
+
+        A candidate the memory budget drops is named with its peak, and the
+        summary counts the candidates the checks refused apart from those the
+        budget dropped, each check by name.
+        """
         # With a pool the accumulator holds AsyncResult, which the direct
         # branch's float values hide from static inference.
         # pylint: disable=no-member
         space = ({}, 0)
         configs = []
         results = {}
+        self.refused = Counter()
         if threads_num:
             with proc.Pool(processes=threads_num) as pool:
                 logger.debug("before loops")
@@ -280,6 +367,8 @@ class ParallelizeLayer:
                     logger.debug("peak_mem = %s", str(peak_mem))
                     if self.mem_eval.mem_fit(peak_mem):
                         configs.append((config, peak_mem))
+                    else:
+                        self._drop(config, peak_mem)
                 pool.close()
                 pool.join()
         else:
@@ -289,8 +378,9 @@ class ParallelizeLayer:
                     configs.append((config, peak_mem))
                     if folder:
                         self.config.write(folder, config)
-        logger.output("%d valid configurations generated", size)
-        logger.output("%d configuration fitting memory to order", len(configs))
+                else:
+                    self._drop(config, peak_mem)
+        self._summarise_search(size, len(results), len(configs))
 
         return configs
 
@@ -313,6 +403,39 @@ class ParallelizeLayer:
                         break
                     space = self.batch_loops(space, pool, (dp, tp, pp, cp))
         return space
+
+    def batch_reachable(self) -> bool:
+        """Whether any candidate the loops build makes the global batch; one line says so where none does.
+
+        Each candidate's batch is its DP x MB x MBS, MB the batch over DP and
+        MBS, so a batch that is no whole number of micro-batches of any DP x
+        MBS the loops reach is refused in every candidate, each with an error.
+        The search stops before building one, with this line instead.
+        """
+        number = self.machine.number
+        reached = set()
+        for tp in self.config.space(Dim.TP, number):
+            for pp in self.config.space(Dim.PP, number // tp):
+                for cp in self.config.space(Dim.CP, number // tp // pp):
+                    dp = number // tp // cp // pp
+                    if dp < 1:
+                        break
+                    for mbs in self.config.space(Dim.MBS, self.global_batch_size // pp // dp):
+                        mbn = self.global_batch_size // dp // mbs
+                        candidate = self.config.make_parallel_config((dp, tp, pp, cp), (mbs, mbn), (1, 1, 1, False))
+                        if self.config.global_batch_size(candidate) == self.global_batch_size:
+                            return True
+                        reached.add(self.config.dim_val(Dim.DP, candidate) * mbs)
+        logger.error(
+            "No candidate makes a global batch of %d (the yaml states %d): the candidates the search builds "
+            "have DP x MBS of %s, and %d is no whole number of micro-batches of any. State -b as a multiple "
+            "of one of them, or let DP shrink by naming PP, CP or MP in -l.",
+            self.global_batch_size,
+            self.config.ccfg.gbs,
+            ", ".join(str(batch) for batch in sorted(reached)),
+            self.global_batch_size,
+        )
+        return False
 
     def batch_loops(self, space: Any, pool: Any, dtpc_p: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
@@ -477,6 +600,7 @@ class ParallelizeLayer:
             # The comparison needs the per-part split at any verbosity; debug.csv stays opt-in.
             debugger = Debug.Debug(config, info_type=Debug.PerfParts, enable=True)
             try:
+                self.set_recompute_mode(self._measured_mode(config))
                 self.config.set_parallel_config(config)
                 peak_mem = self.memory_estim()
                 score = estimate_performance(
@@ -498,6 +622,7 @@ class ParallelizeLayer:
             )
 
             logger.info("config %s has score %f", str(config), score)
+        self.set_recompute_mode(None)
         del debug_parts[-2:]
         return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
 
@@ -510,6 +635,7 @@ class ParallelizeLayer:
                 config, info_type=Debug.PerfParts, enable=self.enable_debug
             )
             logger.info("Test config %s", str(config))
+            self.set_recompute_mode(self._measured_mode(config))
             self.config.set_parallel_config(config)
             logger.debug(self.mem_eval.get_strategy())
             peak_mem = self.memory_estim()
@@ -525,6 +651,7 @@ class ParallelizeLayer:
             scored_space.append((config, peak_mem, real_time, score, values))
 
             logger.info("config %s has score %f", str(config), score)
+        self.set_recompute_mode(None)
         del debug_parts[-2:]
         return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
 
@@ -534,6 +661,65 @@ class ParallelizeLayer:
             f"{self.model_name} on {self.machine.number}"
             + f" {self.machine.device} with {self.global_batch_size} GBS"
         )
+
+    def set_recompute_mode(self, mode: Optional[str]) -> None:
+        """Price what follows under one activation checkpoint mode, or None for the config's own recompute.
+
+        Nothing changes when the mode is the one already stated, so a search
+        without a recompute dimension never touches the config's recompute.
+
+        Args:
+            mode: One of the recompute dimension's modes, or None.
+        """
+        if mode == self._stated_mode:
+            return
+        self._stated_mode = mode
+        if mode is None:
+            restore_recompute(self._parsed_recompute)
+            self.config.state_recompute(None)
+            return
+        state_recompute_mode(self.mem_eval.ccfg, mode)
+        self.config.state_recompute(mode == "full")
+
+    def _measured_mode(self, config: Any) -> Optional[str]:
+        """The mode a measured configuration ran: its own, else the dimension's only one, else None."""
+        mode = getattr(config, "recompute", None)
+        if mode is None and self.recompute_modes is not None and len(self.recompute_modes) == 1:
+            mode = self.recompute_modes[0]
+        return mode
+
+    def _search_and_order(self, yaml_folder: Any, threads_num: Any, cache_file: Any) -> Tuple[list, list, float, float]:
+        """Generate and order the space once, or once per mode of a recompute dimension.
+
+        Each mode's pass prices and checks every candidate under that mode and
+        tags it with the mode; the passes are then ranked together, so a mode
+        that does not fit a candidate only removes that pair.
+
+        Returns:
+            The ordered entries, the parts of their scores, and the seconds
+            generation and ordering took.
+        """
+        scored_space, dbg, generation, ordering = [], [], 0.0, 0.0
+        if not self.batch_reachable():
+            return scored_space, dbg, generation, ordering
+        for mode in self.recompute_modes or (None,):
+            if mode is not None:
+                logger.output("Search with recompute %s", mode)
+                self.set_recompute_mode(mode)
+            start = time.time()
+            space = self.generate_search_space(yaml_folder, threads_num)
+            generated = time.time()
+            scored, parts = self.order_search_space(space, threads_num, cache_file=cache_file)
+            generation += generated - start
+            ordering += time.time() - generated
+            dbg = parts or dbg
+            for entry in scored:
+                entry[0].recompute = mode
+            scored_space += scored
+        if self.recompute_modes is not None:
+            self.set_recompute_mode(None)
+            scored_space.sort(key=lambda entry: entry[2])
+        return scored_space, dbg, generation, ordering
 
     def run_generation_to_ordering(
         self,
@@ -549,13 +735,9 @@ class ParallelizeLayer:
         It is written before anything is plotted, so a plot that fails cannot
         take the ranking with it.
         """
-        start = time.time()
-        space = self.generate_search_space(yaml_folder, threads_num)
-        generation = time.time()
-        scored_space, dbg = self.order_search_space(
-            space, threads_num, cache_file=cache_file
+        scored_space, dbg, generation, ordering = self._search_and_order(
+            yaml_folder, threads_num, cache_file
         )
-        ordering = time.time()
         if ranking_csv:
             Debug.write_ranking_csv(scored_space, ranking_csv)
             logger.output(
@@ -566,15 +748,32 @@ class ParallelizeLayer:
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )
+        priced = self.priced()
+        if not getattr(priced, "seq_len_stated", True):
+            # A warning at parse time scrolls past a search's lines; this one
+            # sits under the table it qualifies (I11).
+            logger.output(
+                "Every number above is priced at %d tokens, the model's context limit: the config states no "
+                "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
+                priced.s,
+            )
+        for line in unset_reads_report():
+            logger.output(line)
         logger.output(
             "Space generation took %.2fs and ordering took %.2fs",
-            generation - start,
-            ordering - generation,
+            generation,
+            ordering,
         )
-        is_not = " NOT" if not self.config.balancing.from_config else ""
-        logger.output(
-            "Offset & Recompute were%s computed from config info", is_not
-        )
+        if self.recompute_modes is None:
+            is_not = " NOT" if not self.config.balancing.from_config else ""
+            logger.output(
+                "Offset & Recompute were%s computed from config info", is_not
+            )
+        else:
+            logger.output(
+                "Offset was NOT computed from config info; recompute was searched over %s",
+                ", ".join(self.recompute_modes),
+            )
         logger.output(
             "Device number is %d, global batch size is %d, dimensions are %s",
             self.machine.number,
@@ -596,6 +795,7 @@ class ParallelizeLayer:
     def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any) -> None:
         """Create an input file for pipeline balancing"""
         parallel_config = scored_space[k][0]
+        self.set_recompute_mode(getattr(parallel_config, "recompute", None))
         self.config.set_parallel_config(parallel_config)
         self.mem_eval.update_config(self.config)
         m = cfg_name + "_nd_to_ppb_" + str(k)
@@ -741,6 +941,11 @@ class Parallelize:  # pylint: disable=R0903
 
     def __init__(self, framework: Any, config: Any, machine: Any, **extra_config: Any) -> None:
         """Dispatch to the unimodal or multimodal search driver."""
+        if extra_config.get("recompute_modes") is not None and framework not in HYPER_FRAMEWORKS:
+            raise ValueError(
+                f"recompute_modes are HyperParallel's activation checkpoint modes, and the {framework} "
+                f"parser states its own recompute: use one of {', '.join(HYPER_FRAMEWORKS)}"
+            )
         logger.debug("before evaluator init")
         if "model" in extra_config:
             model_name = extra_config.pop("model")
@@ -793,9 +998,13 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         s += "\n"
     if len(space) == 0:
         return s
+    # A search with a recompute dimension names each entry's mode after its degrees.
+    moded = any(getattr(entry[0], "recompute", None) for entry in space)
     s += "\t"
     for d in space[0][0].all_dims:
         s += str(d) + " " * (6 - len(str(d)))
+    if moded:
+        s += "Recompute  "
     s += "Memory    Performance score  "
     if debug_parts is not None:
         for dbg_part in debug_parts:
@@ -807,6 +1016,8 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         s += "\t"
         for v in config[0].values():
             s += v + " " * (6 - len(v))
+        if moded:
+            s += f"{config[0].recompute:<11s}"
         s += str(config[1]) + " MB  "  # + str(config[2])
         s += f"{(config[2]):16.12e}"
         for v in config[3]:

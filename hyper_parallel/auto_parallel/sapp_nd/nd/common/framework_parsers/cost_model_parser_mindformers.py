@@ -297,7 +297,10 @@ class CostModelParserMindformers(_CostModelParser):
         op_cfg = self.config.parallel.parallel_optimizer_config
         if op_cfg:
             self.ccfg.op_weight_shard = op_cfg.optimizer_weight_shard_size
-        self.ccfg.optimizer = self.config.optimizer.type
+        # Read from the section's own fields: a missing section reads as 0,
+        # whose .type raised, where the HyperParallel parser takes AdamW.
+        optimizer = vars(self.config).get("optimizer")
+        self.state_optimizer(self.ccfg, getattr(optimizer, "__dict__", {}).get("type"))
         self.ccfg.multiple_of = (
             self.config.model.model_config.multiple_of
             if self.config.model.model_config.multiple_of

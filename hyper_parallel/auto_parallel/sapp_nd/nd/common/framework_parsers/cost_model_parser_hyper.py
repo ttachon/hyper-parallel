@@ -75,6 +75,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlOb
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_activation_checkpoint_mode
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
@@ -258,6 +259,9 @@ class CostModelParserHyperV2(_CostModelParser):
         if self._vision_spec and not self._builds_vision_tower():
             self._vision_spec = None
         self._tie_word_embeddings = bool(spec.get("tie_word_embeddings", False))
+        # The dtype the spec states, the checkpoint's own where the section
+        # states none: the runtime loads the weights in it (_model_dtype).
+        self._spec_dtype = spec.get("torch_dtype")
         self._layer_types = spec.get("layer_types") or []
         self._linear_attn = {
             "n_k": self._spec_int(spec, "linear_num_key_heads"),
@@ -609,6 +613,8 @@ class CostModelParserHyperV2(_CostModelParser):
         """Prefer the Trainer dataset sequence length over the model limit."""
         stated = self._dataset_seq_len()
         seq_len = int(stated or self.ccfg.s or 4096)
+        # The ranking says so beside its table, where a reader looks (I11).
+        self.ccfg.seq_len_stated = bool(stated)
         if not stated:
             # The fallback is the model's context limit, orders of magnitude
             # above any real training length on a long-context model, which
@@ -740,9 +746,19 @@ class CostModelParserHyperV2(_CostModelParser):
         has no replicate field, since the runtime derives it from the world
         size, so without ``context.device_num`` an HSDP run would understate
         the cluster by exactly its replicate factor.
+
+        Without ``context.device_num``, an AutoModels config takes the device
+        count its caller states (``run_nd -d``), as the runtime takes the
+        world size its launcher gives it.  Read from ``dp_shard_size`` alone,
+        a one-node yaml searched on more devices kept its one node's degree,
+        and its micro-batch count with it, in every candidate (M6).
         """
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         device_num = int(self._get_cfg_attr(ctx, "device_num", 0) or 0)
+        source = "context.device_num"
+        if not device_num and is_auto_models_schema(self.config):
+            device_num = int(getattr(self.ccfg, "devices", 0) or 0)
+            source = "the device count (-d)"
         if not device_num:
             if is_auto_models_schema(self.config) and dp_replicate == 1:
                 logger.warning(
@@ -754,7 +770,7 @@ class CostModelParserHyperV2(_CostModelParser):
         denom = self.ccfg.t * self.ccfg.p * self.ccfg.cp
         if denom < 1 or device_num % denom:
             raise ValueError(
-                f"context.device_num={device_num} is not divisible by "
+                f"{source}={device_num} is not divisible by "
                 f"t*p*cp={denom}"
             )
         return max(1, device_num // denom)
@@ -893,18 +909,13 @@ class CostModelParserHyperV2(_CostModelParser):
                     "train.accelerator.context_parallel_algo explicitly "
                     "to 'ulysses_cp' if Ulysses CP is intended."
                 )
-        # Optimizer type — used by GlobalConfig.max_op to detect muon-based
-        # optimizers.  Matches the MF parser's
-        # ``self.ccfg.optimizer = self.config.optimizer.type``.
-        opt_type = (
-            self._get_cfg_attr(optimizer, "_target_", None)
-            or self._get_cfg_attr(optimizer, "type", None)
+        # The optimizer, by its target, which decides the states it keeps
+        # a parameter; the MindFormers parser names it by its type.
+        self.state_optimizer(
+            self.ccfg,
+            self._get_cfg_attr(optimizer, "_target_", None) or self._get_cfg_attr(optimizer, "type", None),
         )
-        # Always a string: GlobalConfig.max_op only bounds OP by the data
-        # parallel degree when this reads as a non-muon optimizer name, and
-        # a train.yaml need not state its optimizer.
-        self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
-        self._init_optimizer_states(optimizer, str(opt_type or ""))
+        self._init_optimizer_states(optimizer)
 
     def _reshards_params(self):
         """Whether HyperParallel's FSDP frees a layer's gathered parameters once it has run.
@@ -918,27 +929,49 @@ class CostModelParserHyperV2(_CostModelParser):
             and self._get_cfg_attr(fsdp, "reshard_after_backward", True)
         )
 
-    def _init_optimizer_states(self, optimizer, target):
-        """State what HyperParallel's optimizer keeps per parameter.
+    def _init_optimizer_states(self, optimizer):
+        """State the width of what HyperParallel's optimizer keeps per parameter.
 
-        Its AdamW keeps two moments and its Muon one momentum per matrix,
-        each ``zeros_like`` the gradient, which FSDP casts to the stored
-        parameter's dtype.  With ``fp32_main_params`` the optimizer keeps an
-        fp32 copy of each narrower parameter, and its states in fp32.
+        Its AdamW keeps two moments and its Muon one momentum per matrix
+        (``state_optimizer`` counts them), each ``zeros_like`` the gradient,
+        which FSDP casts to the stored parameter's dtype.  With
+        ``fp32_main_params`` the optimizer keeps an fp32 copy of each
+        narrower parameter, and its states in fp32.
         """
         stored = self._stored_param_bytes()
         fp32_main = bool(self._get_cfg_attr(optimizer, "fp32_main_params", False))
-        self.ccfg.optimizer_states = 1 if "muon" in target.lower() else 2
         self.ccfg.optimizer_state_bytes = 4 if fp32_main else stored
         self.ccfg.main_param_bytes = 4 if fp32_main and stored < 4 else 0
 
     def _stored_param_bytes(self):
         """The width FSDP stores the parameters in: the model's, whatever FSDP gathers them in."""
-        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         return self._bytes_from_dtype(
             self._get_cfg_attr(self.config, "model_init_dtype", None)
-            or self._get_cfg_attr(model_raw, "torch_dtype", None)
-            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+            or self._model_dtype("param_init_type")
+        )
+
+    def _model_dtype(self, legacy_key: str, cast: Any = None) -> str:
+        """The dtype the runtime loads the model's weights in, by name.
+
+        ``model.torch_dtype`` where the section states one other than
+        ``auto``; else the legacy *legacy_key* (``param_init_type`` for the
+        parameters, ``compute_dtype`` for the compute); else *cast*, a dtype
+        the run casts the weights to before they compute; else the dtype the
+        spec states, which is the checkpoint's own, as the runtime loads the
+        weights under its default ``auto``; else bfloat16 (``_init_bytes``
+        warns).  A model stating none was priced in float32 parameters doing
+        bfloat16 arithmetic, where the runtime loads its checkpoint's, mostly
+        two bytes (I12).
+        """
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        stated = self._get_cfg_attr(model_raw, "torch_dtype", None)
+        if stated and stated != "auto":
+            return str(stated)
+        return str(
+            self._get_cfg_attr(model_raw, legacy_key, None)
+            or cast
+            or getattr(self, "_spec_dtype", None)
+            or "bfloat16"
         )
 
     def _parse_recompute(self):
@@ -962,12 +995,14 @@ class CostModelParserHyperV2(_CostModelParser):
         activation_checkpoint = self._get_cfg_attr(
             self.config, "activation_checkpoint", Config({}),
         )
-        ac_mode = str(
-            self._get_cfg_attr(activation_checkpoint, "mode", None)
-            or self._get_cfg_attr(gc, "activation_checkpoint", "none")
-        )
-        if ac_mode == "off":
-            ac_mode = "none"
+        # Read as the trainer reads it: an unquoted off, which YAML reads as
+        # False, is off rather than a fall through to the legacy key, and a
+        # name that is no mode is refused rather than priced as off (I13).
+        stated, where = self._get_cfg_attr(activation_checkpoint, "mode", None), "activation_checkpoint.mode"
+        if stated is None:
+            stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
+            where = "train.gradient_checkpointing.activation_checkpoint"
+        ac_mode = read_activation_checkpoint_mode(stated, where)
 
         if full_rec_override is not None:
             self.ccfg.full_rec = full_rec_override
@@ -986,23 +1021,28 @@ class CostModelParserHyperV2(_CostModelParser):
 
         ``model_init_dtype`` is a top-level AutoModels key applied after the
         weights are loaded, so it outranks ``model.torch_dtype`` for the
-        stored parameters but not an explicit FSDP ``param_dtype``.
+        stored parameters but not an explicit FSDP ``param_dtype``.  Where
+        nothing states a dtype, the checkpoint's own is taken
+        (:meth:`_model_dtype`), and bfloat16 with a warning where there is
+        no checkpoint either.
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
         mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
-        model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
         init_dtype = self._get_cfg_attr(self.config, "model_init_dtype", None)
+        param_dtype = self._get_cfg_attr(mix_precision, "param_dtype", None)
         self.ccfg.bytes_p = self._bytes_from_dtype(
-            self._get_cfg_attr(mix_precision, "param_dtype", None)
+            param_dtype
             or init_dtype
-            or model_dtype
-            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+            or self._model_dtype("param_init_type")
         )
-        self.ccfg.bytes_compute = self._bytes_from_dtype(
-            model_dtype
-            or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")
-        )
+        self.ccfg.bytes_compute = self._bytes_from_dtype(self._model_dtype("compute_dtype", param_dtype))
+        stated = [self._get_cfg_attr(model_raw, key, None) for key in ("torch_dtype", "param_init_type")]
+        if not any(value and value != "auto" for value in stated) and not getattr(self, "_spec_dtype", None):
+            logger.warning(
+                "neither the config nor a checkpoint states the model's dtype: its weights are priced in "
+                "bfloat16; state model.torch_dtype if they are held in another"
+            )
         self.ccfg.bytes_softmax = self._bytes_from_dtype(
             self._get_cfg_attr(model_raw, "softmax_compute_type", "float32"))
         self.ccfg.bytes_grad = 4

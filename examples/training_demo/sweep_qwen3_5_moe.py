@@ -40,6 +40,14 @@ at OP 16:
     ... --nd-top 5
     ... --nd-top 5 --ep 4,8,16,32,64 --op 16
 
+Recompute is a dimension too. ``--activation-checkpoint`` takes one mode, a
+list of them, or auto for all three: ND prices every strategy under each
+mode and ranks the pairs together, and each one picked runs in its mode. A
+mode left out is never run or proposed, so this runs ND's five best among
+what HyperParallel runs well, leaving its selective policy out:
+
+    ... --nd-top 5 --activation-checkpoint off,full
+
 To start on nodes that are healthy now, name a pool to pick from. The sweep
 first runs the kit's ``select --auto --census`` over it under its own cluster
 config, and writes the nodes that pass into that config:
@@ -91,6 +99,11 @@ STEP_TIME_PATTERN = re.compile(r"\bstep=(\d+)\b.*?\bperformance/step_time=([0-9.
 # places rather than imported: this launcher needs nothing but the standard
 # library, so it runs under whichever python the control node has.
 TRAINER_STEP_COLUMN = "step_trainer"
+# The activation checkpoint modes a sweep may run, and the column a strategy's
+# mode goes in, which nd.debug reads as RECOMPUTE_COLUMN; named in both places
+# for the reason TRAINER_STEP_COLUMN is.
+AC_MODES = ("off", "selective", "full")
+RECOMPUTE_COLUMN = "recompute"
 REMOTE_PROFILES = "output/sweep_profiles"
 STAGES = ("select", "rank", "mirror", "data", "run", "fetch", "classify", "compare", "plot")
 # The degrees a strategy is named by, as ND's ranking and the classified CSV
@@ -245,7 +258,9 @@ class Point:
     ``dp`` is the data-parallel width the dataloader splits the batch over,
     ``world / (tp * cp * pp)``. ``op`` is ND's name for the FSDP shard width,
     which covers the data AND context axes, so it divides ``dp * cp``. ``mbs``
-    is the micro-batch size and ``mb`` the micro-batches per step.
+    is the micro-batch size and ``mb`` the micro-batches per step. ``ac`` is
+    the activation checkpoint mode, named only when the sweep runs several:
+    a sweep of one mode runs it on every strategy.
     """
 
     ep: int
@@ -257,16 +272,19 @@ class Point:
     mb: int
     mbs: int
     gbs: int
+    ac: Optional[str] = None
 
     @property
     def tag(self) -> str:
         """Directory-safe name carrying every degree that can vary.
 
-        The micro-batch size appears only above 1, so a sweep that never
-        changes it keeps the names its earlier runs were profiled under.
+        The micro-batch size appears only above 1, and the activation
+        checkpoint mode only where the sweep runs several, so a sweep that
+        never changes them keeps the names its earlier runs were profiled under.
         """
         tag = f"ep{self.ep}_cp{self.cp}_op{self.op}_tp{self.tp}_pp{self.pp}"
-        return f"{tag}_mbs{self.mbs}" if self.mbs > 1 else tag
+        tag = f"{tag}_mbs{self.mbs}" if self.mbs > 1 else tag
+        return f"{tag}_ac-{self.ac}" if self.ac else tag
 
     @property
     def dims(self) -> Dict[str, int]:
@@ -278,6 +296,28 @@ class Point:
 def _split_ints(text: str) -> List[int]:
     """Parse a comma-separated degree list."""
     return [int(part) for part in text.split(",") if part.strip()]
+
+
+def ac_modes(args: argparse.Namespace) -> Tuple[str, ...]:
+    """The activation checkpoint modes the sweep runs: one, a comma-separated list, or auto for all three.
+
+    With several, every strategy runs once per mode and ND ranks each
+    strategy and mode together (run_nd --recompute), so a mode left out of
+    the list is neither run nor proposed.
+    """
+    stated = [part.strip().lower() for part in str(args.activation_checkpoint).split(",") if part.strip()]
+    if stated == ["auto"]:
+        return AC_MODES
+    if not stated or any(mode not in AC_MODES for mode in stated):
+        raise SystemExit(f"--activation-checkpoint {args.activation_checkpoint}: expected some of "
+                         f"{', '.join(AC_MODES)} separated by commas, or auto")
+    return tuple(dict.fromkeys(stated))
+
+
+def _point_modes(args: argparse.Namespace) -> Tuple[Optional[str], ...]:
+    """The mode each strategy is named with: each mode where the sweep runs several, none otherwise."""
+    modes = ac_modes(args)
+    return modes if len(modes) > 1 else (None,)
 
 
 def _unrunnable(point: Point, args: argparse.Namespace, world: int) -> Optional[str]:
@@ -354,10 +394,11 @@ def expand(args: argparse.Namespace, world: int) -> List[Point]:
                 f"tp*cp*pp ({non_dp}) must divide the world size ({world})")
         dp = world // non_dp
         gbs = args.global_batch_size or world
-        for op in (_split_ints(args.op) if args.op else [dp * cp]):
+        for op, mode in itertools.product(_split_ints(args.op) if args.op else [dp * cp],
+                                          _point_modes(args)):
             point = Point(ep=ep, cp=cp, op=op, tp=tp, pp=pp, dp=dp,
                           mb=gbs // (args.micro_batch_size * dp) or 1,
-                          mbs=args.micro_batch_size, gbs=gbs)
+                          mbs=args.micro_batch_size, gbs=gbs, ac=mode)
             reason = _unrunnable(point, args, world)
             if reason:
                 raise SystemExit(reason)
@@ -383,9 +424,10 @@ def _row_point(row: Dict[str, str], args: argparse.Namespace, gbs: int) -> Point
         return int(row.get(name) or default)
 
     dp, mbs = degree("DP"), degree("MBS", args.micro_batch_size)
+    mode = (row.get(RECOMPUTE_COLUMN) or None) if len(ac_modes(args)) > 1 else None
     return Point(ep=degree("EP"), cp=degree("CP"), op=degree("OP"), tp=degree("MP"),
                  pp=degree("PP"), dp=dp, mb=degree("MB", gbs // (mbs * dp) or 1),
-                 mbs=mbs, gbs=gbs)
+                 mbs=mbs, gbs=gbs, ac=mode)
 
 
 def pick_nd_top(rows: Sequence[Dict[str, str]], args: argparse.Namespace, world: int,
@@ -423,7 +465,7 @@ def pick_nd_top(rows: Sequence[Dict[str, str]], args: argparse.Namespace, world:
             continue
         # Exact text of the score: ND writes it at full precision, so equal
         # text is a tie and not a near miss.
-        key = (point.ep, point.cp, point.tp, point.pp, point.mb, point.mbs, row["score"])
+        key = (point.ep, point.cp, point.tp, point.pp, point.mb, point.mbs, point.ac, row["score"])
         group = groups.setdefault(key, {"rank": int(row["rank"]), "score": float(row["score"]),
                                         "widths": {}})
         group["widths"].setdefault(point.op, (point, float(row["memory_mb"])))
@@ -494,6 +536,20 @@ class Sweep:
         return self.args.global_batch_size or self.world
 
     @property
+    def modes(self) -> Tuple[str, ...]:
+        """The activation checkpoint modes the sweep runs, which ND ranks and prices."""
+        return ac_modes(self.args)
+
+    @property
+    def moded(self) -> bool:
+        """Whether strategies are named by their mode too: the sweep runs several."""
+        return len(self.modes) > 1
+
+    def mode_of(self, point: Point) -> str:
+        """The activation checkpoint mode one strategy runs."""
+        return point.ac or self.modes[0]
+
+    @property
     def shape(self) -> Dict[str, Any]:
         """Everything a strategy leaves fixed and ND's estimate depends on.
 
@@ -504,7 +560,7 @@ class Sweep:
         """
         return {"world": self.world, "layers": self.args.layers,
                 "seq_len": self.args.seq_len,
-                "activation_checkpoint": self.args.activation_checkpoint,
+                "activation_checkpoint": ",".join(self.modes),
                 "global_batch_size": self.gbs,
                 "micro_batch_size": self.args.micro_batch_size,
                 "config": self.args.config.name, "arch": self.args.arch,
@@ -595,7 +651,7 @@ def launch(sweep: Sweep, point: Point, memory: bool = False) -> Optional[str]:
         "scripts/train_lm.py", str(sweep.args.config.relative_to(REPO_ROOT)),
         f"--model.num_hidden_layers={sweep.args.layers}",
         f"--dataset.data_config.seq_length={sweep.args.seq_len}",
-        f"--activation_checkpoint.mode={sweep.args.activation_checkpoint}",
+        f"--activation_checkpoint.mode={sweep.mode_of(point)}",
         f"--training.global_batch_size={point.gbs}",
         f"--training.micro_batch_size={point.mbs}",
         f"--accelerator.tp_size={point.tp}",
@@ -840,7 +896,7 @@ def run_pass(sweep: Sweep, memory: bool, progress: Progress) -> Dict[str, Any]:
         results[point.tag] = {
             "run_id": run_id, "status": status,
             "failed": "\nFAILED:" in status or "TIMED OUT" in status,
-            **point.dims, **harvest_peaks(log), **step_times}
+            **point.dims, RECOMPUTE_COLUMN: sweep.mode_of(point), **harvest_peaks(log), **step_times}
     failed = [tag for tag, data in results.items() if data.get("failed")]
     if failed:
         print(f"\n{len(failed)} of {len(sweep.points)} strategies failed the "
@@ -849,11 +905,12 @@ def run_pass(sweep: Sweep, memory: bool, progress: Progress) -> Dict[str, Any]:
 
 
 def write_peaks_csv(results: Dict[str, Any], path: Path) -> int:
-    """Write the measured peak device memory of every strategy."""
-    columns = ["DP", "MP", "PP", "CP", "EP", "MB", "MBS", "OP",
-               "max_allocated_gb", "max_reserved_gb"]
+    """Write the measured peak device memory of every strategy, and the mode it ran where recorded."""
     rows = [data for data in results.values()
             if isinstance(data, dict) and "max_allocated_gb" in data]
+    columns = (["DP", "MP", "PP", "CP", "EP", "MB", "MBS", "OP"]
+               + ([RECOMPUTE_COLUMN] if any(RECOMPUTE_COLUMN in data for data in rows) else [])
+               + ["max_allocated_gb", "max_reserved_gb"])
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(columns)
@@ -956,11 +1013,13 @@ def load_step_times(sweep: Sweep) -> Dict[str, float]:
 
 
 def merge_csv(parts: Sequence[Tuple[str, Path]], merged: Path,
-              step_times: Optional[Dict[str, float]] = None) -> int:
+              step_times: Optional[Dict[str, float]] = None,
+              modes: Optional[Dict[str, str]] = None) -> int:
     """Concatenate single-row classified CSVs, keeping one header.
 
     Each part is one strategy, named by its tag, so *step_times* adds that
-    strategy's unprofiled step time as a column of the merged CSV. The
+    strategy's unprofiled step time as a column of the merged CSV, and *modes*
+    the activation checkpoint mode it ran, which ND prices it under. The
     classifier's own per-strategy CSVs are left as they are: they hold what the
     profile measured, and the honest total is the harness's to add.
 
@@ -969,6 +1028,7 @@ def merge_csv(parts: Sequence[Tuple[str, Path]], merged: Path,
         merged: The CSV to write, which ND reads with ``--real_csv``.
         step_times: The trainer's own step in milliseconds per tag; a strategy
             missing from it gets an empty cell, never a guess.
+        modes: The mode each tag ran, or None for no column.
 
     Returns:
         How many strategies the merged CSV holds.
@@ -986,13 +1046,14 @@ def merge_csv(parts: Sequence[Tuple[str, Path]], merged: Path,
         elif table[0] != header:
             raise SystemExit(f"{part}: header differs from the first CSV")
         measured = step_times.get(tag)
-        rows += [row + ([f"{measured:.3f}"] if measured else [""])
+        mode = [modes.get(tag, "")] if modes is not None else []
+        rows += [row + ([f"{measured:.3f}"] if measured else [""]) + mode
                  for row in table[1:]]
     if header is None:
         return 0
     with open(merged, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(header + [TRAINER_STEP_COLUMN])
+        writer.writerow(header + [TRAINER_STEP_COLUMN] + ([RECOMPUTE_COLUMN] if modes is not None else []))
         writer.writerows(rows)
     return len(rows)
 
@@ -1025,7 +1086,8 @@ def stage_classify(sweep: Sweep) -> None:
     parts = [(point.tag, part) for point, part
              in ((point, classify(sweep, point)) for point in sweep.points) if part]
     step_times = load_step_times(sweep)
-    count = merge_csv(parts, sweep.merged_csv, step_times)
+    modes = {point.tag: sweep.mode_of(point) for point in sweep.points}
+    count = merge_csv(parts, sweep.merged_csv, step_times, modes)
     harvested = sum(1 for tag, _ in parts if tag in step_times)
     print(f"\n{count} configuration(s) in {sweep.merged_csv}, "
           f"{harvested} of them with the trainer's own step time", flush=True)
@@ -1057,8 +1119,10 @@ def write_nd_config(sweep: Sweep, nd_yaml: Path) -> None:
     dataset = raw.setdefault("dataset", {})
     dataset["data_config"] = dict(dataset.get("data_config") or {},
                                   seq_length=sweep.args.seq_len)
+    # The first mode, which ND's search and comparison replace with each
+    # strategy's own (run_nd --recompute and the measured CSV's column).
     raw["activation_checkpoint"] = dict(raw.get("activation_checkpoint") or {},
-                                        mode=sweep.args.activation_checkpoint)
+                                        mode=sweep.modes[0])
     raw["training"] = dict(raw.get("training") or {}, global_batch_size=sweep.gbs,
                            micro_batch_size=sweep.args.micro_batch_size)
     raw["context"] = dict(raw.get("context") or {}, device_num=sweep.world, expert_shard="group",
@@ -1093,6 +1157,9 @@ def stage_rank(sweep: Sweep) -> None:
         "-d", str(sweep.world), "-A", sweep.args.arch, "-b", str(sweep.gbs),
         "-t", str(max(20, 2 * sweep.args.nd_top)),
         "--ranking_csv", str(sweep.ranking_csv), "-o", str(sweep.out / "nd_rank"),
+        # ND prices each candidate under the modes the sweep runs, which it
+        # otherwise replaces with full recompute whatever the config says.
+        "--recompute", *sweep.modes,
     ] + ratios)
     _shape_file(sweep).write_text(json.dumps(sweep.shape, indent=2), encoding="utf-8")
 
@@ -1152,17 +1219,20 @@ def choose_points(sweep: Sweep) -> List[Point]:
     return points
 
 
-def _strategy_key(row: Dict[str, str]) -> Tuple[int, ...]:
-    """A strategy's degrees, read alike from ND's ranking and a measured CSV."""
-    return tuple(int(row.get(name) or 1) for name in STRATEGY_DIMS)
+def _strategy_key(row: Dict[str, str], moded: bool = False) -> Tuple[Any, ...]:
+    """A strategy's degrees, read alike from ND's ranking and a measured CSV, and its mode where *moded*."""
+    degrees = tuple(int(row.get(name) or 1) for name in STRATEGY_DIMS)
+    return degrees + ((row.get(RECOMPUTE_COLUMN) or "",) if moded else ())
 
 
-def _tag_of(key: Tuple[int, ...]) -> str:
+def _tag_of(key: Tuple[Any, ...]) -> str:
     """The directory name of the strategy a key stands for."""
     degree = dict(zip(STRATEGY_DIMS, key))
     tag = (f"ep{degree['EP']}_cp{degree['CP']}_op{degree['OP']}"
            f"_tp{degree['MP']}_pp{degree['PP']}")
-    return f"{tag}_mbs{degree['MBS']}" if degree["MBS"] > 1 else tag
+    tag = f"{tag}_mbs{degree['MBS']}" if degree["MBS"] > 1 else tag
+    mode = key[len(STRATEGY_DIMS)] if len(key) > len(STRATEGY_DIMS) else ""
+    return f"{tag}_ac-{mode}" if mode else tag
 
 
 def _ranks(values: Sequence[float]) -> List[float]:
@@ -1191,9 +1261,9 @@ def spearman(first: Sequence[float], second: Sequence[float]) -> Optional[float]
     return covariance / spread if spread else None
 
 
-def _nd_estimates(sweep: Sweep) -> Dict[Tuple[int, ...], Dict[str, str]]:
+def _nd_estimates(sweep: Sweep) -> Dict[Tuple[Any, ...], Dict[str, str]]:
     """ND's estimate of each measured strategy, as compare wrote it, by strategy."""
-    return {_strategy_key(row): row for row in _read_rows(sweep.estimates_csv)}
+    return {_strategy_key(row, sweep.moded): row for row in _read_rows(sweep.estimates_csv)}
 
 
 def _measured_step(row: Dict[str, str]) -> float:
@@ -1215,15 +1285,15 @@ def _ranking_table(sweep: Sweep, ranking: Sequence[Dict[str, str]],
     ND's memory comes from compare's estimates, which cover every measured
     strategy, and from the ranking only for a strategy they lack.
     """
-    nd_of: Dict[Tuple[int, ...], Dict[str, str]] = {}
+    nd_of: Dict[Tuple[Any, ...], Dict[str, str]] = {}
     for row in ranking:
-        nd_of.setdefault(_strategy_key(row), row)
+        nd_of.setdefault(_strategy_key(row, sweep.moded), row)
     estimates = _nd_estimates(sweep)
-    peaks = {_strategy_key(row): row for row in _read_rows(sweep.out / "memory.csv")}
+    peaks = {_strategy_key(row, sweep.moded): row for row in _read_rows(sweep.out / "memory.csv")}
     times = [_measured_step(row) for row in measured]
     table = []
     for row, step, place in zip(measured, times, _ranks(times)):
-        key = _strategy_key(row)
+        key = _strategy_key(row, sweep.moded)
         nd_row = nd_of.get(key, {})
         memory_row = estimates.get(key, nd_row)
         table.append({
@@ -1332,6 +1402,9 @@ def stage_compare(sweep: Sweep) -> None:
         "-d", str(sweep.world), "-A", sweep.args.arch,
         "--real_csv", str(sweep.merged_csv), "-o", str(sweep.nd_dir),
         "--write_ratios", str(sweep.ratios_json),
+        # Each measured row is priced under its recompute column; a CSV merged
+        # before the column existed takes the sweep's one mode.
+        "--recompute", *sweep.modes,
     ], check=False)
     if sweep.ratios_json.is_file():
         print(f"\nRatios for the next round in {sweep.ratios_json}: rank it with "
@@ -1373,8 +1446,11 @@ def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
                         help="training sequence length; the dataset is rebuilt "
                              "to match, since its documents are exactly this long")
     parser.add_argument("--activation-checkpoint", default="full",
-                        choices=("off", "full", "selective"),
-                        help="recompute mode; a real run at this size needs full")
+                        help="recompute modes: one of off, selective and full, several "
+                             "separated by commas, or auto for all three. With several, "
+                             "every strategy runs once per mode and ND ranks each "
+                             "strategy and mode together, so a mode left out is neither "
+                             "run nor proposed; a real run at this size needs full")
     parser.add_argument("--samples", type=int, default=0,
                         help="documents to generate; default covers the longest "
                              "configuration's global batch times train_iters, doubled")
@@ -1397,7 +1473,7 @@ def _strategy_label(row: Dict[str, str], varying: Sequence[str]) -> str:
 
 def _varying_dims(rows: Sequence[Dict[str, str]]) -> List[str]:
     """Return the dimension columns that take more than one value."""
-    names = [n for n in ("EP", "CP", "OP", "DP", "MB", "MBS", "MP", "PP") if n in rows[0]]
+    names = [n for n in ("EP", "CP", "OP", "DP", "MB", "MBS", "MP", "PP", RECOMPUTE_COLUMN) if n in rows[0]]
     varying = [n for n in names if len({row[n] for row in rows}) > 1]
     return varying or names[:1]
 
@@ -1422,7 +1498,7 @@ def _draw_time(axis: Any, timing: Sequence[Dict[str, str]]) -> None:
 
 
 def _draw_memory(axis: Any, memory: Sequence[Dict[str, str]],
-                 estimates: Dict[Tuple[int, ...], Dict[str, str]]) -> int:
+                 estimates: Dict[Tuple[Any, ...], Dict[str, str]], moded: bool = False) -> int:
     """Draw each strategy's peak device memory, and ND's estimate where it has one.
 
     The trainer logs the maximum over ranks, in GiB; ND models one rank and
@@ -1435,7 +1511,7 @@ def _draw_memory(axis: Any, memory: Sequence[Dict[str, str]],
     labels = [_strategy_label(row, varying) for row in memory]
     for column, style in (("max_allocated_gb", "o-"), ("max_reserved_gb", "s--")):
         axis.plot(labels, [float(row[column]) for row in memory], style, label=column)
-    nd_rows = [estimates.get(_strategy_key(row)) for row in memory]
+    nd_rows = [estimates.get(_strategy_key(row, moded)) for row in memory]
     drawn = sum(1 for row in nd_rows if row)
     if drawn:
         axis.plot(labels, [float(row["memory_mb"]) / 1024 if row else float("nan")
@@ -1486,14 +1562,14 @@ def stage_plot(sweep: Sweep) -> None:
     if timing:
         _draw_time(axes[panels.index("time")][0], timing)
     if memory:
-        _draw_memory(axes[panels.index("memory")][0], memory, estimates)
+        _draw_memory(axes[panels.index("memory")][0], memory, estimates, sweep.moded)
     _save(figure, sweep.out / "sweep.pdf")
     plt.close(figure)
     print(f"sweep plot: {sweep.out / 'sweep.pdf'} (and .png)", flush=True)
 
     if memory:
         figure, axis = plt.subplots(figsize=(2 + 1.4 * len(memory), 4))
-        drawn = _draw_memory(axis, memory, estimates)
+        drawn = _draw_memory(axis, memory, estimates, sweep.moded)
         _save(figure, sweep.out / "memory.pdf")
         plt.close(figure)
         missing = ("" if drawn == len(memory) else

@@ -24,6 +24,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import torch
+
 from hyper_parallel.auto_parallel import _hf_model_spec as spec_mod
 from hyper_parallel.auto_parallel._hf_model_spec import (
     is_auto_models_schema,
@@ -111,6 +113,46 @@ class TestSharedExpertDerivation(unittest.TestCase):
         with _stub_registry(recorder):
             result = resolve_hf_model_spec({"pretrained_model_name_or_path": "x"})
         self.assertEqual(result["num_shared_experts"], 1)
+
+    def test_a_model_stated_by_hand_is_derived_as_a_resolved_one(self) -> None:
+        """
+        Feature: resolve_hf_model_spec on a model its section states by hand (I1).
+        Description: An all-MoE model, experts 256 wide and one shared
+            expert 512 wide, stated in config_overrides with no checkpoint,
+            and the same model whose checkpoint cannot be resolved.
+        Expectation: Both counts the shared expert as two of the routed
+            width and give the model the shared expert's width as its dense
+            one, as the resolved path does; without that, intermediate_size
+            stayed unstated and the shared expert was priced at nothing.
+        """
+        overrides = {
+            "hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000,
+            "num_experts": 16, "num_experts_per_tok": 4, "moe_intermediate_size": 256,
+            "shared_expert_intermediate_size": 512,
+        }
+        stated = resolve_hf_model_spec({"name": "qwen3_5_moe", "config_overrides": dict(overrides)})
+        with patch.object(spec_mod, "_get_hf_config", side_effect=OSError("offline")):
+            fallback = resolve_hf_model_spec({"pretrained_model_name_or_path": "x",
+                                              "config_overrides": dict(overrides)})
+        for spec in (stated, fallback):
+            self.assertEqual((spec["num_shared_experts"], spec["intermediate_size"]), (2, 512))
+
+    def test_the_checkpoints_dtype_is_read_by_name(self) -> None:
+        """
+        Feature: resolve_hf_model_spec, the checkpoint's dtype (I12).
+        Description: A checkpoint whose config holds its dtype as torch's
+            bfloat16, as newer Transformers state it under dtype, resolved
+            with no torch_dtype in the section, with auto, and with float32.
+        Expectation: bfloat16 by name for the first two, auto stating
+            nothing over the checkpoint; the section's float32 for the last.
+        """
+        recorder = _Recorder(SimpleNamespace(model_type="llama", hidden_size=1024, num_hidden_layers=4,
+                                             num_attention_heads=8, vocab_size=32000, dtype=torch.bfloat16))
+        got = []
+        for stated in ({}, {"torch_dtype": "auto"}, {"torch_dtype": "float32"}):
+            with _stub_registry(recorder):
+                got.append(resolve_hf_model_spec({"pretrained_model_name_or_path": "x", **stated})["torch_dtype"])
+        self.assertEqual(got, ["bfloat16", "bfloat16", "float32"])
 
 
 class TestVisualSequenceLength(unittest.TestCase):

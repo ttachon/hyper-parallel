@@ -21,12 +21,14 @@ import sys
 import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import set_strict
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.ratios as Ratios
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_recompute_modes
 from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
     report,
     traffic_report,
@@ -78,6 +80,38 @@ def _apply_cli_overrides(search_cfg, cli_args):
             )
         search_cfg.cluster_spec["num_nodes"] \
             = max(1, cli_args.devices // cards_per_node)
+    if cli_args.recompute is not None:
+        # --recompute states the recompute dimension over the search config's
+        # parallelism.recompute, as the other flags state their settings.
+        search_cfg.estimator["recompute_modes"] = read_recompute_modes(cli_args.recompute, "--recompute")
+
+
+def _recompute_modes(cli_args):
+    """The recompute dimension of a search: --recompute, else a hyper_v2 yaml's context.recompute.
+
+    A search config states its own in ``parallelism.recompute``, which
+    :func:`_apply_cli_overrides` lets --recompute override.
+
+    Args:
+        cli_args: The parsed CLI namespace.
+
+    Returns:
+        The modes, or None where nothing states the dimension.
+
+    Raises:
+        ValueError: A value that is neither a mode nor auto.
+    """
+    if cli_args.recompute is not None:
+        return read_recompute_modes(cli_args.recompute, "--recompute")
+    if cli_args.framework != "hyper_v2" or cli_args.search_config or not cli_args.yaml_config:
+        return None
+    if not os.path.isfile(cli_args.yaml_config):
+        return None
+    with open(cli_args.yaml_config, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    context = raw.get("context") if isinstance(raw, dict) else None
+    stated = context.get("recompute") if isinstance(context, dict) else None
+    return read_recompute_modes(stated, f"{cli_args.yaml_config}: context.recompute")
 
 
 def _compare_with_real_csv(runner, cli_args):
@@ -204,6 +238,7 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     logger.output(
         "Optimal strategy: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
         "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
+        "recompute=%(activation_checkpoint)s "
         "mem=%(memory_estimate_mb).0f MB score=%(score).2e",
         result,
     )
@@ -418,12 +453,37 @@ if __name__ == "__main__":
         "(the file -c reads) and print how well they predict each configuration "
         "when fitted on the others.",
     )
+    parser.add_argument(
+        "--recompute",
+        nargs="+",
+        default=None,
+        metavar="MODE",
+        help="Search recompute as a dimension: the activation checkpoint modes "
+        "(off, selective, full) a candidate may run, or auto for all three. "
+        "Every candidate is priced under each and the pairs are ranked together, "
+        "so a mode left out is never proposed. Overrides context.recompute of a "
+        "hyper_v2 yaml and the search config's parallelism.recompute. Without "
+        "either, every candidate keeps the recompute it derives, full unless "
+        "-mppb. With --real_csv, the mode of rows that state none.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Refuse a config field no parser set where the estimate reads it, "
+        "instead of pricing it as 0. Without it, a search names the fields it "
+        "read that way under its ranking.",
+    )
 
     args = parser.parse_args()
+    set_strict(args.strict)
     if args.real_csv is not None and not os.path.isfile(args.real_csv):
         parser.error(f"real_csv not found: {args.real_csv}")
     if args.write_ratios is not None and args.real_csv is None:
         parser.error("--write_ratios fits the ratios on a comparison: it needs --real_csv")
+    try:
+        recompute_modes = _recompute_modes(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     max_mem = (
         Memory.from_string(args.max_mem.strip())
@@ -512,6 +572,7 @@ if __name__ == "__main__":
         max_mem=max_mem,
         mem_for_ppb=Memory.from_string(args.mem_for_ppb.strip()),
         # vpp_less_mem=args.less_memory,
+        **({"recompute_modes": recompute_modes} if recompute_modes is not None else {}),
     )
 
     if args.real_csv is not None:

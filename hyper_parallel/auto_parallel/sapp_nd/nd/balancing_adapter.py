@@ -81,6 +81,10 @@ class BalancingAdapter:
         self.prev_offset = offset
         self.prev_recompute = recompute
         self.from_config = manual_ppb
+        # The full recompute a recompute dimension states for every
+        # candidate, while the search prices one of its modes; None leaves
+        # each candidate the recompute derived below.
+        self.stated_recompute = None
         logger.debug(
             "init: layers = %d, from_config = %s, offset = %s, recompute = %s",
             layers,
@@ -191,6 +195,8 @@ class BalancingAdapter:
     def treat_recompute(self, new_pp, new_vpp):
         """Treat recompute config for the new given Pipeline config"""
         new_pip = Pipeline(new_pp, new_vpp)
+        if self.stated_recompute is not None:
+            return self.stated_recompute
         if not self.from_config:
             return self.default_recompute(
                 new_pip, copy.deepcopy(self.prev_recompute)

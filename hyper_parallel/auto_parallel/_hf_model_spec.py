@@ -93,7 +93,14 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "linear_num_value_heads": ("linear_num_value_heads",),
     "linear_value_head_dim": ("linear_value_head_dim",),
     "linear_conv_kernel_dim": ("linear_conv_kernel_dim",),
+    # The dtype the checkpoint's weights are saved in, which the runtime
+    # loads them in under its default torch_dtype of auto; newer
+    # Transformers name it dtype.
+    "torch_dtype": ("dtype", "torch_dtype"),
 }
+# The canonical text-tower fields, which a search hands on to the cost model
+# by these names (``config_adapter._search_runner.CONFIG_OVERRIDE_FIELDS``).
+TEXT_FIELDS: Tuple[str, ...] = tuple(_TEXT_FIELD_ALIASES)
 
 # Vision towers use their own spelling for the shared concepts.
 _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -341,15 +348,32 @@ def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
     passes the shape it builds as factory arguments beside ``_target_``, such as
     a ``num_hidden_layers`` that crops the released model; those name canonical
     fields, so they are overrides too, and the released config must not win over
-    them. ``config_overrides`` keeps priority where both are present.
+    them. ``config_overrides`` keeps priority where both are present. A
+    value of ``auto``, which ``torch_dtype`` takes to load the checkpoint's
+    own, states nothing over the checkpoint.
     """
     overrides = model_raw.get("config_overrides")
     explicit = dict(overrides) if isinstance(overrides, Mapping) else {}
     for field in _TEXT_FIELD_ALIASES:
         value = model_raw.get(field)
-        if value is not None:
+        if value is not None and value != "auto":
             explicit.setdefault(field, value)
     return explicit
+
+
+# Canonical fields that say how a model is held, not what it is: a section
+# stating only these describes no model.
+_HOLDING_FIELDS = frozenset({"torch_dtype"})
+
+
+def _describes_a_model(explicit: Mapping[str, Any]) -> bool:
+    """Whether the fields a section states describe a model, beyond how it is held."""
+    return any(key not in _HOLDING_FIELDS for key in explicit)
+
+
+def _dtype_name(value: Any) -> Any:
+    """A dtype as its plain name, ``bfloat16`` for ``torch.bfloat16``; anything else as it is."""
+    return str(value).replace("torch.", "") if value is not None else None
 
 
 # The censuses this process has run, by config, layer stack and length: a
@@ -391,6 +415,24 @@ def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
     """
     if census_seq_len and not explicit.get("activations"):
         logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
+
+
+def _stated_spec(model_raw: Mapping[str, Any], explicit: Dict[str, Any], census_seq_len: int) -> Dict[str, Any]:
+    """The spec of a model its section states by hand, derived and settled as a resolved one is.
+
+    A model no Transformers config describes, every model Transformers
+    cannot build, is stated field by field, and it takes the derivations a
+    resolved spec does: a shared expert stated by its width counts as that
+    many experts, and an all-MoE model's dense width is its shared
+    expert's.  Without them a hand-described all-MoE model kept no
+    ``intermediate_size``, the width its shared expert is priced at, and
+    its shared expert was dropped (I1).
+    """
+    explicit.setdefault("name", model_raw.get("name", "custom"))
+    _derive_shared_experts(explicit)
+    _derive_dense_ffn_width(explicit)
+    _no_census(census_seq_len, explicit)
+    return _settle_facts(explicit)
 
 
 def _census_layers(spec: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
@@ -456,10 +498,8 @@ def resolve_hf_model_spec(
     model_path = _model_path(model_raw)
 
     if not model_path:
-        if explicit:
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len, explicit)
-            return _settle_facts(explicit)
+        if _describes_a_model(explicit):
+            return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path, "
             "model.config_path or model.config_overrides for Auto Parallel search"
@@ -468,14 +508,12 @@ def resolve_hf_model_spec(
     try:
         model_config = _get_hf_config(model_raw)
     except (ImportError, OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
-        if explicit:
+        if _describes_a_model(explicit):
             logger.warning(
                 "Transformers config resolution failed (%s); "
                 "falling back to model.config_overrides", exc,
             )
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len, explicit)
-            return _settle_facts(explicit)
+            return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "
@@ -483,6 +521,8 @@ def resolve_hf_model_spec(
         ) from exc
 
     spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
+    if "torch_dtype" in spec:
+        spec["torch_dtype"] = _dtype_name(spec["torch_dtype"])
     _derive_shared_experts(spec)
     _derive_dense_ffn_width(spec)
     spec["name"] = str(getattr(model_config, "model_type", None) or model_path)
