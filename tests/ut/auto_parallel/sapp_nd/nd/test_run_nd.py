@@ -1786,6 +1786,26 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
         self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
 
+    def test_t5_states_the_tp_gathers_its_embedding_and_output_run(self) -> None:
+        """
+        Feature: custom_t5, the model's own config (I15).
+        Description: A T5 config through its family hook, then through the
+            encoder's and the decoder's group hooks.
+        Expectation: The model states the 4 TP gathers every other family
+            states on it, which the communication walk prices the embedding
+            and the output layer with, where it stated none and they read 0;
+            the encoder's and the decoder's layers keep their 4 and 6.
+        """
+        t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
+        ArchHooks.custom_t5(t5_cfg)
+        self.assertEqual(vars(t5_cfg).get("n_gather"), 4)
+        wrap = ArchHooks.CWrap(t5_cfg)
+        gathers = []
+        for _, hook in t5_cfg.layer_custom_config:
+            hook(wrap)
+            gathers.append(t5_cfg.n_gather)
+        self.assertEqual(gathers, [4, 6])
+
     def test_an_fsdp_run_keeps_gradients_as_its_parameters(self) -> None:
         """
         Feature: TestSappNDRunND.

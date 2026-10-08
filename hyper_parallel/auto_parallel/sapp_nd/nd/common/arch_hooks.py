@@ -206,6 +206,10 @@ def custom_t5(ccfg):
     _optimizer_bytes(ccfg, 4)
     ccfg.bytes_dropout = 1  # dropout mask
     ccfg.bytes_norm = 4  # normalization input
+    # And the TP gathers every other family states on the model, which the
+    # communication walk prices those two layers with; unstated, they read
+    # 0 and carried no TP traffic (I15).
+    ccfg.n_gather = 4  # num gather (TP)
     ccfg.layer_custom_config = [
         (ccfg.n_lay // 2, hook_encode),
         (ccfg.n_lay // 2, hook_decode),
