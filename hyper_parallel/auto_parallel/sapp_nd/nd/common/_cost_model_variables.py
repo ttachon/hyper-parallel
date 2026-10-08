@@ -61,6 +61,9 @@ class _CostModVar:
     # The MTP layers the model states and the AutoModels trainer does not
     # build, so that nothing prices them; 0 where none was dropped.
     mtp_unpriced: int = 0
+    # The activation checkpoint mode the run trains with, the trainer's
+    # default included, where a HyperParallel parser read one; None elsewhere.
+    stated_ac_mode: str = None
 
     # Strategy
     d: float = 0

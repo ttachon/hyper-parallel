@@ -1014,6 +1014,10 @@ class CostModelParserHyperV2(_CostModelParser):
             stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
             where = "train.gradient_checkpointing.activation_checkpoint"
         ac_mode = read_activation_checkpoint_mode(stated, where)
+        # The mode the run trains with, which a search deriving its own
+        # recompute names under its ranking where the two differ (H1).
+        overridden = full_rec_override is not None or sel_rec_override is not None
+        self.ccfg.stated_ac_mode = None if overridden else ac_mode
 
         if full_rec_override is not None:
             self.ccfg.full_rec = full_rec_override

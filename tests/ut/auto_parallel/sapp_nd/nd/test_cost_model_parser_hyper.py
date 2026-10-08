@@ -577,6 +577,25 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             self.assertEqual(ccfg.sel_rec, expect_sel, f"mode={ac_mode}")
             self.assertEqual(vars(ccfg.rec_op), expect_rec_op, f"mode={ac_mode}")
 
+    def test_the_run_keeps_the_mode_it_trains_with(self):
+        """
+        Feature: _parse_recompute, the run's own mode (H1).
+        Description: A run stating selective, one stating nothing, and one
+            whose model section states the recompute lists MindFormers takes.
+        Expectation: The config keeps the mode the run trains with, the
+            trainer's default off where nothing states one, for a search to
+            name where it prices another; the lists state no mode.
+        """
+        got = []
+        for stated, overrides in (("selective", {}), (None, {}), (None, {"full_rec": True})):
+            cfg = _dense_overrides()
+            cfg["train"]["gradient_checkpointing"].pop("activation_checkpoint")
+            if stated:
+                cfg["train"]["gradient_checkpointing"]["activation_checkpoint"] = stated
+            cfg["model"]["config_overrides"].update(overrides)
+            got.append(_make_ccfg(cfg).stated_ac_mode)
+        self.assertEqual(got, ["selective", "off", None])
+
     def test_selective_recomputes_what_hyperparallel_recomputes(self):
         """
         Feature: HYPER_SELECTIVE_REC_OP.

@@ -800,6 +800,17 @@ class ParallelizeLayer:
             logger.output(
                 "Offset & Recompute were%s computed from config info", is_not
             )
+            stated_mode = getattr(priced, "stated_ac_mode", None)
+            if not self.config.balancing.from_config and stated_mode not in (None, "full"):
+                # The balancing gives every candidate full recompute without
+                # -mppb, whatever the run's mode, which cost an hour twice
+                # because nothing said so (H1).
+                logger.output(
+                    "The run's activation checkpoint mode is %s, and every candidate above is priced fully "
+                    "recomputed: pass --recompute %s, or -mppb, to price the run's own",
+                    stated_mode,
+                    stated_mode,
+                )
         else:
             logger.output(
                 "Offset was NOT computed from config info; recompute was searched over %s",

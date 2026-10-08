@@ -2815,6 +2815,39 @@ class TestSappNDRunND(unittest.TestCase):
             runner.run_generation_to_ordering(None)
         self.assertTrue(any("n_gather by comm.py:tp" in call.args[0] for call in output.call_args_list))
 
+    def test_a_ranking_says_when_it_prices_another_recompute_than_the_runs(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute (H1).
+        Description: A search whose balancing gives every candidate full
+            recompute, for a run training selective, off and full; then the
+            selective run searched with -mppb, and over a recompute dimension.
+        Expectation: The line under the table names selective and off, the
+            two modes the search did not price; it says nothing for full,
+            under -mppb, or over a recompute dimension, which price the
+            run's own.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.batch_reachable = lambda: True
+        runner.set_recompute_mode = lambda mode: None
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: (
+            [(Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP]), 100, 2.5, [])], [])
+        said = []
+        for mode, from_config, modes in (("selective", False, None), ("off", False, None), ("full", False, None),
+                                         ("selective", True, None), ("selective", False, ("off", "full"))):
+            runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=from_config), dimensions=[Dim.DP])
+            runner.recompute_modes = modes
+            runner.priced = lambda mode=mode: SimpleNamespace(stated_ac_mode=mode)
+            with patch.object(Par.logger, "output") as output:
+                runner.run_generation_to_ordering(None)
+            said.append([call.args[1] for call in output.call_args_list if "checkpoint mode is" in call.args[0]])
+        self.assertEqual(said, [["selective"], ["off"], [], [], []])
+
     def test_a_ranking_names_the_mtp_layers_it_does_not_price(self) -> None:
         """
         Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth (I2).
