@@ -42,6 +42,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
     CPAlgo,
     _resolve_cp_algo,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import param_cp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     detect_attention_type,
     AttentionType,
@@ -537,7 +538,9 @@ def _fsdp_rounds(cfg) -> tuple:
     """
     micro = max(1, cfg.m)
     reshards = bool(getattr(cfg, "reshards", False))
-    shards = cfg.shard_p_os_non_exp_partial > cfg.t * cfg.cp
+    # Sharded beyond TP and whatever CP adds to the width (param_cp): with
+    # TP times CP, a HyperParallel shard no wider than CP read as none.
+    shards = cfg.shard_p_os_non_exp_partial > cfg.t * param_cp(cfg)
     return (2 if reshards else 1 / micro), (1 if reshards else 1 / micro), (1 / micro if shards else 1)
 
 
