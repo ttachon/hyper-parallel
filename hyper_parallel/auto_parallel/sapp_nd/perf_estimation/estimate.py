@@ -287,7 +287,13 @@ def efficiency(x):
 
 
 def throughput(precision_bytes, flop):
-    """assumes matrix"""
+    """assumes matrix
+
+    Only PerformanceType.TIME reaches this, and nothing in production asks
+    for it: the live estimate is a relative score whose scale the fitted
+    ratios own (A5).  Its precision_bytes**2 * 1e12 is no device's rate,
+    4 TFLOP/s at bf16, and no other rate is stated anywhere in ND.
+    """
     eff = efficiency(flop / (10.0**12))
     return precision_bytes**2 * (10.0**12) * eff
 
@@ -854,4 +860,3 @@ def estimate_performance(*args, **kwargs):
 # TO-DO
 # Fix More Memory
 # Add Context Parallelism
-# Fix PerformanceType.TIME
