@@ -35,6 +35,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import E
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
+from hyper_parallel.auto_parallel.sapp_nd.nd.common import cost_model_preprocess as PreProcess
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import estimate as estimate_module
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
@@ -133,6 +134,26 @@ class TestEstimatePerformance(unittest.TestCase):
                 self.assertEqual(nd_logger.error.call_count, 0)
                 self.assertGreater(debugger.info[Debug.PerfParts.MP_COMM], 0)
                 self.assertTrue(math.isclose(debugger.info[Debug.PerfParts.BUBBLE], 0.0, abs_tol=1e-12 * total))
+
+    def test_a_vision_language_models_towers_count_their_cast_and_activation(self):
+        """
+        Feature: estimate_performance on a multimodal model, its op counts.
+        Description: The same Qwen3-VL-MoE, estimated on A3 while the config
+            fields no parser set are recorded as they are read.
+        Expectation: No layer of either tower reads its score cast or its
+            feed-forward activation as unset: each is counted once a layer,
+            as on a model with one tower, where every layer of both towers
+            used to read them as 0 and priced the two ops at nothing.
+        """
+        reads = PreProcess.defaultdict(PreProcess.Counter)
+        with tempfile.TemporaryDirectory() as folder, patch(_HF_CONFIG, return_value=_vision_language()):
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as stream:
+                yaml.safe_dump(_vision_language_yaml(), stream)
+            ccfg = EvaluatorV2(path, framework="hyper_v2", log_level=0).ccfg
+            with patch.object(PreProcess, "UNSET_READS", reads):
+                estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A3)
+        self.assertEqual({"n_headCast", "n_ffAct"} & set(reads), set())
 
 
 class TestOpTable(unittest.TestCase):

@@ -713,6 +713,18 @@ def _stage_parts(cfg, ccfg, stages, device_type, debugger):
     return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
 
 
+def _count_cast_and_activation(cfg):
+    """Count a layer's score cast and its feed-forward activation once each.
+
+    No parser and no family hook states either count; the estimate states
+    both on the config it walks, after its hooks.  A multimodal model is
+    walked on copies of its submodules, which a statement on the parent
+    never reached, so their layers read both as 0 (I14).
+    """
+    cfg.n_headCast = 1
+    cfg.n_ffAct = 1
+
+
 def _submodule_parts(cfg, ccfg, device_type, debugger):
     """A multimodal model's per-stage parts, every submodule's summed (F2).
 
@@ -735,6 +747,7 @@ def _submodule_parts(cfg, ccfg, device_type, debugger):
     for name in cfg.mm_order:
         sub = deepcopy(cfg.mm_ccfgs[name])
         check_and_apply_custom_hook(sub)
+        _count_cast_and_activation(sub)
         parts = _stage_parts(sub, ccfg, partitions[name], device_type, debugger)
         totals = parts if totals is None else tuple(
             [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
@@ -789,8 +802,7 @@ def estimate_performance(*args, **kwargs):
         stages = cfg.generate_partitions_vpp()
 
     cfg.n = cfg.d * cfg.t * cfg.p
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
+    _count_cast_and_activation(cfg)
 
     logger.debug(
         "perf_model: DP = %d, TP = %d, EP = %d, PP = %d, MB = %d",
