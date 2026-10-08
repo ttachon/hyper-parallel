@@ -350,6 +350,22 @@ class TestRunNdRecompute(unittest.TestCase):
                         runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
                     self.assertEqual(_RecordingParallelize.calls[-1].get("recompute_dimension"), expected)
 
+    def test_with_ar_the_modes_are_chosen_per_layer(self):
+        """With -ar, --recompute names the modes each layer chooses among, the plan the trainer runs."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = _dense_train_yaml(folder)
+            with patch.object(Par, "Parallelize", _RecordingParallelize), \
+                    patch.dict(os.environ, {"MPLCONFIGDIR": folder}):
+                _RecordingParallelize.calls = []
+                argv = ["run_nd.py", "-f", "hyper_v2", "-y", path, "-d", "8", "-v", "0", "-o", folder,
+                        "-ar", "--recompute", "off", "full"]
+                with patch.object(sys, "argv", argv):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            call = _RecordingParallelize.calls[-1]
+            self.assertEqual((call.get("recompute_modes"), call.get("recompute_mode_per_layer")),
+                             (("off", "full"), True))
+            self.assertNotIn("recompute_dimension", call)
+
 
 if __name__ == "__main__":
     unittest.main()

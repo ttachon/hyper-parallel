@@ -206,6 +206,28 @@ def _recompute_modes(cli_args):
     return read_recompute_modes(stated, f"{cli_args.yaml_config}: context.recompute")
 
 
+def _recompute_kwargs(auto_recompute, modes):
+    """The search's recompute arguments for the modes --recompute or a yaml's context states.
+
+    Without -ar the modes are a dimension, every candidate ranked under each
+    of them. With it they are the modes each layer of a candidate chooses
+    among, the choice the trainer runs as activation_checkpoint.layers, as a
+    search config's ``recompute: per_layer`` makes it.
+
+    Args:
+        auto_recompute: Whether -ar chooses each layer's recompute.
+        modes: The modes stated, or None.
+
+    Returns:
+        The keyword arguments for Parallelize.
+    """
+    if modes is None:
+        return {}
+    if auto_recompute:
+        return {"recompute_modes": modes, "recompute_mode_per_layer": True}
+    return {"recompute_dimension": modes}
+
+
 def _priced_train_yaml(search_config: str) -> str:
     """The train.yaml a search config names, which its search prices.
 
@@ -497,7 +519,11 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Give every layer of each configuration the fastest recompute "
-        "option that fits, instead of scoring it fully recomputed",
+        "option that fits, instead of scoring it fully recomputed. With "
+        "--recompute, or a hyper_v2 yaml's context.recompute, each layer "
+        "chooses among those modes, a plan the trainer runs as "
+        "activation_checkpoint.layers; without, among sets of recomputed ops "
+        "the trainer does not run",
     )
     parser.add_argument(
         "-ao",
@@ -650,7 +676,8 @@ if __name__ == "__main__":
         "so a mode left out is never proposed. Overrides context.recompute of a "
         "hyper_v2 yaml and the search config's parallelism.recompute. Without "
         "either, every candidate keeps the recompute it derives, full unless "
-        "-mppb. With --real_csv, the mode of rows that state none.",
+        "-mppb. With -ar, the modes each layer chooses among instead. With "
+        "--real_csv, the mode of rows that state none.",
     )
     parser.add_argument(
         "--strict",
@@ -781,7 +808,7 @@ if __name__ == "__main__":
         max_mem=max_mem,
         mem_for_ppb=Memory.from_string(args.mem_for_ppb.strip()),
         # vpp_less_mem=args.less_memory,
-        **({"recompute_dimension": recompute_modes} if recompute_modes is not None else {}),
+        **_recompute_kwargs(args.auto_recompute, recompute_modes),
     )
 
     if args.real_csv is not None:
