@@ -787,9 +787,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     checkpoint = config.activation_checkpoint
     layers = getattr(checkpoint, "layers", None)
     plan = f"activation checkpoint {checkpoint.mode}" + (f", layers {layers}" if layers else "")
+    # Flushed, so that the lines reach the node's log as the run goes.
+    log = functools.partial(print, flush=True)
     if getattr(base, "num_micro_batches", 1) > 1 and base.global_rank == 0:
-        print(f"{PREFIX} {base.num_micro_batches} micro-batches a step: the first of each step is probed")
-    probe = OffloadProbe(base.model, base.device, options, plan=plan)
+        log(f"{PREFIX} {base.num_micro_batches} micro-batches a step: the first of each step is probed")
+    probe = OffloadProbe(base.model, base.device, options, plan=plan, log=log)
     base._callbacks.append(probe)  # pylint: disable=protected-access
     trainer.train()
 
