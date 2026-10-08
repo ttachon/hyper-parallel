@@ -805,6 +805,9 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ccfg.os_max_shard = os_max_shard
         ccfg.expert_shard = None
         ccfg.expert_shard_group = False
+        # The legacy schemas' rule, CP sharding parameter state on top of the
+        # optimizer's ranks; HyperParallel's states True (param_cp).
+        ccfg.shard_spans_cp = False
         return ccfg
 
     def test_a_run_that_shards_experts_over_their_whole_group(self):

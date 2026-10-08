@@ -53,6 +53,20 @@ def runs_hyper_selective(ccfg: Any) -> bool:
     return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
+def param_cp(ccfg: Any) -> float:
+    """What CP's ranks divide a parameter's state by, beyond the shard stated for it.
+
+    The legacy schemas shard a parameter, its gradient and its optimizer
+    states over CP's ranks on top of the optimizer's, and a table they gather
+    is a CP rank's share of it.  HyperParallel's ``dp_shard_size`` already
+    spans the DP x CP domain, its dense FSDP mesh being
+    ``(dp_replicate, dp_shard, tp)`` over ``dp * cp`` ranks
+    (``MeshContext.build_meshs``), and the table it gathers is whole: so 1
+    there (``shard_spans_cp``), CP elsewhere (C1).
+    """
+    return 1 if getattr(ccfg, "shard_spans_cp", False) else ccfg.cp
+
+
 class _CostModelParser(ABC):
     """abstract parser class"""
 
@@ -183,19 +197,20 @@ class _CostModelParser(ABC):
             return group
         if not stated:
             if not ccfg.has_op:
-                return ccfg.cp * ccfg.t_exp
+                return param_cp(ccfg) * ccfg.t_exp
             return group if ccfg.edp_group else ccfg.d_exp * ccfg.cp * ccfg.t_exp
         if ccfg.ep > 1:
             return math.gcd(int(stated), group)
-        return ranks * ccfg.cp * ccfg.t_exp
+        return ranks * param_cp(ccfg) * ccfg.t_exp
 
     def config_optimizer_shard(self, ccfg):
         """OP related variables; a routed expert is sharded as :meth:`routed_expert_shard` says."""
         # With optimizer sharding, a parameter is sharded over TP and then
-        # over the optimizer's data-parallel ranks.
+        # over the optimizer's data-parallel ranks, and over CP's where the
+        # stated shard does not span them already (param_cp).
         ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
         # Non expert params
-        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * ccfg.cp
+        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * param_cp(ccfg)
         ccfg.shard_p_os_non_exp = (
             (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
         )

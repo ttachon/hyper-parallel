@@ -39,6 +39,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
     HYPER_SELECTIVE_REC_OP,
+    param_cp,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
@@ -1025,6 +1026,26 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         mock_hf.return_value = self._hf_config(head_dim=128)
         ccfg = _make_ccfg(_auto_models_config())
         self.assertEqual(ccfg.dh, 128)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_cp_shards_no_parameter_state_beyond_the_stated_shard(self, mock_hf):
+        """
+        Feature: param_cp, a parameter's state under CP (C1).
+        Description: An AutoModels run on 64 devices at CP 2 sharding over 16
+            ranks; then the rule on a config of the legacy schemas.
+        Expectation: HyperParallel's dp_shard_size spans CP's ranks, so the
+            run shards a parameter over 16 ranks, as at CP 1, where it was
+            priced over 32 and its state at half; the legacy schemas keep
+            CP's sharding on top of the optimizer's.
+        """
+        mock_hf.return_value = self._hf_config()
+        ccfg = _make_ccfg(_auto_models_config(
+            accelerator={"tp_size": 1, "cp_size": 2, "ep_size": 1, "pp_size": 1},
+            fsdp_config={"dp_shard_size": 16},
+            context={"device_num": 64},
+        ))
+        self.assertEqual((ccfg.d, ccfg.cp, ccfg.shard_spans_cp, ccfg.shard_p_os_non_exp_partial), (32, 2, True, 16))
+        self.assertEqual([param_cp(SimpleNamespace(cp=2, shard_spans_cp=spans)) for spans in (True, False)], [1, 2])
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_an_unstated_dtype_is_the_checkpoints(self, mock_hf):

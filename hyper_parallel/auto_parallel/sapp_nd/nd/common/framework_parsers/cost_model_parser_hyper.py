@@ -845,6 +845,9 @@ class CostModelParserHyperV2(_CostModelParser):
                                                              "gradient_accumulation_shard",
                                                              False))
         self.ccfg.grads_as_params = True
+        # Its dp_shard_size spans the DP x CP domain, so CP shards no
+        # parameter state beyond it (EvalUtils.param_cp).
+        self.ccfg.shard_spans_cp = is_auto_models
         self.ccfg.accumulates_grads = True
         self.ccfg.reshards = self._reshards_params()
         # It adds each layer's reduce-scatter output to the accumulated

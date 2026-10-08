@@ -76,6 +76,10 @@ class _CostModVar:
     # searched candidate states it; sp follows it at every TP.  None where
     # nothing stated it, and sp then follows TP, as it always did.
     seq_parallel: bool = None
+    # Whether the stated FSDP shard spans CP's ranks, as HyperParallel's
+    # dp_shard_size does, so that CP shards no parameter state beyond it
+    # (_cost_model_parser.param_cp); False keeps the legacy schemas' rule.
+    shard_spans_cp: bool = False
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
