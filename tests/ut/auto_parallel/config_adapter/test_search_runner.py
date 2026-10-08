@@ -347,6 +347,26 @@ class TestFormatResult(unittest.TestCase):
         self.assertEqual(result["dp_shard"], 1)
         self.assertEqual(result["dp_replicate"], 2)
 
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    def test_a_shard_spans_dp_and_cp(self, _):
+        """
+        Feature: _format_result under CP.
+        Description: A strategy at DP 4 and CP 2 sharding over 8 ranks, then
+            over 2.
+        Expectation: The shard spans the DP x CP domain of 8 ranks the
+            trainer shards over, where it was cut back to DP's 4, and the
+            trainer replicates the rest: 1 and 4 replicas, where 2 was read.
+        """
+        got = []
+        for shard in (8, 2):
+            result = self._get_runner()._format_result(
+                _make_scored_entry(dp=4, cp=2, dp_shard=shard), _make_full_config())
+            got.append((result["dp_shard"], result["dp_replicate"]))
+        self.assertEqual(got, [(8, 1), (2, 4)])
+
 
 class TestPostFilter(unittest.TestCase):
     """Tests for _post_filter."""

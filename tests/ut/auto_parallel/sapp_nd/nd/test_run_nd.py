@@ -762,6 +762,14 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(global_config.range_space(Dim.PP, 3), range(1, 4))
         self.assertEqual(global_config.bool_space(Dim.SP), [False, True])
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
+        # HyperParallel's shard spans DP x CP, so under CP it reaches that
+        # domain; a legacy schema's stays within DP (C1).
+        got = []
+        for spans in (True, False):
+            fake_ccfg.shard_spans_cp = spans
+            got.append(global_config.max_op(dp=4, tp=2, ep=1, cp=2))
+        fake_ccfg.shard_spans_cp = False
+        self.assertEqual(got, [8, 4])
 
         Dim.TP.set_bound(2)
         try:

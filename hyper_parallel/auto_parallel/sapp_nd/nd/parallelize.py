@@ -480,13 +480,13 @@ class ParallelizeLayer:
     def parallel_loops(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
-        dp, tp, pp, _ = dtpc_p
+        dp, tp, pp, cp = dtpc_p
         for ep in self.config.space(Dim.EP, dp * tp):
             for vpp in self.config.range_space(
                 Dim.VPP, min(4, pp, self.config.total_layer_num() // pp)
             ):
                 for op in self.config.space(
-                    Dim.OP, self.config.max_op(dp, tp, ep)
+                    Dim.OP, self.config.max_op(dp, tp, ep, cp)
                 ):
                     for sp in self.config.bool_space(Dim.SP):
                         space = self.inside_loop_nest(

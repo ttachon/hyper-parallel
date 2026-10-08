@@ -916,6 +916,20 @@ class TestConfigOptimizerShard(unittest.TestCase):
                 _CostModelParser.config_optimizer_shard(None, ccfg)
                 self.assertEqual(ccfg.shard_p_os_non_exp_partial, want)
 
+    def test_a_shard_spanning_dp_and_cp_is_the_runs(self):
+        """BD-H07: HyperParallel's shard spans DP times CP (C1).
+
+        At DP 4 and CP 2, a shard of 8 ranks is the whole domain HyperParallel
+        shards over, where a count not dividing DP was read as DP's 4; under
+        the legacy rule it still is.
+        """
+        got = []
+        for spans in (True, False):
+            ccfg = self._make_parser_ccfg(n_exp=1, os_max_shard=8, d=4, cp=2)
+            ccfg.shard_spans_cp = spans
+            got.append(_CostModelParser.optimizer_ranks(ccfg))
+        self.assertEqual(got, [8, 4])
+
 
 class TestExpertDataParallelGroup(unittest.TestCase):
     """The ranks that hold the same experts, as the runtime's expert mesh spans them."""

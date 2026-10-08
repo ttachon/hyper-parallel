@@ -132,9 +132,12 @@ class _CostModelParser(ABC):
         ``os_max_shard`` counts them, as MindSpore's ``optimizer_weight_shard_size``
         and HyperParallel's ``dp_shard`` do, on top of TP's sharding.  A count
         that does not divide DP shards over all of it, as MindSpore does.
+        HyperParallel's domain is DP times CP, which its shard spans
+        (:func:`param_cp`).
         """
+        domain = ccfg.d * (ccfg.cp if getattr(ccfg, "shard_spans_cp", False) else 1)
         ranks = int(ccfg.os_max_shard or 0)
-        return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
+        return ranks if ranks >= 1 and domain % ranks == 0 else domain
 
     @staticmethod
     def expert_dp_group(ccfg):

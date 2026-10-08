@@ -341,13 +341,17 @@ class GlobalConfig:
             return [False, True]
         return [dim.from_config(self.ccfg)]
 
-    def max_op(self, dp, tp, ep):
+    def max_op(self, dp, tp, ep, cp=1):
         """Compute bound for dimension OP.
 
         OP is the runtime's ``dp_shard_size``, and all the runtime asks of it
         is that the data-parallel group divide into a replicate axis and a
         shard axis (``distributed/mesh.py``, ``MeshContext.build_meshs``), so
-        every divisor of DP is reachable.
+        every divisor of DP is reachable.  HyperParallel's group is DP times
+        CP, its FSDP domain, where a shard spans CP's ranks
+        (``shard_spans_cp``): bounded by DP alone, a strategy under CP could
+        not be sharded wider than DP, though the runtime shards it over the
+        whole domain.
 
         Under Muon this used to narrow to a greatest common divisor over the
         expert count and the attention widths.  Nothing in the runtime asks
@@ -364,4 +368,4 @@ class GlobalConfig:
         ``optimizer_states``.
         """
         del tp, ep  # the shard is bounded by the data-parallel group alone
-        return dp
+        return dp * cp if getattr(self.ccfg, "shard_spans_cp", False) else dp
