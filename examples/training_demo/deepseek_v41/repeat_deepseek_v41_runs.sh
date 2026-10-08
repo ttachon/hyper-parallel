@@ -44,6 +44,14 @@
 #   POINTS="1:1 1:2"  ./repeat_deepseek_v41_runs.sh <model>   # a subset
 #   REPEATS=1         ./repeat_deepseek_v41_runs.sh <model>   # one pass first
 #   EDP_SHARD=1       ./repeat_deepseek_v41_runs.sh <model>   # see the note below
+#   PROFILE=1         ./repeat_deepseek_v41_runs.sh <model>   # parts, not an order
+#
+#   V41_DISABLE_FUSED_INDEXER=1 POINTS="1:1" RUN_ROOT=<dir> \
+#       ./repeat_deepseek_v41_runs.sh <model>
+#       The reference leg of the indexer test: the same strategy with the fused
+#       Lightning-Indexer off, so the kernel launch count moves and nothing else
+#       does. The header says which path was pinned, and the fused path states
+#       itself in each run's log, which is the check that the legs really differ.
 #
 # Interrupted runs: launch it again with the same RUN_ROOT and it skips every
 # point already recorded, so a window that closes early can be continued.
@@ -98,6 +106,18 @@ TIMEOUT=${TIMEOUT:-1800}
 # under 8173 and not far off it. If it does, the topology matches; if it does
 # not, settle that before the other eighteen runs are used for anything.
 EDP_SHARD=${EDP_SHARD:-auto}
+# The profiler stays OFF for anything being ranked, which is what this script
+# exists for. PROFILE=1 turns it on for the one case that needs it: the PARTS,
+# meaning the kernel launch count, the Computing column and Free, none of which
+# exist without the instrument. Keep the two apart. On this model a single
+# profiled run is off the honest step by 3.3% on average and 13.0% at worst, so
+# a profiled run measures composition and never an order.
+#
+# A profiled run also costs much more wall clock than an unprofiled one: the
+# default window is steps 3 and 4, and the step after it pays a synchronous CANN
+# parse, measured at 166 to 248 s on Qwen3.5. One repeat of one point is enough,
+# and the trace lands in <run_dir>/profile.
+PROFILE=${PROFILE:-0}
 
 STAMP=$(date -u '+%Y%m%dT%H%M%SZ')
 RUN_ROOT=${RUN_ROOT:-"${PROJECT_ROOT}/output/nd_v41_repeats/${STAMP}"}
@@ -187,7 +207,14 @@ echo "      tree       ${PROJECT_ROOT}"
 echo "      model      ${MODEL_PATH}"
 echo "      results    ${RUN_ROOT}"
 echo "      iters      ${TRAIN_ITERS}, ranking the steps after ${SKIP_STEPS}"
-echo "      profiler   OFF, which is the whole point"
+if [[ "${PROFILE}" == "0" ]]; then
+    echo "      profiler   OFF, which is the whole point"
+else
+    echo "      profiler   ON, so these runs give PARTS and must not be ranked"
+fi
+if [[ -n "${V41_DISABLE_FUSED_INDEXER:-}" ]]; then
+    echo "      indexer    REFERENCE path pinned by V41_DISABLE_FUSED_INDEXER"
+fi
 echo
 
 for entry in "${order[@]}"; do
@@ -230,7 +257,16 @@ for entry in "${order[@]}"; do
     run_started=$(date +%s)
 
     # Mirrors run_deepseek_v41_online.sh's tp1 mode, with its own log, its own
-    # iteration count and the profiler left at its default of off.
+    # Built per run because the trace directory is this run's own: a shared one
+    # leaves an older profile to be read as if it were this run's, which is the
+    # trap that has already cost one measurement.
+    if [[ "${PROFILE}" == "0" ]]; then
+        profile_args=(--profiling.enabled=false)
+    else
+        profile_args=(--profiling.enabled=true "--profiling.trace_dir=${run_dir}/profile")
+    fi
+
+    # iteration count, and the profiler off unless PROFILE asks for it.
     timeout "${TIMEOUT}" "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
         --nproc_per_node="${NPROC_PER_NODE}" \
@@ -249,7 +285,7 @@ for entry in "${order[@]}"; do
         --training.global_batch_size="${GLOBAL_BATCH}" \
         --training.micro_batch_size="${MICRO_BATCH}" \
         --training.train_iters="${TRAIN_ITERS}" \
-        --profiling.enabled=false \
+        "${profile_args[@]}" \
         > "${log}" 2>&1
     code=$?
     run_seconds=$(( $(date +%s) - run_started ))
