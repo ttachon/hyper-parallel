@@ -576,13 +576,21 @@ def _free_per_step(profile: Path) -> Optional[float]:
     return statistics.fmean(values) / _to_ms(column) if values else None
 
 
-def _fallback_one(profile: Path, steps: int) -> Optional[Dict[str, Any]]:
-    """Measure one profile's exposed host fallback, printing as it goes."""
-    kernels = _find_one(profile, "kernel_details.csv")
-    if kernels is None:
-        print(f"\n{profile}: no kernel_details.csv anywhere under it, skipped")
-        return None
+def _find_all(root: Path, name: str) -> List[Path]:
+    """Find every named file under a directory, newest first.
 
+    Test 2 takes a directory and measures everything in it rather than asking
+    for one path: a profile picked by hand is a profile that can be the wrong
+    one, and every result is labelled with the file it came from anyway.
+    """
+    if root.is_file():
+        return [root] if root.name == name else []
+    return sorted(root.rglob(name), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _fallback_one(kernels: Path, steps: int) -> Optional[Dict[str, Any]]:
+    """Measure one kernel table's exposed host fallback, printing as it goes."""
+    profile = kernels.parent
     rows = _read_rows(kernels)
     names = list(rows[0].keys()) if rows else []
     start_col = _pick(names, "start") or _pick(names, "timestamp")
@@ -646,10 +654,20 @@ def cmd_fallback(args: argparse.Namespace) -> None:
     print("Test 2: is the host operator fallback on the critical path")
     print("=" * 78)
 
-    results = [result for raw in args.profile
-               if (result := _fallback_one(Path(raw), args.steps)) is not None]
+    tables: List[Path] = []
+    for raw in args.profile:
+        found = _find_all(Path(raw), "kernel_details.csv")
+        if not found:
+            print(f"\n{raw}: no kernel_details.csv anywhere under it")
+        tables.extend(path for path in found if path not in tables)
+    if not tables:
+        raise SystemExit("\nno kernel table was found, so nothing was measured")
+    print(f"\n{len(tables)} kernel table(s) found, measuring every one of them.")
+
+    results = [result for table in tables
+               if (result := _fallback_one(table, args.steps)) is not None]
     if not results:
-        raise SystemExit("\nno profile could be read, so nothing was measured")
+        raise SystemExit("\nno kernel table could be read, so nothing was measured")
 
     print("\nRead it as evidence and not as proof: a host operator with no device kernel beside it is "
           "\nconsistent with the device waiting for it, and only the timeline proves an ordering.")
