@@ -621,24 +621,26 @@ def _find_checkpoint_wrappers(module: nn.Module, prefix: str = "") -> dict[str, 
 
 
 def _register_forward_prefetch_layers(containers: list[_LayerContainerInfo]) -> None:
-    """Register swap prefetch chains within each repeated-block container."""
+    """Register swap prefetch chains within each repeated-block container.
+
+    Each wrapped block is chained to the next wrapped one, across any block a
+    per-layer plan leaves off: a block with no next keeps what it saved on the
+    device, and the block after the gap is fetched back while the one left off
+    runs its backward.
+    """
     swap_manager = SwapManager()
     for container_info in containers:
         wrapper_chains = {}
-        for block_index, block_info in enumerate(container_info.blocks):
+        for block_info in container_info.blocks:
             current_block = getattr(block_info.parent, block_info.child_name, None)
             if not isinstance(current_block, nn.Module):
                 continue
             for relative_path, wrapper in _find_checkpoint_wrappers(current_block).items():
-                wrapper_chains.setdefault(relative_path, []).append((block_index, wrapper))
+                wrapper_chains.setdefault(relative_path, []).append(wrapper)
 
         wired_modules: list[nn.Module] = []
         for wrappers in wrapper_chains.values():
-            for (current_index, current_wrapper), (next_index, next_wrapper) in zip(
-                wrappers, wrappers[1:]
-            ):
-                if next_index != current_index + 1:
-                    continue
+            for current_wrapper, next_wrapper in zip(wrappers, wrappers[1:]):
                 swap_manager.set_forward_prefetch_layer(current_wrapper, next_wrapper)
                 wired_modules.extend((current_wrapper, next_wrapper))
         wired_modules = list(dict.fromkeys(wired_modules))  # dedupe, keep order

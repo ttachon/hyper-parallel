@@ -672,19 +672,25 @@ class TestActivationCheckpointLayerPlan(unittest.TestCase):
         expected = "Activation checkpointing per layer in layers: full 0, 2; off 1; selective 3"
         self.assertIn(expected, "\n".join(log_context.output))
 
-    def test_swap_prefetch_chain_links_adjacent_wrapped_layers(self):
-        """Input-swap prefetch links a wrapped block to the next one only where they are adjacent.
+    def test_swap_prefetch_chain_skips_layers_left_off(self):
+        """Input-swap prefetch connects each wrapped block to the next wrapped one, under either plan kind.
 
-        A block left off ends the chain, as it does under layer_ranges, and the
-        next wrapped block starts another.
+        A block with no next keeps what it saved on the device, so a chain cut
+        at the block left off would offload less.
         """
-        model = _IndexedOwner(num_layers=4)
-        swap_manager = MagicMock()
+        plans = (
+            {"layers": {"1": "off"}},
+            {"layers": None, "layer_ranges": [{"first": 1, "count": 1, "mode": "off"}]},
+        )
+        for plan in plans:
+            with self.subTest(plan=plan):
+                model = _IndexedOwner(num_layers=3)
+                swap_manager = MagicMock()
 
-        with patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.SwapManager", return_value=swap_manager):
-            self._wrapper_path(model, "full", {"2": "off"}, swap_inputs=True)
+                with patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.SwapManager", return_value=swap_manager):
+                    self._wrapper_path(model, "full", swap_inputs=True, **plan)
 
-        swap_manager.set_forward_prefetch_layer.assert_called_once_with(model.layers[0], model.layers[1])
+                swap_manager.set_forward_prefetch_layer.assert_called_once_with(model.layers[0], model.layers[2])
 
     def test_plan_must_name_layers_the_model_holds(self):
         """A plan naming a missing layer, or a model it cannot index, is refused before any wrapping."""
