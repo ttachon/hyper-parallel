@@ -243,8 +243,87 @@ class TestRunBlock(unittest.TestCase):
             self.assertEqual(len(commands), 1, f"commands={commands}")
             command = commands[0]
             self.assertEqual(command[command.index("--pool") + 1], str(Path("/home/tt/cluster_all.env")))
+            self.assertEqual(command[command.index("--nodes") + 1], "4")
             self.assertEqual([command[i + 1] for i, word in enumerate(command) if word == "--only"],
                              ["select", "mirror", "data"])
+
+
+class TestNodeCount(unittest.TestCase):
+    """Fewer nodes keep dp_shard 32 and write apart from the demo's 4-node tests."""
+
+    def test_each_node_count_has_its_own_folder(self):
+        """The demo's 4 nodes keep the first folder; 2 nodes get a folder of their own."""
+        self.assertEqual(Runner.out_dir(4), Runner.OUT)
+        self.assertEqual(Runner.out_dir(2), Runner.REPO_ROOT / "output" / "recompute_plan_tests_2nodes")
+
+    def test_a_count_dp_shard_32_cannot_cover_is_refused_before_anything_runs(self):
+        """An odd count, or none, stops setup before the yamls, the config or the sweep."""
+        for nodes in (0, 1, 3):
+            with self.subTest(nodes=nodes):
+                with (
+                    patch.object(Runner, "write_plan_yamls", side_effect=AssertionError("wrote yamls")),
+                    patch.object(Runner, "stream", side_effect=AssertionError("ran the sweep")),
+                ):
+                    with self.assertRaisesRegex(SystemExit, "an even number of 16-die nodes"):
+                        Runner.setup(Path("/home/tt/cluster_all.env"), nodes)
+
+    def test_setup_on_two_nodes_asks_the_sweep_for_two_and_logs_apart(self):
+        """The sweep's select picks 2 nodes, and the setup log goes to the 2-node folder."""
+        with tempfile.TemporaryDirectory() as folder:
+            env = Path(folder) / "cluster.env"
+            env.write_text(_ENV, encoding="utf-8")
+            calls = []
+            with (
+                patch.object(Runner, "CLUSTER_ENV", env),
+                patch.object(Runner, "OUT", Path(folder) / "recompute_plan_tests"),
+                patch.object(Runner, "write_plan_yamls", lambda: []),
+                patch.object(Runner, "stream", lambda command, log: calls.append((command, log)) or 0),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                Runner.main(["setup", "--nodes", "2"])
+
+            self.assertEqual(len(calls), 1, f"calls={calls}")
+            command, log = calls[0]
+            self.assertEqual(command[command.index("--nodes") + 1], "2")
+            self.assertEqual(command[command.index("--op") + 1], "32")
+            self.assertEqual(log, Path(folder) / "recompute_plan_tests_2nodes" / "setup.log")
+
+    def test_run_and_results_follow_the_nodes_setup_selected(self):
+        """With 2 nodes in the kit config, a block runs into the 2-node folder and is read from it."""
+        env = {"nodes": ["n0", "n1"], "log_dir": "/logs", "ssh_user": "root"}
+        calls = []
+        with (
+            patch.object(Runner, "read_cluster_env", lambda: env),
+            patch.object(Runner, "run_block", lambda *args: calls.append(("run", *args))),
+            patch.object(Runner, "results", lambda *args: calls.append(("results", *args))),
+        ):
+            Runner.main(["run", "A", "off3-7", "full"])
+            Runner.main(["results"])
+
+        folder = Runner.out_dir(2)
+        self.assertEqual(calls, [("run", "A", ["off3-7", "full"], folder), ("results", env, folder)])
+
+    def test_a_block_writes_each_test_under_the_folder_it_is_given(self):
+        """Each test's sweep output and the block log go under the folder passed in."""
+        with tempfile.TemporaryDirectory() as folder:
+            env = Path(folder) / "cluster.env"
+            env.write_text(_ENV, encoding="utf-8")
+            (Path(folder) / "plan.yaml").write_text("{}", encoding="utf-8")
+            two_nodes = Path(folder) / "recompute_plan_tests_2nodes"
+            calls = []
+            with (
+                patch.object(Runner, "CLUSTER_ENV", env),
+                patch.object(Runner, "OUT", Path(folder) / "recompute_plan_tests"),
+                patch.object(Runner, "plan_yaml", lambda plan: Path(folder) / "plan.yaml"),
+                patch.object(Runner, "stream", lambda command, log: calls.append((command, log)) or 0),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                Runner.run_block("A", ["off3-7", "full"], two_nodes)
+
+            self.assertEqual([command[command.index("--out") + 1] for command, _ in calls],
+                             [str(two_nodes / "A_off3-7"), str(two_nodes / "A_full")])
+            self.assertEqual({log for _, log in calls}, {two_nodes / "block_A.log"})
+            self.assertFalse((Path(folder) / "recompute_plan_tests").exists())
 
 
 class TestResults(unittest.TestCase):
@@ -296,6 +375,35 @@ class TestResults(unittest.TestCase):
                       "max_allocated_gb +0.000 GiB, max_reserved_gb +0.000 GiB", text)
         self.assertIn("linear layers kept first (0, 1) vs last (5, 6): needs both runs to succeed", text)
         self.assertIn("allocator setting in cluster.env now: off", text)
+
+    def test_a_plan_named_outside_its_block_gets_a_line_and_its_comparison(self):
+        """Full run in both blocks on 2 nodes: both lines, the allocator comparison at full, and no
+        line for a plan that neither block lists nor ran."""
+        env = {"nodes": ["n0", "n1"], "log_dir": "/logs", "ssh_user": "root"}
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / "recompute_plan_tests_2nodes"
+            self._write(out, "A_full", step_trainer=6436.5, step_trainer_sd=4.6,
+                        max_allocated_gb=26.1891, max_reserved_gb=34.9453)
+            self._write(out, "B_full", step_trainer=6440.0, step_trainer_sd=5.0,
+                        max_allocated_gb=26.1891, max_reserved_gb=27.0)
+            env_file = Path(folder) / "cluster.env"
+            env_file.write_text(_ENV, encoding="utf-8")
+            printed = io.StringIO()
+            with (
+                patch.object(Runner, "CLUSTER_ENV", env_file),
+                patch.object(Runner, "remote_grep", lambda *args: ""),
+                contextlib.redirect_stdout(printed),
+            ):
+                Runner.results(env, out)
+
+        text = printed.getvalue()
+        self.assertIn(f"2 node(s) in cluster.env, tests in {out}", text)
+        self.assertIn("A full           ok       6436.5    4.6  26.1891  34.9453   8.76  no plan line", text)
+        self.assertIn("B full           ok       6440.0    5.0  26.1891  27.0000   0.81  no plan line", text)
+        self.assertIn("expandable segments vs the default allocator, full: step_trainer +3.500 ms, "
+                      "max_allocated_gb +0.000 GiB, max_reserved_gb -7.945 GiB", text)
+        self.assertIn("expandable segments vs the default allocator, off3-7: needs both runs to succeed", text)
+        self.assertNotIn("A off2-7", text)
 
 
 if __name__ == "__main__":

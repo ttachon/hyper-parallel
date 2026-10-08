@@ -15,8 +15,12 @@
 """Run the per-layer recompute tests from the cluster's control node, and read them back.
 
 Each test is one recompute plan of the demo's 8-layer Qwen3.5-MoE crop (layers 3
-and 7 full attention, the others linear attention) at EP 2, dp_shard 32,
-edp_shard 32 and 8192 tokens, run once by the strategy sweep's run stage. Block A
+and 7 full attention, the others linear attention) at EP 2, dp_shard 32 and 8192
+tokens, one sequence a die, run once by the strategy sweep's run stage. The
+demo's 4 nodes give edp_shard 32. On 2 nodes edp_shard is 16, which doubles each
+die's share of the expert state (bf16 weight, gradient and Muon momentum, about
+0.56 GiB more a die) and changes nothing else a die holds; their results go to
+output/recompute_plan_tests_2nodes, apart from the demo's. Block A
 runs with the default allocator. Block B runs with
 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True, which this script adds to the
 kit config's REMOTE_ENV_SETUP for block B only and always takes out again. The
@@ -24,7 +28,7 @@ script needs nothing beyond the standard library, apart from PyYAML to write the
 plan yamls.
 
 Usage, from the repository root on the control node:
-    python examples/training_demo/recompute_plan_tests.py setup
+    python examples/training_demo/recompute_plan_tests.py setup             # or: setup --nodes 2
     python examples/training_demo/recompute_plan_tests.py unit
     python examples/training_demo/recompute_plan_tests.py run A
     python examples/training_demo/recompute_plan_tests.py run B
@@ -50,7 +54,10 @@ SWEEP = DEMO_DIR / "sweep_qwen3_5_moe.py"
 TRAIN_YAML = DEMO_DIR / "train_qwen3_5_moe.yaml"
 CLUSTER_ENV = DEMO_DIR / "cluster_qwen3_5_moe.env"
 OUT = REPO_ROOT / "output" / "recompute_plan_tests"
-STRATEGY = ("--ep", "2", "--op", "32")
+DP_SHARD = 32
+STRATEGY = ("--ep", "2", "--op", str(DP_SHARD))
+DEMO_NODES = 4
+DIES_PER_NODE = 16
 ALLOCATOR = "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True"
 
 # Each plan is the activation_checkpoint section of a train yaml.
@@ -64,14 +71,15 @@ PLANS: Dict[str, Dict[str, Any]] = {
     "base_off_0-2": {"mode": "off", "layers": {"0-2": "full"}},
 }
 BLOCKS = {
-    "A": ("base_off_0-2", "off3-7", "off3_5-7", "off0-1_3_7"),
+    "A": ("full", "base_off_0-2", "off3-7", "off3_5-7", "off0-1_3_7"),
     "B": ("full", "off3-7", "off2_4-7", "off2-7"),
 }
 # What each pair of runs tests, and the two runs: the second is the reference.
 COMPARISONS = (
     ("plan over mode off vs the same plan over full", ("A", "base_off_0-2"), ("A", "off3-7")),
     ("linear layers kept first (0, 1) vs last (5, 6)", ("A", "off0-1_3_7"), ("A", "off3_5-7")),
-    ("expandable segments vs the default allocator", ("B", "off3-7"), ("A", "off3-7")),
+    ("expandable segments vs the default allocator, off3-7", ("B", "off3-7"), ("A", "off3-7")),
+    ("expandable segments vs the default allocator, full", ("B", "full"), ("A", "full")),
 )
 UNIT_TESTS = (
     "tests/ut/auto_models/distributed/test_activation_checkpoint.py",
@@ -81,6 +89,22 @@ UNIT_TESTS = (
 )
 LOGGED_PLAN = "per layer in model.layers: .*|Using HuggingFace native"
 FAILURE = r"Tried to allocate [^)]*\)|EL0004[^.]*"
+
+
+def out_dir(nodes: int) -> Path:
+    """The folder the tests on this many nodes write to: the demo's 4 nodes keep the first one."""
+    return OUT if nodes == DEMO_NODES else OUT.with_name(f"{OUT.name}_{nodes}nodes")
+
+
+def check_nodes(nodes: int) -> None:
+    """Refuse a node count whose dies dp_shard 32 cannot cover a whole number of times.
+
+    Raises:
+        SystemExit: The node count is below 1, or odd.
+    """
+    if nodes < 1 or nodes * DIES_PER_NODE % DP_SHARD:
+        raise SystemExit(f"--nodes {nodes}: dp_shard {DP_SHARD} needs a multiple of {DP_SHARD} dies, "
+                         f"so an even number of {DIES_PER_NODE}-die nodes")
 
 
 def plan_yaml(plan: str) -> Path:
@@ -132,10 +156,11 @@ def set_allocator(enabled: bool) -> None:
     print(f"expandable segments {'ON' if enabled else 'off'} in {CLUSTER_ENV.name}", flush=True)
 
 
-def sweep_command(block: str, plan: str) -> List[str]:
-    """The sweep invocation that runs one plan once."""
+def sweep_command(block: str, plan: str, out: Optional[Path] = None) -> List[str]:
+    """The sweep invocation that runs one plan once, writing under ``out`` (default OUT)."""
+    out = out or OUT
     command = [sys.executable, str(SWEEP), *STRATEGY, "--profile-memory", "none",
-               "--config", str(plan_yaml(plan)), "--out", str(OUT / f"{block}_{plan}"), "--only", "run"]
+               "--config", str(plan_yaml(plan)), "--out", str(out / f"{block}_{plan}"), "--only", "run"]
     if PLANS[plan].get("mode", "off") == "off":
         # The sweep states the mode on the command line, which overrides the yaml's.
         command += ["--activation-checkpoint", "off"]
@@ -154,14 +179,15 @@ def stream(command: Sequence[str], log: Path) -> int:
     return process.returncode
 
 
-def setup(pool: Path) -> None:
+def setup(pool: Path, nodes: int = DEMO_NODES) -> None:
     """Write the plan yamls, then select the nodes, copy the code to them and build the dataset."""
+    check_nodes(nodes)
     for path in write_plan_yamls():
         print(f"wrote {path.relative_to(REPO_ROOT)}", flush=True)
     set_allocator(False)
-    command = [sys.executable, str(SWEEP), "--pool", str(pool), *STRATEGY,
+    command = [sys.executable, str(SWEEP), "--pool", str(pool), "--nodes", str(nodes), *STRATEGY,
                "--only", "select", "--only", "mirror", "--only", "data"]
-    if stream(command, OUT / "setup.log"):
+    if stream(command, out_dir(nodes) / "setup.log"):
         raise SystemExit("the sweep's select, mirror and data stages failed: see the lines above")
 
 
@@ -195,8 +221,9 @@ def _signals_stop_cleanly() -> Iterator[None]:
             signal.signal(number, handler)
 
 
-def run_block(block: str, plans: Sequence[str] = ()) -> None:
+def run_block(block: str, plans: Sequence[str] = (), out: Optional[Path] = None) -> None:
     """Run a block's plans one after the other, the allocator set as the block needs."""
+    out = out or OUT
     plans = tuple(plans) or BLOCKS[block]
     unknown = [plan for plan in plans if plan not in PLANS]
     if unknown:
@@ -208,11 +235,11 @@ def run_block(block: str, plans: Sequence[str] = ()) -> None:
         set_allocator(block == "B")
         try:
             for index, plan in enumerate(plans, 1):
-                out = OUT / f"{block}_{plan}"
-                if out.exists():
-                    out.rename(out.with_name(f"{out.name}.{time.strftime('%Y%m%d_%H%M%S')}"))
+                folder = out / f"{block}_{plan}"
+                if folder.exists():
+                    folder.rename(folder.with_name(f"{folder.name}.{time.strftime('%Y%m%d_%H%M%S')}"))
                 print(f"\n##### block {block}, test {index} of {len(plans)}: {plan} #####", flush=True)
-                code = stream(sweep_command(block, plan), OUT / f"block_{block}.log")
+                code = stream(sweep_command(block, plan, out), out / f"block_{block}.log")
                 if code:
                     print(f"the sweep exited with {code}; going on with the next test", flush=True)
         finally:
@@ -220,10 +247,10 @@ def run_block(block: str, plans: Sequence[str] = ()) -> None:
                 set_allocator(False)
 
 
-def read_run(block: str, plan: str) -> Optional[Dict[str, Any]]:
-    """The sweep's record of one test's run, or None where it has not run."""
+def read_run(block: str, plan: str, out: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """The sweep's record of one test's run under ``out`` (default OUT), or None where it has not run."""
     try:
-        states = json.loads((OUT / f"{block}_{plan}" / "run_states.json").read_text(encoding="utf-8"))
+        states = json.loads(((out or OUT) / f"{block}_{plan}" / "run_states.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     runs = [data for data in states.values() if isinstance(data, dict) and "run_id" in data]
@@ -262,17 +289,24 @@ def _difference(first: Dict[str, Any], second: Dict[str, Any], key: str, unit_na
     return f"{key} {float(first[key]) - float(second[key]):+.3f} {unit_name}"
 
 
-def results(env: Dict[str, Any]) -> None:
-    """Print one line per test, the reason each failure gave, then each comparison."""
+def results(env: Dict[str, Any], out: Optional[Path] = None) -> None:
+    """Print one line per test, the reason each failure gave, then each comparison.
+
+    A plan named on the command line outside its block's list gets a line too,
+    when it ran.
+    """
+    out = out or OUT
+    print(f"{len(env['nodes'])} node(s) in {CLUSTER_ENV.name}, tests in {out}")
     print(f"{'test':16s} {'state':6s} {'step ms':>8s} {'sd':>6s} {'alloc':>8s} {'reserved':>8s} "
           f"{'gap':>6s}  plan the trainer logged")
     measured = {}
     for block, plans in BLOCKS.items():
-        for plan in plans:
-            run = read_run(block, plan)
+        for plan in PLANS:
+            run = read_run(block, plan, out)
             name = f"{block} {plan}"
             if run is None:
-                print(f"{name:16s} not run")
+                if plan in plans:
+                    print(f"{name:16s} not run")
                 continue
             measured[(block, plan)] = run
             print(_row(name, run, remote_grep(env, 0, run["run_id"], LOGGED_PLAN)))
@@ -311,6 +345,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     steps = parser.add_subparsers(dest="step", required=True)
     setup_step = steps.add_parser("setup", help="plan yamls, then the sweep's select, mirror and data")
     setup_step.add_argument("--pool", type=Path, default=Path("/home/tt/cluster_all.env"))
+    setup_step.add_argument("--nodes", type=int, default=DEMO_NODES,
+                            help="nodes to select; the tests on any count but 4 write to their own folder")
     steps.add_parser("unit", help="the per-layer plan's unit tests")
     run_step = steps.add_parser("run", help="one block of tests, or the plans named")
     run_step.add_argument("block", choices=sorted(BLOCKS))
@@ -319,15 +355,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     steps.add_parser("reset", help="take the allocator setting out of the kit config")
     args = parser.parse_args(argv)
     if args.step == "setup":
-        setup(args.pool)
+        setup(args.pool, args.nodes)
     elif args.step == "unit":
         sys.exit(unit())
-    elif args.step == "run":
-        run_block(args.block, args.plans)
     elif args.step == "reset":
         set_allocator(False)
     else:
-        results(read_cluster_env())
+        # The tests run on, and are read from, the nodes the last setup selected.
+        env = read_cluster_env()
+        if args.step == "run":
+            run_block(args.block, args.plans, out_dir(len(env["nodes"])))
+        else:
+            results(env, out_dir(len(env["nodes"])))
 
 
 if __name__ == "__main__":
