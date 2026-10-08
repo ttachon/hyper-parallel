@@ -74,7 +74,9 @@ GDN_CHUNK = 64
 # would name them, and until one exists read this as a calibration carrying
 # the measured shape, not as a model of the dispatch.  A cluster that has
 # measured its own says so with ``context.moe_dispatch``, as it states the
-# ratios of the parts in a file.
+# ratios of the parts in a file, and a model whose compute does not grow with
+# EP states 0, which prices no dispatch: DeepSeek V4.1's crop measures 3.3%
+# less compute at EP 16 than at EP 1, where ND with this term prices 60% more.
 MOE_DISPATCH = 1040
 # How far a stage's recorded parts may stray from its time: they are its time
 # taken apart, so only by rounding.
@@ -185,8 +187,8 @@ def _flavour_tables(cfg, attn=None):
     its activation function's entry the same experts, which run it at
     their width, where a dense layer's runs it at the dense width.  A MoE
     layer also dispatches its tokens, which the table prices apart
-    (:data:`MOE_DISPATCH`); a dense layer does not, so only the expert
-    table carries that entry.
+    (:data:`MOE_DISPATCH`, or the cost the run states, 0 pricing none); a
+    dense layer does not, so only the expert table carries that entry.
     """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
@@ -198,7 +200,9 @@ def _flavour_tables(cfg, attn=None):
     exp["n_ffMM"] *= width / cfg.hff
     exp["n_ffBMM"] *= width / cfg.hff
     exp["n_ffAct"] *= experts / cfg.hff
-    dispatch = getattr(cfg, "moe_dispatch", 0) or MOE_DISPATCH
+    dispatch = getattr(cfg, "moe_dispatch", None)
+    if dispatch is None:
+        dispatch = MOE_DISPATCH
     exp["n_dispatch"] = (
         dispatch * cfg.b * cfg.s * cfg.h * max(1, cfg.n_chosen_exp)
         * max(1, getattr(cfg, "ep", 1) or 1) * cfg.bytes_p / cfg.t / cfg.cp

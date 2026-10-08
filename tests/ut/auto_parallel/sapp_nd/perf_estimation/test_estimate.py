@@ -231,6 +231,24 @@ class TestOpTable(unittest.TestCase):
         stated = SimpleNamespace(**{**vars(plain), "moe_dispatch": 2 * MOE_DISPATCH})
         self.assertEqual(_flavour_tables(stated)[1]["n_dispatch"], 2 * one["n_dispatch"])
 
+    def test_a_stated_dispatch_cost_of_zero_prices_no_dispatch(self):
+        """
+        Feature: _flavour_tables, a stated dispatch cost.
+        Description: The MoE layer of width 512 at expert parallel 4, with no
+            dispatch cost, with None, which is how the parser hands over a
+            run that states none, and with a stated 0.
+        Expectation: No cost and None keep the measured default; 0 prices no
+            dispatch at all, for a model whose compute does not grow with
+            the degree, where it used to fall back to the default.
+        """
+        plain = SimpleNamespace(**{**vars(_cfg(128)), "hff_exp": 64, "n_exp": 8, "n_chosen_exp": 2,
+                                   "cap_fact": 1, "n_shared_exp": 1, "n_ffMM": 3, "ep": 4})
+        default = _flavour_tables(plain)[1]["n_dispatch"]
+        self.assertEqual(default, MOE_DISPATCH * 128 * 512 * 2 * 4 * 2 / 2)
+        for stated, want in ((None, default), (0, 0)):
+            cfg = SimpleNamespace(**{**vars(plain), "moe_dispatch": stated})
+            self.assertEqual(_flavour_tables(cfg)[1]["n_dispatch"], want)
+
     def test_the_delta_rule_runs_in_chunks(self):
         """
         Feature: the load of the gated delta rule.

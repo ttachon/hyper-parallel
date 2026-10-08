@@ -1826,6 +1826,23 @@ class TestFsdpResharding(unittest.TestCase):
         with self.assertRaises(ValueError):
             _make_ccfg(_moe_overrides(fsdp_config={}, context={"expert_shard": "all"}))
 
+    def test_a_run_states_its_dispatch_cost_or_switches_it_off(self):
+        """
+        Feature: _parse_expert_sharding, context.moe_dispatch.
+        Description: A MoE run in the AutoModels schema stating no dispatch
+            cost, a cost of 520, a cost of 0, and a negative one.
+        Expectation: Unstated, the parser hands over None, so the estimate
+            keeps its measured default; a stated cost is taken as stated, 0
+            included, which switches the term off; a negative one is refused.
+        """
+        got = [
+            _make_ccfg(_moe_overrides(fsdp_config={}, context=context)).moe_dispatch
+            for context in ({}, {"moe_dispatch": 520}, {"moe_dispatch": 0})
+        ]
+        self.assertEqual(got, [None, 520.0, 0.0])
+        with self.assertRaises(ValueError):
+            _make_ccfg(_moe_overrides(fsdp_config={}, context={"moe_dispatch": -1}))
+
     def test_the_run_accumulates_without_a_pipeline(self):
         """
         Feature: accumulates_grads.
