@@ -27,7 +27,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 class HostLink:
     """How fast a device moves activations to its host's memory and back, as offload prices it.
 
-    A3's bandwidth below is measured; every other figure is an assumption.
+    A3's bandwidth and copy cost below are measured; every other figure is an
+    assumption.
     Measure a link with every die of a job copying at once, as
     ``nd_golden/offload/bench_host_link.py`` does, since a job copies at its
     slowest die, and state it here or with ``run_nd --host_link_gibps``.
@@ -54,12 +55,22 @@ class HostLink:
             it runs; and it may split the forward from the backward
             otherwise than the device does, so that COMPUTE can make the
             forward the copies hide in look longer.
+        copy_cost_ms_per_gib: What the copies cost the step, in milliseconds
+            a GiB moved either way: the time the compute and the collectives
+            beside them lose to the copies, which hide in the forward but
+            still take part of what those need. 0 prices offload as free.
+        score_ms_per_unit: The milliseconds one unit of the score stands
+            for, a calibration round's COMPUTE ratio, which turns that cost
+            into the score's units; unset, the cost converts as a copy's
+            seconds do.
     """
 
     gib_per_s: float
     sustained_tflops: float
     overlap: float = 0.8
     ms_per_unit: Optional[float] = None
+    copy_cost_ms_per_gib: float = 0.0
+    score_ms_per_unit: Optional[float] = None
 
     def __post_init__(self) -> None:
         """Refuse a figure that cannot price a copy."""
@@ -67,10 +78,16 @@ class HostLink:
             raise ValueError(f"a host link needs positive figures and an overlap in (0, 1], not {self}")
         if self.ms_per_unit is not None and self.ms_per_unit <= 0:
             raise ValueError(f"a calibrated host link needs a positive ms_per_unit, not {self}")
+        if self.copy_cost_ms_per_gib < 0 or (self.score_ms_per_unit is not None and self.score_ms_per_unit <= 0):
+            raise ValueError(f"a host link needs a copy cost of 0 or more and a positive score_ms_per_unit, not {self}")
 
     def seconds_per_byte(self) -> float:
         """The seconds one byte takes over the link, one way."""
         return 1.0 / (self.gib_per_s * 2 ** 30)
+
+    def cost_seconds_per_byte(self) -> float:
+        """The step time one byte moved costs, either way, in seconds."""
+        return self.copy_cost_ms_per_gib / 1000.0 / 2 ** 30
 
     def flops_per_second(self) -> float:
         """The device's sustained FLOP/s."""
@@ -105,6 +122,17 @@ class HostLink:
         if self.ms_per_unit is not None:
             return 1000.0 / self.ms_per_unit
         return self.flops_per_second() * bytes_p
+
+    def score_units_per_second(self, bytes_p: float) -> float:
+        """The score's units a second, for the copies' cost: *score_ms_per_unit*'s, else as a copy converts.
+
+        Args:
+            bytes_p: The training precision's bytes, by which the estimate
+                multiplies its FLOPs.
+        """
+        if self.score_ms_per_unit is not None:
+            return 1000.0 / self.score_ms_per_unit
+        return self.units_per_second(bytes_p)
 
 
 class Type:
@@ -183,7 +211,10 @@ class Type:
 # A3's link is measured: 6.92 GiB/s is the slowest die of a two-node job copying
 # to the host on 7 October 2026, where one node alone measured 10.33 to 13.29
 # (nd_golden/offload/host_link_*_1007.txt). The copies to the host bind, in the
-# forward; those back run in the longer backward. The other links are
+# forward; those back run in the longer backward. Its cost is measured too:
+# inside the Demo 2 step on 8 October, four nodes, 4 GiB each way at layer 0's
+# points cost the step 22.5 ms, 2.8 ms a GiB moved, where that job's slowest die
+# copied 8.61 GiB/s alone (nd_golden/offload/probe_4node_1008.txt). The other links are
 # placeholders: 16 GiB/s is hyper_offload's own default before it profiles the
 # link. The throughputs are about half of each device's dense BF16 or FP16
 # peak, which a calibration replaces (HostLink.ms_per_unit).
@@ -195,7 +226,7 @@ Device_A3 = Type(
     name="A3",
     bounds=[16, 24, None],
     bandwidths=[200, 25, 10],
-    host_link=HostLink(gib_per_s=6.92, sustained_tflops=160.0),
+    host_link=HostLink(gib_per_s=6.92, sustained_tflops=160.0, copy_cost_ms_per_gib=2.8),
 )
 device_map = {
     "A2": Device_A2,

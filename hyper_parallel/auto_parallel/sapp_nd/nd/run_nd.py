@@ -39,31 +39,34 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
 )
 
 
-def _link_ratio(cli_parser, cache_file):
-    """The ratio of a ratios file that times a copy: its FORWARD ratio, else its COMPUTE ratio.
+def _link_ratios(cli_parser, cache_file):
+    """The ratios of a ratios file that price the copies: FORWARD, else COMPUTE, for a copy; COMPUTE for its cost.
 
     FORWARD, where a round measured the forward on its own, is the
     milliseconds one unit of the forward the estimate prices stands for: the
     window the copies to the host hide in. COMPUTE stands for the forward and
     the backward together, which the estimate may split otherwise than the
-    device runs them.
+    device runs them, and for the score's units, which the copies' cost to
+    the step is charged in.
 
     Args:
         cli_parser: The parser, to report a file that states neither.
         cache_file: The ratios file of -c, or ``None``.
 
     Returns:
-        The ratio, or ``None`` without a file.
+        ``(copy, cost)``, each ``None`` without a file, the second also
+        where the file states no COMPUTE ratio.
     """
     if cache_file is None:
-        return None
+        return None, None
     with open(cache_file, encoding="utf-8") as handle:
         ratios = json.load(handle)
     name = "FORWARD" if "FORWARD" in ratios else "COMPUTE"
     ratio = ratios.get(name)
     if not isinstance(ratio, (int, float)) or ratio <= 0:
         cli_parser.error(f"{cache_file} states no positive {name} ratio to calibrate the host link with")
-    return float(ratio)
+    compute = ratios.get("COMPUTE")
+    return float(ratio), float(compute) if isinstance(compute, (int, float)) and compute > 0 else None
 
 
 def _link_figures(cli_parser, cli_args):
@@ -71,20 +74,24 @@ def _link_figures(cli_parser, cli_args):
 
     With a ratios file (-c), its FORWARD or COMPUTE ratio turns a copy's
     seconds into the estimate's units, in place of the device's sustained
-    throughput (:func:`_link_ratio`).
+    throughput, and its COMPUTE ratio the copies' cost (:func:`_link_ratios`).
 
     Args:
         cli_parser: The parser, to report a ratios file with neither ratio.
         cli_args: The parsed CLI namespace.
 
     Returns:
-        ``gib_per_s``, ``sustained_tflops``, ``overlap`` and ``ms_per_unit``.
+        ``gib_per_s``, ``sustained_tflops``, ``overlap``, ``ms_per_unit``,
+        ``score_ms_per_unit`` and ``copy_cost_ms_per_gib``.
     """
+    copy_ratio, cost_ratio = _link_ratios(cli_parser, getattr(cli_args, "cache_file", None))
     return {
         "gib_per_s": cli_args.host_link_gibps,
         "sustained_tflops": cli_args.sustained_tflops,
         "overlap": getattr(cli_args, "host_link_overlap", None),
-        "ms_per_unit": _link_ratio(cli_parser, getattr(cli_args, "cache_file", None)),
+        "ms_per_unit": copy_ratio,
+        "score_ms_per_unit": cost_ratio,
+        "copy_cost_ms_per_gib": getattr(cli_args, "host_link_cost", None),
     }
 
 
@@ -454,6 +461,14 @@ if __name__ == "__main__":
         "need; the device's 0.8 when omitted",
     )
     parser.add_argument(
+        "--host_link_cost",
+        type=float,
+        default=None,
+        help="What the copies cost the step, in ms a GiB moved either way, for "
+        "-ao; the device's when omitted (A3: 2.8, measured inside the Demo 2 "
+        "step), 0 to price offload as free",
+    )
+    parser.add_argument(
         "-t",
         "--top_config_number",
         type=int,
@@ -476,7 +491,8 @@ if __name__ == "__main__":
         help="Cache file with ratios to recalibrate ND scores. With -ao its "
         "FORWARD ratio, where a round measured the forward on its own, else "
         "its COMPUTE ratio, also turns a copy's seconds into the estimate's "
-        "units; with a search config (-s) that is all it does. "
+        "units, and its COMPUTE ratio the copies' cost; with a search config "
+        "(-s) that is all it does. "
         "Will be defaulted to 'None'.",
     )
 
@@ -553,9 +569,9 @@ if __name__ == "__main__":
     if args.auto_offload and not args.auto_recompute and not args.search_config:
         parser.error("-ao/--auto_offload offloads in the choice per layer -ar/--auto_recompute makes")
     if not args.auto_offload and (args.host_link_gibps is not None or args.sustained_tflops is not None
-                                  or args.host_link_overlap is not None):
-        parser.error("--host_link_gibps, --sustained_tflops and --host_link_overlap price offload, which needs "
-                     "-ao/--auto_offload")
+                                  or args.host_link_overlap is not None or args.host_link_cost is not None):
+        parser.error("--host_link_gibps, --sustained_tflops, --host_link_overlap and --host_link_cost price "
+                     "offload, which needs -ao/--auto_offload")
     if args.verify:
         if args.framework != "hyper_v2":
             parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")

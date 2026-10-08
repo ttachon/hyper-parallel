@@ -52,7 +52,10 @@ and its last layers nothing when their window is too short. The copies back
 run in the longer backward, one layer ahead, while this micro-batch's
 backward has released what the layers after the next one keep; where that
 does not cover them, the stage keeps the largest layer's offloaded bytes in
-transit. Offload is priced at one chunk per stage.
+transit. Each byte moved costs the step the link's copy cost, out in the
+forward and back in the backward, so where the copies cost time a stage
+offloads no more than it needs to fit. Offload is priced at one chunk per
+stage.
 
 Where a stage's FSDP holds each layer's gradient output until the backward
 ends, and accumulates gradients over several micro-batches, its peak can also
@@ -624,25 +627,36 @@ class _Link:
     Attributes:
         per_byte: The time one byte takes over the link, one way.
         overlap: The share of the compute time the copies may take.
+        cost_per_byte: The step time one byte moved costs, either way.
     """
 
     per_byte: float
     overlap: float
+    cost_per_byte: float = 0.0
 
 
 def _link(link: HostLink, evaluator: EvaluatorV2) -> _Link:
     """*link* in the estimate's units: FLOPs of forward and backward, times the precision's bytes, per device.
 
     A link calibrated with a COMPUTE ratio converts with it instead
-    (:meth:`HostLink.units_per_second`).
+    (:meth:`HostLink.units_per_second`), and the copies' cost with the
+    score's own ratio where one is stated
+    (:meth:`HostLink.score_units_per_second`).
     """
-    return _Link(link.seconds_per_byte() * link.units_per_second(evaluator.ccfg.bytes_p), link.overlap)
+    bytes_p = evaluator.ccfg.bytes_p
+    return _Link(link.seconds_per_byte() * link.units_per_second(bytes_p), link.overlap,
+                 link.cost_seconds_per_byte() * link.score_units_per_second(bytes_p))
 
 
-def _offloaded(option: LayerOption, share: float) -> LayerOption:
-    """*option* with *share* of what it keeps per micro-batch moved to the host, so that it keeps the rest."""
+def _offloaded(option: LayerOption, share: float, cost_per_byte: float = 0.0) -> LayerOption:
+    """*option* with *share* of what it keeps per micro-batch moved to the host, so that it keeps the rest.
+
+    The copies cost the step *cost_per_byte* a byte, out in the forward and
+    back in the backward.
+    """
     return replace(option, memory_per_micro_batch=option.memory_per_micro_batch - share, link_bandwidth=share,
-                   names=())
+                   forward_time=option.forward_time + share * cost_per_byte,
+                   backward_time=option.backward_time + share * cost_per_byte, names=())
 
 
 def _offloadable(option: LayerOption, in_flight: int) -> float:
@@ -880,8 +894,8 @@ def _offload_stage(
     most = next((position for position, share in enumerate(shares) if share <= 0), len(shares))
     if not most:
         return kept
-    offloaded = [_offloaded(option, share) for option, share in zip(plain, shares[:most])]
-    times = list(itertools.accumulate((_time(option) for option in plain[:most]), initial=0.0))
+    offloaded = [_offloaded(option, share, link.cost_per_byte) for option, share in zip(plain, shares[:most])]
+    times = list(itertools.accumulate((_time(option) for option in offloaded), initial=0.0))
     # Offload only where it saves time, more than rounding.
     fastest = math.inf if stay is None else sum(_time(option) for option in stay.values()) * (1 - _ROUNDING)
     for in_transit in (False, True):
@@ -899,11 +913,57 @@ def _offload_stage(
             return None
         chosen = {layer.index: option for layer, option in zip(stage_layers, offloaded[:count])}
         chosen.update(_assign(stage_layers[count:], [choice]))
-        if in_transit:
-            return chosen, max(option.link_bandwidth for option in offloaded[:count])
-        if _returns_fit(stage_layers, chosen, count):
-            return chosen, 0.0
+        transit = max(option.link_bandwidth for option in offloaded[:count]) if in_transit else 0.0
+        if in_transit or _returns_fit(stage_layers, chosen, count):
+            held = _Peaks(peaks.warm_up + transit, None if peaks.backward is None else peaks.backward + transit)
+            return _trim_offload(stage_layers[:count], chosen, plain, held, (stage_layers, fronts, own),
+                                 (capacity, link.cost_per_byte)), transit
     return kept
+
+
+def _trim_offload(
+    offloading: Sequence[_Layer],
+    chosen: Dict[int, LayerOption],
+    plain: Sequence[LayerOption],
+    held: _Peaks,
+    stage: Tuple[Sequence[_Layer], Mapping[Hashable, Tuple[LayerOption, ...]], Mapping[LayerOption, LayerOption]],
+    sizes: Tuple[float, float],
+) -> Dict[int, LayerOption]:
+    """*chosen* with no more offloaded than the stage needs, where the copies cost time.
+
+    What the stage still has under the device's memory once its layers run
+    their choice would be offloaded for nothing but the copies' cost, so the
+    last offloaded layers keep it instead, a layer that keeps all it holds
+    running plain.
+
+    Args:
+        offloading: The stage's layers that offload, in order.
+        chosen: Each layer's option by index, those layers' offloading.
+        plain: Each of the stage's layers' plain option, in order.
+        held: What the stage keeps whatever its layers run, transit included.
+        stage: ``(stage_layers, fronts, own)``, as for :func:`_stage_memory`.
+        sizes: ``(capacity, cost_per_byte)``: the device's memory in bytes,
+            and the step time one byte moved costs.
+
+    Returns:
+        The trimmed choice; *chosen* itself where the copies cost nothing.
+    """
+    capacity, cost_per_byte = sizes
+    if cost_per_byte <= 0:
+        return chosen
+    stage_layers, fronts, own = stage
+    slack = capacity - _stage_memory(stage_layers, held, chosen, fronts, own)
+    chosen = dict(chosen)
+    for position in range(len(offloading) - 1, -1, -1):
+        if slack <= 0:
+            break
+        layer = offloading[position]
+        option = chosen[layer.index]
+        give = min(option.link_bandwidth, slack / layer.in_flight)
+        share = option.link_bandwidth - give
+        chosen[layer.index] = _offloaded(plain[position], share, cost_per_byte) if share > 0 else plain[position]
+        slack -= give * layer.in_flight
+    return chosen
 
 
 def _stages(

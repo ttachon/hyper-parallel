@@ -889,14 +889,39 @@ class TestOffloadWindow(unittest.TestCase):
         fronts = {("unit", None): (plain, full)}
         return fronts, [Candidate._Layer(index, ("unit", None), 1, full) for index in range(count)]
 
-    def _offload_stage(self, count: int, budget: float, per_byte: float) -> Tuple[Dict[int, LayerOption], float]:
-        """The choice of *count* unit layers in *budget* MB, with a link that takes *per_byte* forwards a MB."""
+    def _offload_stage(self, count: int, budget: float, per_byte: float,
+                       cost: float = 0.0) -> Tuple[Dict[int, LayerOption], float]:
+        """The choice of *count* unit layers in *budget* MB, with a link that takes *per_byte* forwards a MB.
+
+        Each MB moved costs the step *cost*.
+        """
         # pylint: disable=protected-access
         fronts, layers = self._unit_layers(count)
         stage = Stage(groups=Candidate._groups(layers), budget=budget * MEGABYTE)
-        link = Candidate._Link(per_byte=per_byte / MEGABYTE, overlap=1.0)
+        link = Candidate._Link(per_byte=per_byte / MEGABYTE, overlap=1.0, cost_per_byte=cost / MEGABYTE)
         return Candidate._offload_stage(layers, stage, Candidate._Peaks(0.0), fronts, {}, link, MEGABYTE,
                                         budget * MEGABYTE)
+
+    def test_the_copies_cost_time_and_only_what_the_stage_needs_moves(self):
+        """
+        Feature: the choice of a stage whose first layers may offload, the copies costing time.
+        Description: The three layers in 7.5 MB, a link that carries 2 MB in
+            the two forwards after the first, and copies that cost 0.1 a MB
+            moved; then 0.3 a MB.
+        Expectation: At 0.1 the first layer runs plain and offloads only the
+            1.5 MB the stage needs to fit, its time 3 and 0.1 for each MB out
+            and back, 3.3, and the stage fills its 7.5 MB. At 0.3 the 2 MB
+            the third layer's plain run needs cost 1.2, more than the 1 it
+            saves, and nothing offloads.
+        """
+        chosen, transit = self._offload_stage(3, 7.5, 1.0, cost=0.1)
+        self.assertEqual(transit, 0.0)
+        self.assertEqual(chosen[0].link_bandwidth, 1.5 * MEGABYTE)
+        self.assertAlmostEqual(chosen[0].forward_time + chosen[0].backward_time, 3.3)
+        self.assertEqual([chosen[index].recompute for index in range(3)], [frozenset(), None, frozenset()])
+        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 7.5 * MEGABYTE)
+        chosen, _ = self._offload_stage(3, 7.5, 1.0, cost=0.3)
+        self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
 
     def test_a_layer_offloads_the_part_its_window_carries(self):
         """
@@ -1111,6 +1136,18 @@ class TestOffload(unittest.TestCase):
             Hard.HostLink.of(None, {"gib_per_s": 8.0, "sustained_tflops": None})
         self.assertEqual(Hard.HostLink.of(None, {"gib_per_s": 8.0, "sustained_tflops": 100.0}), link)
         self.assertEqual(Hard.HostLink.of(link, {"overlap": 1.0}), Hard.HostLink(8.0, 100.0, overlap=1.0))
+        # The copies' cost converts with the score's own ratio where one is stated, else as a copy does.
+        costly = Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0, ms_per_unit=2e-11, copy_cost_ms_per_gib=2.8,
+                               score_ms_per_unit=5e-11)
+        cost_seconds = 2.8e-3 / 2 ** 30
+        self.assertAlmostEqual(Candidate._link(costly, evaluator).cost_per_byte / (cost_seconds * 1000.0 / 5e-11), 1.0,
+                               places=12)
+        unscored = dataclasses.replace(costly, score_ms_per_unit=None)
+        self.assertAlmostEqual(Candidate._link(unscored, evaluator).cost_per_byte / (cost_seconds * 1000.0 / 2e-11),
+                               1.0, places=12)
+        self.assertEqual(Candidate._link(link, evaluator).cost_per_byte, 0.0)
+        with self.assertRaises(ValueError):
+            Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0, copy_cost_ms_per_gib=-1.0)
 
     def test_an_offloading_choice_reads_so(self):
         """
