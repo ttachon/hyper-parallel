@@ -781,6 +781,13 @@ class ParallelizeLayer:
                 "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
                 priced.s,
             )
+        if getattr(priced, "mtp_unpriced", 0):
+            # A stated MTP depth looked priced and was not (I2).
+            logger.output(
+                "The model states %d MTP layer(s), which the AutoModels trainer does not build: no number above "
+                "prices them",
+                priced.mtp_unpriced,
+            )
         for line in unset_reads_report():
             logger.output(line)
         logger.output(

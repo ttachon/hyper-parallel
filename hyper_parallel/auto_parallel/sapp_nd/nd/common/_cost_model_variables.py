@@ -58,6 +58,9 @@ class _CostModVar:
     # False where the config states no training sequence length and the
     # parser costs the model's context limit in its place.
     seq_len_stated: bool = True
+    # The MTP layers the model states and the AutoModels trainer does not
+    # build, so that nothing prices them; 0 where none was dropped.
+    mtp_unpriced: int = 0
 
     # Strategy
     d: float = 0

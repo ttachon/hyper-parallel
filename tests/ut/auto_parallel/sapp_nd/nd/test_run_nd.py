@@ -2815,6 +2815,35 @@ class TestSappNDRunND(unittest.TestCase):
             runner.run_generation_to_ordering(None)
         self.assertTrue(any("n_gather by comm.py:tp" in call.args[0] for call in output.call_args_list))
 
+    def test_a_ranking_names_the_mtp_layers_it_does_not_price(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth (I2).
+        Description: A search over one configuration of a model stating 3 MTP
+            layers the AutoModels trainer does not build, then of one stating
+            none.
+        Expectation: The line under the table names the 3 layers; with none,
+            nothing is said.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False), dimensions=[Dim.DP])
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        for dropped, said in ((3, 1), (0, 0)):
+            with self.subTest(dropped=dropped), patch.object(Par.logger, "output") as output:
+                runner.priced = lambda dropped=dropped: SimpleNamespace(mtp_unpriced=dropped)
+                runner.run_generation_to_ordering(None)
+                lines = [call.args[0] % call.args[1:] for call in output.call_args_list
+                         if "MTP layer(s)" in call.args[0]]
+                self.assertEqual(len(lines), said)
+                if said:
+                    self.assertIn("states 3 MTP layer(s)", lines[0])
+
     def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
         """
         Feature: ParallelizeLayer.generate_search_space, what it says it left out.

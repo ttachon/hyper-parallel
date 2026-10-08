@@ -1061,6 +1061,29 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(_make_ccfg(_auto_models_config()).n_mtp, 0)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_an_mtp_depth_the_trainer_does_not_build_is_said(self, mock_hf):
+        """
+        Feature: an MTP depth the AutoModels trainer drops (I2).
+        Description: A checkpoint declaring 3 MTP layers, then one declaring
+            none.
+        Expectation: ND prices no MTP layer either way; for the three it
+            drops it says so, in a warning and on the config a search reports
+            under its ranking, where a stated depth looked priced and nothing
+            said it was not.
+        """
+        got = []
+        for depth in (3, 0):
+            mock_hf.return_value = self._hf_config(num_nextn_predict_layers=depth)
+            with self.assertLogs(
+                "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper",
+                level="WARNING",
+            ) as said:
+                ccfg = _make_ccfg(_auto_models_config())
+            warned = any("MTP layer(s)" in line for line in said.output)
+            got.append((ccfg.n_mtp, ccfg.mtp_unpriced, warned))
+        self.assertEqual(got, [(0, 3, True), (0, 0, False)])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_mtp_depth_prefers_internal_name(self, mock_hf):
         """
         Feature: MTP depth resolution.

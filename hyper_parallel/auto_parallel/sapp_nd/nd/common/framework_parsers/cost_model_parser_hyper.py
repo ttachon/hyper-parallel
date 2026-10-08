@@ -254,6 +254,14 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override(), self._census_seq_len(), self._replacements()
         )
         if is_auto_models_schema(self.config):
+            # A stated depth looked priced and was not, and nothing said so
+            # (I2): a search repeats this under its ranking.
+            self.ccfg.mtp_unpriced = self._spec_int(spec, "mtp_depth")
+            if self.ccfg.mtp_unpriced:
+                logger.warning(
+                    "The model states %d MTP layer(s), which the AutoModels trainer does not build: "
+                    "ND prices none", self.ccfg.mtp_unpriced,
+                )
             spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
         if self._vision_spec and not self._builds_vision_tower():
