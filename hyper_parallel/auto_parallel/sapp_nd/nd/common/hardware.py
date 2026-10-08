@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import Any, Mapping, Optional
 
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -27,11 +27,11 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 class HostLink:
     """How fast a device moves activations to its host's memory and back, as offload prices it.
 
-    The figures each device states below are assumptions, not measurements:
-    measure the link on the target with hyper_offload's
-    ``profile_transfer_bandwidth``, which reports GiB/s, and the throughput
-    from a profiled training step, or take the vendor's, and state them
-    here or with ``run_nd --host_link_gibps`` and ``--sustained_tflops``.
+    A3's bandwidth and copy cost below are measured; every other figure is an
+    assumption.
+    Measure a link with every die of a job copying at once, as
+    ``nd_golden/offload/bench_host_link.py`` does, since a job copies at its
+    slowest die, and state it here or with ``run_nd --host_link_gibps``.
 
     Attributes:
         gib_per_s: The sustained copy bandwidth between the device and
@@ -39,27 +39,100 @@ class HostLink:
             directions, as hyper_offload and the trainer's input swap run it.
         sustained_tflops: The device's sustained dense throughput at the
             training precision, in TFLOP/s, which turns a copy's seconds into
-            the performance estimate's units.
-        overlap: The share of the compute time the copy stream may take
-            without slowing the compute.
+            the performance estimate's units where no calibration states
+            how long one unit takes.
+        overlap: The share of the forward time the copy stream may take:
+            1 where the copies meet nothing, less where the step's compute
+            or its collectives share what the copies need. 0.8 is an
+            assumption; ``run_nd --host_link_overlap`` states another.
+        ms_per_unit: The milliseconds one unit of the forward the
+            performance estimate prices stands for: a calibration round's
+            FORWARD ratio where it measured the forward on its own, else its
+            COMPUTE ratio. Stated, it turns a copy's seconds into the
+            estimate's units in place of *sustained_tflops*: the estimate
+            counts a step's matmul FLOPs, a fraction of its work, so a
+            device rate makes every forward look several times shorter than
+            it runs; and it may split the forward from the backward
+            otherwise than the device does, so that COMPUTE can make the
+            forward the copies hide in look longer.
+        copy_cost_ms_per_gib: What the copies cost the step, in milliseconds
+            a GiB moved either way: the time the compute and the collectives
+            beside them lose to the copies, which hide in the forward but
+            still take part of what those need. 0 prices offload as free.
+        score_ms_per_unit: The milliseconds one unit of the score stands
+            for, a calibration round's COMPUTE ratio, which turns that cost
+            into the score's units; unset, the cost converts as a copy's
+            seconds do.
     """
 
     gib_per_s: float
     sustained_tflops: float
     overlap: float = 0.8
+    ms_per_unit: Optional[float] = None
+    copy_cost_ms_per_gib: float = 0.0
+    score_ms_per_unit: Optional[float] = None
 
     def __post_init__(self) -> None:
         """Refuse a figure that cannot price a copy."""
         if self.gib_per_s <= 0 or self.sustained_tflops <= 0 or not 0 < self.overlap <= 1:
             raise ValueError(f"a host link needs positive figures and an overlap in (0, 1], not {self}")
+        if self.ms_per_unit is not None and self.ms_per_unit <= 0:
+            raise ValueError(f"a calibrated host link needs a positive ms_per_unit, not {self}")
+        if self.copy_cost_ms_per_gib < 0 or (self.score_ms_per_unit is not None and self.score_ms_per_unit <= 0):
+            raise ValueError(f"a host link needs a copy cost of 0 or more and a positive score_ms_per_unit, not {self}")
 
     def seconds_per_byte(self) -> float:
         """The seconds one byte takes over the link, one way."""
         return 1.0 / (self.gib_per_s * 2 ** 30)
 
+    def cost_seconds_per_byte(self) -> float:
+        """The step time one byte moved costs, either way, in seconds."""
+        return self.copy_cost_ms_per_gib / 1000.0 / 2 ** 30
+
     def flops_per_second(self) -> float:
         """The device's sustained FLOP/s."""
         return self.sustained_tflops * 10 ** 12
+
+    @classmethod
+    def of(cls, link: Optional["HostLink"], figures: Mapping[str, Any]) -> "HostLink":
+        """*link* with the *figures* stated replacing its own, those ``None`` left as they are.
+
+        Args:
+            link: A device's link, or ``None`` for a device that states none.
+            figures: Any of the fields, ``None`` for one not stated.
+
+        Raises:
+            ValueError: Without *link*, where *figures* leave out the
+                bandwidth or the throughput.
+        """
+        stated = {name: value for name, value in figures.items() if value is not None}
+        if link is not None:
+            return replace(link, **stated)
+        if "gib_per_s" not in stated or "sustained_tflops" not in stated:
+            raise ValueError("it states no host link; give both --host_link_gibps and --sustained_tflops for -ao")
+        return cls(**stated)
+
+    def units_per_second(self, bytes_p: float) -> float:
+        """The performance estimate's units a second, calibrated where *ms_per_unit* is stated.
+
+        Args:
+            bytes_p: The training precision's bytes, by which the estimate
+                multiplies its FLOPs.
+        """
+        if self.ms_per_unit is not None:
+            return 1000.0 / self.ms_per_unit
+        return self.flops_per_second() * bytes_p
+
+    def score_units_per_second(self, bytes_p: float) -> float:
+        """The score's units a second, for the copies' cost: *score_ms_per_unit*'s, else as a copy converts.
+
+        Args:
+            bytes_p: The training precision's bytes, by which the estimate
+                multiplies its FLOPs.
+        """
+        if self.score_ms_per_unit is not None:
+            return 1000.0 / self.score_ms_per_unit
+        return self.units_per_second(bytes_p)
 
 
 class Type:
@@ -135,9 +208,16 @@ class Type:
         return assignment
 
 
-# The host links are placeholders until measured (HostLink): 16 GiB/s is
-# hyper_offload's own default before it profiles the link, and the
-# throughputs are about half of each device's dense BF16 or FP16 peak.
+# A3's link is measured: 6.92 GiB/s is the slowest die of a two-node job copying
+# to the host on 7 October 2026, where one node alone measured 10.33 to 13.29
+# (nd_golden/offload/host_link_*_1007.txt). The copies to the host bind, in the
+# forward; those back run in the longer backward. Its cost is measured too:
+# inside the Demo 2 step on 8 October, four nodes, 4 GiB each way at layer 0's
+# points cost the step 22.5 ms, 2.8 ms a GiB moved, where that job's slowest die
+# copied 8.61 GiB/s alone (nd_golden/offload/probe_4node_1008.txt). The other links are
+# placeholders: 16 GiB/s is hyper_offload's own default before it profiles the
+# link. The throughputs are about half of each device's dense BF16 or FP16
+# peak, which a calibration replaces (HostLink.ms_per_unit).
 # Device_A2 = Machine(devices_per_node=8, inter_node_bw=10, intra_node_bw=50)
 Device_A2 = Type(
     name="A2", bounds=[8, None], bandwidths=[50, 10], host_link=HostLink(gib_per_s=16.0, sustained_tflops=140.0)
@@ -146,7 +226,7 @@ Device_A3 = Type(
     name="A3",
     bounds=[16, 24, None],
     bandwidths=[200, 25, 10],
-    host_link=HostLink(gib_per_s=16.0, sustained_tflops=160.0),
+    host_link=HostLink(gib_per_s=6.92, sustained_tflops=160.0, copy_cost_ms_per_gib=2.8),
 )
 device_map = {
     "A2": Device_A2,

@@ -15,6 +15,7 @@
 """run parallelization"""
 
 import argparse
+import json
 import os
 import sys
 
@@ -43,8 +44,64 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
 )
 
 
+def _link_ratios(cli_parser, cache_file):
+    """The ratios of a ratios file that price the copies: FORWARD, else COMPUTE, for a copy; COMPUTE for its cost.
+
+    FORWARD, where a round measured the forward on its own, is the
+    milliseconds one unit of the forward the estimate prices stands for: the
+    window the copies to the host hide in. COMPUTE stands for the forward and
+    the backward together, which the estimate may split otherwise than the
+    device runs them, and for the score's units, which the copies' cost to
+    the step is charged in.
+
+    Args:
+        cli_parser: The parser, to report a file that states neither.
+        cache_file: The ratios file of -c, or ``None``.
+
+    Returns:
+        ``(copy, cost)``, each ``None`` without a file, the second also
+        where the file states no COMPUTE ratio.
+    """
+    if cache_file is None:
+        return None, None
+    with open(cache_file, encoding="utf-8") as handle:
+        ratios = json.load(handle)
+    name = "FORWARD" if "FORWARD" in ratios else "COMPUTE"
+    ratio = ratios.get(name)
+    if not isinstance(ratio, (int, float)) or ratio <= 0:
+        cli_parser.error(f"{cache_file} states no positive {name} ratio to calibrate the host link with")
+    compute = ratios.get("COMPUTE")
+    return float(ratio), float(compute) if isinstance(compute, (int, float)) and compute > 0 else None
+
+
+def _link_figures(cli_parser, cli_args):
+    """The host link figures the CLI states for -ao, ``None`` for each it leaves to the device.
+
+    With a ratios file (-c), its FORWARD or COMPUTE ratio turns a copy's
+    seconds into the estimate's units, in place of the device's sustained
+    throughput, and its COMPUTE ratio the copies' cost (:func:`_link_ratios`).
+
+    Args:
+        cli_parser: The parser, to report a ratios file with neither ratio.
+        cli_args: The parsed CLI namespace.
+
+    Returns:
+        ``gib_per_s``, ``sustained_tflops``, ``overlap``, ``ms_per_unit``,
+        ``score_ms_per_unit`` and ``copy_cost_ms_per_gib``.
+    """
+    copy_ratio, cost_ratio = _link_ratios(cli_parser, getattr(cli_args, "cache_file", None))
+    return {
+        "gib_per_s": cli_args.host_link_gibps,
+        "sustained_tflops": cli_args.sustained_tflops,
+        "overlap": getattr(cli_args, "host_link_overlap", None),
+        "ms_per_unit": copy_ratio,
+        "score_ms_per_unit": cost_ratio,
+        "copy_cost_ms_per_gib": getattr(cli_args, "host_link_cost", None),
+    }
+
+
 def _host_link(cli_parser, cli_args, device):
-    """The host link -ao offloads over: the device's, with what the CLI states replacing its placeholders.
+    """The host link -ao offloads over: the device's, with what the CLI states replacing its figures.
 
     Args:
         cli_parser: The parser, to report a device with no link to offload over.
@@ -56,16 +113,11 @@ def _host_link(cli_parser, cli_args, device):
     """
     if not cli_args.auto_offload:
         return None
-    link = device.host_link
-    if link is None and (cli_args.host_link_gibps is None or cli_args.sustained_tflops is None):
-        cli_parser.error(
-            f"device {device} states no host link; give both --host_link_gibps and --sustained_tflops for -ao"
-        )
-    return Hard.HostLink(
-        gib_per_s=cli_args.host_link_gibps if cli_args.host_link_gibps is not None else link.gib_per_s,
-        sustained_tflops=cli_args.sustained_tflops if cli_args.sustained_tflops is not None else link.sustained_tflops,
-        overlap=link.overlap if link is not None else Hard.HostLink.overlap,
-    )
+    try:
+        return Hard.HostLink.of(device.host_link, _link_figures(cli_parser, cli_args))
+    except ValueError as error:
+        cli_parser.error(f"device {device}: {error}")
+        return None
 
 
 def _apply_cli_overrides(search_cfg, cli_args):
@@ -250,6 +302,12 @@ def _run_hyper_v2_search(cli_parser, cli_args):
 
     search_cfg = read_search_config(cli_args.search_config)
     _apply_cli_overrides(search_cfg, cli_args)
+    offload = None
+    if getattr(cli_args, "auto_offload", False):
+        if search_cfg.estimator.get("recompute_strategy") != "per_layer":
+            cli_parser.error("-ao offloads in a choice of a recompute mode per layer: give the search config "
+                             "recompute: per_layer, and leave out -ar, which chooses one mode for every layer")
+        offload = _link_figures(cli_parser, cli_args)
 
     if getattr(search_cfg, "parallelism_summary", ""):
         logger.output("Parallelism: %s", search_cfg.parallelism_summary)
@@ -266,7 +324,7 @@ def _run_hyper_v2_search(cli_parser, cli_args):
             f"Search config validation failed with {len(hard_errors)} error(s)."
         )
 
-    result = search_strategies(search_cfg)
+    result = search_strategies(search_cfg) if offload is None else search_strategies(search_cfg, offload=offload)
     search_cfg.resolved_strategy = result
 
     output_dir = cli_args.output_dir or "."
@@ -297,6 +355,16 @@ def _log_activation_checkpoint(result):
                       result["activation_checkpoint_layers"])
     else:
         logger.output("Activation checkpoint mode for every layer: %s", result["activation_checkpoint"])
+    if result.get("offloaded_layers"):
+        moved = result.get("offloaded_gib", {})
+        shares = result.get("offloaded_share", {})
+        layers = ", ".join(
+            f"{name} ({moved[name]:.2f} GiB a micro-batch, {shares[name]:.0%} of what it keeps)"
+            if name in moved and name in shares else name
+            for name in result["offloaded_layers"]
+        )
+        logger.output("Offloaded to the host, priced as offload should run: layers %s. The trainer runs no offload "
+                      "yet, so the plan it is given keeps them off", layers)
     per_layer = result.get("recompute_per_layer")
     if per_layer:
         logger.output(
@@ -453,7 +521,24 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="The device's sustained TFLOP/s at the training precision, for "
-        "-ao; the device's placeholder when omitted",
+        "-ao; the device's placeholder when omitted, and unused with -c, whose "
+        "FORWARD or COMPUTE ratio converts a copy's seconds instead",
+    )
+    parser.add_argument(
+        "--host_link_overlap",
+        type=float,
+        default=None,
+        help="The share of the forward the copies may take, for -ao: 1 where "
+        "they meet nothing, less where the step's collectives share what they "
+        "need; the device's 0.8 when omitted",
+    )
+    parser.add_argument(
+        "--host_link_cost",
+        type=float,
+        default=None,
+        help="What the copies cost the step, in ms a GiB moved either way, for "
+        "-ao; the device's when omitted (A3: 2.8, measured inside the Demo 2 "
+        "step), 0 to price offload as free",
     )
     parser.add_argument(
         "-t",
@@ -475,7 +560,11 @@ if __name__ == "__main__":
         "--cache_file",
         type=str,
         default=None,
-        help="Cache file with ratios to recalibrate ND scores. "
+        help="Cache file with ratios to recalibrate ND scores. With -ao its "
+        "FORWARD ratio, where a round measured the forward on its own, else "
+        "its COMPUTE ratio, also turns a copy's seconds into the estimate's "
+        "units, and its COMPUTE ratio the copies' cost; with a search config "
+        "(-s) that is all it does. "
         "Will be defaulted to 'None'.",
     )
 
@@ -599,13 +688,15 @@ if __name__ == "__main__":
 
     if args.auto_recompute and args.mppb:
         parser.error("-ar/--auto_recompute chooses the recompute, so it cannot take it from the yaml (-mppb)")
-    if args.auto_offload and not args.auto_recompute:
+    if args.auto_offload and args.search_config and args.framework != "hyper_v2":
+        parser.error("-ao/--auto_offload with a search config (-s) needs -f hyper_v2, whose search config chooses "
+                     "a recompute mode per layer")
+    if args.auto_offload and not args.auto_recompute and not args.search_config:
         parser.error("-ao/--auto_offload offloads in the choice per layer -ar/--auto_recompute makes")
-    if args.auto_offload and args.search_config:
-        parser.error("-ao/--auto_offload prices a choice per layer; a search config (-s) chooses one mode for the "
-                     "trainer, which runs no offload")
-    if not args.auto_offload and (args.host_link_gibps is not None or args.sustained_tflops is not None):
-        parser.error("--host_link_gibps and --sustained_tflops price offload, which needs -ao/--auto_offload")
+    if not args.auto_offload and (args.host_link_gibps is not None or args.sustained_tflops is not None
+                                  or args.host_link_overlap is not None or args.host_link_cost is not None):
+        parser.error("--host_link_gibps, --sustained_tflops, --host_link_overlap and --host_link_cost price "
+                     "offload, which needs -ao/--auto_offload")
     if args.verify:
         if args.framework != "hyper_v2":
             parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")

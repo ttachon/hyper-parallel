@@ -838,42 +838,123 @@ def _offloaded_indices(choice: RecomputeChoice) -> List[int]:
 
 
 class TestOffloadWindow(unittest.TestCase):
-    """A stage's first layers offload while their copies keep pace with the forward."""
+    """A stage's first layers offload what their copies carry while the forward runs."""
 
     @staticmethod
-    def _limit(copies: Sequence[float], ending: Optional[int] = None) -> int:
-        """How many of four layers, each with a forward of 1, may offload with *copies* to the host."""
+    def _shares(copies: Sequence[float], ending: Optional[int] = None, per_byte: float = 1.0) -> List[float]:
+        """What each of four layers with a forward of 1 moves to the host, keeping *copies* bytes each."""
         stage_layers = []
         for position in range(len(copies)):
             key = ("unit", None) + (("ends warm-up",) if position == ending else ())
             stage_layers.append(Candidate._Layer(position, key, 1, _option(frozenset())))  # pylint: disable=protected-access
         plain = [LayerOption(recompute=frozenset(), memory_per_micro_batch=copy, memory_once=0.0, forward_time=1.0,
                              backward_time=2.0) for copy in copies]
-        link = Candidate._Link(per_byte=1.0, overlap=1.0)  # pylint: disable=protected-access
-        return Candidate._offload_limit(stage_layers, plain, link)  # pylint: disable=protected-access
+        link = Candidate._Link(per_byte=per_byte, overlap=1.0)  # pylint: disable=protected-access
+        return Candidate._offload_shares(stage_layers, plain, link)  # pylint: disable=protected-access
 
-    def test_a_layer_cannot_offload_more_than_the_forward_left_after_it(self):
+    def test_a_layer_moves_what_the_forward_left_after_it_carries(self):
         """
         Feature: the offload window.
         Description: Four layers with a forward of 1 each, whose copies take
             half a forward, one forward, one and a half forwards, or four.
-        Expectation: Each offloaded layer's copy, with those after it, fits
-            in the forward left after it: three layers at half and at one
-            forward, two at one and a half, none at four; the last layer,
-            with no forward left after it, never.
+        Expectation: One stream copies each layer's activations once its
+            forward ends and is done when the forward is: three layers move
+            all they keep at half and at one forward, two at one and a half,
+            and at four the first moves what the three forwards after it
+            carry, three quarters of what it keeps; the last layer, with no
+            forward left after it, nothing.
         """
-        self.assertEqual(self._limit([0.5] * 4), 3)
-        self.assertEqual(self._limit([1.0] * 4), 3)
-        self.assertEqual(self._limit([1.5] * 4), 2)
-        self.assertEqual(self._limit([4.0] * 4), 0)
+        self.assertEqual(self._shares([0.5] * 4), [0.5, 0.5, 0.5, 0.0])
+        self.assertEqual(self._shares([1.0] * 4), [1.0, 1.0, 1.0, 0.0])
+        self.assertEqual(self._shares([1.5] * 4), [1.5, 1.5, 0.0, 0.0])
+        self.assertEqual(self._shares([4.0] * 4), [3.0, 0.0, 0.0, 0.0])
 
     def test_the_layer_that_ends_warm_up_keeps_its_activations(self):
         """
         Feature: the offload window.
         Description: Copies that take no time, the third layer ending warm-up.
-        Expectation: Only the two layers before it may offload.
+        Expectation: Only the two layers before it move anything, all they
+            keep.
         """
-        self.assertEqual(self._limit([0.0] * 4, ending=2), 2)
+        self.assertEqual(self._shares([1.0] * 4, ending=2, per_byte=0.0), [1.0, 1.0])
+
+    @staticmethod
+    def _unit_layers(count: int) -> Tuple[Dict[Any, Tuple[LayerOption, ...]], List[Any]]:
+        """*count* layers of one kind that keep 4 MB plain and 1 MB fully recomputed, with a forward of 1."""
+        # pylint: disable=protected-access
+        plain = LayerOption(recompute=frozenset(), memory_per_micro_batch=4 * MEGABYTE, memory_once=0.0,
+                            forward_time=1.0, backward_time=2.0)
+        full = LayerOption(recompute=None, memory_per_micro_batch=MEGABYTE, memory_once=0.0, forward_time=1.0,
+                           backward_time=3.0)
+        fronts = {("unit", None): (plain, full)}
+        return fronts, [Candidate._Layer(index, ("unit", None), 1, full) for index in range(count)]
+
+    def _offload_stage(self, count: int, budget: float, per_byte: float,
+                       cost: float = 0.0) -> Tuple[Dict[int, LayerOption], float]:
+        """The choice of *count* unit layers in *budget* MB, with a link that takes *per_byte* forwards a MB.
+
+        Each MB moved costs the step *cost*.
+        """
+        # pylint: disable=protected-access
+        fronts, layers = self._unit_layers(count)
+        stage = Stage(groups=Candidate._groups(layers), budget=budget * MEGABYTE)
+        link = Candidate._Link(per_byte=per_byte / MEGABYTE, overlap=1.0, cost_per_byte=cost / MEGABYTE)
+        return Candidate._offload_stage(layers, stage, Candidate._Peaks(0.0), fronts, {}, link, MEGABYTE,
+                                        budget * MEGABYTE)
+
+    def test_the_copies_cost_time_and_only_what_the_stage_needs_moves(self):
+        """
+        Feature: the choice of a stage whose first layers may offload, the copies costing time.
+        Description: The three layers in 7.5 MB, a link that carries 2 MB in
+            the two forwards after the first, and copies that cost 0.1 a MB
+            moved; then 0.3 a MB.
+        Expectation: At 0.1 the first layer runs plain and offloads only the
+            1.5 MB the stage needs to fit, its time 3 and 0.1 for each MB out
+            and back, 3.3, and the stage fills its 7.5 MB. At 0.3 the 2 MB
+            the third layer's plain run needs cost 1.2, more than the 1 it
+            saves, and nothing offloads.
+        """
+        chosen, transit = self._offload_stage(3, 7.5, 1.0, cost=0.1)
+        self.assertEqual(transit, 0.0)
+        self.assertEqual(chosen[0].link_bandwidth, 1.5 * MEGABYTE)
+        self.assertAlmostEqual(chosen[0].forward_time + chosen[0].backward_time, 3.3)
+        self.assertEqual([chosen[index].recompute for index in range(3)], [frozenset(), None, frozenset()])
+        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 7.5 * MEGABYTE)
+        chosen, _ = self._offload_stage(3, 7.5, 1.0, cost=0.3)
+        self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
+
+    def test_a_layer_offloads_the_part_its_window_carries(self):
+        """
+        Feature: the choice of a stage whose first layers may offload.
+        Description: Three layers that keep 4 MB plain and 1 MB fully
+            recomputed, in 7 MB, which hold one plain layer, and a link that
+            carries 2 MB in the two forwards after the first.
+        Expectation: The first layer runs plain and moves half of what it
+            keeps to the host, and the third runs plain too: its backward
+            releases room for those 2 MB to come back, so nothing is held in
+            transit and the stage keeps 7 MB.
+        """
+        chosen, transit = self._offload_stage(3, 7, 1.0)
+        self.assertEqual(transit, 0.0)
+        self.assertEqual([chosen[index].link_bandwidth for index in range(3)], [2 * MEGABYTE, 0.0, 0.0])
+        self.assertEqual([chosen[index].recompute for index in range(3)], [frozenset(), None, frozenset()])
+        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 7 * MEGABYTE)
+        self.assertEqual(option_label(chosen[0]), "no recompute, 50% offloaded to the host")
+
+    def test_a_copy_back_with_no_room_to_land_is_not_offloaded(self):
+        """
+        Feature: the choice of a stage whose first layers may offload.
+        Description: Two such layers in 6 MB, which hold one plain layer,
+            and a link that carries 2 MB in the forward of the second.
+        Expectation: Nothing offloads: the first layer's 2 MB would come
+            back while the second's backward holds all it keeps, and held in
+            transit they leave the second no more room than it has without
+            the link.
+        """
+        chosen, transit = self._offload_stage(2, 6, 0.5)
+        self.assertEqual(transit, 0.0)
+        self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
+        self.assertEqual(sorted(chosen[index].recompute is None for index in range(2)), [False, True])
 
     def test_no_layer_offloads_to_save_only_rounding(self):
         """
@@ -992,17 +1073,96 @@ class TestOffload(unittest.TestCase):
         self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, link=_FAST_LINK),
                          choose_recompute(evaluator, Hard.Device_A2))
 
+    def test_a_mode_per_layer_offloads_its_first_layers_running_off(self):
+        """
+        Feature: choose_recompute with a host link and a mode per layer.
+        Description: PP 1, a device a fifth of the way from all fully
+            recomputed to all plain, off or full for each layer, with and
+            without a link whose copies take no time.
+        Expectation: With the link a run of first layers offloads, each
+            running the plain option and naming the mode off; every range
+            names a mode, the trainer's plan states each offloaded layer
+            off, and the layers save at least as much time as without it.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        modes = ("off", "full")
+        without = choose_recompute(evaluator, Hard.Device_A2, modes=modes, per_layer=True)
+        choice = choose_recompute(evaluator, Hard.Device_A2, modes=modes, per_layer=True, link=_FAST_LINK)
+        offloaded = _offloaded_indices(choice)
+        self.assertGreater(len(offloaded), 0)
+        self.assertEqual(offloaded, list(range(len(offloaded))))
+        self.assertTrue(all(item.mode in modes for item in choice.ranges))
+        self.assertTrue(all(item.mode == "off" and item.option.recompute == frozenset()
+                            for item in choice.ranges if item.option.link_bandwidth))
+        plan = _plan_modes(*trainer_plan(choice), sum(item.count for item in choice.ranges))
+        self.assertEqual([plan[index] for index in offloaded], ["off"] * len(offloaded))
+        self.assertGreaterEqual(sum(choice.stage_savings), sum(without.stage_savings))
+
+    def test_a_mode_per_layer_without_off_does_not_offload(self):
+        """
+        Feature: choose_recompute with a host link and a mode per layer.
+        Description: Full recompute the only mode, chosen per layer, with a
+            link whose copies take no time.
+        Expectation: The choice made without a link: an offloaded layer
+            runs off, which the modes do not offer.
+        """
+        evaluator = self._evaluator("pp1", 0.2)
+        self.assertEqual(choose_recompute(evaluator, Hard.Device_A2, modes=("full",), per_layer=True,
+                                          link=_FAST_LINK),
+                         choose_recompute(evaluator, Hard.Device_A2, modes=("full",), per_layer=True))
+
+    def test_a_calibrated_link_converts_with_the_compute_ratio(self):
+        """
+        Feature: HostLink.ms_per_unit and HostLink.of.
+        Description: A link priced at its sustained throughput, the same
+            link with a COMPUTE ratio stated, and links built from figures.
+        Expectation: A copy's seconds convert at the throughput times the
+            precision's bytes, or at 1000 over the ratio; a ratio that is
+            not positive is refused, as is a device with no link and no
+            figures; HostLink.of replaces only the figures stated.
+        """
+        # pylint: disable=protected-access
+        evaluator = self._evaluator("pp1", 0.2)
+        link = Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0)
+        seconds = 1.0 / (8.0 * 2 ** 30)
+        plain = Candidate._link(link, evaluator)
+        self.assertAlmostEqual(plain.per_byte / (seconds * 100e12 * evaluator.ccfg.bytes_p), 1.0, places=12)
+        calibrated = Candidate._link(Hard.HostLink.of(link, {"ms_per_unit": 5e-11, "gib_per_s": None}), evaluator)
+        self.assertAlmostEqual(calibrated.per_byte / (seconds * 1000.0 / 5e-11), 1.0, places=12)
+        self.assertEqual(calibrated.overlap, link.overlap)
+        with self.assertRaises(ValueError):
+            Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0, ms_per_unit=0.0)
+        with self.assertRaises(ValueError):
+            Hard.HostLink.of(None, {"gib_per_s": 8.0, "sustained_tflops": None})
+        self.assertEqual(Hard.HostLink.of(None, {"gib_per_s": 8.0, "sustained_tflops": 100.0}), link)
+        self.assertEqual(Hard.HostLink.of(link, {"overlap": 1.0}), Hard.HostLink(8.0, 100.0, overlap=1.0))
+        # The copies' cost converts with the score's own ratio where one is stated, else as a copy does.
+        costly = Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0, ms_per_unit=2e-11, copy_cost_ms_per_gib=2.8,
+                               score_ms_per_unit=5e-11)
+        cost_seconds = 2.8e-3 / 2 ** 30
+        self.assertAlmostEqual(Candidate._link(costly, evaluator).cost_per_byte / (cost_seconds * 1000.0 / 5e-11), 1.0,
+                               places=12)
+        unscored = dataclasses.replace(costly, score_ms_per_unit=None)
+        self.assertAlmostEqual(Candidate._link(unscored, evaluator).cost_per_byte / (cost_seconds * 1000.0 / 2e-11),
+                               1.0, places=12)
+        self.assertEqual(Candidate._link(link, evaluator).cost_per_byte, 0.0)
+        with self.assertRaises(ValueError):
+            Hard.HostLink(gib_per_s=8.0, sustained_tflops=100.0, copy_cost_ms_per_gib=-1.0)
+
     def test_an_offloading_choice_reads_so(self):
         """
         Feature: describe and to_records.
         Description: A choice that offloads its first layers.
-        Expectation: Their line says so, and their record states offload.
+        Expectation: Their line says so and how much of what they keep they
+            move, with a link whose copies take no time all of it, and
+            their record states offload and the bytes each moves.
         """
         choice = choose_recompute(self._evaluator("pp1", 0.2), Hard.Device_A2, link=_FAST_LINK)
         first = choice.ranges[0]
         self.assertTrue(first.option.link_bandwidth)
-        self.assertTrue(describe(choice).splitlines()[0].endswith("no recompute, offloaded to the host"))
+        self.assertTrue(describe(choice).splitlines()[0].endswith("no recompute, 100% offloaded to the host"))
         self.assertEqual(to_records(choice)[0]["offload"], True)
+        self.assertEqual(to_records(choice)[0]["offloaded_bytes"], first.option.link_bandwidth)
         self.assertTrue(all("offload" not in record for record, item in zip(to_records(choice), choice.ranges)
                             if not item.option.link_bandwidth))
 

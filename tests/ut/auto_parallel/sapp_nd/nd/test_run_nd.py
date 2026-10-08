@@ -54,7 +54,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.generate_partitions import PartitionGenerator
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
-from hyper_parallel.auto_parallel.sapp_nd.nd.logger import set_verbose_level
+from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger, set_verbose_level
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import comm_time as CommTime
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import estimate as PerfEstimate
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
@@ -945,12 +945,108 @@ class TestSappNDRunND(unittest.TestCase):
                                                    "--sustained_tflops", "200"]):
                 runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
             self.assertEqual(_FakeParallelize.instances[-1].kwargs["host_link"],
-                             Hard.HostLink(gib_per_s=32.0, sustained_tflops=200.0))
+                             Hard.HostLink.of(Hard.Device_A3.host_link, {"gib_per_s": 32.0, "sustained_tflops": 200.0}))
             _FakeParallelize.instances = []
             for extra in (["-ao"], ["-ar", "--host_link_gibps", "32"], ["-ar", "-ao", "-s", config_path]):
                 with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
                     runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
             self.assertEqual(_FakeParallelize.instances, [])
+
+    def test_run_nd_cli_states_the_overlap_and_calibrates_the_link(self) -> None:
+        """
+        Feature: run_nd --host_link_overlap, and -c with -ao.
+        Description: Ask for offload with an overlap stated and a ratios
+            file, then with a ratios file that also states a FORWARD ratio
+            and a copy cost of 0; then the overlap without offload, a copy
+            cost without offload, offload with a ratios file that states no
+            COMPUTE ratio, and one whose FORWARD ratio is 0.
+        Expectation: The search gets the device's link with the overlap and
+            the file's FORWARD ratio replacing its own where it states one,
+            else its COMPUTE ratio, the COMPUTE ratio for the copies' cost,
+            and A3's measured cost of 2.8 ms a GiB unless one is stated; the
+            last four command lines are refused before any search is built.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            files = {}
+            for name, ratios in (("ratios", {"COMPUTE": 6.4e-11}),
+                                 ("forward", {"COMPUTE": 6.4e-11, "FORWARD": 2.3e-11}),
+                                 ("other", {"DP_COMM": 1e-11}),
+                                 ("zero", {"COMPUTE": 6.4e-11, "FORWARD": 0.0})):
+                files[name] = os.path.join(tmp_dir, f"{name}.json")
+                with open(files[name], "w", encoding="utf-8") as fh:
+                    json.dump(ratios, fh)
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-l", "DP", "MP", "-v", "0", "-A", "A3"]
+            for name, ratio, cost in (("ratios", 6.4e-11, []), ("forward", 2.3e-11, ["--host_link_cost", "0"])):
+                _FakeParallelize.instances = []
+                with patch.object(sys, "argv",
+                                  argv + ["-ar", "-ao", "--host_link_overlap", "1", "-c", files[name]] + cost):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                figures = {"overlap": 1.0, "ms_per_unit": ratio, "score_ms_per_unit": 6.4e-11}
+                if cost:
+                    figures["copy_cost_ms_per_gib"] = 0.0
+                self.assertEqual(_FakeParallelize.instances[-1].kwargs["host_link"],
+                                 Hard.HostLink.of(Hard.Device_A3.host_link, figures))
+            self.assertEqual(Hard.Device_A3.host_link.copy_cost_ms_per_gib, 2.8)
+            _FakeParallelize.instances = []
+            for extra in (["-ar", "--host_link_overlap", "1"], ["-ar", "--host_link_cost", "1"],
+                          ["-ar", "-ao", "-c", files["other"]], ["-ar", "-ao", "-c", files["zero"]]):
+                with patch.object(sys, "argv", argv + extra), self.assertRaises(SystemExit):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(_FakeParallelize.instances, [])
+
+    def test_run_nd_cli_hyper_v2_offloads_in_a_mode_per_layer(self) -> None:
+        """
+        Feature: run_nd -ao with a search config.
+        Description: A search config choosing a recompute mode per layer, run
+            with -ao, an overlap and a ratios file, whose best configuration
+            offloads part of its first layer; then one choosing one mode for
+            every layer, run with -ao.
+        Expectation: The first search is handed the figures the CLI states,
+            None for those left to the device, and the log states what the
+            offloaded layer moves; the second is refused before it searches.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml, search_yaml, ratios = (os.path.join(tmp_dir, name)
+                                               for name in ("train.yaml", "search.yaml", "ratios.json"))
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+            with open(ratios, "w", encoding="utf-8") as fh:
+                json.dump({"COMPUTE": 6.4e-11}, fh)
+            fake_result = {
+                "dp": 2, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                "micro_batch_num": 1, "memory_estimate_mb": 100.0, "score": 1.0,
+                "activation_checkpoint": "full", "activation_checkpoint_layers": {"0": "off"},
+                "offloaded_layers": ["0"], "offloaded_gib": {"0": 3.92}, "offloaded_share": {"0": 0.71},
+            }
+            outcomes, lines = [], []
+            for strategy in ("per_layer", "auto"):
+                config = SimpleNamespace(resolved_strategy=None, estimator={"recompute_strategy": strategy},
+                                         cluster_spec={}, constraint={})
+                with patch("hyper_parallel.auto_parallel.config_adapter.read_search_config", return_value=config), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.validate", return_value=[]), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                              return_value=fake_result) as mock_search, \
+                        patch("hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml"):
+                    argv = ["run_nd.py", "-f", "hyper_v2", "-y", train_yaml, "-s", search_yaml, "-o", tmp_dir,
+                            "-v", "0", "-ao", "--host_link_overlap", "1", "-c", ratios]
+                    with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as exc_info, \
+                            patch.object(nd_logger, "output") as output:
+                        runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                outcomes.append((exc_info.exception.code, mock_search.call_args))
+                lines += [call.args[0] % call.args[1:] for call in output.call_args_list
+                          if str(call.args[0]).startswith("Offloaded")]
+        self.assertEqual(outcomes[0][0], 0)
+        self.assertEqual(outcomes[0][1].kwargs["offload"],
+                         {"gib_per_s": None, "sustained_tflops": None, "overlap": 1.0, "ms_per_unit": 6.4e-11,
+                          "score_ms_per_unit": 6.4e-11, "copy_cost_ms_per_gib": None})
+        self.assertEqual(outcomes[1], (2, None))
+        self.assertIn("layers 0 (3.92 GiB a micro-batch, 71% of what it keeps). The trainer runs no offload yet",
+                      "\n".join(lines))
 
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """
