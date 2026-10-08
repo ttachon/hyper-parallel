@@ -50,6 +50,29 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
 # logger.setLevel(proc.SUBDEBUG)
 
 
+def state_machine_links(ccfg: Any, device: Any) -> None:
+    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths (B5).
+
+    The CP check, its topology penalty and the CP cost read them off the
+    config, where nothing assigned them, so they held the config's defaults,
+    8 ranks a node, 400 and 25 GB/s, whatever machine was chosen.  The node
+    is the device's first level and its links the first two levels'
+    bandwidths, the second level's falling back to the first's.
+
+    Args:
+        ccfg: The config the search prices; a multimodal one's submodules
+            take the same machine.
+        device: The machine's ``Hard.Type``; nothing is stated without one.
+    """
+    levels = list(getattr(device, "level_bandwidth", None) or [])
+    if device is None or not levels:
+        return
+    for cfg in [ccfg, *(getattr(ccfg, "mm_ccfgs", None) or {}).values()]:
+        cfg.device_per_node = device.intra_node_num()
+        cfg.bw_intra = levels[0]
+        cfg.bw_inter = levels[1] if len(levels) > 1 else levels[0]
+
+
 class ParallelizeLayer:
     """Parallelize one layer type"""
 
@@ -87,6 +110,7 @@ class ParallelizeLayer:
                                  "recompute from the config: give one of them")
 
         self.mem_eval = evaluator
+        state_machine_links(self.mem_eval._ccfg, getattr(machine, "device", None))
 
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)

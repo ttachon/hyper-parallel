@@ -2572,6 +2572,25 @@ class TestSappNDRunND(unittest.TestCase):
         dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
         self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
+    def test_the_search_states_its_machines_links(self) -> None:
+        """
+        Feature: state_machine_links (B5).
+        Description: A config and a multimodal one with a submodule, given
+            the A3 machine, then a config given no machine.
+        Expectation: Each config takes A3's 16 ranks a node and its 200 and
+            25 GB/s links, where every config kept 8, 400 and 25 whatever
+            the machine; without a machine nothing is stated.
+        """
+        plain, child = SimpleNamespace(), SimpleNamespace()
+        multimodal = SimpleNamespace(mm_ccfgs={"vision": child})
+        for cfg in (plain, multimodal):
+            Par.state_machine_links(cfg, Hard.Device_A3)
+        got = [(cfg.device_per_node, cfg.bw_intra, cfg.bw_inter) for cfg in (plain, multimodal, child)]
+        self.assertEqual(got, [(16, 200, 25)] * 3)
+        untouched = SimpleNamespace()
+        Par.state_machine_links(untouched, None)
+        self.assertEqual(vars(untouched), {})
+
     def test_a_strategy_keeps_the_runs_sequence_parallelism(self) -> None:
         """
         Feature: CostModelConfig.set_strategy, the sequence-parallel divisor (T1).
