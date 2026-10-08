@@ -365,10 +365,20 @@ class Plot:
     dbg_cols: list[str]
     top: int
 
-    def __init__(self, title, rows, debug_parts, top=None):
+    def __init__(
+        self,
+        title: Optional[str],
+        rows: list,
+        debug_parts: list,
+        top: Optional[int] = None,
+        show_top: bool = False,
+    ) -> None:
+        """Initialize the plot table, optionally displaying each configuration's rank."""
         self.title = title
         self.top = top if top is not None else 20
         self.row_title = rows + ["MEM"]
+        if show_top:
+            self.row_title.insert(0, "TOP")
         self.dbg_cols = list(map(str, debug_parts))
         self.col_title = []
         self.cell_text = []
@@ -436,8 +446,11 @@ class Plot:
         include_all = kwargs.get("include_all", False)
         min_e = configs_estimated[0][2]
         i = 0
-        for cfg_e in configs_estimated:
-            self.cell_text.append(cfg_e[0].values() + [cfg_e[1]])
+        for index, cfg_e in enumerate(configs_estimated):
+            cells = cfg_e[0].values() + [cfg_e[1]]
+            if self.row_title[0] == "TOP":
+                cells.insert(0, cfg_e[0].rank or index + 1)
+            self.cell_text.append(cells)
             self.col_title.append("")
             try:
                 self.data.append(
@@ -486,6 +499,8 @@ def plot_nd(
 
     Args:
         configs_estimated: Ranked configurations with memory, score and its parts.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
         output_path: Directory in which to save results.pdf.
         debug_parts: Performance components to plot.
         title: Optional plot title.
@@ -494,7 +509,8 @@ def plot_nd(
         top_result_count: Number of normal results preceding the additions.
     """
     plot = Plot(
-        title, configs_estimated[0][0].keys(), debug_parts, top=max_num
+        title, configs_estimated[0][0].keys(), debug_parts,
+        top=max_num, show_top=True,
     )
     plot.parse_data(configs_estimated, include_all=include_all)
 
@@ -536,7 +552,8 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
 
     Args:
         scored_space: ``(config, memory, score, parts)`` entries, as
-            ``ParallelizeLayer.order_search_space`` sorts them.
+            ``ParallelizeLayer.order_search_space`` sorts them. Stored ranks
+            are preserved; unranked configurations use their input positions.
         path: CSV file to write; its directory is created when missing.
     """
     parts = _score_parts()
@@ -549,7 +566,7 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
                         + [str(part) for part in parts])
         for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
             split = [repr(float(value)) for value in values] if values else [""] * len(parts)
-            writer.writerow([rank] + config.values() + ([config.recompute] if moded else [])
+            writer.writerow([config.rank or rank] + config.values() + ([config.recompute] if moded else [])
                             + [memory, repr(float(score))] + split)
 
 

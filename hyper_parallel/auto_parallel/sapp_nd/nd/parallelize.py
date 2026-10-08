@@ -938,6 +938,8 @@ class ParallelizeLayer:
         scored_space, dbg, generation, ordering = self._search_and_order(
             yaml_folder, threads_num, cache_file
         )
+        for rank, entry in enumerate(scored_space, start=1):
+            entry[0].rank = rank
         if ranking_csv:
             Debug.write_ranking_csv(scored_space, ranking_csv)
             logger.output(
@@ -1269,8 +1271,16 @@ def space_to_string(
     debug_parts: Any = None,
     heading: Optional[str] = None,
 ) -> str:
-    """Space printer"""
-    i = 0
+    """Format ranked configurations for CLI output.
+
+    Args:
+        space: Configurations with memory, performance score and score components.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
+        max_num: Maximum number of configurations to print.
+        debug_parts: Performance components to name in the header.
+        heading: Optional heading replacing the default top-results heading.
+    """
     s = ""
     if heading is not None:
         s += heading + ":\n"
@@ -1282,7 +1292,7 @@ def space_to_string(
         return s
     # A search with a recompute dimension names each entry's mode after its degrees.
     moded = any(getattr(entry[0], "recompute", None) for entry in space)
-    s += "\t"
+    s += "\tTOP   "
     for d in space[0][0].all_dims:
         s += str(d) + " " * (6 - len(str(d)))
     if moded:
@@ -1292,10 +1302,10 @@ def space_to_string(
         for dbg_part in debug_parts:
             s += "\t" + dbg_part.short_name()
     s += "\n"
-    for config in space:
+    for i, config in enumerate(space):
         if max_num is not None and max_num == i:
             break
-        s += "\t"
+        s += f"\t{config[0].rank or i + 1:<6}"
         for v in config[0].values():
             s += v + " " * (6 - len(v))
         if moded:
@@ -1305,7 +1315,6 @@ def space_to_string(
         for v in config[3]:
             s += f"\t{(100*v/config[2]):.2f}%"
         s += "\n"
-        i += 1
     return s
 
 

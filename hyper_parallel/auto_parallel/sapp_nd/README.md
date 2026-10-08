@@ -273,13 +273,19 @@ The console prints `Additional exhaustive configurations` after the top
 results when `-t` is supplied, followed by the number of unique plot additions.
 The plot retains performance order and draws a black vertical divider between
 the normal results and the additions when both groups are present. The divider
-is omitted when there are no additions. Each column's estimated peak memory
+is omitted when there are no additions. The first table row, `TOP`, shows each
+configuration's one-based position in the full performance ranking of all
+configurations that fit memory. The CLI tables also start with a `TOP` column
+using the same global positions for both the top and additional results.
+Additions retain their global ranks even when intermediate results are skipped
+in the plot or additional-results table. Each column's estimated peak memory
 appears in the `MEM` row below the performance bars.
 
 Use a fresh output directory for each run: `debug.csv` and `debug_mem.csv`
 append rows to existing files, while `results.pdf` is replaced. The full
 ranking of configurations that fit memory remains available through
-`--ranking_csv`, independently of the displayed selection.
+`--ranking_csv`, independently of the displayed selection. Its `rank` column
+contains the same global positions as `TOP` in the CLI and plot.
 
 ## Comparing with a Profiled Run
 
