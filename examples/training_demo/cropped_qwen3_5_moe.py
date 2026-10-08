@@ -41,6 +41,7 @@ def build_cropped_qwen3_5_moe(
         compile_config: CompileConfig | dict[str, Any] | None = None,
         activation_checkpoint: str | None = None,
         activation_checkpoint_layer_ranges: list[dict[str, Any]] | None = None,
+        activation_checkpoint_layers: dict[int | str, str] | None = None,
         activation_swap: str = "none",
 ) -> PreTrainedModel:
     """Create a Qwen3.5-MoE model with fewer decoder layers and random weights.
@@ -78,6 +79,9 @@ def build_cropped_qwen3_5_moe(
         activation_checkpoint_layer_ranges: The layer ranges that run another
             recompute mode than ``activation_checkpoint``, as the trainer's
             ``activation_checkpoint.layer_ranges`` states them, or None.
+        activation_checkpoint_layers: The layers that run another recompute
+            mode than ``activation_checkpoint``, as the trainer's
+            ``activation_checkpoint.layers`` states them, or None.
         activation_swap: Activation swap mode.
 
     Returns:
@@ -130,5 +134,6 @@ def build_cropped_qwen3_5_moe(
         compile_config=compile_config,
         activation_checkpoint=activation_checkpoint,
         activation_checkpoint_layer_ranges=activation_checkpoint_layer_ranges,
+        activation_checkpoint_layers=activation_checkpoint_layers,
         activation_swap=activation_swap,
     )

@@ -23,10 +23,13 @@ import importlib
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.distributed.activation_checkpoint import (
+    normalize_activation_checkpoint_layers,
+)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -89,16 +92,30 @@ class ActivationCheckpointLayerRange:
 class ActivationCheckpointConfig:
     """Activation-checkpoint options exposed by the initial YAML schema.
 
-    ``swap_inputs`` is consumed only when ``mode`` or a layer range enables
-    checkpointing. ``layer_ranges`` overrides ``mode`` for the listed layers.
+    ``swap_inputs`` is consumed only when ``mode``, ``layers`` or a layer range
+    recomputes a block.
+
+    ``layers`` runs some transformer blocks in another mode than ``mode``,
+    which every block it does not name runs. Its keys are block indices, or
+    inclusive ranges written ``"first-last"``, and its values are ``"off"``,
+    ``"full"`` or ``"selective"``. With ``mode: full`` and ``layers: {6-7:
+    off}``, blocks 6 and 7 keep their activations and every other block is
+    recomputed; in a model of 8 blocks, ``mode: off`` with ``layers: {0-5:
+    full}`` is the same plan.
+
+    ``layer_ranges`` overrides ``mode`` for the listed layers too, as ranges of
+    ``first`` and ``count``, and recomputes each through Hyper Parallel's own
+    checkpoint wrapper, where ``layers`` keeps HuggingFace's native
+    checkpointing for the fully recomputed blocks. A config states one of them.
     """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
     layer_ranges: Optional[List[ActivationCheckpointLayerRange]] = None
+    layers: Optional[Dict[Union[int, str], str]] = None
 
     def __post_init__(self) -> None:
-        """Reject invalid swap flags and overlapping layer ranges."""
+        """Reject invalid swap flags, an invalid per-layer plan or layer ranges, and both at once."""
         if self.mode not in (None, "off", "full", "selective"):
             raise ValueError(
                 "activation_checkpoint.mode must be off, full, selective or null; "
@@ -106,8 +123,14 @@ class ActivationCheckpointConfig:
             )
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        self.layers = normalize_activation_checkpoint_layers(self.mode, self.layers)
         if self.layer_ranges is None:
             return
+        if self.layers:
+            raise ValueError(
+                "activation_checkpoint.layers and activation_checkpoint.layer_ranges both give "
+                "layers a mode of their own: state one of them"
+            )
         if not isinstance(self.layer_ranges, list):
             raise TypeError("activation_checkpoint.layer_ranges must be a list or null")
 

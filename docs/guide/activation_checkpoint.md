@@ -170,6 +170,21 @@ activation_checkpoint:
 `count` 可省略或设为 `null`，表示从 `first` 延伸到最后一层，且只能用于最后一个区间。
 将区间模式设为 `off` 可覆盖全局 `full` 或 `selective` 模式，在指定层关闭重计算。
 
+`activation_checkpoint.layers` 以映射写出同样的按层模式：键为层索引或闭区间 `"first-last"`，
+值为 `off`、`full` 或 `selective`，未列出的层使用 `activation_checkpoint.mode`。自动并行搜索
+（`recompute: per_layer`）按此格式把选出的方案写入 `resolved.yaml`。
+
+```yaml
+activation_checkpoint:
+  mode: full
+  layers:
+    3-7: 'off'
+```
+
+两种写法的区别在于包裹方式：`layers` 中整层重计算的层沿用 HuggingFace 原生的梯度检查点，
+`layer_ranges` 中每个重计算的层都由 Hyper Parallel 自己的 `checkpoint_wrapper` 包裹。
+同一配置只能使用其中一种，两者同时给出时会报错。
+
 ### 5. 单 tensor 卸载
 
 `swap_tensor_wrapper` 适用于只想卸载某几个明确的大激活 tensor。它需要在模块的 `forward` / `construct` 内部调用，会把其中符合条件的 tensor 注册到当前 swap group 中，等待后续 offload / prefetch 调度。

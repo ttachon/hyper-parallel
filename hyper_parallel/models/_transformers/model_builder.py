@@ -42,6 +42,8 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
+    activation_checkpoint_recomputes,
+    normalize_activation_checkpoint_layers,
 )
 from hyper_parallel.distributed.attention_swap import (
     apply_attention_swap,
@@ -358,6 +360,7 @@ def _apply_activation_features(
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
     activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
+    activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
     has_layer_checkpoint = bool(activation_checkpoint_layer_ranges)
@@ -365,17 +368,23 @@ def _apply_activation_features(
         isinstance(layer_range, Mapping) and layer_range.get("mode", "off") != "off"
         for layer_range in activation_checkpoint_layer_ranges or ()
     )
-    if activation_checkpoint not in (None, "off") or has_layer_checkpoint:
+    # A plan is applied even on top of mode off, which then recomputes only
+    # the blocks the plan names.
+    plan = normalize_activation_checkpoint_layers(activation_checkpoint, activation_checkpoint_layers)
+    if activation_checkpoint not in (None, "off") or has_layer_checkpoint or plan:
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
             layer_ranges=activation_checkpoint_layer_ranges,
+            layers=activation_checkpoint_layers,
         )
     effective_checkpoint = activation_checkpoint
-    if effective_checkpoint in (None, "off") and has_active_layer_checkpoint:
-        effective_checkpoint = "layerwise"
+    if effective_checkpoint in (None, "off") and (
+        has_active_layer_checkpoint or activation_checkpoint_recomputes(effective_checkpoint, plan)
+    ):
+        effective_checkpoint = "per_layer"
     validate_attention_swap(
         activation_swap,
         activation_checkpoint=effective_checkpoint,
@@ -422,6 +431,7 @@ def apply_model_infrastructure(
     activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
+    activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -479,6 +489,7 @@ def apply_model_infrastructure(
         mesh,
         swap_inputs=swap_inputs,
         activation_checkpoint_layer_ranges=activation_checkpoint_layer_ranges,
+        activation_checkpoint_layers=activation_checkpoint_layers,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.

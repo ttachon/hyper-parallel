@@ -30,6 +30,7 @@ Features:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from abc import ABC
@@ -100,6 +101,43 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
+
+
+def _activation_checkpoint_layer_kwargs(
+    model_target: Any,
+    layers: Optional[Dict[Any, str]],
+) -> Dict[str, Any]:
+    """Carry a per-layer activation checkpoint plan to the model target.
+
+    The plan is passed only when one is set, so a model target written before
+    it existed builds unchanged. ``Target.build`` drops an argument its target
+    does not declare, so a target that cannot receive the plan is refused
+    rather than left to train without it.
+
+    Args:
+        model_target: The configured model ``Target``.
+        layers: ``activation_checkpoint.layers``, or ``None``.
+
+    Returns:
+        The keyword arguments to add to the model build.
+
+    Raises:
+        ValueError: A plan is set and the target takes no
+            ``activation_checkpoint_layers`` argument.
+    """
+    if not layers:
+        return {}
+    parameters = inspect.signature(model_target.callable).parameters.values()
+    if not any(
+        parameter.name == "activation_checkpoint_layers"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        raise ValueError(
+            "activation_checkpoint.layers is set, but the model target takes no "
+            "activation_checkpoint_layers argument"
+        )
+    return {"activation_checkpoint_layers": layers}
 
 
 class BaseTrainer(Stateful, ABC):
@@ -285,14 +323,13 @@ class BaseTrainer(Stateful, ABC):
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
+        layer_ranges = getattr(self.config.activation_checkpoint, "layer_ranges", None)
         self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
             activation_checkpoint=self.config.activation_checkpoint.mode,
             activation_checkpoint_layer_ranges=(
-                [item.to_dict() for item in self.config.activation_checkpoint.layer_ranges]
-                if self.config.activation_checkpoint.layer_ranges is not None
-                else None
+                [item.to_dict() for item in layer_ranges] if layer_ranges is not None else None
             ),
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
             activation_swap=self.config.activation_swap,
@@ -300,6 +337,10 @@ class BaseTrainer(Stateful, ABC):
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
+            **_activation_checkpoint_layer_kwargs(
+                self.config.model,
+                getattr(self.config.activation_checkpoint, "layers", None),
+            ),
         )
         self.model_config = self.model.config
         if self.global_rank == 0:

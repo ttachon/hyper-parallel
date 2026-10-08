@@ -183,6 +183,37 @@ class TestConfigOverrides(unittest.TestCase):
         ):
             self._parse("--model.width=[unclosed")
 
+    def test_activation_checkpoint_layer_plan(self) -> None:
+        """A per-layer plan resolves from an override and is stored one way."""
+        config = self._parse(
+            "--activation_checkpoint.mode=full",
+            "--activation_checkpoint.layers={6-7: off, 0: selective}",
+        )
+        layers = config.activation_checkpoint.layers
+        self.assertEqual(
+            layers, {"0": "selective", "6-7": "off"},
+            msg=f"case: layer_plan_override, layers={layers!r}")
+
+    def test_activation_checkpoint_layer_plan_on_mode_off(self) -> None:
+        """On top of the default mode off, a plan names the layers to recompute."""
+        config = self._parse("--activation_checkpoint.layers={0-2: full}")
+        checkpoint = config.activation_checkpoint
+        self.assertEqual(
+            (checkpoint.mode, checkpoint.layers), ("off", {"0-2": "full"}),
+            msg=f"case: layer_plan_on_mode_off, checkpoint={checkpoint!r}")
+
+    def test_activation_checkpoint_layer_plan_needs_a_mode(self) -> None:
+        """A plan does not let an unknown mode through: the mode's own type refuses it first."""
+        with self.assertRaisesRegex(
+            ValueError,
+            r"activation_checkpoint\.mode: expected one of \('off', 'full', 'selective'\), got 'swap'",
+            msg="case: layer_plan_unknown_mode",
+        ):
+            self._parse(
+                "--activation_checkpoint.mode=swap",
+                "--activation_checkpoint.layers={0: full}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

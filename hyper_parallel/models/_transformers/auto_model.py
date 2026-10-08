@@ -19,7 +19,7 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
-from typing import Any, Literal, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import torch
 from transformers import (
@@ -92,6 +92,7 @@ class _BaseHyperAutoModelClass:
         activation_checkpoint: Optional[str] = None,
         activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
         swap_inputs: bool = False,
+        activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
@@ -146,6 +147,7 @@ class _BaseHyperAutoModelClass:
             activation_checkpoint=activation_checkpoint,
             activation_checkpoint_layer_ranges=activation_checkpoint_layer_ranges,
             swap_inputs=swap_inputs,
+            activation_checkpoint_layers=activation_checkpoint_layers,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             **kwargs,
@@ -170,6 +172,7 @@ class _BaseHyperAutoModelClass:
         activation_checkpoint: Optional[str] = None,
         activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
         swap_inputs: bool = False,
+        activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
@@ -211,6 +214,7 @@ class _BaseHyperAutoModelClass:
             activation_checkpoint=activation_checkpoint,
             activation_checkpoint_layer_ranges=activation_checkpoint_layer_ranges,
             swap_inputs=swap_inputs,
+            activation_checkpoint_layers=activation_checkpoint_layers,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             **kwargs,
@@ -240,6 +244,7 @@ class _BaseHyperAutoModelClass:
         activation_checkpoint: Optional[str] = None,
         activation_checkpoint_layer_ranges: Optional[list[dict[str, Any]]] = None,
         swap_inputs: bool = False,
+        activation_checkpoint_layers: Optional[Dict[Union[int, str], Any]] = None,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs,
@@ -312,6 +317,7 @@ class _BaseHyperAutoModelClass:
             activation_checkpoint=activation_checkpoint,
             activation_checkpoint_layer_ranges=activation_checkpoint_layer_ranges,
             swap_inputs=swap_inputs,
+            activation_checkpoint_layers=activation_checkpoint_layers,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
         )
