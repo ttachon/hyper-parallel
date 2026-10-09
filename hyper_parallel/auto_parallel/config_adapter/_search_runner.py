@@ -574,9 +574,14 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
         fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
         configured_fsdp = config.constraint.get("fixed_fsdp_degree")
         result["dp_shard"] = int(configured_fsdp or fsdp_candidates[0])
-    dp_shard = max(1, min(int(result["dp_shard"]), total_dp))
+    # The yaml the search prices is AutoModels-shaped, whose FSDP domain is
+    # DP times CP: the shard may span it, and the trainer replicates the rest
+    # (MeshContext.build_meshs).  Bounded by DP, a shard the search priced
+    # under CP was cut back and its replicas undercounted.
+    domain = total_dp * max(1, int(result.get("cp") or 1))
+    dp_shard = max(1, min(int(result["dp_shard"]), domain))
     result["dp_shard"] = dp_shard
-    result["dp_replicate"] = max(1, total_dp // dp_shard)
+    result["dp_replicate"] = max(1, domain // dp_shard)
     return result
 
 

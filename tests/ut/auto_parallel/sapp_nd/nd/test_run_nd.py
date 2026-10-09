@@ -762,6 +762,14 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(global_config.range_space(Dim.PP, 3), range(1, 4))
         self.assertEqual(global_config.bool_space(Dim.SP), [False, True])
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
+        # HyperParallel's shard spans DP x CP, so under CP it reaches that
+        # domain; a legacy schema's stays within DP (C1).
+        got = []
+        for spans in (True, False):
+            fake_ccfg.shard_spans_cp = spans
+            got.append(global_config.max_op(dp=4, tp=2, ep=1, cp=2))
+        fake_ccfg.shard_spans_cp = False
+        self.assertEqual(got, [8, 4])
 
         Dim.TP.set_bound(2)
         try:
@@ -823,6 +831,28 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(said.call_count, 1)
         self.assertEqual(said.call_args.args[1], "glm4_moe")
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
+
+    def test_hyperparallel_spreads_experts_over_dp_cp_and_tp(self) -> None:
+        """
+        Feature: GlobalConfig.max_ep and moe_valid (F3 of Nelson's review).
+        Description: 64 experts at DP 4, TP 2 and CP 2 with EP 16, wider than
+            DP x TP: under HyperParallel, whose expert mesh spans DP x CP x TP,
+            then under a legacy schema.
+        Expectation: HyperParallel's bound is that domain's 16 ranks, so EP 16
+            is generated and valid, where the search stopped at DP x TP's 8
+            and refused it; a legacy schema keeps DP x TP.
+        """
+        ccfg = _FakeCostModelConfig()
+        ccfg.n_exp = 64
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = ccfg
+        global_config.dimensions = Dim.ALL_DIMS.copy()
+        parallel_config = global_config.make_parallel_config((4, 2, 1, 2), (1, 1), (16, 1, 1, False))
+        got = []
+        for spans in (True, False):
+            ccfg.shard_spans_cp = spans
+            got.append((global_config.max_ep(dp=4, tp=2, cp=2), global_config.moe_valid(parallel_config)))
+        self.assertEqual(got, [(16, True), (8, False)])
 
     def test_ep_constraints_valid_in_global_config(self) -> None:
         """
@@ -1558,7 +1588,7 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: run_nd --real_csv on a strategy the cost model cannot represent.
         Description: Two measured configurations, one refused the way the MoE parser
-            refuses expert parallelism wider than DP x TP; then both refused.
+            refuses expert parallelism wider than its stage; then both refused.
         Expectation: The other is still estimated and the refused one is named; a
             CSV none of whose configurations ND can cost is an error.
         """
@@ -1785,6 +1815,26 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.custom_cm(cm_cfg)
         self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
         self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
+
+    def test_t5_states_the_tp_gathers_its_embedding_and_output_run(self) -> None:
+        """
+        Feature: custom_t5, the model's own config (I15).
+        Description: A T5 config through its family hook, then through the
+            encoder's and the decoder's group hooks.
+        Expectation: The model states the 4 TP gathers every other family
+            states on it, which the communication walk prices the embedding
+            and the output layer with, where it stated none and they read 0;
+            the encoder's and the decoder's layers keep their 4 and 6.
+        """
+        t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
+        ArchHooks.custom_t5(t5_cfg)
+        self.assertEqual(vars(t5_cfg).get("n_gather"), 4)
+        wrap = ArchHooks.CWrap(t5_cfg)
+        gathers = []
+        for _, hook in t5_cfg.layer_custom_config:
+            hook(wrap)
+            gathers.append(t5_cfg.n_gather)
+        self.assertEqual(gathers, [4, 6])
 
     def test_an_fsdp_run_keeps_gradients_as_its_parameters(self) -> None:
         """
@@ -2552,6 +2602,48 @@ class TestSappNDRunND(unittest.TestCase):
         dropped = sorted(op for op, keep in vars(selective.rec_op).items() if not keep)
         self.assertEqual(dropped, ["headCast"], f"recomputed at TP 1: {dropped}")
 
+    def test_the_search_states_its_machines_links(self) -> None:
+        """
+        Feature: state_machine_links (B5).
+        Description: A config and a multimodal one with a submodule, given
+            the A3 machine, then a config given no machine.
+        Expectation: Each config takes A3's 16 ranks a node and its 200 and
+            25 GB/s links, where every config kept 8, 400 and 25 whatever
+            the machine; without a machine nothing is stated.
+        """
+        plain, child = SimpleNamespace(), SimpleNamespace()
+        multimodal = SimpleNamespace(mm_ccfgs={"vision": child})
+        for cfg in (plain, multimodal):
+            Par.state_machine_links(cfg, Hard.Device_A3)
+        got = [(cfg.device_per_node, cfg.bw_intra, cfg.bw_inter) for cfg in (plain, multimodal, child)]
+        self.assertEqual(got, [(16, 200, 25)] * 3)
+        untouched = SimpleNamespace()
+        Par.state_machine_links(untouched, None)
+        self.assertEqual(vars(untouched), {})
+
+    def test_a_strategy_keeps_the_runs_sequence_parallelism(self) -> None:
+        """
+        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor (T1).
+        Description: The DeepSeek MindFormers yaml at TP 4 without sequence
+            parallelism and with it, each moved to TP 2; then a searched
+            candidate at TP 2 stating SP off and on.
+        Expectation: The divisor follows the run's choice at the new TP, 1
+            without and 2 with, where the strategy setter set it to TP for
+            every candidate; a candidate that states SP decides it.
+        """
+        with open(config_path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        got = []
+        for use_sp in (False, True):
+            data["parallel_config"]["use_seq_parallel"] = use_sp
+            cfg = CostModelConfig(copy.deepcopy(data))
+            cfg.set_strategy(mp=2)
+            got.append(cfg.sp)
+            for stated in (False, True):
+                cfg.set_strategy(mp=2, sp=stated)
+                got.append(cfg.sp)
+        self.assertEqual(got, [1, 1, 2, 2, 1, 2])
+
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""
         child = copy.copy(cost_cfg)
@@ -2752,6 +2844,68 @@ class TestSappNDRunND(unittest.TestCase):
         with patch.object(PreProcess, "UNSET_READS", reads), patch.object(Par.logger, "output") as output:
             runner.run_generation_to_ordering(None)
         self.assertTrue(any("n_gather by comm.py:tp" in call.args[0] for call in output.call_args_list))
+
+    def test_a_ranking_says_when_it_prices_another_recompute_than_the_runs(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute (H1).
+        Description: A search whose balancing gives every candidate full
+            recompute, for a run training selective, off and full; then the
+            selective run searched with -mppb, and over a recompute dimension.
+        Expectation: The line under the table names selective and off, the
+            two modes the search did not price; it says nothing for full,
+            under -mppb, or over a recompute dimension, which price the
+            run's own.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.batch_reachable = lambda: True
+        runner.set_recompute_mode = lambda mode: None
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: (
+            [(Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP]), 100, 2.5, [])], [])
+        said = []
+        for mode, from_config, modes in (("selective", False, None), ("off", False, None), ("full", False, None),
+                                         ("selective", True, None), ("selective", False, ("off", "full"))):
+            runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=from_config), dimensions=[Dim.DP])
+            runner.recompute_modes = modes
+            runner.priced = lambda mode=mode: SimpleNamespace(stated_ac_mode=mode)
+            with patch.object(Par.logger, "output") as output:
+                runner.run_generation_to_ordering(None)
+            said.append([call.args[1] for call in output.call_args_list if "checkpoint mode is" in call.args[0]])
+        self.assertEqual(said, [["selective"], ["off"], [], [], []])
+
+    def test_a_ranking_names_the_mtp_layers_it_does_not_price(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth (I2).
+        Description: A search over one configuration of a model stating 3 MTP
+            layers the AutoModels trainer does not build, then of one stating
+            none.
+        Expectation: The line under the table names the 3 layers; with none,
+            nothing is said.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False), dimensions=[Dim.DP])
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        for dropped, said in ((3, 1), (0, 0)):
+            with self.subTest(dropped=dropped), patch.object(Par.logger, "output") as output:
+                runner.priced = lambda dropped=dropped: SimpleNamespace(mtp_unpriced=dropped)
+                runner.run_generation_to_ordering(None)
+                lines = [call.args[0] % call.args[1:] for call in output.call_args_list
+                         if "MTP layer(s)" in call.args[0]]
+                self.assertEqual(len(lines), said)
+                if said:
+                    self.assertIn("states 3 MTP layer(s)", lines[0])
 
     def test_the_search_counts_what_its_checks_refuse_apart_from_what_memory_drops(self) -> None:
         """

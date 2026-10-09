@@ -35,6 +35,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import E
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
+from hyper_parallel.auto_parallel.sapp_nd.nd.common import cost_model_preprocess as PreProcess
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation import estimate as estimate_module
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import (
@@ -134,6 +135,26 @@ class TestEstimatePerformance(unittest.TestCase):
                 self.assertGreater(debugger.info[Debug.PerfParts.MP_COMM], 0)
                 self.assertTrue(math.isclose(debugger.info[Debug.PerfParts.BUBBLE], 0.0, abs_tol=1e-12 * total))
 
+    def test_a_vision_language_models_towers_count_their_cast_and_activation(self):
+        """
+        Feature: estimate_performance on a multimodal model, its op counts.
+        Description: The same Qwen3-VL-MoE, estimated on A3 while the config
+            fields no parser set are recorded as they are read.
+        Expectation: No layer of either tower reads its score cast or its
+            feed-forward activation as unset: each is counted once a layer,
+            as on a model with one tower, where every layer of both towers
+            used to read them as 0 and priced the two ops at nothing.
+        """
+        reads = PreProcess.defaultdict(PreProcess.Counter)
+        with tempfile.TemporaryDirectory() as folder, patch(_HF_CONFIG, return_value=_vision_language()):
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as stream:
+                yaml.safe_dump(_vision_language_yaml(), stream)
+            ccfg = EvaluatorV2(path, framework="hyper_v2", log_level=0).ccfg
+            with patch.object(PreProcess, "UNSET_READS", reads):
+                estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A3)
+        self.assertEqual({"n_headCast", "n_ffAct"} & set(reads), set())
+
 
 class TestOpTable(unittest.TestCase):
     """Each op's load follows the tensor it runs over."""
@@ -230,6 +251,24 @@ class TestOpTable(unittest.TestCase):
         self.assertEqual(four["n_dispatch"], 4 * one["n_dispatch"])
         stated = SimpleNamespace(**{**vars(plain), "moe_dispatch": 2 * MOE_DISPATCH})
         self.assertEqual(_flavour_tables(stated)[1]["n_dispatch"], 2 * one["n_dispatch"])
+
+    def test_a_stated_dispatch_cost_of_zero_prices_no_dispatch(self):
+        """
+        Feature: _flavour_tables, a stated dispatch cost.
+        Description: The MoE layer of width 512 at expert parallel 4, with no
+            dispatch cost, with None, which is how the parser hands over a
+            run that states none, and with a stated 0.
+        Expectation: No cost and None keep the measured default; 0 prices no
+            dispatch at all, for a model whose compute does not grow with
+            the degree, where it used to fall back to the default.
+        """
+        plain = SimpleNamespace(**{**vars(_cfg(128)), "hff_exp": 64, "n_exp": 8, "n_chosen_exp": 2,
+                                   "cap_fact": 1, "n_shared_exp": 1, "n_ffMM": 3, "ep": 4})
+        default = _flavour_tables(plain)[1]["n_dispatch"]
+        self.assertEqual(default, MOE_DISPATCH * 128 * 512 * 2 * 4 * 2 / 2)
+        for stated, want in ((None, default), (0, 0)):
+            cfg = SimpleNamespace(**{**vars(plain), "moe_dispatch": stated})
+            self.assertEqual(_flavour_tables(cfg)[1]["n_dispatch"], want)
 
     def test_the_delta_rule_runs_in_chunks(self):
         """

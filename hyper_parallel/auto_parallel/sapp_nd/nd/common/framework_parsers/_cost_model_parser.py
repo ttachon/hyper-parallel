@@ -53,6 +53,20 @@ def runs_hyper_selective(ccfg: Any) -> bool:
     return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
+def param_cp(ccfg: Any) -> float:
+    """What CP's ranks divide a parameter's state by, beyond the shard stated for it.
+
+    The legacy schemas shard a parameter, its gradient and its optimizer
+    states over CP's ranks on top of the optimizer's, and a table they gather
+    is a CP rank's share of it.  HyperParallel's ``dp_shard_size`` already
+    spans the DP x CP domain, its dense FSDP mesh being
+    ``(dp_replicate, dp_shard, tp)`` over ``dp * cp`` ranks
+    (``MeshContext.build_meshs``), and the table it gathers is whole: so 1
+    there (``shard_spans_cp``), CP elsewhere (C1).
+    """
+    return 1 if getattr(ccfg, "shard_spans_cp", False) else ccfg.cp
+
+
 class _CostModelParser(ABC):
     """abstract parser class"""
 
@@ -118,9 +132,12 @@ class _CostModelParser(ABC):
         ``os_max_shard`` counts them, as MindSpore's ``optimizer_weight_shard_size``
         and HyperParallel's ``dp_shard`` do, on top of TP's sharding.  A count
         that does not divide DP shards over all of it, as MindSpore does.
+        HyperParallel's domain is DP times CP, which its shard spans
+        (:func:`param_cp`).
         """
+        domain = ccfg.d * (ccfg.cp if getattr(ccfg, "shard_spans_cp", False) else 1)
         ranks = int(ccfg.os_max_shard or 0)
-        return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
+        return ranks if ranks >= 1 and domain % ranks == 0 else domain
 
     @staticmethod
     def expert_dp_group(ccfg):
@@ -144,6 +161,19 @@ class _CostModelParser(ABC):
         """
         expert_tp = int(ccfg.etp) if ccfg.etp > 1 else 1
         return int(ccfg.d * ccfg.t * ccfg.cp) // int(expert_tp * ccfg.ep)
+
+    @staticmethod
+    def expert_dp_ranks(ccfg: Any) -> int:
+        """How many ranks hold the same slice of a routed expert, so reduce its gradient together.
+
+        The stage's ranks over EP and over the expert's tensor shard
+        ``t_exp``, whose ranks hold different slices: context parallelism's
+        ranks hold the same weights and reduce their gradients with the
+        data-parallel ones, where ``d_exp`` counts the latter alone outside an
+        expert tensor shard, and :meth:`expert_dp_group` counts TP's ranks
+        whatever slice they hold.
+        """
+        return max(1, int(ccfg.d * ccfg.t * ccfg.cp) // (max(1, int(ccfg.t_exp)) * max(1, int(ccfg.ep))))
 
     @staticmethod
     def routed_expert_shard(ccfg, ranks):
@@ -170,19 +200,20 @@ class _CostModelParser(ABC):
             return group
         if not stated:
             if not ccfg.has_op:
-                return ccfg.cp * ccfg.t_exp
+                return param_cp(ccfg) * ccfg.t_exp
             return group if ccfg.edp_group else ccfg.d_exp * ccfg.cp * ccfg.t_exp
         if ccfg.ep > 1:
             return math.gcd(int(stated), group)
-        return ranks * ccfg.cp * ccfg.t_exp
+        return ranks * param_cp(ccfg) * ccfg.t_exp
 
     def config_optimizer_shard(self, ccfg):
         """OP related variables; a routed expert is sharded as :meth:`routed_expert_shard` says."""
         # With optimizer sharding, a parameter is sharded over TP and then
-        # over the optimizer's data-parallel ranks.
+        # over the optimizer's data-parallel ranks, and over CP's where the
+        # stated shard does not span them already (param_cp).
         ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
         # Non expert params
-        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * ccfg.cp
+        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * param_cp(ccfg)
         ccfg.shard_p_os_non_exp = (
             (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
         )
@@ -243,15 +274,12 @@ class _CostModelParser(ABC):
             if ((ccfg.d == 1) or not ccfg.has_op)
             else (2 if not ccfg.has_grad_shard else 3)
         )  # data parallel comm factor
-        # Left on d_exp on purpose: this factor asks whether a rank shares its
-        # expert shard with another, which is the group's replicas, not the
-        # whole group, and edp_group counts TP's ranks as well.  Under context
-        # parallelism d_exp reads 1 where the group holds several, so the
-        # factor is still wrong there; it needs the replica count, which is
-        # the group over shard_p_os_exp.
+        # Whether another rank holds the same slice of a routed expert, as a
+        # shard or a copy, so that its gradient is reduced: d_exp left CP's
+        # ranks out and read 1 where they reduce it (X3).
         ccfg.comm_d_exp = (
             0
-            if ((ccfg.d_exp == 1) or not ccfg.has_op)
+            if ((_CostModelParser.expert_dp_ranks(ccfg) == 1) or not ccfg.has_op)
             else (2 if not ccfg.has_grad_shard else 3)
         )  # data parallel comm factor
         ccfg.comm_t = float(ccfg.t > 1)  # tensor parallel comm factor

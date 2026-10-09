@@ -175,7 +175,8 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.cp = self.config.tmp.cp
         cc.d = self.config.tmp.dp
         cc.ep = max(mod.expert_model_parallel_size, self.config.tmp.ep)
-        cc.sp = cc.t if mod.sequence_parallel else 1
+        cc.seq_parallel = bool(mod.sequence_parallel)
+        cc.sp = cc.t if cc.seq_parallel else 1
         if cc.cp > 1 and cc.sp > 1:
             logger.warning(
                 "sequence parallelism and context parallelism are both enabled"
@@ -310,9 +311,9 @@ class CostModelParserMindspeed(_CostModelParser):
         )  # data parallel comm factor
         cc.comm_d_exp = (
             0
-            if ((cc.d_exp == 1) or not cc.has_op)
+            if ((_CostModelParser.expert_dp_ranks(cc) == 1) or not cc.has_op)
             else (2 if not cc.has_grad_shard else 3)
-        )  # data parallel comm factor
+        )  # data parallel comm factor, CP's ranks included (X3)
         cc.comm_t = float(cc.t > 1)  # tensor parallel comm factor
         cc.comm_ep = float(
             cc.ep > 1 or cc.n_exp > 1

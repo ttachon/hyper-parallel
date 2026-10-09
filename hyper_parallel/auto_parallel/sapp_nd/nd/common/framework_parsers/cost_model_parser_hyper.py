@@ -254,6 +254,14 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override(), self._census_seq_len(), self._replacements()
         )
         if is_auto_models_schema(self.config):
+            # A stated depth looked priced and was not, and nothing said so
+            # (I2): a search repeats this under its ranking.
+            self.ccfg.mtp_unpriced = self._spec_int(spec, "mtp_depth")
+            if self.ccfg.mtp_unpriced:
+                logger.warning(
+                    "The model states %d MTP layer(s), which the AutoModels trainer does not build: "
+                    "ND prices none", self.ccfg.mtp_unpriced,
+                )
             spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
         if self._vision_spec and not self._builds_vision_tower():
@@ -781,6 +789,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
         )
+        self.ccfg.seq_parallel = use_sp
         self.ccfg.sp = self.ccfg.t if use_sp else 1
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
@@ -806,12 +815,14 @@ class CostModelParserHyperV2(_CostModelParser):
                 raise ValueError(f"context.expert_shard takes 'group' or nothing, not {rule!r}")
             self.ccfg.expert_shard_group = rule == "group"
             # What a MoE layer's token dispatch costs on this cluster.  A run
-            # that measured its own states the number; unstated, the estimate
-            # keeps the one measured on A3 (``estimate.MOE_DISPATCH``).
+            # that measured its own states the number, and a model whose
+            # compute does not grow with EP states 0, which switches the term
+            # off; unstated, the estimate keeps the one measured on A3
+            # (``estimate.MOE_DISPATCH``).
             stated = self._get_cfg_attr(ctx, "moe_dispatch", None)
             if stated is not None and float(stated) < 0:
                 raise ValueError(f"context.moe_dispatch takes a cost, not {stated!r}")
-            self.ccfg.moe_dispatch = float(stated) if stated is not None else 0
+            self.ccfg.moe_dispatch = float(stated) if stated is not None else None
 
     def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
         """Populate optimizer and gradient sharding settings.
@@ -834,6 +845,9 @@ class CostModelParserHyperV2(_CostModelParser):
                                                              "gradient_accumulation_shard",
                                                              False))
         self.ccfg.grads_as_params = True
+        # Its dp_shard_size spans the DP x CP domain, so CP shards no
+        # parameter state beyond it (EvalUtils.param_cp).
+        self.ccfg.shard_spans_cp = is_auto_models
         self.ccfg.accumulates_grads = True
         self.ccfg.reshards = self._reshards_params()
         # It adds each layer's reduce-scatter output to the accumulated
@@ -1003,6 +1017,10 @@ class CostModelParserHyperV2(_CostModelParser):
             stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
             where = "train.gradient_checkpointing.activation_checkpoint"
         ac_mode = read_activation_checkpoint_mode(stated, where)
+        # The mode the run trains with, which a search deriving its own
+        # recompute names under its ranking where the two differ (H1).
+        overridden = full_rec_override is not None or sel_rec_override is not None
+        self.ccfg.stated_ac_mode = None if overridden else ac_mode
 
         if full_rec_override is not None:
             self.ccfg.full_rec = full_rec_override

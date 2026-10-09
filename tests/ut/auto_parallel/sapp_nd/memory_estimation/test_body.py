@@ -805,6 +805,9 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ccfg.os_max_shard = os_max_shard
         ccfg.expert_shard = None
         ccfg.expert_shard_group = False
+        # The legacy schemas' rule, CP sharding parameter state on top of the
+        # optimizer's ranks; HyperParallel's states True (param_cp).
+        ccfg.shard_spans_cp = False
         return ccfg
 
     def test_a_run_that_shards_experts_over_their_whole_group(self):
@@ -913,6 +916,20 @@ class TestConfigOptimizerShard(unittest.TestCase):
                 _CostModelParser.config_optimizer_shard(None, ccfg)
                 self.assertEqual(ccfg.shard_p_os_non_exp_partial, want)
 
+    def test_a_shard_spanning_dp_and_cp_is_the_runs(self):
+        """BD-H07: HyperParallel's shard spans DP times CP (C1).
+
+        At DP 4 and CP 2, a shard of 8 ranks is the whole domain HyperParallel
+        shards over, where a count not dividing DP was read as DP's 4; under
+        the legacy rule it still is.
+        """
+        got = []
+        for spans in (True, False):
+            ccfg = self._make_parser_ccfg(n_exp=1, os_max_shard=8, d=4, cp=2)
+            ccfg.shard_spans_cp = spans
+            got.append(_CostModelParser.optimizer_ranks(ccfg))
+        self.assertEqual(got, [8, 4])
+
 
 class TestExpertDataParallelGroup(unittest.TestCase):
     """The ranks that hold the same experts, as the runtime's expert mesh spans them."""
@@ -961,6 +978,24 @@ class TestExpertDataParallelGroup(unittest.TestCase):
         ccfg = self._ccfg(d=2, t=1, cp=1, ep=16)
         with self.assertRaises(TypeError):
             _CostModelParser.config_dp_tp_exp(None, ccfg)
+
+    def test_context_parallel_ranks_reduce_an_experts_gradient(self):
+        """An expert's gradient is reduced over CP's ranks too (X3).
+
+        On 64 ranks with an optimizer shard: at CP 2, DP 32 and EP 32 leave
+        one DP rank over EP, but the two CP ranks hold the same experts and
+        reduce their gradients, so the expert's DP communication is priced,
+        where it read 0; at CP 1 and EP 64 no other rank holds them; at TP 2
+        without EP the TP ranks hold different slices and reduce nothing.
+        """
+        got = []
+        for d, t, cp, ep in ((32, 1, 2, 32), (64, 1, 1, 64), (1, 2, 1, 1)):
+            ccfg = self._ccfg(d=d, t=t, cp=cp, ep=ep)
+            ccfg.has_op, ccfg.has_grad_shard = True, False
+            _CostModelParser.config_dp_tp_exp(None, ccfg)
+            _CostModelParser.config_comm_flag(None, ccfg)
+            got.append(ccfg.comm_d_exp)
+        self.assertEqual(got, [2, 0, 0])
 
 
 if __name__ == "__main__":

@@ -74,7 +74,9 @@ GDN_CHUNK = 64
 # would name them, and until one exists read this as a calibration carrying
 # the measured shape, not as a model of the dispatch.  A cluster that has
 # measured its own says so with ``context.moe_dispatch``, as it states the
-# ratios of the parts in a file.
+# ratios of the parts in a file, and a model whose compute does not grow with
+# EP states 0, which prices no dispatch: DeepSeek V4.1's crop measures 3.3%
+# less compute at EP 16 than at EP 1, where ND with this term prices 60% more.
 MOE_DISPATCH = 1040
 # How far a stage's recorded parts may stray from its time: they are its time
 # taken apart, so only by rounding.
@@ -185,8 +187,8 @@ def _flavour_tables(cfg, attn=None):
     its activation function's entry the same experts, which run it at
     their width, where a dense layer's runs it at the dense width.  A MoE
     layer also dispatches its tokens, which the table prices apart
-    (:data:`MOE_DISPATCH`); a dense layer does not, so only the expert
-    table carries that entry.
+    (:data:`MOE_DISPATCH`, or the cost the run states, 0 pricing none); a
+    dense layer does not, so only the expert table carries that entry.
     """
     base = op_table(cfg, attn)
     exp = deepcopy(base)  # Verify this with MF MoEV2
@@ -198,7 +200,9 @@ def _flavour_tables(cfg, attn=None):
     exp["n_ffMM"] *= width / cfg.hff
     exp["n_ffBMM"] *= width / cfg.hff
     exp["n_ffAct"] *= experts / cfg.hff
-    dispatch = getattr(cfg, "moe_dispatch", 0) or MOE_DISPATCH
+    dispatch = getattr(cfg, "moe_dispatch", None)
+    if dispatch is None:
+        dispatch = MOE_DISPATCH
     exp["n_dispatch"] = (
         dispatch * cfg.b * cfg.s * cfg.h * max(1, cfg.n_chosen_exp)
         * max(1, getattr(cfg, "ep", 1) or 1) * cfg.bytes_p / cfg.t / cfg.cp
@@ -283,7 +287,13 @@ def efficiency(x):
 
 
 def throughput(precision_bytes, flop):
-    """assumes matrix"""
+    """assumes matrix
+
+    Only PerformanceType.TIME reaches this, and nothing in production asks
+    for it: the live estimate is a relative score whose scale the fitted
+    ratios own (A5).  Its precision_bytes**2 * 1e12 is no device's rate,
+    4 TFLOP/s at bf16, and no other rate is stated anywhere in ND.
+    """
     eff = efficiency(flop / (10.0**12))
     return precision_bytes**2 * (10.0**12) * eff
 
@@ -709,6 +719,18 @@ def _stage_parts(cfg, ccfg, stages, device_type, debugger):
     return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
 
 
+def _count_cast_and_activation(cfg):
+    """Count a layer's score cast and its feed-forward activation once each.
+
+    No parser and no family hook states either count; the estimate states
+    both on the config it walks, after its hooks.  A multimodal model is
+    walked on copies of its submodules, which a statement on the parent
+    never reached, so their layers read both as 0 (I14).
+    """
+    cfg.n_headCast = 1
+    cfg.n_ffAct = 1
+
+
 def _submodule_parts(cfg, ccfg, device_type, debugger):
     """A multimodal model's per-stage parts, every submodule's summed (F2).
 
@@ -731,6 +753,7 @@ def _submodule_parts(cfg, ccfg, device_type, debugger):
     for name in cfg.mm_order:
         sub = deepcopy(cfg.mm_ccfgs[name])
         check_and_apply_custom_hook(sub)
+        _count_cast_and_activation(sub)
         parts = _stage_parts(sub, ccfg, partitions[name], device_type, debugger)
         totals = parts if totals is None else tuple(
             [left + right for left, right in zip(*pair)] for pair in zip(totals, parts)
@@ -785,8 +808,7 @@ def estimate_performance(*args, **kwargs):
         stages = cfg.generate_partitions_vpp()
 
     cfg.n = cfg.d * cfg.t * cfg.p
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
+    _count_cast_and_activation(cfg)
 
     logger.debug(
         "perf_model: DP = %d, TP = %d, EP = %d, PP = %d, MB = %d",
@@ -838,4 +860,3 @@ def estimate_performance(*args, **kwargs):
 # TO-DO
 # Fix More Memory
 # Add Context Parallelism
-# Fix PerformanceType.TIME

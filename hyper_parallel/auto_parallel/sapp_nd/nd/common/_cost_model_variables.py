@@ -58,6 +58,12 @@ class _CostModVar:
     # False where the config states no training sequence length and the
     # parser costs the model's context limit in its place.
     seq_len_stated: bool = True
+    # The MTP layers the model states and the AutoModels trainer does not
+    # build, so that nothing prices them; 0 where none was dropped.
+    mtp_unpriced: int = 0
+    # The activation checkpoint mode the run trains with, the trainer's
+    # default included, where a HyperParallel parser read one; None elsewhere.
+    stated_ac_mode: str = None
 
     # Strategy
     d: float = 0
@@ -66,6 +72,14 @@ class _CostModVar:
     cp: float = 0
     ep: float = 1
     sp: float = 0
+    # Whether the run shards its sequence over TP, as its parser or a
+    # searched candidate states it; sp follows it at every TP.  None where
+    # nothing stated it, and sp then follows TP, as it always did.
+    seq_parallel: bool = None
+    # Whether the stated FSDP shard spans CP's ranks, as HyperParallel's
+    # dp_shard_size does, so that CP shards no parameter state beyond it
+    # (_cost_model_parser.param_cp); False keeps the legacy schemas' rule.
+    shard_spans_cp: bool = False
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
@@ -143,8 +157,9 @@ class _CostModVar:
     # result back (``_flavour_tables``).
     n_dispatch: float = 0
     # What that dispatch costs on this cluster, as ``context.moe_dispatch``
-    # states it; 0 leaves the measured default (``estimate.MOE_DISPATCH``).
-    moe_dispatch: float = 0
+    # states it: None, unstated, keeps the measured default
+    # (``estimate.MOE_DISPATCH``), and 0 prices no dispatch at all.
+    moe_dispatch: float = None
     # The ranks that hold the same experts, as the runtime's expert mesh spans
     # them; see ``_CostModelParser.expert_dp_group``.  ``d_exp`` is the older
     # per-CP, per-expert-TP-rank form of it and cannot carry CP.
