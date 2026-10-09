@@ -359,9 +359,11 @@ sapp_nd/
 ### Models
 
 - Transformer dense models, including Llama-series and Qwen-series up to Qwen 2.5.
-- Qwen3-series, including MoE variants. Models whose layers are not all the
-  same attention flavour (Qwen3.5's linear/full alternation) are costed as if
-  every layer were full attention.
+- Qwen3-series, including MoE variants, and Qwen3.5, whose stack alternates
+  linear and full attention: the model's `layer_types` names each layer's
+  kind, and each layer is priced as its kind. A model that states no
+  `layer_types`, or names a kind its op profile lacks, is priced as the
+  profile's default kind throughout.
 - Mixture-of-Experts models, including DeepSeekV3.
 - Multimodal models are in progress.
 
@@ -394,7 +396,11 @@ step, or take the vendor's figures; then state them in `hardware.py` or pass
 - `MB`: micro-batch number.
 - `MBS`: micro-batch size.
 - `VPP`: virtual pipeline parallelism.
-- `CP`: context parallelism is planned.
+- `CP`: context parallelism. Its time is what the algorithm exchanges each
+  layer: the keys and values ring and hybrid CP gather, the query, key, value
+  and output Ulysses all-to-alls, or a linear-attention layer's recurrent
+  state. Its memory is a rank's share of the sequence, plus the other ranks'
+  keys and values where the algorithm gathers them.
 
 ## Notes
 
