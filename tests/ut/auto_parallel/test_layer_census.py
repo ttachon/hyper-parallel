@@ -14,11 +14,14 @@
 # ============================================================================
 """Tests for the layer census, the records it states, and their pricing."""
 import functools
+import importlib
 import os
 import sys
 import tempfile
+import textwrap
+import types
 import unittest
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import patch
 
 import torch
@@ -29,8 +32,10 @@ from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
 from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=protected-access
     CensusUnavailable,
     KindActivations,
+    _delta_rule_held,
     _matmul_flops,
     _measure,
+    _positions,
     _RecomputedMatmuls,
     _selective_contexts,
     activations_from_dict,
@@ -44,6 +49,7 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_saved_ops,
     replacement_specs,
     tp_config,
+    delta_rule_module,
 )
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
@@ -80,6 +86,19 @@ def _qwen3():
 
 
 _STACK = [{"kind": "linear_attention", "count": 1}, {"kind": "full_attention", "count": 1}]
+
+_BY_NAME_MODELING = textwrap.dedent('''
+    import torch
+
+
+    def torch_chunk_gated_delta_rule(query, key, value, g=None, beta=None, **kwargs):
+        return value * 3, None
+
+
+    class GatedDeltaNet(torch.nn.Module):
+        def forward(self, hidden):
+            return torch_chunk_gated_delta_rule(hidden, hidden, hidden, g=hidden, beta=hidden)[0]
+''')
 
 
 class _Layer(torch.nn.Module):
@@ -294,6 +313,65 @@ class TestLayerCensus(unittest.TestCase):
         with patch.object(torch.ops, "aten", _AtenWithoutGroupedMM()):
             self.assertEqual(_matmul_flops(aten.mm.default, (left, right)), 2 * 4 * 8 * 2)
             self.assertEqual(_matmul_flops(aten.add.Tensor, (left, left)), 0)
+
+    def test_a_rotary_on_three_grids_gets_a_row_of_ids_for_each(self):
+        """
+        Feature: _positions, the position ids a layer's rotary embedding is handed.
+        Description: Both kinds of a Qwen3.5 layer censused with a rotary that
+            refuses a single row of ids, as Transformers 5.17 and 5.18 build
+            it, then a rotary on one grid.
+        Expectation: Each kind keeps what it keeps where the rotary expands
+            the row itself, so the census runs on either; the rotary on one
+            grid is handed the one row.
+        """
+        config = _qwen35_text()
+        expanding = [census_layer(config, index, 64) for index in (0, 1)]
+        rotary_cls = importlib.import_module(
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe").Qwen3_5MoeTextRotaryEmbedding
+        forward = rotary_cls.forward
+
+        def refusing(rotary: Any, hidden: torch.Tensor, position_ids: torch.Tensor) -> Any:
+            """The rotary as Transformers 5.17 builds it, which takes three rows of ids and no fewer."""
+            if position_ids.ndim != 3:
+                raise IndexError("too many indices for tensor of dimension 2")
+            return forward(rotary, hidden, position_ids)
+
+        with patch.object(rotary_cls, "forward", refusing):
+            self.assertEqual([census_layer(config, index, 64) for index in (0, 1)], expanding)
+        handed = []
+        _positions(lambda hidden, ids: handed.append(tuple(ids.shape)), torch.zeros(1, 8, 4), 8)
+        self.assertEqual(handed, [(1, 8)])
+
+    def test_the_delta_rule_is_reached_however_transformers_calls_it(self):
+        """
+        Feature: delta_rule_module and _delta_rule_held.
+        Description: A gated delta rule attention calling its modeling
+            module's torch_chunk_gated_delta_rule by name and holding no
+            rule, as Transformers 5.15 and later build it, one holding it, as
+            earlier versions did, and a plain projection.
+        Expectation: The first two run a delta rule and the projection none.
+            While the census holds the layer, the one calling by name runs
+            the rule the census gives it, through the attribute the census
+            follows; afterwards the name is its modeling module's own again.
+        """
+        modeling = types.ModuleType("_by_name_modeling")
+        exec(_BY_NAME_MODELING, modeling.__dict__)  # pylint: disable=exec-used
+        by_name = modeling.__dict__["GatedDeltaNet"]()
+        holding = torch.nn.Linear(2, 2)
+        holding.chunk_gated_delta_rule = modeling.torch_chunk_gated_delta_rule
+        self.assertEqual([delta_rule_module(module) for module in (by_name, holding, torch.nn.Linear(2, 2))],
+                         [True, True, False])
+        original = modeling.torch_chunk_gated_delta_rule
+        layer = torch.nn.Sequential(by_name)
+        hidden = torch.ones(2)
+        followed = []
+        with _delta_rule_held(modeling, layer, lambda query, key, value, **kwargs: (value + 1, None)):
+            rule = by_name.chunk_gated_delta_rule
+            by_name.chunk_gated_delta_rule = lambda *args, **kwargs: followed.append(True) or rule(*args, **kwargs)
+            self.assertEqual(layer(hidden).tolist(), [2.0, 2.0])
+        self.assertEqual(followed, [True])
+        self.assertIs(modeling.torch_chunk_gated_delta_rule, original)
+        self.assertEqual(layer(hidden).tolist(), [3.0, 3.0])
 
     def test_each_kind_gets_its_record(self):
         """
