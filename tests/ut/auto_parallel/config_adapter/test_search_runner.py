@@ -457,8 +457,8 @@ class TestPostFilterMemory(unittest.TestCase):
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_candidate_fallback_stays_within_budget(self, _):
-        """The no-candidate-match fallback picks a fitting entry, not the first one."""
+    def test_no_candidate_match_returns_nothing(self, _):
+        """A fitting strategy outside the candidate lists is not returned in their place."""
         config = _make_full_config()
         config.search_space["tensor_parallel_degree"] = [16, 32]
         entries = [
@@ -466,8 +466,7 @@ class TestPostFilterMemory(unittest.TestCase):
             _make_scored_entry(tp=4, mem=50.0 * 1024),
         ]
         filtered = sr._post_filter(entries, config)
-        self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0][1], 50.0 * 1024)
+        self.assertEqual(filtered, [], f"asked TP 16 or 32, got TP {[e[0].dims_val[_MOCK_TP] for e in filtered]}")
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
@@ -938,6 +937,56 @@ class TestSearchStrategies(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             sr.search_strategies(config)
         self.assertIn("memory budget", str(ctx.exception))
+        self.assertNotIn("candidate lists", str(ctx.exception))
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_refuses_lists_nothing_matches(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """Asked for degrees no fitting strategy has, the search refuses and names what it found."""
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [
+            _make_scored_entry(tp=2, mem=40.0 * 1024),
+            _make_scored_entry(tp=4, mem=30.0 * 1024),
+        ]
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.search_space["tensor_parallel_degree"] = [16, 32]
+        with self.assertRaises(ValueError) as ctx:
+            sr.search_strategies(config)
+        message = str(ctx.exception)
+        self.assertIn("candidate lists", message, f"the refusal should name the lists: {message}")
+        self.assertIn("tensor_parallel_degree asks [16, 32]", message, f"got: {message}")
+        self.assertIn("[2, 4]", message, f"the refusal should give the degrees found: {message}")
+        self.assertNotIn("pipeline_parallel_degree", message, f"a list some strategy meets is not named: {message}")
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_refuses_lists_met_only_apart(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """Lists each met by some fitting strategy, never by one, are refused as such."""
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [
+            _make_scored_entry(tp=2, dp=4, mem=40.0 * 1024),
+            _make_scored_entry(tp=8, dp=2, mem=30.0 * 1024),
+        ]
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        config.search_space["tensor_parallel_degree"] = [2, 4]
+        config.search_space["data_parallel_replicate_degree"] = [1, 2]
+        with self.assertRaises(ValueError) as ctx:
+            sr.search_strategies(config)
+        self.assertIn("never all at once", str(ctx.exception), f"got: {ctx.exception}")
 
 
 # ── Minimal HyperV2 yaml builder ──────────────────────────────────────────

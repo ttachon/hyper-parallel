@@ -395,8 +395,9 @@ def _post_filter(
             set is derived from *config* (backward-compatible).
 
     Returns:
-        A filtered list.  May be empty if no entry satisfies all
-        candidate constraints -- the caller decides how to handle this.
+        The entries that fit the memory budget and sit in every list.  Empty
+        when none does: a strategy outside the lists is never returned in
+        their place, and the caller refuses the search.
     """
     space = config.search_space
     if candidate_dims is None:
@@ -427,15 +428,38 @@ def _post_filter(
                 break
         if keep:
             filtered.append(entry)
-
-    if not filtered and feasible:
-        logger.warning(
-            "Post-filter removed ALL %d candidates; "
-            "no strategy matches the user's candidate constraints.",
-            len(feasible),
-        )
-        return feasible[:1]
     return filtered
+
+
+def _no_candidate_match(feasible: list, config: NormalizedConfig, candidate_dims: Set[Any]) -> str:
+    """Say why no strategy that fits the budget is in the candidate lists.
+
+    ND searches each dimension within its own bounds and the lists only
+    filter what it found, so a list can ask for degrees the search never
+    reached.  Naming the degrees it did reach shows which.
+
+    Args:
+        feasible: The scored entries that fit the memory budget.
+        config: The normalized config whose ``search_space`` holds the lists.
+        candidate_dims: The dimensions that have a list of their own.
+
+    Returns:
+        The refusal, naming each list no fitting strategy meets.
+    """
+    unmet = []
+    for space_key, dim_obj in _search_dim_map().items():
+        if dim_obj not in candidate_dims:
+            continue
+        asked = list(config.search_space.get(space_key, []))
+        found = sorted({entry[0].dims_val.get(dim_obj) for entry in feasible} - {None})
+        if not set(found) & set(asked):
+            unmet.append(f"{space_key} asks {asked}, the strategies that fit take {found}")
+    why = "; ".join(unmet) if unmet else "each list is met by some of them, but never all at once"
+    return (
+        f"None of the {len(feasible)} strategies that fit the memory budget is in the candidate "
+        f"lists: {why}. ND searches each dimension within its own bounds and the lists only "
+        "filter what it finds: widen the lists, or the budget."
+    )
 
 
 def _pinned_degree(config: NormalizedConfig, constraint_key: str, space_key: str) -> int:
@@ -634,6 +658,9 @@ def search_strategies(config: NormalizedConfig, offload: Optional[Mapping[str, A
 
     filtered = _post_filter(scored_space, config, candidate_dims)
     if not filtered:
+        feasible = _filter_by_memory(scored_space, _memory_budget_gb(config))
+        if feasible:
+            raise ValueError(_no_candidate_match(feasible, config, candidate_dims))
         lightest_gb = min(float(entry[1]) for entry in scored_space) / 1024.0
         raise ValueError(
             "No strategy fits the memory budget of "
