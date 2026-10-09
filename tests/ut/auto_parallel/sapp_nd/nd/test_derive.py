@@ -28,6 +28,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (
     derive_flash_attention_factor,
     derive_layer_fields,
     derive_recompute_switches,
+    optimizer_ranks,
     runs_hyper_selective,
 )
 
@@ -200,6 +201,19 @@ class TestOptimizerSharding(unittest.TestCase):
             ccfg = _config(d=8, t=4, os_max_shard=ranks, has_op=has_op)
             derive(ccfg)
             self.assertEqual(ccfg.shard_p_os_non_exp_partial, want, f"{ranks} ranks, has_op={has_op}")
+
+    def test_a_shard_spanning_dp_and_cp_is_the_runs(self):
+        """
+        Feature: optimizer_ranks, HyperParallel's shard over DP times CP (C1).
+        Description: DP 4 and CP 2 with a stated shard of 8 ranks, for a run
+            whose shard spans CP's ranks and for one of the legacy schemas.
+        Expectation: 8, the whole domain HyperParallel shards over, where a
+            count not dividing DP was read as DP's 4; the legacy rule still
+            reads 4.
+        """
+        got = [optimizer_ranks(_config(d=4, cp=2, os_max_shard=8, shard_spans_cp=spans))
+               for spans in (True, False)]
+        self.assertEqual(got, [8, 4])
 
 
 class TestDeriveFamily(unittest.TestCase):

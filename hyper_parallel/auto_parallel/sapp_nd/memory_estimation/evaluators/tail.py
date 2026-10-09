@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import param_cp
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
 if TYPE_CHECKING:
@@ -112,20 +113,20 @@ class EvalMTP:
         mtp_dp_comm_size = 0
         param_size = EvalMTP.num_params_mtp(ccfg, ctx)
         mtp_dp_comm_size += (
-            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * ccfg.cp)
+            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * param_cp(ccfg))
         )
         # Shared Head
         ctx.current_node = LayerType.EMBEDDING_LAYER
         param_size = ctx.eval.num_p(ccfg, ctx)
         mtp_dp_comm_size += (
-            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * ccfg.cp)
+            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * param_cp(ccfg))
         )
         mtp_dp_comm_size += ccfg.n_mtp * ctx.eval.dyn.comm.dp(ccfg, ctx)
         # Shared Tail
         ctx.current_node = LayerType.OUTPUT_LAYER
         param_size = ctx.eval.num_p(ccfg, ctx)
         mtp_dp_comm_size += (
-            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * ccfg.cp)
+            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * param_cp(ccfg))
         )
         mtp_dp_comm_size += ccfg.n_mtp * EvalTailSingle.comm_out_single(
             ccfg, ctx
@@ -200,7 +201,7 @@ class EvalTailSingle:
         return (
             ccfg.comm_d_non_exp
             * ctx.eval.num_p(ccfg, ctx)
-            / (ccfg.t * ccfg.cp)
+            / (ccfg.t * param_cp(ccfg))
         )
 
     @staticmethod

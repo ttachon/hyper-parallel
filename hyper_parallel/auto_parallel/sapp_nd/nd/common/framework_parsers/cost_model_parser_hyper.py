@@ -68,7 +68,7 @@ and wins over anything read from the checkpoint.
 """
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 import logging
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.balancing_adapter import front_loaded_offset
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
@@ -147,6 +147,14 @@ class CostModelParserHyperV2(_CostModelParser):
             self._replacements(),
         )
         if is_auto_models_schema(self.config):
+            # A stated depth looked priced and was not, and nothing said so
+            # (I2): a search repeats this under its ranking.
+            self.ccfg.mtp_unpriced = self._spec_int(spec, "mtp_depth")
+            if self.ccfg.mtp_unpriced:
+                logger.warning(
+                    "The model states %d MTP layer(s), which the AutoModels trainer does not build: "
+                    "ND prices none", self.ccfg.mtp_unpriced,
+                )
             spec = self._without_mtp(spec)
         self._vision_spec = spec.pop("vision", None)
         if self._vision_spec and not self._builds_vision_tower():
@@ -470,18 +478,19 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         return str(device_mem_str) if device_mem_str else "64GB"
 
-    def _moe_dispatch(self) -> float:
+    def _moe_dispatch(self) -> Optional[float]:
         """What a MoE layer's token dispatch costs on this cluster, ``context.moe_dispatch``.
 
-        A run that measured its own states the number; unstated, the estimate
-        keeps the one measured on A3 (``estimate.MOE_DISPATCH``), which 0 asks
-        for.
+        A run that measured its own states the number, and a model whose
+        compute does not grow with EP states 0, which switches the term off;
+        unstated (None), the estimate keeps the one measured on A3
+        (``estimate.MOE_DISPATCH``).
         """
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
         stated = self._get_cfg_attr(ctx, "moe_dispatch", None)
         if stated is not None and float(stated) < 0:
             raise ValueError(f"context.moe_dispatch takes a cost, not {stated!r}")
-        return float(stated) if stated is not None else 0
+        return float(stated) if stated is not None else None
 
     def _exec_spec(self) -> ExecSpec:
         """State the run the train yaml describes.
@@ -706,6 +715,9 @@ class CostModelParserHyperV2(_CostModelParser):
             "optimizer_shard": weight_shard,
             "grad_shard": bool(self._get_cfg_attr(accel, "gradient_accumulation_shard", False)),
             "grad_shard_as_params": True,
+            # Its dp_shard_size spans the DP x CP domain, so CP shards no
+            # parameter state beyond it (derive.param_cp).
+            "shard_spans_cp": is_auto_models,
             "grad_accumulation": True,
             # It adds each layer's reduce-scatter output to the accumulated
             # gradient only in the root's backward hook.
@@ -873,6 +885,10 @@ class CostModelParserHyperV2(_CostModelParser):
             stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
             where = "train.gradient_checkpointing.activation_checkpoint"
         ac_mode = read_activation_checkpoint_mode(stated, where)
+        # The mode the run trains with, which a search deriving its own
+        # recompute names under its ranking where the two differ (H1).
+        overridden = full_rec_override is not None or sel_rec_override is not None
+        self.ccfg.stated_ac_mode = None if overridden else ac_mode
         return {
             "full_recompute": full_rec_override if full_rec_override is not None else ac_mode == "full",
             "selective_recompute": sel_rec_override if sel_rec_override is not None else ac_mode == "selective",

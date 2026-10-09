@@ -39,7 +39,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import exec_of
 from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive, param_cp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -571,6 +571,25 @@ class TestCostModelParserHyperV2(unittest.TestCase):
             self.assertEqual(ccfg.sel_rec, expect_sel, f"mode={ac_mode}")
             self.assertEqual(vars(ccfg.rec_op), expect_rec_op, f"mode={ac_mode}")
 
+    def test_the_run_keeps_the_mode_it_trains_with(self):
+        """
+        Feature: _parse_recompute, the run's own mode (H1).
+        Description: A run stating selective, one stating nothing, and one
+            whose model section states the recompute lists MindFormers takes.
+        Expectation: The config keeps the mode the run trains with, the
+            trainer's default off where nothing states one, for a search to
+            name where it prices another; the lists state no mode.
+        """
+        got = []
+        for stated, overrides in (("selective", {}), (None, {}), (None, {"full_rec": True})):
+            cfg = _dense_overrides()
+            cfg["train"]["gradient_checkpointing"].pop("activation_checkpoint")
+            if stated:
+                cfg["train"]["gradient_checkpointing"]["activation_checkpoint"] = stated
+            cfg["model"]["config_overrides"].update(overrides)
+            got.append(_make_ccfg(cfg).stated_ac_mode)
+        self.assertEqual(got, ["selective", "off", None])
+
     def test_selective_recomputes_what_hyperparallel_recomputes(self):
         """
         Feature: HYPER_SELECTIVE_REC_OP.
@@ -1029,6 +1048,26 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.dh, 128)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_cp_shards_no_parameter_state_beyond_the_stated_shard(self, mock_hf):
+        """
+        Feature: param_cp, a parameter's state under CP (C1).
+        Description: An AutoModels run on 64 devices at CP 2 sharding over 16
+            ranks; then the rule on a config of the legacy schemas.
+        Expectation: HyperParallel's dp_shard_size spans CP's ranks, so the
+            run shards a parameter over 16 ranks, as at CP 1, where it was
+            priced over 32 and its state at half; the legacy schemas keep
+            CP's sharding on top of the optimizer's.
+        """
+        mock_hf.return_value = self._hf_config()
+        ccfg = _make_ccfg(_auto_models_config(
+            accelerator={"tp_size": 1, "cp_size": 2, "ep_size": 1, "pp_size": 1},
+            fsdp_config={"dp_shard_size": 16},
+            context={"device_num": 64},
+        ))
+        self.assertEqual((ccfg.d, ccfg.cp, ccfg.shard_spans_cp, ccfg.shard_p_os_non_exp_partial), (32, 2, True, 16))
+        self.assertEqual([param_cp(SimpleNamespace(cp=2, shard_spans_cp=spans)) for spans in (True, False)], [1, 2])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_an_unstated_dtype_is_the_checkpoints(self, mock_hf):
         """
         Feature: the model's dtype where the config states none (I12).
@@ -1080,6 +1119,29 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         spec = resolve_hf_model_spec(_auto_models_config()["model"])
         self.assertEqual(spec["mtp_depth"], 1)
         self.assertEqual(_make_ccfg(_auto_models_config()).n_mtp, 0)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_an_mtp_depth_the_trainer_does_not_build_is_said(self, mock_hf):
+        """
+        Feature: an MTP depth the AutoModels trainer drops (I2).
+        Description: A checkpoint declaring 3 MTP layers, then one declaring
+            none.
+        Expectation: ND prices no MTP layer either way; for the three it
+            drops it says so, in a warning and on the config a search reports
+            under its ranking, where a stated depth looked priced and nothing
+            said it was not.
+        """
+        got = []
+        for depth in (3, 0):
+            mock_hf.return_value = self._hf_config(num_nextn_predict_layers=depth)
+            with self.assertLogs(
+                "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper",
+                level="WARNING",
+            ) as said:
+                ccfg = _make_ccfg(_auto_models_config())
+            warned = any("MTP layer(s)" in line for line in said.output)
+            got.append((ccfg.n_mtp, ccfg.mtp_unpriced, warned))
+        self.assertEqual(got, [(0, 3, True), (0, 0, False)])
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_mtp_depth_prefers_internal_name(self, mock_hf):
@@ -1823,6 +1885,23 @@ class TestFsdpResharding(unittest.TestCase):
         self.assertEqual(got, [(False, 1), (True, 2)])
         with self.assertRaises(ValueError):
             _make_ccfg(_moe_overrides(fsdp_config={}, context={"expert_shard": "all"}))
+
+    def test_a_run_states_its_dispatch_cost_or_switches_it_off(self):
+        """
+        Feature: _moe_dispatch, context.moe_dispatch.
+        Description: A MoE run in the AutoModels schema stating no dispatch
+            cost, a cost of 520, a cost of 0, and a negative one.
+        Expectation: Unstated, the parser hands over None, so the estimate
+            keeps its measured default; a stated cost is taken as stated, 0
+            included, which switches the term off; a negative one is refused.
+        """
+        got = [
+            _make_ccfg(_moe_overrides(fsdp_config={}, context=context)).moe_dispatch
+            for context in ({}, {"moe_dispatch": 520}, {"moe_dispatch": 0})
+        ]
+        self.assertEqual(got, [None, 520.0, 0.0])
+        with self.assertRaises(ValueError):
+            _make_ccfg(_moe_overrides(fsdp_config={}, context={"moe_dispatch": -1}))
 
     def test_the_run_accumulates_without_a_pipeline(self):
         """

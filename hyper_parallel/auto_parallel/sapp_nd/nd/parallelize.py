@@ -62,6 +62,29 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
 # logger.setLevel(proc.SUBDEBUG)
 
 
+def state_machine_links(ccfg: Any, device: Any) -> None:
+    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths (B5).
+
+    The CP check, its topology penalty and the CP cost read them off the
+    config, where nothing assigned them, so they held the config's defaults,
+    8 ranks a node, 400 and 25 GB/s, whatever machine was chosen.  The node
+    is the device's first level and its links the first two levels'
+    bandwidths, the second level's falling back to the first's.
+
+    Args:
+        ccfg: The config the search prices; a multimodal one's submodules
+            take the same machine.
+        device: The machine's ``Hard.Type``; nothing is stated without one.
+    """
+    levels = list(getattr(device, "level_bandwidth", None) or [])
+    if device is None or not levels:
+        return
+    for cfg in [ccfg, *(getattr(ccfg, "mm_ccfgs", None) or {}).values()]:
+        cfg.device_per_node = device.intra_node_num()
+        cfg.bw_intra = levels[0]
+        cfg.bw_inter = levels[1] if len(levels) > 1 else levels[0]
+
+
 class ParallelizeLayer:
     """Parallelize one layer type"""
 
@@ -105,6 +128,7 @@ class ParallelizeLayer:
                                  "auto_recompute chooses one for each: give one of them")
 
         self.mem_eval = evaluator
+        state_machine_links(self.mem_eval._ccfg, getattr(machine, "device", None))
         # The options chosen for each configuration the ordering scored.
         self.recompute_choices = {}
 
@@ -288,7 +312,7 @@ class ParallelizeLayer:
             return self._refuse("a degree out of bounds")
         if not self.config.moe_valid(parallel_config):
             logger.warning("expert parallel is higher than expert number")
-            return self._refuse("EP over the experts or DP x TP")
+            return self._refuse("EP over the experts or the ranks they spread over")
         if hasattr(self.config, 'ep_constraints_valid') and not self.config.ep_constraints_valid(parallel_config):
             logger.warning("EP divisibility constraints not satisfied")
             return self._refuse("EP divisibility")
@@ -526,13 +550,13 @@ class ParallelizeLayer:
     def parallel_loops(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
-        dp, tp, pp, _ = dtpc_p
-        for ep in self.config.space(Dim.EP, dp * tp):
+        dp, tp, pp, cp = dtpc_p
+        for ep in self.config.space(Dim.EP, self.config.max_ep(dp, tp, cp)):
             for vpp in self.config.range_space(
                 Dim.VPP, min(4, pp, self.config.total_layer_num() // pp)
             ):
                 for op in self.config.space(
-                    Dim.OP, self.config.max_op(dp, tp, ep)
+                    Dim.OP, self.config.max_op(dp, tp, ep, cp)
                 ):
                     for sp in self.config.bool_space(Dim.SP):
                         space = self.inside_loop_nest(
@@ -781,8 +805,8 @@ class ParallelizeLayer:
         """Order the given space with performance estimation.
 
         A measured configuration the cost model cannot represent, such as
-        expert parallelism wider than DP x TP, is left out and named, so that
-        it does not end the comparison of every other one.
+        expert parallelism wider than its stage, is left out and named, so
+        that it does not end the comparison of every other one.
         """
         scored_space = []
         debug_parts = []
@@ -947,6 +971,13 @@ class ParallelizeLayer:
                 "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
                 priced.s,
             )
+        if getattr(priced, "mtp_unpriced", 0):
+            # A stated MTP depth looked priced and was not (I2).
+            logger.output(
+                "The model states %d MTP layer(s), which the AutoModels trainer does not build: no number above "
+                "prices them",
+                priced.mtp_unpriced,
+            )
         for line in unset_reads_report():
             logger.output(line)
         logger.output(
@@ -959,6 +990,19 @@ class ParallelizeLayer:
             logger.output(
                 "Offset & Recompute were%s computed from config info", is_not
             )
+            stated_mode = getattr(priced, "stated_ac_mode", None)
+            # -ar chooses each candidate's recompute itself, and says how below.
+            if (not self.config.balancing.from_config and not self.auto_recompute
+                    and stated_mode not in (None, "full")):
+                # The balancing gives every candidate full recompute without
+                # -mppb, whatever the run's mode, which cost an hour twice
+                # because nothing said so (H1).
+                logger.output(
+                    "The run's activation checkpoint mode is %s, and every candidate above is priced fully "
+                    "recomputed: pass --recompute %s, or -mppb, to price the run's own",
+                    stated_mode,
+                    stated_mode,
+                )
         else:
             logger.output(
                 "Offset was NOT computed from config info; recompute was searched over %s",

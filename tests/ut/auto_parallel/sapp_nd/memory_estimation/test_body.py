@@ -39,7 +39,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body impo
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (
-    HYPER_SELECTIVE_REC_OP, derive_expert_degrees, derive_optimizer_sharding,
+    HYPER_SELECTIVE_REC_OP, derive_comm_flags, derive_expert_degrees, derive_optimizer_sharding,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
@@ -878,6 +878,9 @@ class TestConfigOptimizerShard(unittest.TestCase):
         ccfg.os_max_shard = os_max_shard
         ccfg.expert_shard = None
         ccfg.expert_shard_group = False
+        # The legacy schemas' rule, CP sharding parameter state on top of the
+        # optimizer's ranks; HyperParallel's states True (param_cp).
+        ccfg.shard_spans_cp = False
         return ccfg
 
     def test_a_run_that_shards_experts_over_their_whole_group(self):
@@ -980,6 +983,24 @@ class TestExpertDataParallelGroup(unittest.TestCase):
         ccfg = self._ccfg(d=2, t=1, cp=1, ep=16)
         with self.assertRaises(TypeError):
             derive_expert_degrees(ccfg)
+
+    def test_context_parallel_ranks_reduce_an_experts_gradient(self):
+        """An expert's gradient is reduced over CP's ranks too (X3).
+
+        On 64 ranks with an optimizer shard: at CP 2, DP 32 and EP 32 leave
+        one DP rank over EP, but the two CP ranks hold the same experts and
+        reduce their gradients, so the expert's DP communication is priced,
+        where it read 0; at CP 1 and EP 64 no other rank holds them; at TP 2
+        without EP the TP ranks hold different slices and reduce nothing.
+        """
+        got = []
+        for d, t, cp, ep in ((32, 1, 2, 32), (64, 1, 1, 64), (1, 2, 1, 1)):
+            ccfg = self._ccfg(d=d, t=t, cp=cp, ep=ep)
+            ccfg.has_op, ccfg.has_grad_shard = True, False
+            derive_expert_degrees(ccfg)
+            derive_comm_flags(ccfg)
+            got.append(ccfg.comm_d_exp)
+        self.assertEqual(got, [2, 0, 0])
 
 
 if __name__ == "__main__":

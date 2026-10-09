@@ -156,11 +156,12 @@ class TestKindsAndFlavours(unittest.TestCase):
     def test_a_single_kind_is_its_own_default(self):
         """
         Feature: default kind.
-        Description: A family with one kind, and t5 with two and no default.
-        Expectation: The one kind, and None.
+        Description: A family with one kind, and t5 with two.
+        Expectation: The one kind, and the encoder t5 names, whose TP
+            gathers the model's embedding and output layer run (I15).
         """
         self.assertEqual(load_op_profile("qwen").default, "decoder")
-        self.assertIsNone(load_op_profile("t5").default)
+        self.assertEqual(load_op_profile("t5").default, "encoder")
 
     def test_an_unknown_flavour_is_refused(self):
         """

@@ -50,6 +50,7 @@ CONFIG_FIELDS = {
     "expert_shard_group": "expert_shard_group",
     "grad_shard": "has_grad_shard",
     "grad_shard_as_params": "grad_shard_as_params",
+    "shard_spans_cp": "shard_spans_cp",
     "grad_accumulation": "grad_accumulation",
     "reshard_params": "reshard_params",
     "deferred_grad_accumulation": "deferred_grad_accumulation",
@@ -211,8 +212,9 @@ def strategy_exec(ccfg: Any, strategy: Mapping[str, Any]) -> ExecSpec:
     """Return the ExecSpec a keyword strategy states, over the config it changes.
 
     A degree or a micro-batching is stated when it is given as an integer,
-    and ``op`` states the optimizer sharding.  The search runs sequence
-    parallelism at every TP degree, and the global batch follows the
+    and ``op`` states the optimizer sharding.  Sequence parallelism is the
+    candidate's where it states ``sp``, else the run's, and on at every TP
+    degree for a run that states none; the global batch follows the
     micro-batching the strategy leaves.  The recompute layers and the offset
     are stated when given.
 
@@ -228,7 +230,12 @@ def strategy_exec(ccfg: Any, strategy: Mapping[str, Any]) -> ExecSpec:
         stated["optimizer_shard"] = op
         # op <= 1 means no optimizer sharding
         stated["optimizer_parallel"] = op > 1
-    stated["sequence_parallel"] = True
+    # Every candidate ran sequence parallelism, so a run without it had the
+    # activations TP does not shard divided by TP all the same, and a search
+    # over SP priced its twins alike (T1).
+    sp = strategy.get("sp")
+    run_sp = getattr(ccfg, "sequence_parallel", None)
+    stated["sequence_parallel"] = bool(sp) if sp is not None else run_sp is None or bool(run_sp)
     stated["global_batch_size"] = (
         stated.get("micro_batch_size", ccfg.b) * stated.get("dp", ccfg.d)
         * stated.get("micro_batch_num", ccfg.m)

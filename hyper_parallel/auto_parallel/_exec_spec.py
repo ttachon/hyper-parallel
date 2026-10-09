@@ -191,6 +191,11 @@ class ExecSpec:
         grad_shard: Whether gradients are sharded too.
         grad_shard_as_params: Whether each gradient is sharded as its
             parameter is, as FSDP holds it; ``grad_shard`` does not apply.
+        shard_spans_cp: Whether the optimizer's shard spans context
+            parallelism's ranks too, as HyperParallel's ``dp_shard_size``
+            does over its ``dp * cp`` FSDP domain, so that CP shards no
+            parameter state beyond it and the tables it gathers are whole;
+            unstated, CP shards a parameter's state again (C1).
         grad_accumulation: Whether gradients take memory without pipeline
             parallelism too; under it they always do.
         deferred_grad_accumulation: Whether FSDP holds each layer's
@@ -275,6 +280,7 @@ class ExecSpec:
     expert_shard_group: Optional[bool] = None
     grad_shard: Optional[bool] = None
     grad_shard_as_params: Optional[bool] = None
+    shard_spans_cp: Optional[bool] = None
     grad_accumulation: Optional[bool] = None
     deferred_grad_accumulation: Optional[bool] = None
     overlapped_grad_reduce: Optional[bool] = None
@@ -386,7 +392,7 @@ _KINDS: Dict[str, tuple] = {
     "size": ("etp", "param_bytes", "compute_bytes", "softmax_bytes", "grad_bytes",
              "optimizer_state_bytes", "main_param_bytes", "norm_bytes", "dropout_bytes"),
     "flag": ("sequence_parallel", "shard_activations", "loss_parallel", "optimizer_parallel", "grad_shard",
-             "grad_shard_as_params", "grad_accumulation", "deferred_grad_accumulation",
+             "grad_shard_as_params", "shard_spans_cp", "grad_accumulation", "deferred_grad_accumulation",
              "overlapped_grad_reduce", "reshard_params", "param_casts", "expert_shard_group",
              "mtp_in_offset",
              "emb_out_in_offset",

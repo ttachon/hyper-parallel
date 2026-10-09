@@ -20,6 +20,7 @@ How to run this:
 import copy
 import os
 import unittest
+from types import SimpleNamespace
 
 # The package has an import cycle that only the memory estimator's import order
 # settles; the performance modules cannot be the first a process loads.
@@ -37,6 +38,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import (
+    _fsdp_rounds,
     _recomputed_comm,
     estimate_comm,
     prepare_context,
@@ -169,6 +171,28 @@ class TestRecomputePricing(unittest.TestCase):
         self.assertEqual([parts[part] for part in comm], [compute_only[part] for part in comm])
         self.assertGreater(parts[Debug.PerfParts.RECOMPUTE], compute_only[Debug.PerfParts.RECOMPUTE])
         self.assertAlmostEqual(parts[Debug.PerfParts.BUBBLE] / score, 0.0, places=12)
+
+
+class TestFsdpRounds(unittest.TestCase):
+    """How often FSDP gathers, and how often the copies of a shard all-reduce."""
+
+    def test_a_shard_no_wider_than_cp_still_shards(self):
+        """
+        Feature: _fsdp_rounds, the all-reduce of a shard's copies.
+        Description: 4 micro-batches at CP 2 and TP 1 with a width of 2: a
+            HyperParallel shard over 2 ranks, then a legacy schema's width,
+            which is CP's alone.
+        Expectation: The HyperParallel shard is one, so its copies all-reduce
+            once a step, a quarter a micro-batch, where a width no wider than
+            TP times CP read as none; the legacy width shards nothing beyond
+            CP, so its copies all-reduce every micro-batch.
+        """
+        got = [
+            _fsdp_rounds(SimpleNamespace(m=4, reshards=True, shard_p_os_non_exp_partial=2, t=1, cp=2,
+                                         shard_spans_cp=spans))[2]
+            for spans in (True, False)
+        ]
+        self.assertEqual(got, [0.25, 1])
 
 
 if __name__ == "__main__":

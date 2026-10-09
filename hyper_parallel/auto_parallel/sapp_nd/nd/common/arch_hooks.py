@@ -264,8 +264,10 @@ def apply_family(ccfg: Any) -> None:
     """Give *ccfg* what its family decides, and the op counts of its default kind.
 
     A vision tower takes the vision profile's encoder counts, whatever
-    counts it carries from its language model.  A family whose stack always
-    states its kinds, t5's, has no default kind: each layer takes its kind's.
+    counts it carries from its language model.  Each layer of a stack takes
+    its own kind's counts; the default kind's are the ones the model's
+    config prices its embedding and output layer with, so t5 names its
+    encoder (I15).  A family that names none gives the model no counts.
     """
     derive_family(ccfg)
     arch = getattr(ccfg, "arch", None)

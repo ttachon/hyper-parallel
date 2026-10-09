@@ -16,6 +16,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import param_cp
+
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
@@ -46,7 +48,7 @@ class EvalHead:
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
         b_p = ccfg.bytes_p
-        b_p /= ccfg.cp
+        b_p /= param_cp(ccfg)
         return param_size * b_p
 
     @staticmethod
@@ -57,7 +59,7 @@ class EvalHead:
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
         b_os = ccfg.bytes_optim_table
-        b_os /= ccfg.cp
+        b_os /= param_cp(ccfg)
         return param_size * b_os
 
     @staticmethod
@@ -68,7 +70,7 @@ class EvalHead:
         param_size = ctx.eval.num_p(ccfg, ctx)
         param_size /= ccfg.shard_embed
         b_grad = ccfg.bytes_grad
-        b_grad /= ccfg.cp
+        b_grad /= param_cp(ccfg)
         return param_size * b_grad
 
     @staticmethod
@@ -77,7 +79,7 @@ class EvalHead:
         return (
             ccfg.comm_d_non_exp
             * ctx.eval.num_p(ccfg, ctx)
-            / (ccfg.shard_embed / (ccfg.gather_embed or 1) * ccfg.cp)
+            / (ccfg.shard_embed / (ccfg.gather_embed or 1) * param_cp(ccfg))
         )
 
     @staticmethod

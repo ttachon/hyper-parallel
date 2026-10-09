@@ -14,7 +14,7 @@
 # ============================================================================
 """Experimental : Comm time"""
 from copy import copy, deepcopy
-from typing import Mapping, NamedTuple
+from typing import NamedTuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -44,6 +44,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
     _resolve_cp_algo,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import apply_layer_kind, layer_kinds
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import param_cp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     detect_attention_type,
     AttentionType,
@@ -86,7 +87,11 @@ def _cp_comm_zero(ccfg):
 
 
 class _CPVolumes(NamedTuple):
-    """Algorithm-specific CP communication volumes of one layer."""
+    """Algorithm-specific CP communication volumes of one layer.
+
+    ``comm_volume`` is what :func:`cp_traffic` moves, the only field a score
+    reads; the others are logged.
+    """
 
     kv_volume_per_step: float
     total_kv_volume: float
@@ -117,55 +122,24 @@ def _cp_comm_cost_common(ccfg, volumes, attention_type, kv_dim, cp_algo,
     )
 
 
-def _cp_rec_factor(ccfg, ctx):
-    """Recompute coefficient, matching the old cp_comm_non_exp."""
-    rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
-    # A layer's own switches, which the walk's context carries, else the config's.
-    stated = getattr(ctx, "switches", None) if ctx else None
-    if isinstance(stated, Mapping):
-        rec_op_gather = stated.get("gather", 0)
-    else:
-        rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
-    return (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
-
-
-def _ulysses_cp_volumes(ccfg, rec_factor):
+def _ulysses_cp_volumes(ccfg):
     """Ulysses CP volumes: two All2All over (cp-1)/cp of the local shard."""
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
     t = max(1, ccfg.t)
     local_qkv = s * b * (ccfg.a / t) * ccfg.dh * 2
     a2a_vol = local_qkv * (cp - 1) / cp
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ulysses attention coeff = 0.5*rec_factor + 0.5
-    ulysses_attn_coeff = 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ulysses_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
-    return _CPVolumes(a2a_vol, a2a_vol * 2, comm_vol, 0, 2)
+    return _CPVolumes(a2a_vol, a2a_vol * 2, cp_traffic(ccfg, CPAlgo.ULYSSES_CP), 0, 2)
 
 
-def _ring_cp_volumes(ccfg, rec_factor, kv_dim):
+def _ring_cp_volumes(ccfg, kv_dim, cp_algo):
     """Ring CP volumes: cp-1 P2P steps of s/cp tokens of KV, both directions."""
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
-    t = max(1, ccfg.t)
     kv_bytes = 4
     kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
     total_kv = kv_vol_step * (cp - 1) * 2
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ring attention coeff = 2*0.5*rec_factor + 0.5 (extra /cp from (s/cp)^2)
-    ring_attn_coeff = 2 * 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ring_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
-    return _CPVolumes(kv_vol_step, total_kv, comm_vol, int(cp - 1), 2)
+    return _CPVolumes(kv_vol_step, total_kv, cp_traffic(ccfg, cp_algo), int(cp - 1), 2)
 
 
 def cp_traffic(ccfg: CostModelConfig, cp_algo: CPAlgo) -> float:
@@ -208,7 +182,11 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
         and receives the rest from other ranks.
         Per-All2All volume = s * b * (a/t) * bytes * (cp-1)/cp (head dims).
         Total volume = 2 * per-All2All volume.
+
+    *ctx* is not read: the exchange a recompute sends again is priced by
+    the walk that recomputes it (``_recomputed_comm``).
     """
+    del ctx
     if ccfg.cp <= 1:
         return _cp_comm_zero(ccfg)
 
@@ -220,13 +198,11 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
     cp_algo = _resolve_cp_algo(ccfg)
     topology, effective_bandwidth = _cp_resolve_topology(
         ccfg.cp, ccfg.device_per_node, ccfg.bw_intra, ccfg.bw_inter)
-    rec_factor = _cp_rec_factor(ccfg, ctx)
 
     if cp_algo == CPAlgo.ULYSSES_CP:
-        volumes = _ulysses_cp_volumes(ccfg, rec_factor)
+        volumes = _ulysses_cp_volumes(ccfg)
     else:
-        volumes = _ring_cp_volumes(ccfg, rec_factor, kv_dim)
-    volumes = volumes._replace(comm_volume=cp_traffic(ccfg, cp_algo))
+        volumes = _ring_cp_volumes(ccfg, kv_dim, cp_algo)
     return _cp_comm_cost_common(
         ccfg, volumes, attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
@@ -564,7 +540,9 @@ def _fsdp_rounds(cfg) -> tuple:
     """
     micro = max(1, cfg.m)
     reshards = bool(getattr(cfg, "reshards", False))
-    shards = cfg.shard_p_os_non_exp_partial > cfg.t * cfg.cp
+    # Sharded beyond TP and whatever CP adds to the width (param_cp): with
+    # TP times CP, a HyperParallel shard no wider than CP read as none.
+    shards = cfg.shard_p_os_non_exp_partial > cfg.t * param_cp(cfg)
     return (2 if reshards else 1 / micro), (1 if reshards else 1 / micro), (1 / micro if shards else 1)
 
 
@@ -627,8 +605,6 @@ def _accumulate_stage_comm(param, stage, stage_id):
                     cfg, param["ctx"]
                 ).comm_volume
             # min(device_type.level_bound_number[0], param["cfg"].ep)
-            # comm_cp += EvalLayerComm.cp_comm_layer
-            # (param["cfg"], param["ctx"])
             if param["with_recomp"] and layer in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER):
                 tp_again, ep_again, cp_again = _recomputed_comm(cfg, param["ctx"], layer)
                 comm[Dim.TP] += tp_again
