@@ -29,7 +29,7 @@ from hyper_parallel.auto_parallel._layer_stack import LayerStack, StackGroup
 from hyper_parallel.auto_parallel._op_profiles import LayerKind
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, RealParts, estimation_in_real_parts
+from hyper_parallel.auto_parallel.sapp_nd.nd.debug import Debug, PerfParts, RealParts, estimation_in_real_parts
 
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
     RatioType,
@@ -984,6 +984,12 @@ def estimate_performance(*args, **kwargs):
         device_type,
         memory,
     ) = _resolve_estimate_args(args, kwargs)
+    cache_file = kwargs.get("cache_file")
+    if cache_file is not None and not (debugger and debugger.is_enabled()):
+        # The ratios rescale the parts a debugger records, so the parts are
+        # recorded whether or not anyone asked to see them: a search that
+        # writes no debug output must not rank on the uncalibrated score.
+        debugger = Debug(None, info_type=PerfParts)
 
     # Process custom model config: the config's own hook when its hook class
     # gives it one, as the memory estimate applies it, else its family.
@@ -1048,7 +1054,6 @@ def estimate_performance(*args, **kwargs):
     perf += estimate_p2p(timed, ccfg, stage_perfs, debugger=debugger)
     logger.info("PerfEst: perf %s", perf)
 
-    cache_file = kwargs.get("cache_file")
     return _finalize_perf(perf, cache_file, debugger, memory)  # / cfg.gbs
 
 # TO-DO

@@ -672,6 +672,7 @@ class ParallelizeLayer:
                             priced,
                             device_type=self.machine.device,
                             memory=mem,
+                            cache_file=cache_file,
                             stage_savings=savings,
                         )
                 scored_space.append((config, mem, score, values))

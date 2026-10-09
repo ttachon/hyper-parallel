@@ -970,6 +970,27 @@ class TestSearchStrategies(unittest.TestCase):
         return_value=_make_mock_dim_module(),
     )
     @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_a_ratios_file_reaches_the_search(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """estimator["ratios_file"] is the ratios file ND scores with; without it ND scores raw."""
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [_make_scored_entry(tp=2)]
+        mock_parallelize_cls.return_value = mock_runner
+
+        for stated in (None, "ratios.json"):
+            config = _make_full_config()
+            if stated:
+                config.estimator["ratios_file"] = stated
+            sr.search_strategies(config)
+            passed = mock_runner.run_generation_to_ordering.call_args.kwargs.get("cache_file")
+            self.assertEqual(passed, stated, f"stated {stated}, the search got {passed}")
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
     def test_search_strategies_refuses_lists_met_only_apart(
         self, mock_parallelize_cls, mock_get_dim,
     ):  # pylint: disable=unused-argument

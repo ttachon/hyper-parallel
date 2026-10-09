@@ -19,6 +19,7 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/perf_estimation/test_estimate.py -v
 """
 import copy
+import json
 import math
 import os
 import tempfile
@@ -159,6 +160,29 @@ class TestEstimatePerformance(unittest.TestCase):
         ccfg = CostModelConfig(DEEPSEEK_YAML)
         with self.assertRaises(ValueError):
             estimate_performance(ccfg, device_type=Hard.Device_A2, stage_savings=[0.0] * (ccfg.p - 1))
+
+    def test_a_ratios_file_calibrates_with_or_without_a_debugger(self):
+        """
+        Feature: estimate_performance with a ratios file.
+        Description: Estimate DeepSeek with one ratios file, once with a debugger recording the
+            parts and once without, as a search at -v 1 or a worker of the pool estimates.
+        Expectation: Both give the calibrated score, which is not the raw one.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        raw = estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A2)
+        ratios = {"COMPUTE": 2.0, "DP_COMM": 0.5, "DP_REDUCE": 1.5, "MP_COMM": 1.0,
+                  "EP_COMM": 0.25, "CP_COMM": 1.0, "PP_COMM": 1.0, "BUBBLE": 1.0}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "ratios.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(ratios, handle)
+            debugger = Debug.Debug(None, info_type=Debug.PerfParts)
+            recorded = estimate_performance(deepcopy(ccfg), debugger=debugger, device_type=Hard.Device_A2,
+                                            cache_file=path)
+            quiet = estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A2, cache_file=path)
+        self.assertEqual(quiet, recorded, f"without a debugger {quiet}, with one {recorded}")
+        self.assertNotEqual(quiet, raw, f"the ratios file left the raw score {raw}")
+
     def test_a_vision_language_model_records_every_towers_communication(self):
         """
         Feature: estimate_performance on a multimodal model, its recorded parts.

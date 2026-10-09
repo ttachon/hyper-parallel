@@ -190,6 +190,10 @@ def _apply_cli_overrides(search_cfg, cli_args):
             search_cfg.estimator.pop("recompute_modes", None)
         else:
             search_cfg.estimator["recompute_modes"] = modes
+    if getattr(cli_args, "cache_file", None) is not None:
+        # -c names the ratios the search scores with, as on the CLI path;
+        # the search config path dropped it and ranked on the raw score.
+        search_cfg.estimator["ratios_file"] = cli_args.cache_file
 
 
 def _recompute_modes(cli_args):

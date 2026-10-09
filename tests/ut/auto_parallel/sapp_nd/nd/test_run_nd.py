@@ -1508,6 +1508,49 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(cluster_spec["device_type"], "A3")
             self.assertEqual(mock_search.call_count, 2)
 
+    def test_run_nd_cli_hyper_v2_c_reaches_the_search_config(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: ``-f hyper_v2 -s search.yaml -c ratios.json``.
+        Expectation: The ratios file reaches the search as ``estimator["ratios_file"]``, where it
+                     was dropped before.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            ratios = os.path.join(tmp_dir, "ratios.json")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+            with open(ratios, "w", encoding="utf-8") as fh:
+                json.dump({"COMPUTE": 1.0}, fh)
+            fake_config = SimpleNamespace(
+                resolved_strategy=None, constraint={}, estimator={},
+                cluster_spec={"num_nodes": 2, "cards_per_node": 8, "device_type": "A2"},
+            )
+            fake_result = {"dp": 1, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                           "micro_batch_num": 1, "memory_estimate_mb": 100.0, "score": 1.0}
+            argv = ["run_nd.py", "-f", "hyper_v2", "-y", train_yaml, "-s", search_yaml, "-c", ratios, "-v", "0"]
+            with patch(
+                "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                return_value=fake_config,
+            ), \
+                    patch("hyper_parallel.auto_parallel.config_adapter.validate", return_value=[]), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                        return_value=fake_result,
+                    ) as mock_search, \
+                    patch("hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml"), \
+                    patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit) as exc_info:
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+            self.assertEqual(exc_info.exception.code, 0)
+            self.assertEqual(mock_search.call_count, 1)
+            self.assertEqual(fake_config.estimator.get("ratios_file"), ratios,
+                             f"estimator after -c: {fake_config.estimator}")
+
     def test_run_nd_cli_hyper_v2_d_refuses_part_of_a_node(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -3049,6 +3092,25 @@ class TestSappNDRunND(unittest.TestCase):
         multimodal.print_parallelism()
         with self.assertRaises(TypeError):
             multimodal.set_strategy(model_name="missing", dp=1)
+    def test_a_quiet_search_hands_its_ratios_file_to_every_estimate(self) -> None:
+        """
+        Feature: Parallelize.order_search_space.
+        Description: Order two configurations with a ratios file at a verbosity that writes no debug output.
+        Expectation: Every estimate receives the ratios file, as it does when debugging, so the
+                     verbosity cannot change what is calibrated.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.config = SimpleNamespace(set_parallel_config=lambda config: True)
+        runner.priced = SimpleNamespace
+        runner.machine = SimpleNamespace(device=Hard.Device_A2)
+        runner.enable_debug = False
+        space = [(SimpleNamespace(name="a"), 10), (SimpleNamespace(name="b"), 20)]
+        with patch.object(Par, "estimate_performance", side_effect=[3.0, 1.0]) as estimate:
+            scored, _ = runner.order_search_space(space, threads_num=None, cache_file="ratios.json")
+        self.assertEqual([entry[2] for entry in scored], [1.0, 3.0])
+        files = [call.kwargs.get("cache_file") for call in estimate.call_args_list]
+        self.assertEqual(files, ["ratios.json", "ratios.json"], f"the ratios file each estimate got: {files}")
+
     def test_parallelize_layer_control_flow_without_estimators(self) -> None:
         """
         Feature: TestSappNDRunND.

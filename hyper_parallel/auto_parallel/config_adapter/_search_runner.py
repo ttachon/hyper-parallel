@@ -595,6 +595,9 @@ def search_strategies(config: NormalizedConfig, offload: Optional[Mapping[str, A
     Args:
         config: A fully populated ``NormalizedConfig`` from
             :func:`read_search_config` or :func:`read_hp_yaml_config`.
+            ``config.estimator["ratios_file"]``, when set, names the ratios
+            file ``run_nd --write_ratios`` fits, which ND scores with
+            (``run_nd -s ... -c`` sets it); without it ND scores raw.
         offload: With a choice of a recompute mode per layer, let each
             stage's first layers run off and offload what they keep, over the
             device's host link with these of its figures replaced
@@ -651,6 +654,7 @@ def search_strategies(config: NormalizedConfig, offload: Optional[Mapping[str, A
         yaml_folder=None,
         threads_num=None,
         top_num=None,
+        cache_file=config.estimator.get("ratios_file"),
     )
 
     if not scored_space:
