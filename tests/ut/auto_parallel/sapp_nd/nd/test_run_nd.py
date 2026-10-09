@@ -1680,6 +1680,11 @@ class TestSappNDRunND(unittest.TestCase):
         runner.config = SimpleNamespace(
             balancing=SimpleNamespace(from_config=False), dimensions=dimensions,
         )
+        # The bare runner has no evaluator: the batch check, which bounds degrees
+        # with GlobalConfig.space, and the priced config, whose sequence length
+        # the ranking's footnote reads (I11), are stubbed as their own tests do.
+        runner.batch_reachable = lambda: True
+        runner.priced = lambda: SimpleNamespace(seq_len_stated=True, s=4096)
         runner.generate_search_space = lambda folder, threads_num: [entry[:2] for entry in scored_space]
         runner.order_search_space = lambda space, threads_num, cache_file: (
             scored_space, [Debug.PerfParts.FW_COMPUTE],
@@ -1701,7 +1706,9 @@ class TestSappNDRunND(unittest.TestCase):
                     patch.object(Par.logger, "output") as cli_output:
                 try:
                     result = runner.run_generation_to_ordering(None, top_num=2, dimensions=[Dim.EP], **options)
-                    self.assertIs(result, scored_space)
+                    # The search collects each recompute mode's entries into a list of
+                    # its own: the same entries, in the same order, not the same list.
+                    self.assertEqual(result, scored_space)
                     self.assertEqual([entry[0].rank for entry in result], list(range(1, 8)))
                     cli_tables = [
                         call.args[0] for call in cli_output.call_args_list
