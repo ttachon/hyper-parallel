@@ -608,19 +608,6 @@ def _classify(spans: Sequence[_Span]) -> Tuple[List[Tuple[float, float]], List[T
     return host, compute, comm_ms, by_name
 
 
-def _free_per_step(profile: Path) -> Optional[float]:
-    """Return the profiler's Free column per step in milliseconds, or None."""
-    trace = _find_one(profile, "step_trace_time.csv")
-    if trace is None:
-        return None
-    rows = _read_rows(trace)
-    column = _pick(list(rows[0].keys()) if rows else [], "free")
-    if not column:
-        return None
-    values = [value for row in rows if (value := _float(row.get(column))) is not None]
-    return statistics.fmean(values) / _to_ms(column) if values else None
-
-
 def _find_all(root: Path, name: str) -> List[Path]:
     """Find every named file under a directory, newest first.
 
@@ -657,40 +644,57 @@ def _fallback_one(kernels: Path, steps: int) -> Optional[Dict[str, Any]]:
 
     host, compute, comm_ms, by_name = _classify(spans)
     cover = _merge(compute)
-    host_summed, host_wall = _span_total(host), _span_total(_merge(host))
+    host_wall = _span_total(_merge(host))
     exposed = sum(_uncovered(start, end, cover) for start, end in host)
-    compute_wall = _span_total(cover)
-    share = 100 * exposed / host_wall if host_wall else 0.0
+    # The window is [start_step, end_step), which is ONE step on the V4.1
+    # launcher's defaults and two on the Qwen3.5 sweep's. Counting it from the
+    # profile's own trace is what stops every figure here being halved.
+    trace = _find_one(profile, "step_trace_time.csv")
+    counted = _profiled_steps(trace) if trace is not None else None
+    used = counted or steps
+    stage = _stage_columns(trace) if trace is not None else {}
+    result = {
+        "profile": str(profile), "kernel_details": str(kernels), "kernels": len(rows),
+        "steps_covered": used,
+        "steps_source": "counted in step_trace_time.csv" if counted else "--steps, not counted",
+        "host_summed_ms": round(_span_total(host) / used, 1),
+        "host_wall_ms": round(host_wall / used, 1),
+        "host_exposed_ms": round(exposed / used, 1),
+        "host_exposed_share_pct": round(100 * exposed / host_wall, 1) if host_wall else 0.0,
+        "device_compute_wall_ms": round(_span_total(cover) / used, 1),
+        "comm_summed_ms": round(comm_ms / used, 1),
+        "computing_ms": stage.get("computing_ms"),
+        "free_ms": stage.get("free_ms"),
+        "top_operators": {name: round(value / used, 1) for name, value in by_name.most_common(6)},
+    }
+    _print_fallback(result)
+    return result
 
-    print(f"\n  over {len(rows):,} kernels and {steps} step(s), per step:")
-    print(f"    host fallback, summed        {host_summed / steps:9.1f} ms  (occupancy, several at once)")
-    print(f"    host fallback, wall clock    {host_wall / steps:9.1f} ms  (its own union)")
-    print(f"    of that, no device kernel    {exposed / steps:9.1f} ms  <- the critical path share")
-    print(f"    device compute, wall clock   {compute_wall / steps:9.1f} ms")
-    print(f"    collectives, summed          {comm_ms / steps:9.1f} ms")
-    print(f"\n    {share:.0f}% of the fallback's wall clock runs with the device idle")
 
-    free_ms = _free_per_step(profile)
-    if free_ms:
-        print(f"    against Free of {free_ms:.1f} ms a step, that is "
-              f"{100 * (exposed / steps) / free_ms:.0f}% of the idle")
+def _print_fallback(result: Dict[str, Any]) -> None:
+    """Print one profile's fallback measurement, against the right denominator."""
+    print(f"\n  over {result['kernels']:,} kernels and {result['steps_covered']} step(s)"
+          f" ({result['steps_source']}), per step:")
+    print(f"    host fallback, summed        {result['host_summed_ms']:9.1f} ms  (occupancy)")
+    print(f"    host fallback, wall clock    {result['host_wall_ms']:9.1f} ms  (its own union)")
+    print(f"    of that, no cube or vector   {result['host_exposed_ms']:9.1f} ms  <- the exposed share")
+    print(f"    cube and vector, wall clock  {result['device_compute_wall_ms']:9.1f} ms")
+    print(f"    collectives, summed          {result['comm_summed_ms']:9.1f} ms")
+    print(f"\n    {result['host_exposed_share_pct']:.0f}% of the fallback runs with no cube or "
+          "vector kernel beside it")
+
+    computing = result.get("computing_ms")
+    if computing:
+        print(f"    against Computing of {computing:.1f} ms a step, that is "
+              f"{100 * result['host_exposed_ms'] / computing:.0f}% of it")
+    if result.get("free_ms"):
+        print(f"    Free is {result['free_ms']:.1f} ms a step and is NOT the denominator: the")
+        print("    profiler counts this fallback inside Computing, so it is device work that")
+        print("    starves the matrix and vector units, not device idle.")
 
     print("\n  top fallback operators, summed ms a step:")
-    for name, value in by_name.most_common(6):
-        print(f"    {name[:52]:52s} {value / steps:9.1f}")
-
-    return {
-        "profile": str(profile), "kernel_details": str(kernels), "kernels": len(rows),
-        "steps_covered": steps,
-        "host_summed_ms": round(host_summed / steps, 1),
-        "host_wall_ms": round(host_wall / steps, 1),
-        "host_exposed_ms": round(exposed / steps, 1),
-        "host_exposed_share_pct": round(share, 1),
-        "device_compute_wall_ms": round(compute_wall / steps, 1),
-        "comm_summed_ms": round(comm_ms / steps, 1),
-        "free_ms": round(free_ms, 1) if free_ms else None,
-        "top_operators": {name: round(value / steps, 1) for name, value in by_name.most_common(6)},
-    }
+    for name, value in result["top_operators"].items():
+        print(f"    {name[:52]:52s} {value:9.1f}")
 
 
 def cmd_fallback(args: argparse.Namespace) -> None:
