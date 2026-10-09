@@ -23,8 +23,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-# The memory model loads before the time model, whose modules import each other through it.
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation import estimate_v2  # pylint: disable=unused-import
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd import ratios as Ratios

@@ -22,9 +22,6 @@ import os
 import unittest
 from types import SimpleNamespace
 
-# The package has an import cycle that only the memory estimator's import order
-# settles; the performance modules cannot be the first a process loads.
-import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
