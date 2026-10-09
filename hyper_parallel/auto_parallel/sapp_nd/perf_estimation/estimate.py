@@ -75,14 +75,17 @@ GDN_CHUNK = 64
 # on the 128-token sweeps it adds 3.2 ms a unit of EP, where the measured
 # compute is flat from EP 4 to EP 64, 196 to 210 ms, and this would add 205 ms
 # by EP 64: at a shape whose step is launch bound, 53 to 67% of it idle,
-# neither this term nor the compute model under it holds.  Which kernels grow
-# with EP is not measured yet; a kernel table per EP at the training shape
-# would name them, and until one exists read this as a calibration carrying
-# the measured shape, not as a model of the dispatch.  A cluster that has
-# measured its own says so with ``context.moe_dispatch``, as it states the
-# ratios of the parts in a file, and a model whose compute does not grow with
-# EP states 0, which prices no dispatch: DeepSeek V4.1's crop measures 3.3%
-# less compute at EP 16 than at EP 1, where ND with this term prices 60% more.
+# neither this term nor the compute model under it holds.  The kernel tables
+# per EP at the training shape name what grows: the routing's sort and index
+# kernels, launched as often at every degree above 1 and each running longer,
+# a cost linear in the tokens the all-to-all hands a rank.  This coefficient
+# stands in for that until it is priced from the tokens, so read it as a
+# calibration carrying the measured shape, not as a model of the dispatch.  A
+# cluster that has measured its own says so with ``context.moe_dispatch``, as
+# it states the ratios of the parts in a file, and a model whose compute does
+# not grow with EP states 0, which prices no dispatch: DeepSeek V4.1's crop
+# measures 3.3% less compute at EP 16 than at EP 1, where ND with this term
+# prices 60% more.
 MOE_DISPATCH = 1040
 # How far a stage's recorded parts may stray from its time: they are its time
 # taken apart, so only by rounding.
