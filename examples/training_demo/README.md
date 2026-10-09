@@ -346,6 +346,30 @@ The generated yaml is the config with the values the launch uses, and it
 states the world size so that ND derives the data-parallel width the trainer
 does.
 
+### Inspecting ND's search plot
+
+To inspect ND's search results before choosing strategies to profile, run the
+standard search from the repository root with `-t 5 -l DP EP MP CP OP -eee 2`.
+
+This requests five top results and two distinct additional configurations for
+each of the five dimensions. Each addition has degree greater than one for
+the dimension it is assigned to; when enough unused candidates remain, the
+plot contains fifteen configurations. `results.pdf` separates the top results
+from the additions with a black vertical line, and shows memory in its `MEM`
+row. A positive `-eee` takes precedence over `-e` and `-ee`.
+
+Use `-e 2` to count qualifying top results toward the requested two per
+dimension, or `-ee 2` to always select two further qualifying results per
+dimension. Those two options share additions across dimensions, so they can
+produce fewer than ten unique additions. All three default to zero. Their
+combined counting rules and supported modes are described in
+[ND exhaustive plot selection](../../hyper_parallel/auto_parallel/sapp_nd/README.md#exhaustive-plot-selection).
+
+The command reads the model path and training shape from the YAML; to inspect
+a particular sweep's shape, pass its generated `nd_model.yaml` instead. Use a
+fresh `-o` directory to keep the appended debug CSV rows from different runs
+separate.
+
 ### Profiling the strategies ND ranks best
 
 A sweep can also let ND choose what to run. `--nd-top N` runs ND's search at

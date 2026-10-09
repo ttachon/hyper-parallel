@@ -942,16 +942,28 @@ class ParallelizeLayer:
         top_num: Any = None,
         cache_file: Any = None,
         ranking_csv: Optional[str] = None,
+        exhaustive: int = 0,
+        force_exhaustive: int = 0,
+        fforce_exhaustive: int = 0,
+        dimensions: Optional[list] = None,
     ) -> Any:
         """Search, order and print the configurations that fit memory.
 
         ``ranking_csv``, when given, receives every one of them in ND's order.
         It is written before anything is plotted, so a plot that fails cannot
-        take the ranking with it.
+        take the ranking with it. ``exhaustive`` sets the minimum number of
+        plotted results with each requested dimension above degree one.
+        When ``force_exhaustive >= exhaustive``, append that many qualifying
+        results per dimension. Otherwise, append at least ``force_exhaustive``
+        and count those additions toward the ``exhaustive`` minimum.
+        ``fforce_exhaustive`` takes precedence and reserves distinct additions
+        for each requested dimension.
         """
         scored_space, dbg, generation, ordering = self._search_and_order(
             yaml_folder, threads_num, cache_file
         )
+        for rank, entry in enumerate(scored_space, start=1):
+            entry[0].rank = rank
         if ranking_csv:
             Debug.write_ranking_csv(scored_space, ranking_csv)
             logger.output(
@@ -959,9 +971,55 @@ class ParallelizeLayer:
                 len(scored_space),
                 ranking_csv,
             )
+
+        plot_space = scored_space
+        exhaustive_additions = []
+        has_exhaustive = (
+            exhaustive > 0 or force_exhaustive > 0 or fforce_exhaustive > 0
+        )
+        if fforce_exhaustive > 0:
+            plot_space, exhaustive_additions = _fforce_exhaustive_plot_space(
+                scored_space,
+                dimensions if dimensions is not None else self.config.dimensions,
+                top_num,
+                fforce_exhaustive,
+            )
+        elif exhaustive > 0 or force_exhaustive > 0:
+            plot_space, exhaustive_additions = _exhaustive_plot_space(
+                scored_space,
+                dimensions if dimensions is not None else self.config.dimensions,
+                top_num,
+                exhaustive,
+                force_exhaustive,
+            )
+
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )
+        if exhaustive_additions:
+            if top_num is not None:
+                printed_ids = {
+                    config[0].unique_name()
+                    for config in scored_space[:max(0, top_num)]
+                }
+                additional_to_print = [
+                    config
+                    for config in exhaustive_additions
+                    if config[0].unique_name() not in printed_ids
+                ]
+                if additional_to_print:
+                    logger.output(
+                        space_to_string(
+                            additional_to_print,
+                            max_num=len(additional_to_print),
+                            debug_parts=dbg,
+                            heading="Additional exhaustive configurations",
+                        )
+                    )
+            logger.output(
+                "Exhaustive plot additions: %d unique configuration(s)",
+                len(exhaustive_additions),
+            )
         priced = self.priced()
         if not getattr(priced, "seq_len_stated", True):
             # A warning at parse time scrolls past a search's lines; this one
@@ -1018,13 +1076,20 @@ class ParallelizeLayer:
         )
         if self.enable_debug:
             output_path = Debug.output_dir()
-            if scored_space:
+            if plot_space:
                 Debug.plot_nd(
-                    scored_space,
+                    plot_space,
                     output_path,
                     dbg,
                     title=self.plot_title(),
-                    max_num=top_num,
+                    max_num=(
+                        len(plot_space) if has_exhaustive else top_num
+                    ),
+                    include_all=has_exhaustive,
+                    top_result_count=(
+                        len(plot_space) - len(exhaustive_additions)
+                        if exhaustive_additions else None
+                    ),
                 )
         return scored_space
 
@@ -1244,11 +1309,26 @@ class Parallelize:  # pylint: disable=R0903
         return self.instance.__getattribute__(name)
 
 
-def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) -> str:
-    """Space printer"""
-    i = 0
+def space_to_string(
+    space: Any,
+    max_num: Any = None,
+    debug_parts: Any = None,
+    heading: Optional[str] = None,
+) -> str:
+    """Format ranked configurations for CLI output.
+
+    Args:
+        space: Configurations with memory, performance score and score components.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
+        max_num: Maximum number of configurations to print.
+        debug_parts: Performance components to name in the header.
+        heading: Optional heading replacing the default top-results heading.
+    """
     s = ""
-    if max_num is not None:
+    if heading is not None:
+        s += heading + ":\n"
+    elif max_num is not None:
         s += "Top " + str(max_num) + " configurations:\n"
     else:
         s += "\n"
@@ -1256,7 +1336,7 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         return s
     # A search with a recompute dimension names each entry's mode after its degrees.
     moded = any(getattr(entry[0], "recompute", None) for entry in space)
-    s += "\t"
+    s += "\tTOP   "
     for d in space[0][0].all_dims:
         s += str(d) + " " * (6 - len(str(d)))
     if moded:
@@ -1266,10 +1346,10 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         for dbg_part in debug_parts:
             s += "\t" + dbg_part.short_name()
     s += "\n"
-    for config in space:
+    for i, config in enumerate(space):
         if max_num is not None and max_num == i:
             break
-        s += "\t"
+        s += f"\t{config[0].rank or i + 1:<6}"
         for v in config[0].values():
             s += v + " " * (6 - len(v))
         if moded:
@@ -1279,8 +1359,94 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         for v in config[3]:
             s += f"\t{(100*v/config[2]):.2f}%"
         s += "\n"
-        i += 1
     return s
+
+
+def _exhaustive_plot_space(
+    scored_space: list,
+    dimensions: list,
+    top_num: Optional[int],
+    exhaustive: int,
+    force_exhaustive: int,
+) -> tuple:
+    """Add ranked configs to the normal plot to meet per-dimension counts."""
+    normal_plot = Debug.top_plot_configs(scored_space, top_num)
+    normal_ids = {entry[0].unique_name() for entry in normal_plot}
+    selected_ids = set(normal_ids)
+
+    for dimension in dimensions:
+        present = sum(
+            1
+            for entry in normal_plot
+            if entry[0].has_dim(dimension) and entry[0].val(dimension) > 1
+        )
+        if force_exhaustive >= exhaustive:
+            needed = force_exhaustive
+        else:
+            needed = max(force_exhaustive, exhaustive - present)
+        added = 0
+        if needed == 0:
+            continue
+        for entry in scored_space:
+            config_id = entry[0].unique_name()
+            if config_id in normal_ids:
+                continue
+            if entry[0].has_dim(dimension) and entry[0].val(dimension) > 1:
+                selected_ids.add(config_id)
+                added += 1
+                if added >= needed:
+                    break
+
+    plot_space = [
+        entry for entry in scored_space if entry[0].unique_name() in selected_ids
+    ]
+    additions = [
+        entry for entry in plot_space if entry[0].unique_name() not in normal_ids
+    ]
+    return plot_space, additions
+
+
+def _fforce_exhaustive_plot_space(
+    scored_space: list,
+    dimensions: list,
+    top_num: Optional[int],
+    fforce_exhaustive: int,
+) -> tuple:
+    """Add distinct ranked configs for each dimension to the normal plot."""
+    normal_plot = Debug.top_plot_configs(scored_space, top_num)
+    selected_ids = {entry[0].unique_name() for entry in normal_plot}
+    added_by_dimension = {}
+
+    for dimension in dimensions:
+        added = 0
+        for entry in scored_space:
+            config_id = entry[0].unique_name()
+            if config_id in selected_ids:
+                continue
+            if entry[0].has_dim(dimension) and entry[0].val(dimension) > 1:
+                selected_ids.add(config_id)
+                added += 1
+                if added >= fforce_exhaustive:
+                    break
+        added_by_dimension[dimension] = added
+
+    for dimension, added in added_by_dimension.items():
+        if added < fforce_exhaustive:
+            logger.warning(
+                "Only %d of %d unique exhaustive result(s) found for dimension %s",
+                added,
+                fforce_exhaustive,
+                dimension,
+            )
+
+    plot_space = [
+        entry for entry in scored_space if entry[0].unique_name() in selected_ids
+    ]
+    normal_ids = {entry[0].unique_name() for entry in normal_plot}
+    additions = [
+        entry for entry in plot_space if entry[0].unique_name() not in normal_ids
+    ]
+    return plot_space, additions
 
 
 def pool_estimate_memory(config: CostModelConfig) -> float:

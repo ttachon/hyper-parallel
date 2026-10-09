@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -365,10 +365,20 @@ class Plot:
     dbg_cols: list[str]
     top: int
 
-    def __init__(self, title, rows, debug_parts, top=None):
+    def __init__(
+        self,
+        title: Optional[str],
+        rows: list,
+        debug_parts: list,
+        top: Optional[int] = None,
+        show_top: bool = False,
+    ) -> None:
+        """Initialize the plot table, optionally displaying each configuration's rank."""
         self.title = title
         self.top = top if top is not None else 20
         self.row_title = rows + ["MEM"]
+        if show_top:
+            self.row_title.insert(0, "TOP")
         self.dbg_cols = list(map(str, debug_parts))
         self.col_title = []
         self.cell_text = []
@@ -433,10 +443,14 @@ class Plot:
         """Parse test data for plot"""
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
+        include_all = kwargs.get("include_all", False)
         min_e = configs_estimated[0][2]
         i = 0
-        for cfg_e in configs_estimated:
-            self.cell_text.append(cfg_e[0].values() + [cfg_e[1]])
+        for index, cfg_e in enumerate(configs_estimated):
+            cells = cfg_e[0].values() + [cfg_e[1]]
+            if self.row_title[0] == "TOP":
+                cells.insert(0, cfg_e[0].rank or index + 1)
+            self.cell_text.append(cells)
             self.col_title.append("")
             try:
                 self.data.append(
@@ -447,21 +461,58 @@ class Plot:
                     real_data.append(tuple(measured_bars(cfg_e[5], plot_idle)))
             except IndexError:
                 score = cfg_e[2]
-                if i >= self.top or (min_e is not None and score > min_e * 20):
+                if not include_all and (
+                    i >= self.top or (min_e is not None and score > min_e * 20)
+                ):
                     self.cell_text.pop()
                     break
                 self.data.append(tuple([cfg_e[0], score] + cfg_e[3]))
                 i += 1
 
 
+def top_plot_configs(configs_estimated: list, max_num: Optional[int] = None) -> list:
+    """Return the configurations the standard ND plot would include."""
+    if not configs_estimated:
+        return []
+    top = max_num if max_num is not None else 20
+    if top <= 0:
+        return []
+    best_score = configs_estimated[0][2]
+    selected = []
+    for config in configs_estimated:
+        if len(selected) >= top or config[2] > best_score * 20:
+            break
+        selected.append(config)
+    return selected
+
+
 def plot_nd(
-    configs_estimated, output_path, debug_parts, title=None, max_num=None
-):
-    """Plot estimation"""
+    configs_estimated: list,
+    output_path: str,
+    debug_parts: list,
+    title: Optional[str] = None,
+    max_num: Optional[int] = None,
+    include_all: bool = False,
+    top_result_count: Optional[int] = None,
+) -> None:
+    """Plot estimation with a divider before any additional configurations.
+
+    Args:
+        configs_estimated: Ranked configurations with memory, score and its parts.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
+        output_path: Directory in which to save results.pdf.
+        debug_parts: Performance components to plot.
+        title: Optional plot title.
+        max_num: Maximum number of configurations in the normal plot.
+        include_all: Include every supplied configuration without normal plot limits.
+        top_result_count: Number of normal results preceding the additions.
+    """
     plot = Plot(
-        title, configs_estimated[0][0].keys(), debug_parts, top=max_num
+        title, configs_estimated[0][0].keys(), debug_parts,
+        top=max_num, show_top=True,
     )
-    plot.parse_data(configs_estimated)
+    plot.parse_data(configs_estimated, include_all=include_all)
 
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "estim"] + plot.dbg_cols)
@@ -471,6 +522,8 @@ def plot_nd(
     )
     axis.set_ylim(ymin=1)
     axis.legend(loc="upper left", bbox_to_anchor=(1, 1))
+    if top_result_count is not None and 0 < top_result_count < len(plot.data):
+        axis.axvline(top_result_count - 0.5, color="black", linewidth=1.5)
 
     plot.make_table()
     plot.close(output_path, "results")
@@ -499,7 +552,8 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
 
     Args:
         scored_space: ``(config, memory, score, parts)`` entries, as
-            ``ParallelizeLayer.order_search_space`` sorts them.
+            ``ParallelizeLayer.order_search_space`` sorts them. Stored ranks
+            are preserved; unranked configurations use their input positions.
         path: CSV file to write; its directory is created when missing.
     """
     parts = _score_parts()
@@ -512,7 +566,7 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
                         + [str(part) for part in parts])
         for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
             split = [repr(float(value)) for value in values] if values else [""] * len(parts)
-            writer.writerow([rank] + config.values() + ([config.recompute] if moded else [])
+            writer.writerow([config.rank or rank] + config.values() + ([config.recompute] if moded else [])
                             + [memory, repr(float(score))] + split)
 
 

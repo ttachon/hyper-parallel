@@ -1690,6 +1690,239 @@ class TestSappNDRunND(unittest.TestCase):
                 plot_idle=True,
             )
 
+    def test_top_ranks_match_cli_and_plot_with_exhaustive_additions(self) -> None:
+        """Test CLI and plot TOP positions retain gaps from the full ND ranking."""
+        dimensions = [Dim.DP, Dim.EP]
+        degrees = [(1, 1), (2, 1), (4, 1), (2, 2), (8, 1), (16, 1), (4, 4)]
+        scored_space = [
+            (
+                Dim.Dimensions([(Dim.DP, dp), (Dim.EP, ep)], all_dims=dimensions),
+                128,
+                float(rank),
+                [float(rank)],
+            )
+            for rank, (dp, ep) in enumerate(degrees, start=1)
+        ]
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = True
+        runner.model_name = "unit"
+        runner.global_batch_size = 16
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=16)
+        runner.config = SimpleNamespace(
+            balancing=SimpleNamespace(from_config=False), dimensions=dimensions,
+        )
+        runner.generate_search_space = lambda folder, threads_num: [entry[:2] for entry in scored_space]
+        runner.order_search_space = lambda space, threads_num, cache_file: (
+            scored_space, [Debug.PerfParts.FW_COMPUTE],
+        )
+        # The search first checks that a batch is reachable, and notes what the
+        # priced config left unstated, neither of which this runner's config holds.
+        runner.batch_reachable = lambda: True
+        runner.priced = SimpleNamespace
+        cases = [
+            ({}, ["1", "2"], True),
+            ({"exhaustive": 2}, ["1", "2", "4", "7"], True),
+            ({"force_exhaustive": 2}, ["1", "2", "4", "7"], True),
+            ({"fforce_exhaustive": 2}, ["1", "2", "4", "7"], True),
+            ({"fforce_exhaustive": 2}, ["1", "2", "4", "7"], False),
+        ]
+
+        for options, expected_ranks, enable_debug in cases:
+            runner.enable_debug = enable_debug
+            with self.subTest(options=options, enable_debug=enable_debug), \
+                    tempfile.TemporaryDirectory() as tmp_dir, \
+                    patch.object(Debug, "output_dir", return_value=tmp_dir), \
+                    patch.object(Debug.Plot, "close"), \
+                    patch.object(Par.logger, "output") as cli_output:
+                try:
+                    result = runner.run_generation_to_ordering(None, top_num=2, dimensions=[Dim.EP], **options)
+                    self.assertEqual(result, scored_space)
+                    self.assertEqual([entry[0].rank for entry in result], list(range(1, 8)))
+                    cli_tables = [
+                        call.args[0] for call in cli_output.call_args_list
+                        if "Performance score" in call.args[0]
+                    ]
+                    for text in cli_tables:
+                        self.assertEqual(text.splitlines()[1].split()[0], "TOP")
+                    self.assertEqual(
+                        [line.split()[0] for text in cli_tables for line in text.splitlines()[2:] if line.strip()],
+                        expected_ranks,
+                    )
+                    if enable_debug:
+                        table = plt.gca().tables[0]
+                        self.assertEqual(table[1, -1].get_text().get_text(), "TOP")
+                        self.assertEqual(
+                            [table[1, column].get_text().get_text() for column in range(len(expected_ranks))],
+                            expected_ranks,
+                        )
+                finally:
+                    plt.close("all")
+
+    def test_exhaustive_plot_space_precedence_and_top_up(self) -> None:
+        """Test exhaustive counts and numeric force-exhaustive precedence."""
+        values = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        scored_space = [
+            (
+                Dim.Dimensions([(Dim.DP, value)], all_dims=[Dim.DP]),
+                128,
+                float(index),
+                [],
+            )
+            for index, value in enumerate(values, start=1)
+        ]
+        cases = [
+            # (top M, exhaustive, force exhaustive, additions, total qualifying)
+            (3, 5, 2, 3, 5),
+            (3, 2, 2, 2, 4),
+            (3, 2, 4, 4, 6),
+            (8, 5, 2, 2, 9),
+            (3, 4, 0, 2, 4),
+        ]
+
+        for top_num, exhaustive, force_exhaustive, expected_additions, expected_total in cases:
+            with self.subTest(
+                top_num=top_num,
+                exhaustive=exhaustive,
+                force_exhaustive=force_exhaustive,
+            ):
+                normal_plot = Debug.top_plot_configs(scored_space, top_num)
+                plot_space, additions = Par._exhaustive_plot_space(
+                    scored_space,
+                    [Dim.DP],
+                    top_num,
+                    exhaustive,
+                    force_exhaustive,
+                )
+                qualifying_total = sum(
+                    1
+                    for config in plot_space
+                    if config[0].has_dim(Dim.DP) and config[0].val(Dim.DP) > 1
+                )
+
+                self.assertEqual(len(additions), expected_additions)
+                self.assertEqual(qualifying_total, expected_total)
+                self.assertLessEqual(len(normal_plot), top_num)
+
+        multi_dim_space = [
+            (
+                Dim.Dimensions(
+                    [(Dim.DP, dp), (Dim.OP, op)],
+                    all_dims=[Dim.DP, Dim.OP],
+                ),
+                128,
+                float(index),
+                [],
+            )
+            for index, (dp, op) in enumerate(
+                [(1, 1), (2, 1), (1, 2), (2, 2), (4, 1), (1, 4)],
+                start=1,
+            )
+        ]
+        plot_space, additions = Par._exhaustive_plot_space(
+            multi_dim_space,
+            [Dim.DP, Dim.OP],
+            top_num=2,
+            exhaustive=2,
+            force_exhaustive=0,
+        )
+        for dimension in (Dim.DP, Dim.OP):
+            qualifying_total = sum(
+                1
+                for config in plot_space
+                if config[0].has_dim(dimension) and config[0].val(dimension) > 1
+            )
+            self.assertGreaterEqual(qualifying_total, 2)
+        self.assertEqual(len(additions), 2)
+
+    def test_exhaustive_plot_includes_candidates_past_standard_score_cutoff(self) -> None:
+        """Test exhaustive candidates survive the normal 20x score cutoff."""
+        scores = [1.0, 2.0, 3.0, 21.0]
+        values = [1, 2, 4, 8]
+        scored_space = [
+            (
+                Dim.Dimensions([(Dim.DP, value)], all_dims=[Dim.DP]),
+                128,
+                score,
+                [],
+            )
+            for value, score in zip(values, scores)
+        ]
+        plot_space, additions = Par._exhaustive_plot_space(
+            scored_space,
+            [Dim.DP],
+            top_num=10,
+            exhaustive=3,
+            force_exhaustive=0,
+        )
+        debug_parts = [Debug.PerfParts.FW_COMPUTE]
+
+        standard_plot = Debug.Plot("unit", [Dim.DP], debug_parts, top=len(plot_space))
+        standard_plot.parse_data(plot_space)
+        exhaustive_plot = Debug.Plot("unit", [Dim.DP], debug_parts, top=len(plot_space))
+        exhaustive_plot.parse_data(plot_space, include_all=True)
+
+        self.assertEqual(len(additions), 1)
+        self.assertEqual(len(standard_plot.data), 3)
+        self.assertEqual(len(exhaustive_plot.data), 4)
+
+    def test_fforce_exhaustive_adds_distinct_results_per_dimension(self) -> None:
+        """Test each requested dimension receives distinct additional configs."""
+        dimensions = [Dim.DP, Dim.EP, Dim.TP, Dim.CP, Dim.OP]
+        candidate_values = [
+            {Dim.DP: 2, Dim.EP: 2},
+            {Dim.DP: 4, Dim.EP: 4},
+            {Dim.EP: 8},
+            {Dim.EP: 16},
+            {Dim.TP: 2},
+            {Dim.TP: 4},
+            {Dim.CP: 2},
+            {Dim.CP: 4},
+            {Dim.OP: 2},
+            {Dim.OP: 4},
+        ]
+        scored_space = [
+            (
+                Dim.Dimensions([(dimension, 1) for dimension in dimensions], all_dims=dimensions),
+                128,
+                1.0,
+                [],
+            )
+        ]
+        scored_space.extend(
+            (
+                Dim.Dimensions(
+                    [
+                        (dimension, values.get(dimension, 1))
+                        for dimension in dimensions
+                    ],
+                    all_dims=dimensions,
+                ),
+                128,
+                float(index),
+                [],
+            )
+            for index, values in enumerate(candidate_values, start=2)
+        )
+
+        plot_space, additions = Par._fforce_exhaustive_plot_space(
+            scored_space,
+            dimensions,
+            top_num=1,
+            fforce_exhaustive=2,
+        )
+        addition_ids = {entry[0].unique_name() for entry in additions}
+
+        self.assertEqual(len(additions), 10)
+        self.assertEqual(len(addition_ids), 10)
+        self.assertEqual(len(plot_space), 11)
+        for dimension in dimensions:
+            qualifying = sum(
+                1
+                for entry in additions
+                if entry[0].has_dim(dimension) and entry[0].val(dimension) > 1
+            )
+            self.assertGreaterEqual(qualifying, 2)
+
     def test_a_comparison_writes_a_plot_without_idle_and_its_estimates(self) -> None:
         """
         Feature: the files run_nd --real_csv writes beside its plot.
@@ -1811,27 +2044,29 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: the CSV of a search's configurations in ND's order.
         Description: Two configurations, one with its score split into parts and
-            one without.
-        Expectation: Rows keep ND's order and rank, scores keep full precision,
-            and missing parts are blank.
+            one without, with and without ranks from the full search.
+        Expectation: Rows keep stored global ranks or fall back to their input
+            positions, scores keep full precision, and missing parts are blank.
         """
         first = Dim.Dimensions([(Dim.DP, 8), (Dim.SP, False), (Dim.OP, 4)],
                                all_dims=[Dim.DP, Dim.SP, Dim.OP])
         second = Dim.Dimensions([(Dim.DP, 4), (Dim.SP, True), (Dim.OP, 2)],
                                 all_dims=[Dim.DP, Dim.SP, Dim.OP])
         parts = [str(part) for part in Debug.PerfParts][:-2]
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = os.path.join(tmp_dir, "nested", "ranking.csv")
-            Debug.write_ranking_csv(
-                [(first, 100, 91599458344632.31, [1.5] * len(parts)), (second, 120, 1e14, [])], path)
-            with open(path, newline="", encoding="utf-8") as handle:
-                rows = list(csv.reader(handle))
-        self.assertEqual(rows[0], ["rank", "DP", "SP", "OP", "memory_mb", "score"] + parts)
-        self.assertEqual(rows[1][:6], ["1", "8", "False", "4", "100", "91599458344632.31"])
-        self.assertEqual(float(rows[1][5]), 91599458344632.31)
-        self.assertEqual(rows[1][6:], ["1.5"] * len(parts))
-        self.assertEqual(rows[2][:6], ["2", "4", "True", "2", "120", "100000000000000.0"])
-        self.assertEqual(rows[2][6:], [""] * len(parts))
+        for ranks, expected in (((None, None), ("1", "2")), ((4, 7), ("4", "7"))):
+            first.rank, second.rank = ranks
+            with self.subTest(ranks=ranks), tempfile.TemporaryDirectory() as tmp_dir:
+                path = os.path.join(tmp_dir, "nested", "ranking.csv")
+                Debug.write_ranking_csv(
+                    [(first, 100, 91599458344632.31, [1.5] * len(parts)), (second, 120, 1e14, [])], path)
+                with open(path, newline="", encoding="utf-8") as handle:
+                    rows = list(csv.reader(handle))
+            self.assertEqual(rows[0], ["rank", "DP", "SP", "OP", "memory_mb", "score"] + parts)
+            self.assertEqual(rows[1][:6], [expected[0], "8", "False", "4", "100", "91599458344632.31"])
+            self.assertEqual(float(rows[1][5]), 91599458344632.31)
+            self.assertEqual(rows[1][6:], ["1.5"] * len(parts))
+            self.assertEqual(rows[2][:6], [expected[1], "4", "True", "2", "120", "100000000000000.0"])
+            self.assertEqual(rows[2][6:], [""] * len(parts))
 
     def test_the_ranking_is_written_before_the_plot(self) -> None:
         """
@@ -1861,6 +2096,31 @@ class TestSappNDRunND(unittest.TestCase):
             with open(path, newline="", encoding="utf-8") as handle:
                 rows = list(csv.reader(handle))
         self.assertEqual(rows[1][:5], ["1", "8", "4", "100", "2.5"])
+
+    def test_run_nd_cli_passes_exhaustive_options_to_the_search(self) -> None:
+        """Test short and long exhaustive CLI options reach the search runner."""
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            option_forms = [
+                (["-e", "5", "-ee", "2"], 5, 2, 0),
+                (["--exhaustive", "5", "--force_exhaustive", "2"], 5, 2, 0),
+                (["-eee", "2"], 0, 0, 2),
+                (["--fforce-exhaustive", "2"], 0, 0, 2),
+            ]
+            for options, exhaustive, force_exhaustive, fforce_exhaustive in option_forms:
+                _FakeParallelize.instances = []
+                argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"] + options
+                with patch.object(sys, "argv", argv):
+                    runpy.run_module(
+                        "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                        run_name="__main__",
+                    )
+
+                run_kwargs = _FakeParallelize.instances[-1].last_run_kwargs()
+                self.assertEqual(run_kwargs["exhaustive"], exhaustive)
+                self.assertEqual(run_kwargs["force_exhaustive"], force_exhaustive)
+                self.assertEqual(run_kwargs["fforce_exhaustive"], fforce_exhaustive)
 
     def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
         """
