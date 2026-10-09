@@ -657,6 +657,43 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
         ) from exc
 
 
+# Model families whose attention a census cannot price here, by model type,
+# with what is missing.  Their layers build and run on this host, through
+# Transformers' own eager path, and that path is not the one the run takes:
+# measuring it prices a layer nobody runs, as a replacement this host cannot
+# build does (:func:`_replaced`, F53).  A family belongs here only while no
+# contract in :mod:`~hyper_parallel.auto_parallel._npu_contracts` states what
+# its kernels save; stating one is what takes it out again.
+_NO_ACTIVATION_CONTRACT = {
+    "deepseek_v4": (
+        "its sparse attention and Lightning Indexer run as NPU kernels with no torch path a run "
+        "takes, and no contract states what they save, so a census here would price Transformers' "
+        "eager attention instead: that keeps an fp32 score of one sequence by another, and each "
+        "Indexer layer keeps seven fp32 candidate scores. Measured on the DeepSeek-V4.1 crop at "
+        "4096 tokens it reads 77.9 GiB a rank against a 37.6 GiB measured peak"
+    ),
+}
+
+
+def _no_contract(config: Any) -> None:
+    """Refuse a census of a model whose kernels no contract states.
+
+    Raises:
+        CensusUnavailable: If *config*'s family is one of
+            :data:`_NO_ACTIVATION_CONTRACT`.  A layer's parameters do not
+            depend on which kernel runs it and are counted as ever
+            (:func:`census_parameters`); what it keeps for its backward
+            does, so this refuses rather than answer with the bytes of a
+            layer the run does not build.
+    """
+    missing = _NO_ACTIVATION_CONTRACT.get(str(getattr(config, "model_type", "")))
+    if missing is not None:
+        raise CensusUnavailable(
+            f"no census of a {config.model_type} layer: {missing}; state the kernels' contracts, "
+            f"or drop context.census and read the formulas' memory as an estimate, not as a bound"
+        )
+
+
 def _modeling(config: Any) -> Any:
     """The Transformers modeling module of *config*'s model."""
     model_type = str(config.model_type)
@@ -684,13 +721,30 @@ def _classes(modeling: Any) -> Tuple[type, type]:
 
 
 def tp_config(config: Any, tp: int) -> Any:
-    """*config* as one of *tp* tensor-parallel ranks holds its layers: heads and widths divided."""
+    """*config* as one of *tp* tensor-parallel ranks holds its layers: heads and widths divided.
+
+    Two of the fields divided can be one field.  A Transformers config class
+    may declare an ``attribute_map``, and DeepSeek-V4's maps
+    ``intermediate_size`` onto ``moe_intermediate_size``, so a model whose
+    feed-forward is all experts states one width under two names.  Dividing
+    each name in turn then divides that width by *tp* twice, and the layer
+    built as a rank's share is a quarter as wide at TP 2 rather than half,
+    which makes the split the census derives from the pair too large and ND
+    over-reward tensor parallelism.  Qwen3-MoE keeps the two apart, which is
+    why this stayed hidden.  Each underlying attribute is divided once.
+    """
     config = copy.deepcopy(config)
     config.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    aliases = getattr(type(config), "attribute_map", None) or {}
+    divided = set()
     for name in _TP_FIELDS:
+        target = aliases.get(name, name)
+        if target in divided:
+            continue
         value = getattr(config, name, None)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             setattr(config, name, max(1, value // tp))
+            divided.add(target)
     return config
 
 
@@ -1034,7 +1088,12 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         and the bytes of activations the backward holds when it holds the
         most, its own gradients included, less the parameters and those
         gradients.
+
+    Raises:
+        CensusUnavailable: If no contract states what this model's kernels
+            save (:func:`_no_contract`).
     """
+    _no_contract(config)
     with _fake_layer(config, layer_index, gdn_backend=gdn_backend,
                      replacements=replacements) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)

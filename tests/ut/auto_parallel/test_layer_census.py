@@ -905,5 +905,293 @@ class TestCensusPricing(unittest.TestCase):
             self.assertAlmostEqual(log[(0, 0, index, "S")]["_activ"], kept, delta=1)
 
 
+def _deepseek_v4():
+    """A four-layer DeepSeek-V4 config of width 256, the family the V4.1 recipe's factory builds."""
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import (  # pylint: disable=C0415
+        DeepseekV4Config,
+    )
+    return DeepseekV4Config(vocab_size=1024, hidden_size=256, num_hidden_layers=4,
+                            num_attention_heads=4, num_key_value_heads=1, head_dim=64,
+                            intermediate_size=128, moe_intermediate_size=128, n_routed_experts=4,
+                            num_experts_per_tok=2, q_lora_rank=32)
+
+
+def _saved_bytes(run) -> int:
+    """The bytes *run*'s forward saves for its backward, on fake tensors."""
+    seen, total = set(), 0
+
+    def pack(tensor):
+        nonlocal total
+        address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
+        if address not in seen:
+            seen.add(address)
+            total += tensor.untyped_storage().nbytes()
+        return tensor
+
+    with FakeTensorMode(allow_non_fake_inputs=True), \
+            torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        run()
+    return total
+
+
+class TestV41SparseAttentionContract(unittest.TestCase):
+    """The contract of DeepSeek-V4.1's sparse attention keeps what its kernel's caller keeps."""
+
+    @staticmethod
+    def _call(seq: int, heads: int = 8, head_dim: int = 64, selected: int = 32, rope: int = 8):
+        """Run the contract once at *seq* tokens, with the caller's layouts."""
+        from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+            npu_sparse_attention_with_scalar_sink,
+        )
+        query = torch.randn(1, heads, seq, head_dim, dtype=torch.bfloat16, requires_grad=True)
+        key_value = torch.randn(1, 1, seq, head_dim, dtype=torch.bfloat16, requires_grad=True)
+        indices = torch.zeros(1, seq, selected, dtype=torch.int32)
+        sinks = torch.randn(heads, dtype=torch.bfloat16, requires_grad=True)
+        out = npu_sparse_attention_with_scalar_sink(query, key_value, indices, sinks, rope, 0.125)
+        return out
+
+    def test_the_output_has_the_shape_its_caller_reshapes_to(self):
+        """
+        Feature: the contract's output.
+        Expectation: A row per token and head, (batch, tokens, heads, head
+            dim), which is the shape the kernel's caller returns after it
+            rescales the sink's share out of the softmax sum.
+        """
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = self._call(seq=128)
+        self.assertEqual(tuple(out.shape), (1, 128, 8, 64))
+
+    def test_it_keeps_the_nine_tensors_its_caller_keeps(self):
+        """
+        Feature: what the contract saves for its backward.
+        Expectation: Exactly the nine tensors
+            _NpuSparseAttentionWithScalarSink hands save_for_backward, in
+            its shapes: the queries and padded keys token-major, the two
+            auxiliary rotary coordinates, the selected indices with the
+            sink's column, two fp32 statistics of one scalar a token and
+            head, the output, and the sink's share of each row.
+        """
+        seq, heads, head_dim, selected, rope = 128, 8, 64, 32, 8
+        padded = max(seq + 1, selected + 2)
+        want = (
+            seq * heads * head_dim * 2          # queries, token-major
+            + padded * head_dim * 2             # padded keys
+            + seq * heads * rope * 2            # query rope coordinates
+            + padded * rope * 2                 # key rope coordinates
+            + seq * (selected + 1) * 4          # selected indices plus the sink's column
+            + seq * heads * 4 * 2               # the two fp32 statistics
+            + seq * heads * head_dim * 2        # the output
+            + seq * heads * 4                   # the sink's share of each row
+        )
+        got = _saved_bytes(lambda: self._call(seq, heads, head_dim, selected, rope))
+        self.assertEqual(got, want)
+
+    def test_its_backward_hands_each_input_a_gradient_of_its_own_shape(self):
+        """
+        Feature: a backward through the contract.
+        Expectation: The queries, the keys and the sinks each get a
+            gradient shaped as they were passed, which is not the
+            token-major layout the kernel is handed: the caller gives
+            (batch, heads, tokens, head dim) and the kernel takes
+            (tokens, heads, head dim). Returning the saved shapes instead
+            makes autograd refuse the whole backward.
+        """
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = self._call(seq=64)
+            out.sum().backward()
+        # The backward ran, which is the assertion: autograd checks every
+        # gradient against its input's shape and raises otherwise.
+        self.assertEqual(tuple(out.shape), (1, 64, 8, 64))
+
+    def test_the_installer_binds_both_paths_and_restores_them(self):
+        """
+        Feature: v41_attention_contract, which the census installs around a
+            V4.1 layer.
+        Expectation: Where the V4.1 attention is in the tree, both the
+            kernel's name and the reference beside it are bound to the
+            contract inside the context and restored on the way out, since
+            a layer picks between them by the device it runs on and a
+            census is on none. Where the module is absent, as on the
+            cost model's own lineage, it is a no-op that says so.
+        """
+        import importlib  # pylint: disable=C0415
+        from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+            npu_sparse_attention_with_scalar_sink,
+            v41_attention_contract,
+        )
+        try:
+            module = importlib.import_module(
+                "hyper_parallel.components.modules.shared_compressed_dsa_attention")
+        except ImportError:
+            module = None
+        with v41_attention_contract(64) as patched:
+            self.assertEqual(patched, module is not None)
+            if module is not None:
+                self.assertIs(module.npu_sparse_attention_with_scalar_sink,
+                              npu_sparse_attention_with_scalar_sink)
+                self.assertIsNot(module._reference_sparse_attention, None)  # pylint: disable=W0212
+        if module is not None:
+            self.assertIsNot(module.npu_sparse_attention_with_scalar_sink,
+                             npu_sparse_attention_with_scalar_sink)
+
+    def test_the_indexer_contract_wraps_every_selection_and_restores_them(self):
+        """
+        Feature: v41_indexer_contract, which states that the fused Lightning
+            Indexer keeps nothing for a backward.
+        Expectation: Where the V4.1 attention is in the tree, all four
+            selection functions are bound to a wrapper inside the context
+            and restored on the way out. The wrapper computes the same
+            indices, since no_grad changes whether a graph is recorded and
+            never what is computed, so the contract needs no shape declared.
+            Where the module is absent it is a no-op that says so.
+        """
+        import importlib  # pylint: disable=C0415
+        from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+            _V41_SELECTION,
+            v41_indexer_contract,
+        )
+        try:
+            module = importlib.import_module(
+                "hyper_parallel.components.modules.shared_compressed_dsa_attention")
+        except ImportError:
+            module = None
+        before = ({name: getattr(module, name) for name in _V41_SELECTION}
+                  if module is not None else {})
+        with v41_indexer_contract() as wrapped:
+            self.assertEqual(wrapped, module is not None)
+            for name, original in before.items():
+                self.assertIsNot(getattr(module, name), original)
+        for name, original in before.items():
+            self.assertIs(getattr(module, name), original)
+
+    def test_what_it_keeps_follows_the_sequence_and_not_its_square(self):
+        """
+        Feature: the contract against the reference path beside it.
+        Expectation: Doubling the tokens roughly doubles what is kept. This
+            is the whole reason the contract is needed: the reference keeps
+            an fp32 score of one sequence by another, which quadruples, and
+            on the V4.1 crop that read 77.9 GiB a rank at 4096 tokens
+            against a 37.6 GiB measured peak.
+        """
+        small = _saved_bytes(lambda: self._call(seq=256))
+        large = _saved_bytes(lambda: self._call(seq=512))
+        self.assertAlmostEqual(large / small, 2.0, delta=0.05)
+
+
+class TestTensorParallelConfig(unittest.TestCase):
+    """A rank's share of a config divides each width once, whatever it is called."""
+
+    def test_one_width_under_two_names_is_divided_once(self):
+        """
+        Feature: tp_config on a DeepSeek-V4 config, whose attribute_map maps
+            intermediate_size onto moe_intermediate_size, so a model whose
+            feed-forward is all experts states one width under two names.
+        Expectation: A rank of 2 holds half that width. Dividing each name in
+            turn gave a quarter, so the layer the census built as a rank's
+            share was half the width it should be, the split derived from the
+            pair came out too large, and ND over-rewarded tensor parallelism.
+        """
+        from hyper_parallel.auto_parallel._layer_census import tp_config  # pylint: disable=C0415
+        config = _deepseek_v4()
+        self.assertEqual(config.intermediate_size, config.moe_intermediate_size)
+        whole = config.moe_intermediate_size
+        half = tp_config(config, 2)
+        self.assertEqual(half.moe_intermediate_size, whole // 2)
+        self.assertEqual(half.intermediate_size, whole // 2)
+        self.assertEqual(half.num_attention_heads, config.num_attention_heads // 2)
+
+    def test_two_widths_under_two_names_are_each_divided(self):
+        """
+        Feature: tp_config on a Qwen3-MoE config, which keeps the dense and
+            the expert width apart.
+        Expectation: Both are halved, so de-duplicating the aliased pair does
+            not stop a model that really has two widths from splitting both.
+        """
+        from hyper_parallel.auto_parallel._layer_census import tp_config  # pylint: disable=C0415
+        config = _qwen3_moe()
+        self.assertNotEqual(config.intermediate_size, config.moe_intermediate_size)
+        half = tp_config(config, 2)
+        self.assertEqual(half.intermediate_size, config.intermediate_size // 2)
+        self.assertEqual(half.moe_intermediate_size, config.moe_intermediate_size // 2)
+
+
+class TestKernelContracts(unittest.TestCase):
+    """A census of a model whose kernels no contract states is refused, not answered."""
+
+    def test_a_model_whose_kernels_no_contract_states_is_refused(self):
+        """
+        Feature: census_layer on a DeepSeek-V4 config, the family the
+            DeepSeek-V4.1 recipe's factory builds.
+        Expectation: The census refuses, naming the kernels and what the
+            eager path it would otherwise measure keeps, rather than
+            answering with the bytes of a layer no run builds.  Before this
+            it raised AttributeError out of the rotary embedding, which no
+            caller catches, so the whole cost model stopped.
+        """
+        with self.assertRaises(CensusUnavailable) as refusal:
+            census_layer(_deepseek_v4(), 0, 128)
+        said = str(refusal.exception)
+        self.assertIn("deepseek_v4", said)
+        self.assertIn("Lightning Indexer", said)
+        self.assertIn("not as a bound", said)
+
+    def test_the_whole_stack_of_kinds_is_refused_as_one(self):
+        """
+        Feature: census_activations on the same config, the entry the model
+            spec calls.
+        Expectation: It refuses with the same reason, which the spec
+            catches, so a run asking for a census of this family is priced
+            by the formulas rather than stopped.
+        """
+        with self.assertRaises(CensusUnavailable):
+            census_activations(_deepseek_v4(), [{"kind": "decoder", "count": 4}], seq_length=128)
+
+    def test_the_parameters_of_such_a_layer_are_still_counted(self):
+        """
+        Feature: census_parameters on the same config.
+        Expectation: It answers, because which kernel runs a layer does not
+            change how many parameters it has, and verify mode sets these
+            beside what ND prices.  Only what a layer keeps for its
+            backward depends on the kernel.
+        """
+        parts = census_parameters(_deepseek_v4(), 0)
+        self.assertIn("routed", parts)
+        self.assertGreater(parts["routed"], 0)
+        self.assertGreater(parts["attention"], 0)
+
+    def test_a_run_told_it_has_no_census_is_told_its_memory_is_not_a_bound(self):
+        """
+        Feature: resolve_hf_model_spec asked for a census with the model
+            stated by hand, as a model Transformers cannot build must be.
+        Expectation: The warning says the memory is an estimate and not a
+            bound, because the formulas alone have measured 37 to 55% below
+            a real peak and a search filters feasibility on that number.
+        """
+        model = {"config_overrides": {"hidden_size": 64, "num_hidden_layers": 2,
+                                      "num_attention_heads": 4, "vocab_size": 128}}
+        with self.assertLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING") as logs:
+            resolve_hf_model_spec(model, census_seq_len=128)
+        said = "\n".join(logs.output)
+        self.assertIn("NOT a bound", said)
+        self.assertIn("may still run out of memory", said)
+
+    def test_stated_records_are_taken_without_that_warning(self):
+        """
+        Feature: the same spec, with the census records its reader measured
+            stated in the overrides.
+        Expectation: The records reach the spec and nothing warns that the
+            memory is not a bound, since it then rests on a measurement;
+            this is the route a model Transformers cannot build has to its
+            records.
+        """
+        record = {"saved": 1024.0, "saved_tp": 0.0, "working": 2048.0,
+                  "working_tp": 0.0, "seq_length": 128}
+        model = {"config_overrides": {"hidden_size": 64, "num_hidden_layers": 2,
+                                      "num_attention_heads": 4, "vocab_size": 128,
+                                      "activations": {"decoder": record}}}
+        spec = resolve_hf_model_spec(model, census_seq_len=128)
+        self.assertEqual(spec["activations"]["decoder"], record)
+
+
 if __name__ == "__main__":
     unittest.main()

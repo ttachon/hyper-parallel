@@ -48,6 +48,7 @@ census left (:func:`_drop_fake_caches`, F55).
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 import importlib.machinery
 import sys
@@ -199,6 +200,79 @@ def _unpermute_backward(ctx: Any, grad: torch.Tensor) -> Tuple[Optional[torch.Te
 _UNPERMUTE.register_autograd(_unpermute_backward, setup_context=_unpermute_saves)
 
 
+def _v41_sparse_output(query: torch.Tensor, key_value: torch.Tensor, sparse_indices: torch.Tensor,
+                       sinks: torch.Tensor, rope_head_dim: int, scale: float) -> torch.Tensor:
+    """The sparse attention's output, a row per token and head, as the kernel's caller reshapes it."""
+    del key_value, sparse_indices, sinks, rope_head_dim, scale
+    batch, heads, seq, head_dim = query.shape
+    return query.new_empty((batch, seq, heads, head_dim))
+
+
+_V41_SPARSE = torch.library.custom_op(
+    "nd_census_npu::v41_sparse_attention", mutates_args=(),
+    schema=("(Tensor query, Tensor key_value, Tensor sparse_indices, Tensor sinks, "
+            "int rope_head_dim, float scale) -> Tensor"))(_v41_sparse_output)
+_V41_SPARSE.register_fake(_v41_sparse_output)
+
+
+def _v41_sparse_saves(ctx: Any, inputs: Tuple[Any, ...], output: torch.Tensor) -> None:
+    """Keep what the kernel's own caller keeps, in the shapes it keeps them.
+
+    Copied from the nine tensors
+    ``_NpuSparseAttentionWithScalarSink.forward`` hands
+    ``ctx.save_for_backward``: the queries and the padded keys in the
+    kernel's token-major layout, the two auxiliary rotary coordinates that
+    carry the sink, the selected indices with the sink's column appended,
+    the combined softmax maximum and the corrected sum, the output, and the
+    sink's share of each row's mass.  The statistics are one scalar a token
+    and head, not the eight-wide pair the dense fused attention keeps,
+    because that caller views them as (batch, tokens, heads).
+    """
+    query, key_value, sparse_indices, sinks, rope_head_dim, _scale = inputs
+    batch, heads, seq, head_dim = query.shape
+    keys, selected = key_value.shape[2], sparse_indices.shape[-1]
+    # The gradients go back in the shapes the caller passed, which are not
+    # the token-major ones the kernel is given.
+    ctx.gradients = tuple((tuple(tensor.shape), tensor.dtype) for tensor in (query, key_value, sinks))
+    # The caller pads the keys so every one of them is selected at most
+    # once and the sink still has a row of its own.
+    padded = max(keys + 1, selected + 2)
+    rope = int(rope_head_dim)
+    stats = [query.new_empty((batch * seq, heads, 1), dtype=torch.float32) for _ in range(2)]
+    ctx.save_for_backward(
+        query.new_empty((batch * seq, heads, head_dim)),
+        key_value.new_empty((batch * padded, 1, head_dim)),
+        query.new_empty((batch * seq, heads, rope)),
+        key_value.new_empty((batch * padded, 1, rope)),
+        sparse_indices.new_empty((batch * seq, 1, selected + 1), dtype=torch.int32),
+        stats[0], stats[1], output,
+        query.new_empty((batch, seq, heads), dtype=torch.float32),
+    )
+
+
+def _v41_sparse_backward(ctx: Any, grad: torch.Tensor) -> Tuple[Any, ...]:
+    """A gradient for the queries, the keys and the sinks, in the shapes they came in."""
+    gradients = [torch.empty(shape, dtype=dtype, device=grad.device) for shape, dtype in ctx.gradients]
+    return gradients[0], gradients[1], None, gradients[2], None, None
+
+
+_V41_SPARSE.register_autograd(_v41_sparse_backward, setup_context=_v41_sparse_saves)
+
+
+def npu_sparse_attention_with_scalar_sink(query: torch.Tensor, key_value: torch.Tensor,
+                                          sparse_indices: torch.Tensor, sinks: torch.Tensor,
+                                          rope_head_dim: int, scale: float) -> torch.Tensor:
+    """The contract of DeepSeek-V4.1's sparse attention, Omni's kernel and the sink it encodes.
+
+    Stands in for
+    ``components/modules/shared_compressed_dsa_attention.npu_sparse_attention_with_scalar_sink``,
+    whose kernel is ``omni_training_custom_ops``' and has no torch path a
+    run takes: the reference beside it keeps an fp32 score of one sequence
+    by another, which is not what the run keeps (F53).
+    """
+    return _V41_SPARSE(query, key_value, sparse_indices, sinks, int(rope_head_dim), float(scale))
+
+
 def npu_rms_norm(x: torch.Tensor, gamma: torch.Tensor, epsilon: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
     """``torch_npu.npu_rms_norm``'s contract."""
     return _RMS_NORM(x, gamma, float(epsilon))
@@ -345,3 +419,125 @@ def npu_contracts() -> Iterator[types.ModuleType]:
             # Including a module that imported the stand-in while it stood in.
             for module in _holders(TORCH_NPU):
                 module.torch_npu = previous
+
+
+# Where DeepSeek-V4.1's sparse attention lives, and the two names in it that
+# decide which path a call takes.
+_V41_ATTENTION = "hyper_parallel.components.modules.shared_compressed_dsa_attention"
+_V41_OMNI = "npu_sparse_attention_with_scalar_sink"
+_V41_REFERENCE = "_reference_sparse_attention"
+
+
+@contextlib.contextmanager
+def v41_attention_contract(rope_head_dim: int) -> Iterator[bool]:
+    """DeepSeek-V4.1's sparse attention as its contract, for what runs inside.
+
+    A V4.1 layer picks its attention by the device it is running on
+    (``self._use_omni_attention and query.device.type == "npu"``), so a
+    census, whose tensors are fake and on no device, always takes the
+    reference beside the kernel.  That reference keeps an fp32 score of one
+    sequence by another where the kernel keeps nine tensors that follow the
+    sequence, so measuring it prices a layer no run builds: on the
+    validation crop at 4096 tokens it read 77.9 GiB a rank against a 37.6
+    GiB measured peak (F53).
+
+    Both names are bound to the contract for as long as the context lasts,
+    so either branch of that choice reaches it.  *rope_head_dim* is the
+    width of the auxiliary rotary coordinates the kernel's caller passes and
+    the reference's own signature does not carry, so the census states it
+    from the model's config.
+
+    Yields:
+        Whether the module was there to patch, which is False on a tree
+        that carries no V4.1 attention.
+    """
+    try:
+        module = importlib.import_module(_V41_ATTENTION)
+    except ImportError:
+        yield False
+        return
+
+    def contract(query: torch.Tensor, key_value: torch.Tensor, sparse_indices: torch.Tensor,
+                 sinks: torch.Tensor, scale: float) -> torch.Tensor:
+        """The reference's signature, answered by the kernel's contract."""
+        return npu_sparse_attention_with_scalar_sink(
+            query, key_value, sparse_indices, sinks, int(rope_head_dim), float(scale))
+
+    held = {name: getattr(module, name) for name in (_V41_OMNI, _V41_REFERENCE)}
+    setattr(module, _V41_REFERENCE, contract)
+    setattr(module, _V41_OMNI, npu_sparse_attention_with_scalar_sink)
+    try:
+        yield True
+    finally:
+        for name, value in held.items():
+            setattr(module, name, value)
+
+
+# The Lightning Indexer's selection functions, which return the chosen
+# indices and nothing else.  One of the four already states that it needs no
+# autograd graph; the other three do not, which is the whole of this contract.
+_V41_SELECTION = (
+    "compressed_causal_topk",
+    "compressed_causal_candidates",
+    "compressed_causal_topk_and_candidates",
+    "compressed_candidate_topk",
+)
+
+
+@contextlib.contextmanager
+def v41_indexer_contract() -> Iterator[bool]:
+    """DeepSeek-V4.1's Indexer selection as its fused operator keeps it, which is nothing.
+
+    The selection returns int32 indices, and the Indexer's own KL loss
+    differentiates itself by hand, under ``no_grad``, from the projections
+    rather than through the selection.  So no gradient flows through the
+    scores, and the fused operator keeps nothing for a backward.  Running the
+    selection without recording a graph states exactly that, and needs no
+    shape declared, because ``no_grad`` changes whether a graph is kept and
+    never what is computed: the indices are the same indices.
+
+    Install it only for a run that takes the fused selection.  A run that
+    falls back to the reference really does keep those bytes, measured at
+    4.36 GiB a rank on the validation crop at 2048 tokens across the eight
+    layers that carry an Indexer, so for that run the bytes are not an
+    artefact and a census must count them.  Which path a run takes is settled
+    by a probe at runtime and recorded nowhere
+    (``v41_fused_indexer`` reaches the selection as ``use_provider``, whose
+    contract is to fall back silently), so this cannot be inferred from the
+    recipe.
+
+    Of the four, ``compressed_causal_topk`` already carries
+    ``@torch.no_grad()`` and is wrapped here only for uniformity.  That the
+    other three do not is a defect in the runtime rather than in the cost
+    model: on the reference path they hold an fp32 score of one sequence by
+    another that no backward reads, which three decorators would free.  That
+    change belongs to the model's owners, so the census states the contract
+    and does not alter what a run keeps.
+
+    Yields:
+        Whether the selection was there to wrap, which is False on a tree
+        that carries no V4.1 attention.
+    """
+    try:
+        module = importlib.import_module(_V41_ATTENTION)
+    except ImportError:
+        yield False
+        return
+
+    def without_a_graph(selection: Any) -> Any:
+        """*selection*, computing the same indices without recording a graph."""
+        @functools.wraps(selection)
+        def run(*args: Any, **kwargs: Any) -> Any:
+            """The selection's own indices, with no graph kept behind them."""
+            with torch.no_grad():
+                return selection(*args, **kwargs)
+        return run
+
+    held = {name: getattr(module, name) for name in _V41_SELECTION if hasattr(module, name)}
+    for name, selection in held.items():
+        setattr(module, name, without_a_graph(selection))
+    try:
+        yield bool(held)
+    finally:
+        for name, selection in held.items():
+            setattr(module, name, selection)

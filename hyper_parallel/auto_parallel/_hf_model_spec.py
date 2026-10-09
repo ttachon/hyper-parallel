@@ -404,9 +404,21 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
             # The formulas price the layers, as they do without a census: a
             # census of Transformers' own modules would price a layer the run
             # does not build (F53).
-            logger.warning("no census of the layers: %s", exc)
+            logger.warning("%s", _NOT_A_BOUND % exc)
             _CENSUSES[key] = {}
     return copy.deepcopy(_CENSUSES[key])
+
+
+# What a run is told when a census it asked for did not happen.  Measured
+# without one, the formulas read 37 to 55% below Qwen3.5's peak and 49.9%
+# below the DeepSeek-V4.1 crop's, so a memory a search filters on is an
+# estimate and not an upper bound, and a strategy it calls feasible may not
+# be.  Said once, in the run's own log, where the number is read.
+_NOT_A_BOUND = (
+    "no census of the layers: %s. The formulas price them instead, and without a census they have "
+    "measured 37 to 55%% below a real peak, so this run's memory is an estimate and NOT a bound: a "
+    "strategy it reports as fitting may still run out of memory"
+)
 
 
 def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
@@ -416,7 +428,7 @@ def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
     ND a spec whose overrides state the records its reader measured.
     """
     if census_seq_len and not explicit.get("activations"):
-        logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
+        logger.warning("%s", _NOT_A_BOUND % "it needs the checkpoint's Transformers config")
 
 
 def _stated_spec(model_raw: Mapping[str, Any], explicit: Dict[str, Any], census_seq_len: int) -> Dict[str, Any]:
