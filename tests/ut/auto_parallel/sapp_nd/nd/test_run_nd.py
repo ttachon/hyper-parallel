@@ -832,6 +832,28 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(said.call_args.args[1], "glm4_moe")
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
 
+    def test_hyperparallel_spreads_experts_over_dp_cp_and_tp(self) -> None:
+        """
+        Feature: GlobalConfig.max_ep and moe_valid (F3 of Nelson's review).
+        Description: 64 experts at DP 4, TP 2 and CP 2 with EP 16, wider than
+            DP x TP: under HyperParallel, whose expert mesh spans DP x CP x TP,
+            then under a legacy schema.
+        Expectation: HyperParallel's bound is that domain's 16 ranks, so EP 16
+            is generated and valid, where the search stopped at DP x TP's 8
+            and refused it; a legacy schema keeps DP x TP.
+        """
+        ccfg = _FakeCostModelConfig()
+        ccfg.n_exp = 64
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = ccfg
+        global_config.dimensions = Dim.ALL_DIMS.copy()
+        parallel_config = global_config.make_parallel_config((4, 2, 1, 2), (1, 1), (16, 1, 1, False))
+        got = []
+        for spans in (True, False):
+            ccfg.shard_spans_cp = spans
+            got.append((global_config.max_ep(dp=4, tp=2, cp=2), global_config.moe_valid(parallel_config)))
+        self.assertEqual(got, [(16, True), (8, False)])
+
     def test_ep_constraints_valid_in_global_config(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1566,7 +1588,7 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: run_nd --real_csv on a strategy the cost model cannot represent.
         Description: Two measured configurations, one refused the way the MoE parser
-            refuses expert parallelism wider than DP x TP; then both refused.
+            refuses expert parallelism wider than its stage; then both refused.
         Expectation: The other is still estimated and the refused one is named; a
             CSV none of whose configurations ND can cost is an error.
         """

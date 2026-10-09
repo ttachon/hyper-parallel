@@ -128,22 +128,38 @@ class GlobalConfig:
             self.ccfg.config.dump(file_name, folder)
 
     def moe_valid(self, parallel_config):
-        """Check whether  the model is MoE"""
+        """Whether a MoE model's EP fits its experts and the ranks they spread over (:meth:`max_ep`)."""
         expert_num = self.ccfg.n_exp
         if expert_num > 1:
             ep = self.dim_val(Dim.EP, parallel_config)
             dp = self.dim_val(Dim.DP, parallel_config)
             mp = self.dim_val(Dim.TP, parallel_config)
+            cp = self.dim_val(Dim.CP, parallel_config)
             logger.debug(
-                "moe valid ? EP %d <= E %d & EP %d <= DP %d * MP %d",
+                "moe valid ? EP %d <= E %d & EP %d <= %d, DP %d MP %d CP %d",
                 ep,
                 expert_num,
                 ep,
+                self.max_ep(dp, mp, cp),
                 dp,
                 mp,
+                cp,
             )
-            return ep <= min(expert_num, dp * mp)
+            return ep <= min(expert_num, self.max_ep(dp, mp, cp))
         return True
+
+    def max_ep(self, dp: int, tp: int, cp: int = 1) -> int:
+        """Compute bound for dimension EP: the ranks a stage spreads its experts over.
+
+        They are its DP x TP ranks, and under HyperParallel its DP x CP x TP
+        ranks: it builds its expert mesh ``(edp_replicate, edp_shard, ep)``
+        over the whole ``(dp, cp, tp)`` device mesh
+        (``MeshContext._build_expert_parallel_mesh``), the domain its FSDP
+        shard spans as well (``shard_spans_cp``).  Bounded by DP x TP, a
+        strategy under CP could not spread its experts over CP's ranks,
+        though the runtime does (F3).
+        """
+        return dp * tp * (cp if getattr(self.ccfg, "shard_spans_cp", False) else 1)
 
     def ep_constraints_valid(self, parallel_config):
         """Check EP-specific divisibility constraints (C1, C2).

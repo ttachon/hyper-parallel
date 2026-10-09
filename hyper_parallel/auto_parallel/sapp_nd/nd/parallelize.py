@@ -246,7 +246,7 @@ class ParallelizeLayer:
             return self._refuse("a degree out of bounds")
         if not self.config.moe_valid(parallel_config):
             logger.warning("expert parallel is higher than expert number")
-            return self._refuse("EP over the experts or DP x TP")
+            return self._refuse("EP over the experts or the ranks they spread over")
         if hasattr(self.config, 'ep_constraints_valid') and not self.config.ep_constraints_valid(parallel_config):
             logger.warning("EP divisibility constraints not satisfied")
             return self._refuse("EP divisibility")
@@ -481,7 +481,7 @@ class ParallelizeLayer:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
         dp, tp, pp, cp = dtpc_p
-        for ep in self.config.space(Dim.EP, dp * tp):
+        for ep in self.config.space(Dim.EP, self.config.max_ep(dp, tp, cp)):
             for vpp in self.config.range_space(
                 Dim.VPP, min(4, pp, self.config.total_layer_num() // pp)
             ):
@@ -615,8 +615,8 @@ class ParallelizeLayer:
         """Order the given space with performance estimation.
 
         A measured configuration the cost model cannot represent, such as
-        expert parallelism wider than DP x TP, is left out and named, so that
-        it does not end the comparison of every other one.
+        expert parallelism wider than its stage, is left out and named, so
+        that it does not end the comparison of every other one.
         """
         scored_space = []
         debug_parts = []
