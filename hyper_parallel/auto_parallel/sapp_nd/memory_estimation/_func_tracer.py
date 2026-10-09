@@ -16,9 +16,24 @@
 import ast
 import inspect
 import linecache
+import os
 import sys
+import sysconfig
 import textwrap
 import weakref
+from types import CodeType
+
+# Where the code the tracer does not follow lives: the interpreter's standard
+# library and installed packages. HyperParallel's own code is followed wherever
+# it is installed.
+_LIBRARIES = tuple(sorted({
+    os.path.join(os.path.normcase(os.path.realpath(path)), "")
+    for name, path in sysconfig.get_paths().items()
+    if name in ("stdlib", "platstdlib", "purelib", "platlib")
+}))
+_INSTALLED = {"site-packages", "dist-packages"}
+_PACKAGE = os.path.join(os.path.normcase(os.path.realpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir))), "")
 
 
 class _FuncTracer:
@@ -85,6 +100,22 @@ class _FuncTracer:
                         s = s.replace(n, type(attr).__name__)
         return s
 
+    @staticmethod
+    def follows(co: CodeType) -> bool:
+        """Whether the tracer follows code object *co*: HyperParallel's, or source outside the interpreter's libraries.
+
+        Library code is not the formula being traced, and its source may not be
+        there to read line by line: a frozen module has none, and a statement
+        spanning lines does not parse one line at a time.
+        """
+        filename = co.co_filename
+        if filename.startswith("<") or not os.path.isfile(filename):
+            return False
+        path = os.path.normcase(os.path.realpath(filename))
+        if path.startswith(_PACKAGE):
+            return True
+        return not path.startswith(_LIBRARIES) and not _INSTALLED & set(path.split(os.sep))
+
     def fetch_node_from_lineno(self, lineno, co):
         """Get AST node from a line num in source code"""
         for node in ast.walk(self.code_trees[co]):
@@ -99,6 +130,8 @@ class _FuncTracer:
 
         # Handling function call
         if event == "call":
+            if not self.follows(co):
+                return None
             self.extract_ast(co)
             _, _, _, values = inspect.getargvalues(frame)
             args_str = ",".join(
@@ -188,15 +221,15 @@ class _FuncTracer:
 
         def tracked_fun(*args, **kwargs):
             """Wrapper"""
+            # Only the traced call runs under the tracer, never its own printing.
+            print("Tracing...")
             sys.settrace(self.line_tracer)
             try:
-                print("Tracing...")
                 res = fun(*args, **kwargs)
-                print(self.trace_str)
-                self.trace_str = ""
-                return res
             finally:
                 sys.settrace(None)
+            print(self.trace_str)
+            self.trace_str = ""
             return res
 
         return tracked_fun

@@ -20,6 +20,7 @@ How to run this:
 import os
 import sys
 import tempfile
+import textwrap
 import unittest
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -90,6 +91,11 @@ def _trace_sample(value: int, holder: Any) -> int:
     total = value + holder.offset
     total *= 2
     return total
+
+
+def _trace_library(text: str) -> str:
+    """Small function calling into the standard library, used by _FuncTracer tests."""
+    return textwrap.dedent(text)
 
 
 def _dynamic_mem_for_ppb(**_kwargs: Any) -> tuple:
@@ -733,6 +739,28 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertIsNotNone(
             tracer.fetch_node_from_lineno(_trace_sample.__code__.co_firstlineno + 2, _trace_sample.__code__)
         )
+
+    def test_func_tracer_follows_no_library_code(self) -> None:
+        """
+        Feature: _FuncTracer.follows.
+        Description: A traced function calling into the standard library, whose
+            source the tracer cannot read line by line: a frozen module has
+            none, and a statement spanning lines does not parse on its own.
+        Expectation: The call returns its result, the tracer parsed the traced
+            function alone, and HyperParallel's own code is followed.
+        """
+        tracer = _FuncTracer()
+        previous_trace = sys.gettrace()
+        try:
+            result = tracer.wrap(_trace_library)(" a\n b")
+        finally:
+            # _FuncTracer deliberately clears tracing; restore pytest-cov's tracer.
+            sys.settrace(previous_trace)
+
+        self.assertEqual(result, "a\nb")
+        self.assertEqual(list(tracer.code_trees), [_trace_library.__code__])
+        self.assertTrue(tracer.follows(_FuncTracer.follows.__code__))
+        self.assertFalse(tracer.follows(textwrap.dedent.__code__))
 
     def test_evaluator_public_helpers_with_fake_backbone(self) -> None:
         """
