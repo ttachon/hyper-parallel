@@ -729,7 +729,11 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
             sys.settrace(previous_trace)
 
         self.assertEqual(result, 10)
-        self.assertIn(_trace_sample.__code__, tracer.code_trees)
+        traced = set(tracer.code_trees.keys())
+        self.assertEqual(
+            traced, {_trace_sample.__code__},
+            f"only the wrapped call is traced, not its prints: got {sorted(code.co_name for code in traced)}",
+        )
         self.assertIsNotNone(
             tracer.fetch_node_from_lineno(_trace_sample.__code__.co_firstlineno + 2, _trace_sample.__code__)
         )
