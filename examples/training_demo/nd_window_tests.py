@@ -321,9 +321,32 @@ def _read_repeat_leg(root: Path) -> Dict[str, Any]:
     return {"root": str(root), **_leg_stats(runs, steps), "fused_engaged": engaged, "logs": logs}
 
 
-def _stage_columns(trace: Path, steps_covered: int) -> Dict[str, Any]:
+def _profiled_steps(trace: Path) -> Optional[int]:
+    """Count the steps a profile actually covers, from its own step trace.
+
+    The window is ``[start_step, end_step)``, so it is one step on the V4.1
+    launcher's defaults and two on the Qwen3.5 sweep's. Guessing it halves or
+    doubles every per-step figure derived from a kernel count, so it is counted
+    here rather than passed in.
+
+    Args:
+        trace: A step_trace_time.csv.
+
+    Returns:
+        The number of distinct steps in it, or None when there is no step
+        column to count.
+    """
+    rows = _read_rows(trace)
+    names = list(rows[0].keys()) if rows else []
+    column = next((n for n in names if n.strip().lower() == "step"), None) or _pick(names, "step")
+    if column is None:
+        return None
+    steps = {row[column] for row in rows if row.get(column) not in (None, "")}
+    return len(steps) or None
+
+
+def _stage_columns(trace: Path) -> Dict[str, Any]:
     """Read the Computing, Free and Stage columns of a step trace, per step."""
-    del steps_covered  # the file holds one row a step, so a mean is per step
     rows = _read_rows(trace)
     names = list(rows[0].keys()) if rows else []
     out: Dict[str, Any] = {"step_trace_time": str(trace)}
@@ -351,21 +374,25 @@ def _read_profile_parts(profile: Optional[Path], steps: int) -> Dict[str, Any]:
     """
     if profile is None:
         return {"state": "not given"}
-    out: Dict[str, Any] = {"state": "read", "profile": str(profile), "steps_covered": steps}
+    out: Dict[str, Any] = {"state": "read", "profile": str(profile)}
+
+    trace = _find_one(profile, "step_trace_time.csv")
+    counted = _profiled_steps(trace) if trace is not None else None
+    out["steps_covered"] = counted or steps
+    out["steps_source"] = "counted in step_trace_time.csv" if counted else "--steps, not counted"
 
     kernels = _find_one(profile, "kernel_details.csv")
     if kernels is None:
         out["launches"] = None
         out["launches_note"] = f"no kernel_details.csv under {profile}"
     else:
-        out["launches"] = round(len(_read_rows(kernels)) / steps)
+        out["launches"] = round(len(_read_rows(kernels)) / out["steps_covered"])
         out["kernel_details"] = str(kernels)
 
-    trace = _find_one(profile, "step_trace_time.csv")
     if trace is None:
         out["stage_note"] = f"no step_trace_time.csv under {profile}"
     else:
-        out.update(_stage_columns(trace, steps))
+        out.update(_stage_columns(trace))
     return out
 
 
@@ -397,8 +424,16 @@ def _path_verdict(fused: Dict[str, Any],
     return "ok", "", fused_says, ref_says
 
 
-def _report_slope(fused_parts: Dict[str, Any], ref_parts: Dict[str, Any]) -> Dict[str, Any]:
-    """Print the launch count against idle, and return what it adds to the result."""
+def _report_slope(fused_parts: Dict[str, Any], ref_parts: Dict[str, Any],
+                  verdict: str) -> Dict[str, Any]:
+    """Print the launch count against idle, and return what it adds to the result.
+
+    The slope is only a measurement when the two legs really ran different
+    code. On a void pair it would divide a real idle difference by a launch
+    difference that is pure noise, and the quotient looks like a finding. So
+    the numbers are printed either way and the slope is computed only when the
+    experiment actually happened.
+    """
     launches = [parts.get("launches") for parts in (fused_parts, ref_parts)]
     idles = [parts.get("free_ms") for parts in (fused_parts, ref_parts)]
     if any(value is None for value in launches + idles):
@@ -410,12 +445,22 @@ def _report_slope(fused_parts: Dict[str, Any], ref_parts: Dict[str, Any]) -> Dic
 
     launch_delta = launches[1] - launches[0]
     idle_delta = idles[1] - idles[0]
-    print(f"\nlaunches a step: fused {launches[0]:,}, reference {launches[1]:,}, "
+    for label, parts in (("fused", fused_parts), ("reference", ref_parts)):
+        print(f"\n{label} profile: {parts['steps_covered']} step(s), {parts['steps_source']}")
+    print(f"launches a step: fused {launches[0]:,}, reference {launches[1]:,}, "
           f"{launch_delta:+,} ({100 * launch_delta / launches[0]:+.1f}%)")
     print(f"device idle a step: fused {idles[0]:.1f} ms, reference {idles[1]:.1f} ms, {idle_delta:+.1f} ms")
     added: Dict[str, Any] = {"launch_delta": launch_delta, "idle_delta_ms": round(idle_delta, 1)}
-    if not launch_delta:
-        print("\n  the launch count did not move, so this pair cannot test the slope at all")
+
+    if verdict != "ok":
+        print("\n  NO SLOPE. The two legs ran the same code, so the launch difference above is "
+              "run to run\n  variation and a slope computed from it would be an artefact, not a "
+              "result. The idle\n  difference is real and unexplained, but this pair cannot say "
+              "what explains it.")
+        return added
+    if abs(launch_delta) < 0.01 * launches[0]:
+        print("\n  NO SLOPE. The launch count moved by under 1%, which is inside run to run "
+              "variation,\n  so this pair cannot test the slope whatever the idle did.")
         return added
 
     local = 1e3 * idle_delta / launch_delta
@@ -509,7 +554,7 @@ def cmd_indexer(args: argparse.Namespace) -> None:
         "step_delta_pct": round(100 * step_delta / fused["mean_ms"], 2),
         "worst_spread_pct": worst_spread,
     }
-    payload.update(_report_slope(fused_parts, ref_parts))
+    payload.update(_report_slope(fused_parts, ref_parts, verdict))
     _write_result(Path(args.results), "indexer", payload)
 
 
