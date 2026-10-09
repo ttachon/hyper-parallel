@@ -668,7 +668,8 @@ def summarize(payloads: Sequence[Dict[str, Any]], options: argparse.Namespace, p
     steps = []
     for step, records in sorted(by_step.items()):
         every = [phases(record, layers) for record in records]
-        entry = {"step": step, "mode": records[0]["mode"], "warmup": records[0]["warmup"],
+        # "index" is the step's number; "step", set below with the phases, its time.
+        entry = {"index": step, "mode": records[0]["mode"], "warmup": records[0]["warmup"],
                  "failed": sum(record["failed"] for record in records),
                  "ignored": max(record["ignored"] for record in records)}
         for key in ("forward", "after0", "head", "backward", "step"):
