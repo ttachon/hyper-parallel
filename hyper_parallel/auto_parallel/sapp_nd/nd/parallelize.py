@@ -16,6 +16,7 @@
 
 from collections import Counter
 from contextlib import nullcontext
+from dataclasses import replace
 import time
 import copy
 import multiprocessing as proc
@@ -29,12 +30,20 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import E
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     MODES,
+    RecomputeAnalysis,
     RecomputeChoice,
     choose_recompute,
     describe,
     mode_ranges,
     trainer_plan,
     whole_modes,
+)
+from hyper_parallel.auto_parallel.sapp_nd.recompute.potential import (
+    keep_recompute_potential,
+    recompute_next_plot_groups,
+    recompute_plot_data,
+    sort_recompute_results,
+    write_recompute_csv,
 )
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
@@ -107,6 +116,8 @@ class ParallelizeLayer:
         self.mem_eval = evaluator
         # The options chosen for each configuration the ordering scored.
         self.recompute_choices = {}
+        self.recompute_potentials = {}
+        self.recompute_results = {}
 
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
@@ -695,6 +706,74 @@ class ParallelizeLayer:
             self.recompute_choices[parallel_config] = choice
         return choice
 
+    def recompute_potential_sequence(
+        self,
+        parallel_config: Dim.Dimensions,
+        base_score: Optional[float] = None,
+        base_memory: Optional[float] = None,
+        cache_file: Optional[str] = None,
+        base_parts: Optional[Tuple[float, ...]] = None,
+    ) -> list[RecomputeChoice]:
+        """Retain a sequence adding one FULL layer at a time at fixed parallel degrees.
+
+        Args:
+            parallel_config: One memory-fitting configuration, without varying its degrees.
+            base_score: Its already computed score, reused when provided.
+            base_memory: Its peak memory, used when no recompute plan is available.
+            cache_file: Optional performance-estimate cache.
+            base_parts: Already computed score components, reused for plotting.
+
+        Returns:
+            The original plan followed by each fastest fitting one-layer extension.
+            A whole-model fallback or an offload plan is retained without extensions.
+            A baseline with no ranges or mode means the optimizer provided no plan.
+
+        Raises:
+            ValueError: Automatic selection among named modes is not enabled.
+        """
+        if not self.auto_recompute or not self.recompute_mode_per_layer:
+            raise ValueError("recompute potentials require -ar and --recompute or YAML context.recompute modes")
+        self.config.set_parallel_config(parallel_config)
+        choice = self.recompute_choices.get(parallel_config)
+        if choice is None:
+            choice = self.choose_recompute(parallel_config)
+        if choice is None:
+            memory = self.memory_estim() if base_memory is None else base_memory
+            choice = RecomputeChoice((), (float(memory),), ())
+        dimensions = tuple((str(dim), self.config.dim_val(dim, parallel_config)) for dim in Dim.ALL_DIMS)
+        if base_score is None:
+            base_score = choice.score
+        if base_score is None or base_parts is None:
+            debugger = Debug.Debug(parallel_config, info_type=Debug.PerfParts, enable=True)
+            priced = self.priced_with_mode(choice.mode) if choice.mode is not None else self.priced()
+            estimated = estimate_performance(
+                priced, device_type=self.machine.device, memory=int(round(choice.memory)),
+                stage_savings=choice.stage_savings or None, cache_file=cache_file, debugger=debugger,
+            )
+            if base_score is None:
+                base_score = estimated
+            if base_parts is None:
+                base_parts = tuple(debugger.info[part] for part in Debug.PerfParts
+                                   if part not in {Debug.PerfParts.TOTAL, Debug.PerfParts.MEMORY})
+        kept = [replace(choice, score=base_score, dimensions=dimensions, score_parts=tuple(base_parts))]
+        all_results = list(kept)
+        if (choice.mode is None and "full" in self.recompute_modes
+                and any(item.mode != "full" for item in choice.ranges)
+                and not any(item.option.link_bandwidth for item in choice.ranges)):
+            self.mem_eval.set_config(self.config.ccfg)
+            analyzer = RecomputeAnalysis(
+                self.mem_eval, self.machine.device, self.recompute_modes,
+                selective=self.recompute_selective, dimensions=dimensions,
+            )
+            while True:
+                results = analyzer.analyze_recompute_performance(kept[-1], cache_file=cache_file)
+                all_results.extend(results)
+                if keep_recompute_potential(kept[-1], kept, results) is None:
+                    break
+        self.recompute_potentials[parallel_config] = kept
+        self.recompute_results[parallel_config] = sort_recompute_results(all_results)
+        return kept
+
     def _one_mode_whole(self) -> Optional[RecomputeChoice]:
         """The fastest mode that fits, for every layer, each mode priced on the whole model.
 
@@ -1032,6 +1111,21 @@ class ParallelizeLayer:
         )
         if self.enable_debug:
             output_path = Debug.output_dir()
+            if not logger.disabled and getattr(self, "recompute_mode_per_layer", False):
+                self.recompute_potentials = {}
+                self.recompute_results = {}
+                for config, memory, score, parts in scored_space:
+                    self.recompute_potential_sequence(
+                        config, base_score=score, base_memory=memory, cache_file=cache_file, base_parts=tuple(parts),
+                    )
+                path = os.path.join(output_path, "recompute_potentials.csv")
+                write_recompute_csv(self.recompute_potentials, path)
+                logger.output(
+                    "%d retained recompute plans for %d of %d configurations written to %s",
+                    sum(len(choices) for choices in self.recompute_potentials.values()),
+                    len(self.recompute_potentials), len(scored_space), path,
+                )
+                self._plot_recompute_results(scored_space, dbg, top_num, output_path)
             if plot_space:
                 Debug.plot_nd(
                     plot_space,
@@ -1056,6 +1150,22 @@ class ParallelizeLayer:
                     ),
                 )
         return scored_space
+
+    def _plot_recompute_results(self, scored_space: list, debug_parts: list, top_num: Optional[int], folder: str) -> None:
+        """Write the retained sequence and next-score comparison for the top parallel configurations."""
+        top = scored_space[:max(0, 20 if top_num is None else top_num)]
+        retained = [(entry[0], self.recompute_potentials[entry[0]]) for entry in top]
+        following = recompute_next_plot_groups(scored_space, self.recompute_results, top_num)
+        for groups, filename, description in (
+            (retained, "result_recompute_inc", "Retained recompute sequence"),
+            (following, "result_recompute_full_next", "Recompute plans below the next score, plus the next best"),
+        ):
+            if groups:
+                Debug.plot_recompute(
+                    recompute_plot_data(groups), folder, debug_parts, filename,
+                    title=f"{self.plot_title()}\n{description}",
+                )
+                logger.output("Recompute plot written to %s", os.path.join(folder, filename + ".pdf"))
 
     def _log_recompute(self, scored_space: Any) -> None:
         """Log how the recompute was chosen, and the best configuration's, as the trainer states it where it can."""

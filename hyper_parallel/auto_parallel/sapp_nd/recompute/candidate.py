@@ -81,6 +81,8 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import E
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import HostLink
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import layer_kinds
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.nd.debug import Debug, PerfParts
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import (
     LayerOption,
@@ -148,10 +150,13 @@ class RecomputeChoice:
             units.
         mode: The mode every layer runs, one of :data:`MODES`, when one mode
             was chosen for all of them; ``None`` for a choice per layer.
-        score: The candidate's score under the choice, where the whole model
-            was priced with it, a model priced on several submodules; ``None``
-            where the search takes *stage_savings* off the score of the
-            config's own recompute.
+        score: The candidate's score when the whole model or a recompute
+            potential was priced with this choice; ``None`` until a caller
+            scores the plan using *stage_savings*.
+        dimensions: Fixed parallel degrees for a scored recompute potential;
+            empty for a choice that has not been analyzed separately.
+        score_parts: Performance components in PerfParts order, excluding
+            TOTAL and MEMORY, when the scored plan is available for plotting.
     """
 
     ranges: Tuple[LayerRange, ...]
@@ -159,6 +164,8 @@ class RecomputeChoice:
     stage_savings: Tuple[float, ...]
     mode: Optional[str] = None
     score: Optional[float] = None
+    dimensions: Tuple[Tuple[str, int], ...] = ()
+    score_parts: Tuple[float, ...] = ()
 
     @property
     def memory(self) -> float:
@@ -1061,6 +1068,135 @@ def choose_recompute(
     if link is not None and config.vp == 1:
         return _offload_result(layers, stages, peaks, fronts, own, _link(link, evaluator), bucket, capacity)
     return _each_layer(layers, stages, peaks, fronts, own, (bucket, capacity))
+
+
+class RecomputeAnalysis:
+    """Cache layer costs for scoring recompute alternatives at one fixed strategy."""
+
+    def __init__(
+        self,
+        evaluator: EvaluatorV2,
+        device_type: Any,
+        modes: Sequence[str],
+        selective: Optional[Mapping[str, int]] = None,
+        dimensions: Tuple[Tuple[str, int], ...] = (),
+    ) -> None:
+        """Prepare the memory model once for a sequence of recompute changes.
+
+        Args:
+            evaluator: Evaluator already set to the fixed parallel strategy.
+            device_type: Device used by the performance estimate.
+            modes: Allowed named recompute modes.
+            selective: Switches used by the runtime's selective policy.
+            dimensions: Snapshot of the strategy's parallel degrees.
+
+        Raises:
+            ValueError: An empty mode list or an unknown mode.
+        """
+        if not modes or set(modes) - set(MODES):
+            raise ValueError(f"recompute analysis requires modes from {', '.join(MODES)}")
+        self._config = evaluator.ccfg
+        self._device_type = device_type
+        self._dimensions = dimensions
+        self._layers = []
+        self._fronts = {}
+        self._by_mode = {}
+        self._own = {}
+        self._peaks = []
+        self._capacity = self._config.device_capacity.to_mb().size
+        if self._config.multimodal or self._config.pp_sched not in SCHEDULES or "full" not in modes:
+            return
+        counts = micro_batches_in_flight(evaluator)
+        profiles = layer_profiles(
+            evaluator, device_type, most_in_flight=max(max(row) for row in counts),
+            each_switch="selective" in modes and selective is None,
+            in_flight=[count for row in counts for count in row],
+        )
+        modes = _priced_modes(modes, profiles, selective)
+        fronts, by_mode = _offered(profiles, configured_switches(evaluator), modes, selective)
+        found = _body_layers(evaluator, fronts, counts)
+        if found is None:
+            return
+        self._layers, self._fronts, self._by_mode, self._own = _charge_working_sets(*found, fronts, by_mode)
+        _, self._peaks = _stages(evaluator, self._layers, self._fronts, self._own)
+
+    def analyze_recompute_performance(
+        self, current: RecomputeChoice, cache_file: Optional[str] = None
+    ) -> List[RecomputeChoice]:
+        """Score fitting alternatives that change exactly one non-FULL layer to FULL.
+
+        The parallel strategy and every other layer's option remain fixed.
+        Reuse this analyzer while building a sequence for that strategy.
+
+        Args:
+            current: Defined per-layer recompute plan to extend.
+            cache_file: Optional cache used by the performance estimate.
+
+        Returns:
+            Scored alternatives; an empty list when no layer can be changed.
+
+        Raises:
+            ValueError: A plan has different degrees, invalid layer coverage,
+                an unavailable mode, or activation offload options.
+        """
+        if current.dimensions and current.dimensions != self._dimensions:
+            raise ValueError("recompute alternatives must keep the same parallel dimensions")
+        if not self._layers or current.mode is not None:
+            return []
+        defined = {}
+        for item in current.ranges:
+            if item.count <= 0 or item.first < 0 or item.option.link_bandwidth:
+                raise ValueError("recompute analysis requires positive layer ranges without activation offload")
+            for index in range(item.first, item.first + item.count):
+                if index in defined:
+                    raise ValueError("recompute layer ranges must not overlap")
+                defined[index] = item
+        every = sorted((layer for stage in self._layers for layer in stage), key=lambda layer: layer.index)
+        if set(defined) != {layer.index for layer in every}:
+            raise ValueError("the recompute plan must define every body layer exactly once")
+        chosen = {}
+        for layer in every:
+            item = defined[layer.index]
+            if item.kind != layer.key[1] or item.mode not in self._by_mode[layer.key]:
+                raise ValueError("the recompute plan must use the fixed model's kinds and allowed modes")
+            chosen[layer.index] = self._by_mode[layer.key][item.mode]
+        results = []
+        for layer in every:
+            if defined[layer.index].mode == "full":
+                continue
+            changed = dict(chosen)
+            changed[layer.index] = self._by_mode[layer.key]["full"]
+            result = _result(self._layers, self._peaks, changed, None, self._fronts, self._own)
+            if result.memory > self._capacity:
+                continue
+            option = self._own.get(changed[layer.index], changed[layer.index])
+            ranges = _full_layer_ranges(current.ranges, layer.index, option)
+            debugger = Debug(None, PerfParts, enable=True)
+            score = estimate_performance(
+                self._config, device_type=self._device_type, memory=int(round(result.memory)),
+                stage_savings=result.stage_savings, cache_file=cache_file, debugger=debugger,
+            )
+            parts = tuple(debugger.info[part] for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY})
+            results.append(replace(
+                result, ranges=ranges, score=score, dimensions=self._dimensions, score_parts=parts,
+            ))
+        return results
+
+
+def _full_layer_ranges(ranges: Sequence[LayerRange], index: int, option: LayerOption) -> Tuple[LayerRange, ...]:
+    """Split only the range containing *index*, preserving every other layer's defined mode."""
+    changed = []
+    for item in ranges:
+        end = item.first + item.count
+        if not item.first <= index < end:
+            changed.append(item)
+            continue
+        if item.first < index:
+            changed.append(replace(item, count=index - item.first))
+        changed.append(replace(item, first=index, count=1, option=option, mode="full"))
+        if index + 1 < end:
+            changed.append(replace(item, first=index + 1, count=end - index - 1))
+    return tuple(changed)
 
 
 def _option_modes(by_mode: Mapping[Hashable, Mapping[str, LayerOption]]) -> Dict[LayerOption, str]:

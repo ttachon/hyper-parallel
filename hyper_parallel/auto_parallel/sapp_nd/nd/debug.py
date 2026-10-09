@@ -26,6 +26,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 from matplotlib.font_manager import FontProperties
+from matplotlib.backends.backend_pdf import PdfPages
 from scipy.stats import pearsonr
 import yaml
 
@@ -558,6 +559,142 @@ def plot_nd(
 
     plot.make_table()
     plot.close(output_path, "results")
+
+
+def plot_recompute(
+    groups: list[tuple[Dim.Dimensions, list[dict]]],
+    output_path: str,
+    debug_parts: list,
+    filename: str,
+    title: Optional[str] = None,
+    columns_per_page: int = 12,
+) -> None:
+    """Write a summary of all plans followed by detail pages for each fixed strategy.
+
+    Args:
+        groups: Ranked parallel configurations and their selected recompute records.
+        output_path: Directory in which to save the PDF.
+        debug_parts: Performance components in each record's parts tuple.
+        filename: PDF basename without its extension.
+        title: Optional model and selection description.
+        columns_per_page: Maximum number of plans on one detail page. The summary
+            includes every selected plan, with dividers between configurations.
+
+    Raises:
+        ValueError: The page size is non-positive or score components are incomplete.
+    """
+    if columns_per_page <= 0:
+        raise ValueError("columns_per_page must be positive")
+    if not groups:
+        return
+    os.makedirs(output_path, exist_ok=True)
+    path = os.path.join(output_path, filename + ".pdf")
+    with PdfPages(path) as document:
+        plans = [(config, record) for config, records in groups for record in records]
+        labels = [f"{config.rank}.{index + 1}" for config, records in groups for index in range(len(records))]
+        summary_title = f"{title or 'ND recompute'}\nSummary | {len(plans)} plans across {len(groups)} configurations"
+        if plans:
+            figure = _recompute_page(plans, debug_parts, summary_title, labels)
+            empty = [str(config.rank) for config, records in groups if not records]
+            if empty:
+                figure.text(0.5, 0.01, "No qualifying plans for TOP " + ", ".join(empty), ha="center", fontsize=8)
+        else:
+            figure = _empty_recompute_page([config for config, _ in groups], summary_title)
+        document.savefig(figure, bbox_inches="tight")
+        plt.close(figure)
+        for config, records in groups:
+            if not records:
+                figure = _empty_recompute_page([config], f"{title or 'ND recompute'}\nTOP {config.rank}")
+                document.savefig(figure, bbox_inches="tight")
+                plt.close(figure)
+                continue
+            for start in range(0, len(records), columns_per_page):
+                page = records[start:start + columns_per_page]
+                page_title = (
+                    f"{title or 'ND recompute'}\n"
+                    f"TOP {config.rank} | plans {start + 1}-{start + len(page)} of {len(records)}"
+                )
+                labels = [str(start + index + 1) for index in range(len(page))]
+                figure = _recompute_page([(config, record) for record in page], debug_parts, page_title, labels)
+                document.savefig(figure, bbox_inches="tight")
+                plt.close(figure)
+
+
+def _empty_recompute_page(configs: list[Dim.Dimensions], title: str):
+    """Explain an empty selection and identify its parallel configurations."""
+    figure = plt.figure(figsize=(12, max(5, 3 + 0.3 * len(configs))))
+    figure.text(0.5, 0.8, title, ha="center", fontsize=12)
+    figure.text(0.5, 0.6, "No recompute plan satisfies the selection for these configurations.", ha="center")
+    descriptions = [
+        f"TOP {config.rank}: " + "  ".join(f"{dim}={value}" for dim, value in config.dims_val.items())
+        for config in configs
+    ]
+    figure.text(0.5, 0.45, "\n".join(descriptions), ha="center", va="top")
+    return figure
+
+
+def _recompute_page(plans: list[tuple[Dim.Dimensions, dict]], debug_parts: list, title: str, labels: list[str]):
+    """Draw variants with readable layer tables and dividers between parallel configurations."""
+    if any(len(record["parts"]) != len(debug_parts) for _, record in plans):
+        raise ValueError("recompute plot records must include every performance component")
+    rows = ["TOP"] + plans[0][0].keys() + ["RFULL", "RMOD", "RLAYER", "MEM", "SCORE"]
+    columns = []
+    for config, record in plans:
+        layers = record["layers"]
+        columns.append(
+            [str(config.rank)] + config.values() + [
+                str(record["full_layers"]) if record["full_layers"] is not None else "-",
+                record["mode"].upper() if record["mode"] else "-",
+                yaml.safe_dump(layers, default_flow_style=False, sort_keys=False).strip() if layers is not None else "-",
+                f"{record['memory']:.0f} MB", f"{record['score']:.6g}",
+            ]
+        )
+    cells = list(map(list, zip(*columns)))
+    line_counts = [max(str(text).count("\n") + 1 for text in row) for row in cells]
+    heights = [0.20] + [0.18 * count + 0.06 for count in line_counts]
+    table_height = sum(heights)
+    figure = plt.figure(figsize=(max(12, 1.3 * len(plans) + 3), 4.5 + table_height))
+    grid = figure.add_gridspec(2, 1, height_ratios=[3.5, table_height], hspace=0.10)
+    axis = figure.add_subplot(grid[0])
+    parts = list(map(str, debug_parts))
+    frame = pd.DataFrame([record["parts"] for _, record in plans], columns=parts, index=labels)
+    frame.plot.bar(ax=axis, stacked=True, color=gen_colors(parts), width=0.65, rot=0)
+    axis.set_xlim(-0.5, len(plans) - 0.5)
+    axis.set_ylim(
+        min(0, float(frame.clip(upper=0).sum(axis=1).min()) * 1.05),
+        max(1, float(frame.clip(lower=0).sum(axis=1).max()) * 1.05),
+    )
+    axis.set_ylabel("Performance score (lower is better)")
+    axis.set_xlabel("")
+    axis.legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=8)
+    axis.set_title(title, fontsize=11)
+    table_axis = figure.add_subplot(grid[1])
+    table_axis.axis("off")
+    table = table_axis.table(cellText=cells, rowLabels=list(map(str, rows)), colLabels=labels,
+                             cellLoc="center", loc="center", bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_height(heights[row] / table_height)
+        cell.set_edgecolor("white")
+        if row == 0:
+            cell.set_facecolor("#eeeeee")
+            continue
+        row_title = rows[row - 1]
+        if column == -1:
+            cell.get_text().set_color(dim_color(row_title))
+            cell.get_text().set_fontweight("bold")
+        else:
+            cell.set_facecolor(near_white(pastel(dim_color(row_title)), 0.9))
+            if row_title == "RLAYER":
+                cell.get_text().set_fontfamily("monospace")
+                cell.get_text().set_ha("center" if cells[row - 1][column] == "{}" else "left")
+    for index in range(1, len(plans)):
+        if plans[index][0] != plans[index - 1][0]:
+            axis.axvline(index - 0.5, color="black", linewidth=1.5)
+            table_axis.axvline(index / len(plans), color="black", linewidth=1.5, zorder=10)
+    figure.subplots_adjust(left=0.09, right=0.84, top=0.88, bottom=0.035)
+    return figure
 
 
 def _score_parts() -> list:
