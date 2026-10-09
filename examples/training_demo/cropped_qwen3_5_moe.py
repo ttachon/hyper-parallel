@@ -16,15 +16,23 @@
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Literal
 
 from transformers import AutoConfig, PreTrainedModel
 
 from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.qwen3_5.adapter.delta_rule import install_delta_rule
+
+logger = logging.getLogger(__name__)
 
 _QWEN3_5_MOE_MODEL_TYPES = ("qwen3_5_moe", "qwen3_5_moe_text")
+# Which chunked gated delta rule the linear-attention layers run without
+# context parallelism: HyperParallel's, whose backward stays linear in the
+# sequence, or the one the installed Transformers ships.
+_DELTA_RULES = ("hyperparallel", "transformers")
 
 
 def build_cropped_qwen3_5_moe(
@@ -43,6 +51,7 @@ def build_cropped_qwen3_5_moe(
         activation_checkpoint_layer_ranges: list[dict[str, Any]] | None = None,
         activation_checkpoint_layers: dict[int | str, str] | None = None,
         activation_swap: str = "none",
+        delta_rule: Literal["hyperparallel", "transformers"] = "hyperparallel",
 ) -> PreTrainedModel:
     """Create a Qwen3.5-MoE model with fewer decoder layers and random weights.
 
@@ -83,12 +92,25 @@ def build_cropped_qwen3_5_moe(
             mode than ``activation_checkpoint``, as the trainer's
             ``activation_checkpoint.layers`` states them, or None.
         activation_swap: Activation swap mode.
+        delta_rule: The chunked gated delta rule the linear-attention layers
+            run: ``"hyperparallel"`` for the rule that reproduces
+            Transformers' torch fallback exactly with a backward linear in
+            the sequence (:func:`install_delta_rule`), or ``"transformers"``
+            for the fallback itself, the run before that change. Under
+            context parallelism the layers run HyperParallel's rule either way.
 
     Returns:
         A parallelized, randomly initialized cropped Qwen3.5-MoE model.
+
+    Raises:
+        ValueError: If ``num_hidden_layers``, ``num_experts`` or
+            ``delta_rule`` is invalid, or ``config_path`` holds no
+            Qwen3.5-MoE configuration.
     """
     if num_hidden_layers <= 0:
         raise ValueError("num_hidden_layers must be positive")
+    if delta_rule not in _DELTA_RULES:
+        raise ValueError(f"delta_rule must be one of {_DELTA_RULES}; got {delta_rule!r}")
 
     config = AutoConfig.from_pretrained(
         config_path,
@@ -124,7 +146,7 @@ def build_cropped_qwen3_5_moe(
         text_config.experts_implementation = experts_implementation
     config.use_cache = False
 
-    return HyperAutoModelForCausalLM.from_config(
+    model = HyperAutoModelForCausalLM.from_config(
         config,
         distributed_setup=distributed_setup,
         peft_config=peft_config,
@@ -137,3 +159,7 @@ def build_cropped_qwen3_5_moe(
         activation_checkpoint_layers=activation_checkpoint_layers,
         activation_swap=activation_swap,
     )
+    if delta_rule == "hyperparallel":
+        switched = install_delta_rule(model)
+        logger.info("delta_rule=hyperparallel: %d linear-attention layers switched", switched)
+    return model

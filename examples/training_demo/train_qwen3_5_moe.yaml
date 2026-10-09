@@ -30,6 +30,11 @@ model:
   torch_dtype: bfloat16
   attn_implementation: sdpa
   validate_placement: false
+  # The linear-attention layers' chunked gated delta rule: hyperparallel
+  # reproduces the installed Transformers' torch fallback exactly with a
+  # backward linear in the sequence; transformers runs the fallback itself,
+  # the run before that change, for timing one against the other.
+  delta_rule: hyperparallel
 
 training:
   train_iters: 10
