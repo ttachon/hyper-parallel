@@ -32,6 +32,12 @@ import pytest
 # skips that chain; nothing in this suite uses tensorflow.
 os.environ.setdefault("USE_TF", "0")
 
+# With no backend named, matplotlib picks an interactive one where a display
+# exists (TkAgg on Windows), and a Python whose Tcl/Tk files are missing then
+# fails whichever drawing test first opens a figure, so the red one depends on
+# test order. No test shows a window: draw to files.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 
 class NoAcceleratorGuard:
     """Fail fast when a CPU-gated test accidentally reaches for a device.
