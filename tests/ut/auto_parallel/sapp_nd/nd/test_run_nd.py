@@ -19,6 +19,7 @@ How to run this:
 """
 import copy
 import csv
+import io
 import json
 import os
 import runpy
@@ -1506,6 +1507,48 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(cluster_spec["num_nodes"], 8)
             self.assertEqual(cluster_spec["device_type"], "A3")
             self.assertEqual(mock_search.call_count, 2)
+
+    def test_run_nd_cli_hyper_v2_d_refuses_part_of_a_node(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: ``-f hyper_v2 -s search.yaml`` with a ``-d`` that is not a whole number of
+                     nodes: 8 cards on A3, whose node holds 16, and 12 where the config states 8.
+        Expectation: The run stops with a usage error before any search: the search config counts
+                     whole nodes and would price 16 devices for either.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+
+            for flags, cluster_spec, node in (
+                    (["-A", "A3", "-d", "8"], {"num_nodes": 4, "device_type": "A2"}, 16),
+                    (["-d", "12"], {"num_nodes": 4, "cards_per_node": 8, "device_type": "A2"}, 8),
+            ):
+                fake_config = SimpleNamespace(resolved_strategy=None, constraint={}, cluster_spec=cluster_spec)
+                argv = ["run_nd.py", "-f", "hyper_v2", "-y", train_yaml, "-s", search_yaml, "-v", "0"] + flags
+                with patch(
+                    "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                    return_value=fake_config,
+                ), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.validate", return_value=[]), \
+                        patch(
+                            "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                        ) as mock_search, \
+                        patch("hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml"), \
+                        patch.object(sys, "argv", argv), \
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(exc_info.exception.code, 2, f"{flags}: exit code {exc_info.exception.code}")
+                self.assertIn(f"not a whole number of nodes of {node} cards", stderr.getvalue(),
+                              f"{flags}: stderr was {stderr.getvalue()!r}")
+                mock_search.assert_not_called()
+                self.assertEqual(cluster_spec["num_nodes"], 4, f"{flags}: num_nodes {cluster_spec['num_nodes']}")
 
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """

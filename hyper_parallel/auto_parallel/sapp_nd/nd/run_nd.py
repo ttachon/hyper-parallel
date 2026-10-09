@@ -137,6 +137,9 @@ def _apply_cli_overrides(search_cfg, cli_args):
     Args:
         search_cfg: The search config read from ``-s/--search-config``.
         cli_args: The parsed CLI namespace.
+
+    Raises:
+        ValueError: When ``-d`` is not a whole number of nodes.
     """
     if cli_args.device_type is not None:
         # -A sets the device the search prices, as it does on the CLI path;
@@ -165,15 +168,16 @@ def _apply_cli_overrides(search_cfg, cli_args):
                 cards_per_node, cli_args.device_type,
             )
         cards_per_node = max(1, cards_per_node)
+        nodes = max(1, cli_args.devices // cards_per_node)
         if cli_args.devices % cards_per_node:
-            logger.warning(
-                "devices=%d is not a multiple of cards_per_node=%d: "
-                "%d device(s) will not be placed",
-                cli_args.devices, cards_per_node,
-                cli_args.devices % cards_per_node,
+            # A search config counts whole nodes, so a part of one was rounded
+            # and another cluster than the one asked for priced.
+            raise ValueError(
+                f"-d {cli_args.devices} is not a whole number of nodes of {cards_per_node} cards: a search "
+                f"config counts whole nodes and would price {nodes * cards_per_node} devices. Give -d a "
+                f"multiple of {cards_per_node}, or price exactly {cli_args.devices} with -y and no -s"
             )
-        search_cfg.cluster_spec["num_nodes"] \
-            = max(1, cli_args.devices // cards_per_node)
+        search_cfg.cluster_spec["num_nodes"] = nodes
     if getattr(cli_args, "recompute", None) is not None:
         # --recompute states the search config's parallelism.recompute, as the
         # other flags state their settings: the modes the search chooses
@@ -334,7 +338,10 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     Debug.set_output_dir(cli_args.output_dir)
 
     search_cfg = read_search_config(cli_args.search_config)
-    _apply_cli_overrides(search_cfg, cli_args)
+    try:
+        _apply_cli_overrides(search_cfg, cli_args)
+    except ValueError as exc:
+        cli_parser.error(str(exc))
     offload = None
     if getattr(cli_args, "auto_offload", False):
         if search_cfg.estimator.get("recompute_strategy") != "per_layer":
