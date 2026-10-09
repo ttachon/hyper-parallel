@@ -48,7 +48,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import torch  # pylint: disable=forbidden-backend-import
 from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.auto_parallel._layer_census import _fake_layer, _positions, _run
+from hyper_parallel.auto_parallel._layer_census import _fake_layer, _positions, _run, delta_rule_module
 from hyper_parallel.auto_parallel._model_spec import LayerGroup, ModelSpec, ModelSpecError, OpCounts
 from hyper_parallel.auto_parallel._op_profiles import OpProfile, infer_arch, load_op_profile
 
@@ -114,7 +114,7 @@ def _experts(ffn: Any) -> Optional[Any]:
 def layer_shape(layer: Any) -> LayerShape:
     """The flavours and the parameters of *layer*."""
     attention, (_, ffn), _ = _parts(layer)
-    linear = any(hasattr(module, "chunk_gated_delta_rule") for module in attention.modules())
+    linear = any(delta_rule_module(module) for module in attention.modules())
     return LayerShape("linear" if linear else "full", "moe" if _experts(ffn) is not None else "dense",
                       tuple((name, tuple(param.shape)) for name, param in layer.named_parameters()))
 

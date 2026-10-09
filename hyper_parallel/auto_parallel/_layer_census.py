@@ -677,11 +677,31 @@ def tp_config(config: Any, tp: int) -> Any:
     return config
 
 
+def _grid_rotary(rotary: Any) -> bool:
+    """Whether *rotary* embeds a position on three grids, time, height and width, as a multimodal model's does.
+
+    Qwen3.5's and Qwen3-VL's hold the grids' ``mrope_section``; Qwen2-VL's
+    config states it.
+    """
+    if getattr(rotary, "mrope_section", None) is not None:
+        return True
+    config = getattr(rotary, "config", None)
+    return any(isinstance(getattr(config, name, None), Mapping) and "mrope_section" in getattr(config, name)
+               for name in ("rope_parameters", "rope_scaling"))
+
+
 def _positions(rotary: Any, hidden: torch.Tensor, seq_length: int) -> Tuple[torch.Tensor, Any]:
-    """The position ids of a sequence of *seq_length* tokens, and the embeddings *rotary* gives them."""
+    """The position ids of a sequence of *seq_length* tokens, and the embeddings *rotary* gives them.
+
+    A rotary on three grids (:func:`_grid_rotary`) is handed a row of ids
+    for each grid, as its model hands them, a text token's index on all
+    three; the layers keep the one row. Transformers 5.17 and 5.18 refuse
+    the single row the versions before them expanded themselves.
+    """
     position_ids = torch.arange(seq_length).unsqueeze(0)
+    rotary_ids = position_ids[None].expand(3, *position_ids.shape) if _grid_rotary(rotary) else position_ids
     with torch.no_grad():
-        return position_ids, rotary(hidden, position_ids)
+        return position_ids, rotary(hidden, rotary_ids)
 
 
 def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
@@ -694,6 +714,60 @@ def _run(layer: Any, hidden: torch.Tensor, positions: Tuple[torch.Tensor, Any],
         ("attention_mask", None), ("use_cache", False)) if name in accepted}
     out = (call or layer)(hidden, **kwargs)
     return out[0] if isinstance(out, tuple) else out
+
+
+# The function a gated-delta-rule attention of Transformers 5.15 and later
+# calls by name, which its modeling module defines; earlier versions hold the
+# rule in the module's ``chunk_gated_delta_rule``.
+_DELTA_RULE_FUNCTION = "torch_chunk_gated_delta_rule"
+
+
+def delta_rule_module(module: Any) -> bool:
+    """Whether *module* runs a gated delta rule, whichever way its Transformers version calls it.
+
+    Up to 5.14 the module holds the rule in ``chunk_gated_delta_rule``; from
+    5.15 its forward calls its modeling module's ``torch_chunk_gated_delta_rule``
+    by name, and the module holds nothing.
+    """
+    if hasattr(module, "chunk_gated_delta_rule"):
+        return True
+    forward = inspect.unwrap(getattr(type(module), "forward", None) or (lambda: None))
+    return _DELTA_RULE_FUNCTION in getattr(getattr(forward, "__code__", None), "co_names", ())
+
+
+@contextlib.contextmanager
+def _delta_rule_held(modeling: Any, layer: Any, rule: Callable[..., Any]) -> Iterator[None]:
+    """Have *layer*'s delta rule module run *rule* through its ``chunk_gated_delta_rule``, while the context lasts.
+
+    The census swaps and follows the rule through that attribute.  A module
+    of Transformers 5.15 or later, which calls its modeling module's function
+    by name, gets the attribute too, and the name runs it.
+
+    Raises:
+        ValueError: If the layer holds more than one such module, which the
+            name could not tell apart.
+    """
+    modules = [module for module in layer.modules() if delta_rule_module(module)]
+    for module in modules:
+        module.chunk_gated_delta_rule = rule
+    by_name = getattr(modeling, _DELTA_RULE_FUNCTION, None)
+    if not modules or by_name is None:
+        yield
+        return
+    if len(modules) > 1:
+        raise ValueError(f"{type(layer).__name__} holds {len(modules)} gated delta rule modules, and "
+                         f"{_DELTA_RULE_FUNCTION} cannot tell which one calls it")
+    module = modules[0]
+
+    def by_attribute(*args: Any, **kwargs: Any) -> Any:
+        """The module's rule as the attribute holds it when called: the census wraps it afterwards."""
+        return module.chunk_gated_delta_rule(*args, **kwargs)
+
+    setattr(modeling, _DELTA_RULE_FUNCTION, by_attribute)
+    try:
+        yield
+    finally:
+        setattr(modeling, _DELTA_RULE_FUNCTION, by_name)
 
 
 @contextlib.contextmanager
@@ -714,7 +788,8 @@ def _fake_layer(config: Any, layer_index: int, gdn_backend: str = _EAGER_GDN,
 
     Where *replacements* are given, the modules they name are HyperParallel's
     fused ones, running under the kernels' contracts for as long as the layer
-    does.
+    does.  Eager is Transformers' own Python rule, never a kernel a hub or the
+    ``fla`` package would put in its place.
 
     Raises:
         ValueError: If *gdn_backend* names no backend the runtime has.
@@ -739,17 +814,16 @@ def _fake_layer(config: Any, layer_index: int, gdn_backend: str = _EAGER_GDN,
             rotary = rotary_cls(config=config)
         finally:
             torch.set_default_dtype(default)
-        for module in layer.modules():
-            if hasattr(module, "chunk_gated_delta_rule"):
-                module.chunk_gated_delta_rule = (
-                    _gated_delta_rule(modeling) if gdn_backend == _HYPER_GDN
-                    else modeling.torch_chunk_gated_delta_rule)
-        if replacements:
-            holder = _Holder(layers=layer)
-            _replaced(holder, replacements)
-            layer = holder.model.layers[0]
-        layer.train()
-        yield layer, rotary
+        rule = (_gated_delta_rule(modeling) if gdn_backend == _HYPER_GDN
+                else inspect.unwrap(getattr(modeling, _DELTA_RULE_FUNCTION, None) or (lambda: None)))
+        with _delta_rule_held(modeling, layer, rule):
+            if replacements:
+                holder = _Holder(layers=layer)
+                _replaced(holder, replacements)
+                layer = holder.model.layers[0]
+            layer.train()
+            yield layer, rotary
+
 
 
 class _PartFlops(TorchDispatchMode):
