@@ -177,8 +177,11 @@ def node_states(text: str) -> List[Tuple[int, str]]:
     return [(int(m.group(1)), m.group(3).strip()) for m in NODE_STATE_PATTERN.finditer(text)]
 
 
-def wait(kit: Kit, run_id: str, timeout: float, poll: float) -> Tuple[str, List[int]]:
+def wait(kit: Kit, run_id: str, nodes: int, timeout: float, poll: float) -> Tuple[str, List[int]]:
     """Block until run *run_id* is over; how it ended, and the nodes that died.
+
+    Only the first *nodes* nodes count, the ones the launch used: the others
+    report NO RUN for this run, which would otherwise end up in its status.
 
     A dead rank ends the job but leaves the others waiting in a collective until
     HCCL's timeout, so a node reported DEAD stops the whole run at once, which
@@ -188,7 +191,7 @@ def wait(kit: Kit, run_id: str, timeout: float, poll: float) -> Tuple[str, List[
     while True:
         text = subprocess.run(kit.command("status", run_id), check=False, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout or ""
-        states = node_states(text)
+        states = [(index, state) for index, state in node_states(text) if index < nodes]
         dead = [(index, state) for index, state in states if state.startswith("DEAD")]
         if dead:
             kit.run("kill", run_id)
@@ -201,19 +204,28 @@ def wait(kit: Kit, run_id: str, timeout: float, poll: float) -> Tuple[str, List[
         time.sleep(poll)
 
 
-def run_test(kit: Kit, name: str, test: Test, timeout: float, poll: float) -> Dict[str, str]:
-    """Launch one test, wait for it, and keep rank 0's lines; its record."""
+def run_test(kit: Kit, name: str, test: Test, timeout: float, poll: float,
+             guard: bool = True) -> Dict[str, str]:
+    """Launch one test, wait for it, and keep rank 0's lines; its record.
+
+    With *guard*, the kit's own readiness check runs first and the test is
+    skipped rather than launched where any device of the config is busy.
+    """
     print(f"\n=== {name}: {test.answers}", flush=True)
     if len(kit.env["nodes"]) < test.nodes:
         return {"test": name, "status": f"SKIPPED: needs {test.nodes} nodes, the config has "
                                          f"{len(kit.env['nodes'])}"}
     started = time.strftime("%Y-%m-%d %H:%M:%S")
+    if guard and kit.run("npu")[0]:
+        print(f"=== {name}: SKIPPED, a device is busy or a node is unreachable", flush=True)
+        return {"test": name, "status": "SKIPPED: a device is busy or a node is unreachable",
+                "started": started}
     code, text = kit.run("torchrun", "-n", str(test.nodes), test.script, *test.args)
     found = RUN_ID_PATTERN.search(text)
     if code or not found:
         return {"test": name, "status": f"NOT LAUNCHED (kit exit {code})", "started": started}
     run_id = found.group(1)
-    status, dead = wait(kit, run_id, timeout, poll)
+    status, dead = wait(kit, run_id, test.nodes, timeout, poll)
     lines = [line for line in kit.on_node(0, f"grep -aE {shlex.quote(LINES)} {shlex.quote(kit.log(run_id, 0))}")
              .splitlines() if line.strip()]
     for index in dead[:2]:
@@ -244,14 +256,21 @@ def chosen(names: Sequence[str]) -> List[str]:
     return picked
 
 
-def run(kit: Kit, names: Sequence[str], timeout: float, poll: float) -> None:
-    """Run the tests named one after another, adding each record to output/offload_tests/runs.json."""
+def run(kit: Kit, names: Sequence[str], timeout: float, poll: float, guard: bool = True) -> None:
+    """Run the tests named one after another, each record added to output/offload_tests/runs.json.
+
+    A run stopped by hand ends the sequence: whoever stopped it wants the
+    devices, and the next test would take them straight back.
+    """
     index = OUT / "runs.json"
     for name in chosen(names):
-        record = run_test(kit, name, TESTS[name], timeout, poll)
+        record = run_test(kit, name, TESTS[name], timeout, poll, guard)
         records = json.loads(index.read_text(encoding="utf-8")) if index.exists() else []
         OUT.mkdir(parents=True, exist_ok=True)
         index.write_text(json.dumps(records + [record], indent=2) + "\n", encoding="utf-8")
+        if "KILLED" in record["status"]:
+            print(f"\n{name} was stopped by hand, so the rest are left unrun.", flush=True)
+            break
     print(f"\ndone: python {Path(__file__).relative_to(REPO_ROOT).as_posix()} results", flush=True)
 
 
@@ -295,6 +314,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_step.add_argument("names", nargs="+", help=f"of {', '.join([*GROUPS, *TESTS])}")
     run_step.add_argument("--timeout", type=float, default=1800, help="seconds one test may take")
     run_step.add_argument("--poll", type=float, default=20, help="seconds between status checks")
+    run_step.add_argument("--no-guard", action="store_true",
+                          help="launch without the kit's readiness check first")
     steps.add_parser("results", help="rank 0's lines of every test run")
     args = parser.parse_args(argv)
     if args.step == "results":
@@ -304,7 +325,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     elif args.step == "check":
         check(Kit(args.cluster, args.env, args.ssh))
     else:
-        run(Kit(args.cluster, args.env, args.ssh), args.names, args.timeout, args.poll)
+        run(Kit(args.cluster, args.env, args.ssh), args.names, args.timeout, args.poll,
+            not args.no_guard)
 
 
 if __name__ == "__main__":
