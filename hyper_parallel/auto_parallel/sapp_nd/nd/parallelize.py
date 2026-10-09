@@ -1046,6 +1046,14 @@ class ParallelizeLayer:
                         len(plot_space) - len(exhaustive_additions)
                         if exhaustive_additions else None
                     ),
+                    recompute_plans=(
+                        {
+                            entry[0]: trainer_plan(self.recompute_choices[entry[0]])
+                            for entry in plot_space
+                            if entry[0] in self.recompute_choices
+                        }
+                        if getattr(self, "recompute_mode_per_layer", False) else None
+                    ),
                 )
         return scored_space
 

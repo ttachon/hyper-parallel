@@ -19,7 +19,6 @@ import colorsys
 import csv
 from enum import Enum, auto
 from pathlib import Path
-from functools import partial
 from math import isnan, sqrt
 from typing import Optional
 
@@ -28,6 +27,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 from matplotlib.font_manager import FontProperties
 from scipy.stats import pearsonr
+import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -385,9 +385,12 @@ class Plot:
         self.data = []
 
     def make_table(self):
-        """Make table below plot with each parallelism degree"""
+        """Make the table below the plot with parallelism degrees and YAML recompute settings."""
         self.cell_text = list(map(list, zip(*self.cell_text)))  # transpose
-        max_rows = list(map(max, map(partial(map, _cell_number), self.cell_text)))
+        max_rows = [
+            None if title in {"RMOD", "RLAYER"} else max(map(_cell_number, cells))
+            for title, cells in zip(self.row_title, self.cell_text)
+        ]
         the_table = plt.table(
             cellText=self.cell_text,
             rowLabels=self.row_title,
@@ -397,17 +400,25 @@ class Plot:
         )
         row_colors = list(map(dim_color, self.row_title))
         for row in range(len(self.row_title)):
+            line_count = max(str(text).count("\n") + 1 for text in self.cell_text[row])
             cell = the_table[row + 1, -1]
             cell.set_edgecolor("none")
             cell.get_text().set_color(row_colors[row])
             cell.set_text_props(fontproperties=FontProperties(weight="bold"))
+            cell.set_height(cell.get_height() * line_count)
             for col in range(len(self.cell_text[0])):
                 cell = the_table[row + 1, col]
-                value = _cell_number(str(cell.get_text().get_text()))
-                try:
-                    ratio = 1 - (value / max_rows[row])
-                except ZeroDivisionError:
-                    ratio = 0
+                cell.set_height(cell.get_height() * line_count)
+                if max_rows[row] is None:
+                    ratio = 1
+                else:
+                    value = _cell_number(str(cell.get_text().get_text()))
+                    try:
+                        ratio = 1 - (value / max_rows[row])
+                    except ZeroDivisionError:
+                        ratio = 0
+                if self.row_title[row] == "RLAYER":
+                    cell.set_text_props(ha="center", fontfamily="monospace")
                 logger.debug(
                     "tmax = %s, ratio = %f, col=%s, newcolor=%s",
                     str(max_rows[row]),
@@ -444,10 +455,22 @@ class Plot:
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
         include_all = kwargs.get("include_all", False)
+        recompute_plans = kwargs.get("recompute_plans")
         min_e = configs_estimated[0][2]
         i = 0
         for index, cfg_e in enumerate(configs_estimated):
-            cells = cfg_e[0].values() + [cfg_e[1]]
+            cells = cfg_e[0].values()
+            if "RMOD" in self.row_title:
+                mode, layers = (recompute_plans or {}).get(
+                    cfg_e[0], (getattr(cfg_e[0], "recompute", None), None)
+                )
+                cells.append(mode.upper() if mode else "-")
+                if "RLAYER" in self.row_title:
+                    cells.append(
+                        yaml.safe_dump(layers, default_flow_style=False, sort_keys=False).strip()
+                        if layers is not None else "-"
+                    )
+            cells.append(cfg_e[1])
             if self.row_title[0] == "TOP":
                 cells.insert(0, cfg_e[0].rank or index + 1)
             self.cell_text.append(cells)
@@ -494,8 +517,9 @@ def plot_nd(
     max_num: Optional[int] = None,
     include_all: bool = False,
     top_result_count: Optional[int] = None,
+    recompute_plans: Optional[dict[Dim.Dimensions, tuple[str, dict[str, str]]]] = None,
 ) -> None:
-    """Plot estimation with a divider before any additional configurations.
+    """Plot estimation with optional recompute rows and a divider before additions.
 
     Args:
         configs_estimated: Ranked configurations with memory, score and its parts.
@@ -507,12 +531,19 @@ def plot_nd(
         max_num: Maximum number of configurations in the normal plot.
         include_all: Include every supplied configuration without normal plot limits.
         top_result_count: Number of normal results preceding the additions.
+        recompute_plans: Global activation checkpoint modes and YAML layer
+            overrides from automatic selection among named modes. None omits
+            RLAYER; configurations with a recompute mode still show RMOD.
     """
     plot = Plot(
         title, configs_estimated[0][0].keys(), debug_parts,
         top=max_num, show_top=True,
     )
-    plot.parse_data(configs_estimated, include_all=include_all)
+    if _has_recompute(configs_estimated) or recompute_plans is not None:
+        plot.row_title.insert(-1, "RMOD")
+    if recompute_plans is not None:
+        plot.row_title.insert(-1, "RLAYER")
+    plot.parse_data(configs_estimated, include_all=include_all, recompute_plans=recompute_plans)
 
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "estim"] + plot.dbg_cols)
