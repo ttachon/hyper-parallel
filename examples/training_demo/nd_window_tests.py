@@ -81,6 +81,10 @@ _IDLE_PER_LAUNCH_US = 28.7
 _HOST_CORE = "ai_cpu"
 _COMM_CORE = "comm"
 
+# Directory names every Ascend profile ends with, which say nothing about which
+# run produced it. Stripped before a profile is labelled.
+_GENERIC_PROFILE_DIRS = ("ascend_profiler_output", "profile", "profiles")
+
 # The sweep's own dimension columns, which together identify a strategy.
 _KEY = ("DP", "MP", "PP", "CP", "EP", "MB", "MBS", "OP")
 
@@ -867,17 +871,32 @@ def _summarise_indexer(data: Dict[str, Any], out: List[str]) -> None:
                    f"{_IDLE_PER_LAUNCH_US} fitted, predicted {data['idle_predicted_ms']:+.1f} ms")
 
 
+def _profile_label(profile: str) -> str:
+    """Name a profile by the run it came from, not by the profiler's own folder.
+
+    Every Ascend profile ends in the same two or three directory names, so a
+    label taken from the leaf makes two different runs look identical. This
+    walks up to the first names that say which run it was.
+    """
+    parts = [part for part in Path(profile).parts
+             if part.lower() not in _GENERIC_PROFILE_DIRS and not part.lower().endswith("_ascend_pt")]
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    return parts[-1] if parts else profile
+
+
 def _summarise_fallback(data: Dict[str, Any], out: List[str]) -> None:
     """Render test 2 into the summary block."""
     out.append("TEST 2  host operator fallback, is it on the critical path")
     for entry in data["profiles"]:
-        name = Path(entry["profile"]).name
-        out.append(f"  {name[:28]:28s} fallback {entry['host_wall_ms']:7.1f} ms a step, "
+        label = _profile_label(entry["profile"])
+        out.append(f"  {label[:26]:26s} fallback {entry['host_wall_ms']:7.1f} ms a step, "
                    f"exposed {entry['host_exposed_ms']:7.1f} ({entry['host_exposed_share_pct']:.0f}%)")
-        if entry.get("free_ms"):
-            share = 100 * entry["host_exposed_ms"] / entry["free_ms"]
-            out.append(f"  {'':28s} Free {entry['free_ms']:.1f} ms a step, "
-                       f"so the fallback explains {share:.0f}% of the idle")
+        computing = entry.get("computing_ms")
+        if computing:
+            # Free is NOT the denominator: this work is counted inside Computing.
+            out.append(f"  {'':26s} {100 * entry['host_exposed_ms'] / computing:.0f}% of Computing "
+                       f"({computing:.1f} ms a step), which is the denominator, not Free")
 
 
 def _summarise_ep16(data: Dict[str, Any], out: List[str]) -> None:
@@ -891,7 +910,8 @@ def _summarise_ep16(data: Dict[str, Any], out: List[str]) -> None:
 
 _RENDERERS = (("indexer", _summarise_indexer, "test 1, the indexer path"),
               ("fallback", _summarise_fallback, "test 2, the host fallback"),
-              ("ep16", _summarise_ep16, "test 3, the expert degree 16 pair"))
+              ("ep16", _summarise_ep16,
+               "test 3, the expert degree 16 pair (Qwen3.5, a separate round)"))
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
