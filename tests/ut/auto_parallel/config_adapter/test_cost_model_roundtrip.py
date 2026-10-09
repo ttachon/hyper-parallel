@@ -32,6 +32,7 @@ import yaml
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 from hyper_parallel.auto_parallel.config_adapter._search_runner import _build_hp_yaml_dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
 )
@@ -225,15 +226,6 @@ class TestNoDiskRoundTrip(unittest.TestCase):
     """
 
     @staticmethod
-    def _cost_model_config():
-        """Import CostModelConfig in package order, avoiding the import cycle."""
-        import hyper_parallel.auto_parallel.sapp_nd.memory_estimation  # noqa: F401  pylint: disable=C0415,W0611
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (  # pylint: disable=C0415
-            CostModelConfig,
-        )
-        return CostModelConfig
-
-    @staticmethod
     def _scalars(ccfg):
         """Every plain-valued field the parser populated."""
         return {
@@ -250,7 +242,6 @@ class TestNoDiskRoundTrip(unittest.TestCase):
         Expectation: Both select CostModelParserHyperV2 and populate every
             scalar field identically.
         """
-        cost_model_config = self._cost_model_config()
         yaml_dict = _build_hp_yaml_dict(_normalized_config())
 
         handle, path = tempfile.mkstemp(suffix=".yaml", prefix="roundtrip_")
@@ -258,10 +249,10 @@ class TestNoDiskRoundTrip(unittest.TestCase):
         try:
             with open(path, "w", encoding="utf-8") as stream:
                 yaml.dump(yaml_dict, stream, default_flow_style=False, sort_keys=False)
-            via_disk = cost_model_config(path, None, "hyper_v2", None)
+            via_disk = CostModelConfig(path, None, "hyper_v2", None)
         finally:
             os.remove(path)
-        via_memory = cost_model_config(yaml_dict, None, "hyper_v2", None)
+        via_memory = CostModelConfig(yaml_dict, None, "hyper_v2", None)
 
         self.assertIs(type(via_memory.parser), type(via_disk.parser))
         self.assertEqual(self._scalars(via_memory), self._scalars(via_disk))
@@ -274,9 +265,7 @@ class TestNoDiskRoundTrip(unittest.TestCase):
             string reached the framework lookup.
         Expectation: The named framework selects the parser either way.
         """
-        cost_model_config = self._cost_model_config()
-        ccfg = cost_model_config(_build_hp_yaml_dict(_normalized_config()),
-                                 None, "hyper_v2", None)
+        ccfg = CostModelConfig(_build_hp_yaml_dict(_normalized_config()), None, "hyper_v2", None)
         self.assertIsInstance(ccfg.parser, CostModelParserHyperV2)
 
 if __name__ == "__main__":

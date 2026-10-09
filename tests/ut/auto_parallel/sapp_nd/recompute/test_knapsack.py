@@ -24,9 +24,6 @@ import random
 import unittest
 from typing import Dict, Hashable, Optional, Sequence, Tuple
 
-# The package has an import cycle that only the memory estimator's import order
-# settles; the performance modules cannot be the first a process loads.
-import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.recompute.front import LayerOption, layer_fronts

@@ -30,9 +30,6 @@ from unittest.mock import patch
 
 import yaml
 
-# The package has an import cycle that only the memory estimator's import order
-# settles; the performance modules cannot be the first a process loads.
-import hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2  # pylint: disable=unused-import
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel import _hf_model_spec

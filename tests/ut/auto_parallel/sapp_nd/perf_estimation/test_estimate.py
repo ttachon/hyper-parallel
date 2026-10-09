@@ -31,8 +31,6 @@ from unittest.mock import patch
 
 import yaml
 
-# The package has an import cycle that only the memory estimator's import order
-# settles; perf_estimation.estimate cannot be the first module a process loads.
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
