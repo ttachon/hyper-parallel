@@ -1593,6 +1593,35 @@ class TestSappNDRunND(unittest.TestCase):
                 mock_search.assert_not_called()
                 self.assertEqual(cluster_spec["num_nodes"], 4, f"{flags}: num_nodes {cluster_spec['num_nodes']}")
 
+    def test_debug_rows_held_open_reach_the_file_when_the_block_ends(self) -> None:
+        """
+        Feature: Debug.holding_open.
+        Description: Write two rows of one CSV inside the block, as a search writes a row a
+            candidate, then one row of another CSV outside any block.
+        Expectation: The held CSV is opened once and holds its titles and both rows once the block
+            ends; the row outside a block is on disk at once; and the folder can be deleted, so no
+            file is left open.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 4)], all_dims=[Dim.DP, Dim.MBS])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def row(name: str, total: int) -> Any:
+                """A row of *total* for the CSV *name* in the folder."""
+                debug = Debug.Debug(dims, [Debug.PerfParts.TOTAL])
+                debug.output_file = os.path.join(tmp_dir, name)
+                debug.info[Debug.PerfParts.TOTAL] = total
+                return debug
+
+            first, second, single = row("held.csv", 9), row("held.csv", 10), row("single.csv", 11)
+            with patch("builtins.open", wraps=open) as opened:
+                with Debug.holding_open():
+                    first.write()
+                    second.write()
+            self.assertEqual(opened.call_count, 1)
+            single.write()
+            for name, rows in (("held.csv", (first, second)), ("single.csv", (single,))):
+                with open(os.path.join(tmp_dir, name), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), first.column_titles() + "".join(r.values() for r in rows))
+
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.

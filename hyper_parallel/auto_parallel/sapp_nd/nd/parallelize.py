@@ -466,7 +466,8 @@ class ParallelizeLayer:
                 pool.close()
                 pool.join()
         else:
-            results, size = self.device_loops(space, None)
+            with Debug.holding_open():
+                results, size = self.device_loops(space, None)
             for config, peak_mem in results.items():
                 if self.mem_eval.mem_fit(peak_mem):
                     configs.append((config, peak_mem))
@@ -624,7 +625,7 @@ class ParallelizeLayer:
             proc.Pool(processes=threads_num)
             if multiproc
             else nullcontext()
-        ) as pool:
+        ) as pool, Debug.holding_open():
             for config, peak in space:
                 self.config.set_parallel_config(config)
                 values = []
