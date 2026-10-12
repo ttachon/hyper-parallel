@@ -14,7 +14,7 @@
 # ============================================================================
 """Getters"""
 
-from copy import deepcopy
+from copy import copy
 from typing import Any, Dict, List, Tuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, apply_layer_kind, layer_groups
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import runs_hyper_selective
@@ -28,7 +28,10 @@ def get_layer_group_configs(cfg):
 
     A config whose layers run on it as it stands is one group, priced with
     ``cfg`` itself.  Otherwise each kind is applied once, to a copy of
-    ``cfg`` that every group of that kind shares.
+    ``cfg`` that every group of that kind shares.  A kind sets top-level
+    fields only (``apply_layer_kind``), so a shallow copy leaves ``cfg``
+    intact, as ``comm_time``'s walk copies it for the same reason; a deep
+    copy cost 0.36 ms, twice a candidate and once a kind.
     """
     groups = layer_groups(cfg)
     if all(kind is None for kind, _ in groups):
@@ -36,7 +39,7 @@ def get_layer_group_configs(cfg):
     configs = {}
     for kind, _ in groups:
         if kind.name not in configs:
-            configs[kind.name] = deepcopy(cfg)
+            configs[kind.name] = copy(cfg)
             apply_layer_kind(CWrap(configs[kind.name]), kind)
     return [(configs[kind.name], count) for kind, count in groups]
 
