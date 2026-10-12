@@ -27,28 +27,37 @@ recomputed, each right after its pick: the baseline each plan is read against in
 demo's delta rule, hyperparallel, which no earlier round of this demo ran, so no earlier time is a baseline.
 Before each launch the kit's readiness check runs, and a busy device skips that run until the next ``run``.
 
+On that rule the default allocator reserves 5.57 GiB more beyond allocation than on the old one (E10, 12 October),
+room the budget above does not leave. ``run --expandable-segments`` runs the round with
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True in the kit config's REMOTE_ENV_SETUP, as block B of the recompute
+plan tests did, and always takes it out again; each run records the allocator it ran on, and the results say it.
+
 The script needs nothing beyond the standard library, apart from PyYAML to write the plan yamls.
 
 Usage, from the repository root on the control node:
     python examples/training_demo/nd_top_plans.py setup        # plan yamls, 4 nodes from the pool, mirror, data
     python examples/training_demo/nd_top_plans.py run          # every pick, then the anchors; a run kept is skipped
     python examples/training_demo/nd_top_plans.py run p08 a1   # only these; --again runs a kept one anew
+    python examples/training_demo/nd_top_plans.py run --expandable-segments   # the same on that allocator
     python examples/training_demo/nd_top_plans.py results
+    python examples/training_demo/nd_top_plans.py reset        # only after a run with the setting was killed outright
 """
 import argparse
+import contextlib
 import csv
 import importlib.util
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set
 
 DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parent.parent
@@ -71,6 +80,7 @@ NODE_TAG = re.compile(r"^\[node[0-9]+\]\s*")
 LOGGED_PLAN = "per layer in model.layers: .*"
 LOGGED_RULE = "delta_rule=hyperparallel: [0-9]+ linear-attention layers switched"
 FAILURE = r"Tried to allocate [^)]*\)|EL0004[^.]*|cannot import name '[^']*'"
+ALLOCATOR = "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True"
 OFF_3_7 = {"3-7": "off"}
 
 
@@ -236,6 +246,58 @@ def setup(pool: Path) -> None:
                          "fix that node, or run setup again to select others")
 
 
+def with_allocator(text: str, enabled: bool) -> str:
+    """Return a kit config with the allocator setting added to its REMOTE_ENV_SETUP, or taken out.
+
+    Raises:
+        SystemExit: The config sets the allocator some other way, or has no
+            one-line REMOTE_ENV_SETUP to add the setting to.
+    """
+    setting = f"; {ALLOCATOR}"
+    stripped = text.replace(setting, "")
+    if "PYTORCH_NPU_ALLOC_CONF" in stripped:
+        raise SystemExit(f"{CLUSTER_ENV} sets PYTORCH_NPU_ALLOC_CONF its own way: take that out by hand first")
+    if not enabled:
+        return stripped
+    lines = stripped.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        if body.startswith("REMOTE_ENV_SETUP=") and body.endswith('"'):
+            lines[index] = body[:-1] + setting + '"' + line[len(body):]
+            return "".join(lines)
+    raise SystemExit(f'{CLUSTER_ENV} has no one-line REMOTE_ENV_SETUP="..." to add the allocator setting to')
+
+
+def set_allocator(enabled: bool) -> None:
+    """Add the allocator setting to the kit config, or take it out, and say which."""
+    text = CLUSTER_ENV.read_text(encoding="utf-8")
+    updated = with_allocator(text, enabled)
+    if updated != text:
+        CLUSTER_ENV.write_text(updated, encoding="utf-8")
+    print(f"expandable segments {'ON' if enabled else 'off'} in {CLUSTER_ENV.name}", flush=True)
+
+
+def _stop(signum: int, frame: Any) -> None:
+    """Turn a termination or a hangup into SystemExit, so the allocator setting still comes out."""
+    del frame
+    raise SystemExit(f"stopped by signal {signum}")
+
+
+@contextlib.contextmanager
+def _signals_stop_cleanly() -> Iterator[None]:
+    """Make a kill, or a lost terminal that nohup does not already ignore, end the round through its cleanup."""
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None and signal.getsignal(number) is not signal.SIG_IGN:
+            previous[number] = signal.signal(number, _stop)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
 def read_run(run: Run) -> Optional[Dict[str, Any]]:
     """The sweep's record of one run, or None where it has not run."""
     try:
@@ -255,8 +317,8 @@ def _state(record: Dict[str, Any]) -> str:
             f"{_number(record.get('max_reserved_gb'), 2)} reserved")
 
 
-def launch(run: Run, again: bool) -> None:
-    """Run one strategy through the sweep, unless it has run or a device is busy."""
+def launch(run: Run, again: bool, allocator: str = "default") -> None:
+    """Run one strategy through the sweep, unless it has run or a device is busy, and note the allocator it ran on."""
     folder = OUT / run.folder
     kept = read_run(run)
     if kept is not None and not again:
@@ -269,22 +331,31 @@ def launch(run: Run, again: bool) -> None:
         folder.rename(folder.with_name(f"{folder.name}.{time.strftime('%Y%m%d_%H%M%S')}"))
     if stream(sweep_command(run), OUT / "runs.log"):
         print(f"{run.name}: the sweep exited with an error; going on with the next run", flush=True)
+    if folder.is_dir():
+        (folder / "allocator.txt").write_text(allocator + "\n", encoding="utf-8")
     record = read_run(run)
     print(f"{run.name}: {_state(record) if record else 'no record, so it did not run'}", flush=True)
 
 
-def run_all(names: Sequence[str], again: bool) -> None:
-    """Launch the runs named, or all, one after the other, once the nodes agree on their environment."""
+def run_all(names: Sequence[str], again: bool, expandable: bool = False) -> None:
+    """Launch the runs named, or all, one after the other, once the nodes agree, on the allocator asked for."""
     chosen = runs_named(names)
     missing = sorted({plan_yaml(run).name for run in chosen if not plan_yaml(run).exists()})
     if missing:
         raise SystemExit(f"run setup first: {', '.join(missing)} missing")
     if not same_environment():
         raise SystemExit("the nodes do not answer the same torch versions: fix the odd node, or run setup again")
-    for index, run in enumerate(chosen, 1):
-        print(f"\n##### {index} of {len(chosen)}: {run.name}, {run.strategy}, recompute {run.plan} #####",
-              flush=True)
-        launch(run, again)
+    allocator = "expandable segments" if expandable else "default"
+    with _signals_stop_cleanly():
+        set_allocator(expandable)
+        try:
+            for index, run in enumerate(chosen, 1):
+                print(f"\n##### {index} of {len(chosen)}: {run.name}, {run.strategy}, recompute {run.plan}, "
+                      f"{allocator} allocator #####", flush=True)
+                launch(run, again, allocator)
+        finally:
+            if expandable:
+                set_allocator(False)
     print(f"\ndone: python {Path(__file__).relative_to(REPO_ROOT).as_posix()} results", flush=True)
 
 
@@ -321,7 +392,10 @@ def measure(env: Dict[str, Any], run: Run) -> Dict[str, Any]:
                            "state": "not run" if not record else ("FAILED" if record.get("failed") else "ok"),
                            "step_ms": record.get("step_trainer"), "step_sd": record.get("step_trainer_sd"),
                            "alloc_gib": record.get("max_allocated_gb"), "reserved_gib": record.get("max_reserved_gb"),
-                           "logged_plan": "", "logged_rule": "", "failure": ""}
+                           "logged_plan": "", "logged_rule": "", "failure": "", "allocator": ""}
+    recorded = OUT / run.folder / "allocator.txt"
+    if record and recorded.is_file():
+        row["allocator"] = recorded.read_text(encoding="utf-8").strip()
     if record.get("run_id"):
         row["logged_plan"] = remote_grep(env, 0, record["run_id"], LOGGED_PLAN)
         row["logged_rule"] = remote_grep(env, 0, record["run_id"], LOGGED_RULE)
@@ -399,6 +473,22 @@ def verdict(rows: Dict[str, Dict[str, Any]], sweep: ModuleType) -> List[str]:
     return _following_nd(timed, sweep) + _against_full(rows) + _memory(rows)
 
 
+def allocators(rows: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Which allocator the runs ran on, as each recorded it, and whether the setting was left in the kit config."""
+    used: Dict[str, List[str]] = {}
+    for name, row in rows.items():
+        if row["state"] != "not run":
+            used.setdefault(row["allocator"] or "not recorded", []).append(name)
+    if len(used) > 1:
+        lines = ["Allocator MIXED: " + "; ".join(f"{kind} for {', '.join(names)}" for kind, names in used.items())]
+    else:
+        lines = [f"Allocator: {next(iter(used))} for every run." if used else "Allocator: no run yet."]
+    if ALLOCATOR in CLUSTER_ENV.read_text(encoding="utf-8"):
+        lines.append(f"The allocator setting is still ON in {CLUSTER_ENV.name}, left by a run killed outright: "
+                     f"take it out with python {Path(__file__).relative_to(REPO_ROOT).as_posix()} reset")
+    return lines
+
+
 def results(env: Dict[str, Any], sweep: ModuleType) -> None:
     """Print one line per run in ND's order, each failure's reason, then the verdict; write results.csv."""
     rows = {run.name: measure(env, run) for run in RUNS}
@@ -413,7 +503,7 @@ def results(env: Dict[str, Any], sweep: ModuleType) -> None:
         if rows[run.name]["failure"]:
             print(f"{'':10s}{rows[run.name]['failure']}")
     print()
-    print("\n".join(verdict(rows, sweep)))
+    print("\n".join(allocators(rows) + verdict(rows, sweep)))
     table = OUT / "results.csv"
     table.parent.mkdir(parents=True, exist_ok=True)
     with open(table, "w", newline="", encoding="utf-8") as handle:
@@ -432,12 +522,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_step = steps.add_parser("run", help="every pick then the anchors, or the runs named")
     run_step.add_argument("names", nargs="*", help="p01 to p16, a1, a2")
     run_step.add_argument("--again", action="store_true", help="run a kept run anew, its old folder renamed")
+    run_step.add_argument("--expandable-segments", action="store_true",
+                          help="run with PYTORCH_NPU_ALLOC_CONF=expandable_segments:True, taken out after")
     steps.add_parser("results", help="one line per run, then the verdict")
+    steps.add_parser("reset", help="take the allocator setting out of the kit config")
     args = parser.parse_args(argv)
     if args.step == "setup":
         setup(args.pool)
     elif args.step == "run":
-        run_all(args.names, args.again)
+        run_all(args.names, args.again, args.expandable_segments)
+    elif args.step == "reset":
+        set_allocator(False)
     else:
         sweep = load_sweep()
         results(sweep.read_cluster_env(CLUSTER_ENV), sweep)

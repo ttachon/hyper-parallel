@@ -25,6 +25,7 @@ import csv
 import importlib.util
 import io
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,11 @@ Runner = _load("nd_top_plans")
 Sweep = _load("sweep_qwen3_5_moe")
 
 _ENV = {"nodes": ["n0", "n1"], "log_dir": "/logs", "ssh_user": "root"}
+_KIT_CONFIG = (
+    'NODES=(\n  192.168.0.143\n  192.168.0.245\n)\nSSH_USER="root"\n'
+    'REMOTE_ENV_SETUP="source /home/tt/init_env.sh; export HCCL_EXEC_TIMEOUT=900"\n'
+    'LOG_DIR="/home/tt/cluster_logs"\n'
+)
 
 
 def _run(name: str):
@@ -262,6 +268,87 @@ class TestResults(unittest.TestCase):
 
         self.assertEqual(printed.getvalue().count("not run"), len(Runner.RUNS))
         self.assertIn("No pick has a step time yet.", printed.getvalue())
+
+
+class TestAllocator(unittest.TestCase):
+    """A round can run on expandable segments, which always come out of the kit config again."""
+
+    def test_setting_is_added_once_and_taken_out(self):
+        """Adding twice gives one setting; taking it out gives the config back; another form is refused."""
+        enabled = Runner.with_allocator(Runner.with_allocator(_KIT_CONFIG, True), True)
+
+        self.assertEqual(enabled.count(Runner.ALLOCATOR), 1, f"enabled={enabled!r}")
+        self.assertIn(f'HCCL_EXEC_TIMEOUT=900; {Runner.ALLOCATOR}"\n', enabled)
+        self.assertEqual(Runner.with_allocator(enabled, False), _KIT_CONFIG)
+        own = _KIT_CONFIG.replace("900", "900; export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512")
+        with self.assertRaisesRegex(SystemExit, "its own way"):
+            Runner.with_allocator(own, True)
+
+    def test_a_round_on_expandable_segments_takes_the_setting_out_even_when_stopped(self):
+        """Every launch sees the setting; once the round stops, by hand here, the config is as it was."""
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "cluster.env"
+            config.write_text(_KIT_CONFIG, encoding="utf-8")
+            (Path(folder) / "plan.yaml").write_text("{}", encoding="utf-8")
+            seen = []
+
+            def fake_stream(command: list, log: Path) -> int:
+                """Record whether the setting was on; stop the round at the second launch."""
+                del command, log
+                seen.append(Runner.ALLOCATOR in config.read_text(encoding="utf-8"))
+                if len(seen) == 2:
+                    raise KeyboardInterrupt
+                return 0
+
+            with (
+                patch.object(Runner, "CLUSTER_ENV", config),
+                patch.object(Runner, "OUT", Path(folder) / "out"),
+                patch.object(Runner, "plan_yaml", lambda run: Path(folder) / "plan.yaml"),
+                patch.object(Runner, "same_environment", lambda: True),
+                patch.object(Runner.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0)),
+                patch.object(Runner, "stream", fake_stream),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    Runner.run_all(["p01", "a1", "p02"], again=False, expandable=True)
+
+            self.assertEqual(seen, [True, True])
+            self.assertEqual(config.read_text(encoding="utf-8"), _KIT_CONFIG)
+
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "no SIGHUP on this platform")
+    def test_a_hangup_nohup_ignores_stays_ignored(self):
+        """Under nohup a lost terminal must not end the round; a kill still ends it through its cleanup."""
+        hangup = getattr(signal, "SIGHUP")
+        previous = signal.signal(hangup, signal.SIG_IGN)
+        try:
+            with Runner._signals_stop_cleanly():  # pylint: disable=protected-access
+                self.assertIs(signal.getsignal(hangup), signal.SIG_IGN)
+                self.assertIs(signal.getsignal(signal.SIGTERM), Runner._stop)  # pylint: disable=protected-access
+        finally:
+            signal.signal(hangup, previous)
+
+    def test_results_say_the_allocator_each_run_recorded_and_a_setting_left_behind(self):
+        """Runs on two allocators read as mixed; a setting left in the config is named, and reset takes it out."""
+        with tempfile.TemporaryDirectory() as folder:
+            out, config = Path(folder) / "out", Path(folder) / "cluster.env"
+            config.write_text(Runner.with_allocator(_KIT_CONFIG, True), encoding="utf-8")
+            for name, allocator in (("p01", "expandable segments"), ("a1", "default")):
+                TestResults._write(out, name, step_trainer=6000.0)  # pylint: disable=protected-access
+                (out / _run(name).folder / "allocator.txt").write_text(allocator + "\n", encoding="utf-8")
+            printed = io.StringIO()
+            with (
+                patch.object(Runner, "OUT", out),
+                patch.object(Runner, "CLUSTER_ENV", config),
+                patch.object(Runner, "remote_grep", lambda *args: ""),
+                contextlib.redirect_stdout(printed),
+            ):
+                Runner.results(_ENV, Sweep)
+                Runner.main(["reset"])
+            reset = config.read_text(encoding="utf-8")
+
+        self.assertIn("Allocator MIXED: expandable segments for p01; default for a1", printed.getvalue())
+        self.assertIn("The allocator setting is still ON in cluster.env", printed.getvalue())
+        self.assertEqual(reset, _KIT_CONFIG)
 
 
 if __name__ == "__main__":
