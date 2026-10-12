@@ -133,7 +133,11 @@ def nd_spec(model_dir: str, divisor: int, experts: int) -> Dict[str, Any]:
     Only fields ND reads are emitted, and only where the crop actually builds
     what they describe: the released ``num_nextn_predict_layers`` and every
     DSpark field are left out because the validation crop builds neither, and
-    stating them would price layers that never run.
+    stating them would price layers that never run.  No dtype is emitted: the
+    width a run loads, keeps and computes in is the run's, stated as the
+    launcher states it (``model.torch_dtype``, ``model_init_dtype`` and FSDP's
+    ``mix_precision``), and ND refuses ``compute_dtype`` among the model's
+    facts (register D17).
 
     Args:
         model_dir: The released checkpoint directory.
@@ -162,7 +166,6 @@ def nd_spec(model_dir: str, divisor: int, experts: int) -> Dict[str, Any]:
         "num_experts": dims["num_experts"],
         "num_experts_per_tok": dims.get("num_experts_per_tok", 1),
         "num_shared_experts": dims.get("n_shared_experts", 0),
-        "compute_dtype": "bfloat16",
     }
     return spec
 
