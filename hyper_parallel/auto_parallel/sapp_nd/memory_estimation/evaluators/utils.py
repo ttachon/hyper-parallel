@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Mapping
 import operator
 import ast
+import functools
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 if TYPE_CHECKING:
@@ -38,6 +39,15 @@ OPS_MAP = {
     "abs": abs,
     "round": round,
 }
+
+
+@functools.lru_cache(maxsize=256)
+def _parsed_expr(expr: str) -> ast.AST:
+    """The expression a communication formula sums, parsed once rather than once a layer and candidate.
+
+    The evaluation only reads the tree, so every call can share it.
+    """
+    return ast.parse(expr).body[0].value
 
 
 class EvalUtils:
@@ -116,10 +126,7 @@ class EvalUtils:
     @classmethod
     def eval_expr_insight(cls, **kwargs):
         """compute and categorize math expression"""
-        nodes = ast.parse(kwargs.get("expr"))
-        # print(ast.dump(nodes, indent=1))
-        # print(kwargs["expr"])
-        return cls.__eval_ast_mem(nodes.body[0].value, 0, **kwargs)[0]
+        return cls.__eval_ast_mem(_parsed_expr(kwargs.get("expr")), 0, **kwargs)[0]
 
     @staticmethod
     def __log_ast_mem(ctx, cat, mem):

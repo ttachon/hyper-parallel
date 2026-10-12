@@ -20,6 +20,7 @@ import ast
 import math
 import logging
 import inspect
+import functools
 import pprint
 import importlib
 import matplotlib.pyplot as plt
@@ -49,6 +50,12 @@ if TYPE_CHECKING:
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 EVAL_YML = os.path.join(current_dir, "configs_eval/default.yaml")
+
+
+@functools.lru_cache(maxsize=4096)
+def _parameters(fun: Any) -> Tuple[inspect.Parameter, ...]:
+    """A communication formula's parameters, read once a formula rather than once a layer and candidate."""
+    return tuple(inspect.signature(fun).parameters.values())
 
 
 class _Backbone:
@@ -232,7 +239,7 @@ class _Backbone:
             for k, fun in vars(comm_eval_field).items():
                 if fun is None:
                     continue
-                sig_param = inspect.signature(fun).parameters.values()
+                sig_param = _parameters(fun)
                 if (
                     # any(
                     #     p.kind == inspect.Parameter.VAR_KEYWORD
