@@ -165,6 +165,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-b GLOBAL_BATCH_SIZE]
     [-m MODEL]
     [-l [DIMENSIONS ...]]
+    [-j JOBS]
     [-v VERBOSITY]
     [-A DEVICE_TYPE]
     [-mppb | --manual_pipeline_balance]
@@ -187,6 +188,15 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-b`, `--global_batch_size`: global batch size. If omitted, ND uses the yaml value.
 - `-m`, `--model`: model name. If omitted, ND uses the yaml value.
 - `-l`, `--dimensions`: parallel dimensions to vary.
+- `-j`, `--jobs`: worker processes that price the search's candidates, `1` to
+  price them in the main process. The default is `ND_JOBS`, else half the
+  logical cores and at most 4, and 1 above verbosity 2, whose line per
+  estimate only the main process prints. The workers start before the yaml is
+  parsed and rebuild the search from the command line, so a search with `-ar`,
+  `--recompute`, a recompute dimension in its yaml or a multimodal model, and
+  `--real_csv`, `-s` and `-V`, price in the main process, and so does a search
+  of fewer than 2000 candidates, for which starting the workers costs more
+  than they save. Every output is the same either way.
 - `-v`, `--verbosity`: verbosity in range `[0, 6]`, default `2`. Plots and
   debug CSV files are generated from level `2`.
 - `-A`, `--device_type`: device type, such as `A2` or `A3`.

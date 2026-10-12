@@ -44,6 +44,10 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 # own tests name a folder of their own.
 os.environ["ND_CENSUS_CACHE"] = "off"
 
+# run_nd prices a search in worker processes unless told otherwise (-j); a test
+# that runs run_nd prices in its own process, and the pool's tests bring theirs.
+os.environ["ND_JOBS"] = "1"
+
 
 class NoAcceleratorGuard:
     """Fail fast when a CPU-gated test accidentally reaches for a device.

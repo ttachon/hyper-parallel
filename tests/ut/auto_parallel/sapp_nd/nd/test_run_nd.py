@@ -1717,7 +1717,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
         runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
-        runner.memory_estim = lambda: 32
+        runner.memory_estim = lambda debugger=None: 32
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
             """Fill two parts the way estimate_performance does and return the score."""
@@ -2053,7 +2053,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
         runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
-        runner.memory_estim = lambda: 2048
+        runner.memory_estim = lambda debugger=None: 2048
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
             """Fill one part the way estimate_performance does and return the score."""
@@ -2103,7 +2103,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=set_parallel_config)
         runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
-        runner.memory_estim = lambda: 32
+        runner.memory_estim = lambda debugger=None: 32
         with tempfile.TemporaryDirectory() as tmp_dir:
             csv_path = os.path.join(tmp_dir, "real.csv")
             with open(csv_path, "w", encoding="utf-8") as csv_file:
@@ -3237,12 +3237,6 @@ class TestSappNDRunND(unittest.TestCase):
         wrapper.instance = SimpleNamespace(marker="delegated")
         self.assertEqual(wrapper.marker, "delegated")
 
-        with patch.object(Par, "EvaluatorV2") as evaluator_cls:
-            evaluator_cls.return_value.estimate_peak.return_value = 7
-            self.assertEqual(Par.pool_estimate_memory("config"), 7)
-        with patch.object(Par, "estimate_performance", return_value=9):
-            self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
-
     def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
         """
         Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
@@ -3443,7 +3437,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         runner.mem_eval = SimpleNamespace(get_strategy=lambda: {"dp": 2})
         runner.priced = lambda: runner.config.ccfg
-        runner.memory_estim = lambda: 32
+        runner.memory_estim = lambda debugger=None: 32
 
         class _FakeDebug:
             """Debug facade with stable accounting entries."""
