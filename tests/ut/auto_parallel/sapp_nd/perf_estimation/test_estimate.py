@@ -123,6 +123,34 @@ class TestEstimatePerformance(unittest.TestCase):
         self.assertEqual(_plain_values(ccfg), before)
         self.assertEqual(estimate_performance(ccfg, device_type=Hard.Device_A2), first)
 
+    def test_one_compute_walk_prices_both_as_two_walks_do(self):
+        """
+        Feature: estimate_comp both.
+        Description: DeepSeek's stages fully recomputed, with every other layer selective, and
+            plain, each priced by one walk returning both sums and by the two walks it replaces.
+        Expectation: The same numbers to the last bit, the recomputed sums above the plain ones
+            wherever a layer recomputes.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        check_and_apply_custom_hook(ccfg)
+        ccfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), softmax=0, gather=0))
+        stages = ccfg.generate_partitions_vpp()
+        custom = CustomConfig()
+
+        def _layout(odd: LayerType, even: LayerType) -> list:
+            """The stages with each recomputed layer turned to *odd* or *even* by its place in its chunk."""
+            return [[[(odd if i % 2 else even) if layer == LayerType.FULL_REC_LAYER else layer
+                      for i, layer in enumerate(chunk)] for chunk in stage] for stage in stages]
+
+        layouts = (stages, _layout(LayerType.SEL_REC_LAYER, LayerType.FULL_REC_LAYER),
+                   _layout(LayerType.NOT_REC_LAYER, LayerType.NOT_REC_LAYER))
+        for index, layout in enumerate(layouts):
+            one = estimate_comp(copy.deepcopy(ccfg), custom, layout, both=True)
+            two = (estimate_comp(copy.deepcopy(ccfg), custom, layout),
+                   estimate_comp(copy.deepcopy(ccfg), custom, layout, with_recomp=True))
+            self.assertEqual(one, two, f"layout {index}")
+            self.assertEqual(one[1] == one[0], index == 2, f"layout {index}")
+
     @staticmethod
     def _debugged(ccfg: CostModelConfig, **kwargs: Any) -> tuple:
         """The score and its parts."""

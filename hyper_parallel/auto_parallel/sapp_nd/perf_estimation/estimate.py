@@ -234,8 +234,8 @@ def _regular_layer_flop(cfg, ccfg, lcfg, tables, layer, with_recomp, switches=No
 
 
 # Evaluation functions
-def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
-    """FW + BW"""
+def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None, both=False):
+    """FW + BW; with ``both``, ``(plain, recomputed)`` from one walk over the layers"""
     _ = debugger
     # Full attention prices from the model's own attention dimensions.
     tables = {"full": _flavour_tables(cfg)}
@@ -243,16 +243,19 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
     # Each layer's own recompute switches, where the config states several.
     switches_at = get_layer_switches_by_position(cfg, stages)
 
-    flops = []
+    # One sum a mode, each taking its terms in the order a walk of that mode alone did.
+    modes = (False, True) if both else (with_recomp,)
+    sums = tuple([] for _ in modes)
     for stage_id, stage in enumerate(stages):
-        flops += [0]
+        for flops in sums:
+            flops += [0]
         for chunk_id, chunk in enumerate(stage):
             for lay_id, layer in enumerate(chunk):
                 if layer == LayerType.EMBEDDING_LAYER:
                     continue
 
                 if layer == LayerType.OUTPUT_LAYER:
-                    flops[-1] += (1 if cfg.dc_kv == 0 else cfg.n_mtp) * (
+                    output = (1 if cfg.dc_kv == 0 else cfg.n_mtp) * (
                         1
                         / 16  # bias_imbalance
                         * 6
@@ -263,20 +266,23 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
                         * cfg.bytes_p
                         / cfg.t
                     )
+                    for flops in sums:
+                        flops[-1] += output
                     continue
 
                 position = (stage_id, chunk_id, lay_id)
-                flops[-1] += _regular_layer_flop(
-                    cfg, ccfg, lccfg_at[position], tables, layer, with_recomp, switches_at.get(position)
-                )
+                for flops, mode in zip(sums, modes):
+                    flops[-1] += _regular_layer_flop(
+                        cfg, ccfg, lccfg_at[position], tables, layer, mode, switches_at.get(position)
+                    )
 
-    return flops
+    return sums if both else sums[0]
 
 
-def estimate_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
+def estimate_comp(cfg, ccfg, stages, with_recomp=False, debugger=None, both=False):
     """wrapper"""
     return estimate_op_bulk_comp(
-        cfg, ccfg, stages, with_recomp, debugger=debugger
+        cfg, ccfg, stages, with_recomp, debugger=debugger, both=both
     )
 
 
@@ -921,22 +927,18 @@ def _stage_parts(cfg, ccfg, stages, device_type, debugger):
     # recompute walks add as RECOMPUTE alone; recorded as communication too,
     # it made the parts outgrow the time, and the bubble, their difference,
     # went negative.
-    compute_perfs = estimate_comp(
-        cfg, ccfg, stages, with_recomp=False, debugger=debugger
-    )
-    recompute_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
-        else estimate_comp(cfg, ccfg, stages, with_recomp=True)
-    )
-    comm_perfs = estimate_comm(
-        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
-    )
-    recomm_perfs = (
-        [0] * cfg.p
-        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
-        else estimate_comm(cfg, ccfg, stages, device_type, with_recomp=True)
-    )
+    # Where the recompute is priced, one walk prices both modes, each sum
+    # taking its terms in the order a walk of that mode alone did.
+    if ccfg.retype in {RecType.COMPUTE_ONLY, RecType.WITH}:
+        compute_perfs, recompute_perfs = estimate_comp(cfg, ccfg, stages, debugger=debugger, both=True)
+    else:
+        compute_perfs = estimate_comp(cfg, ccfg, stages, with_recomp=False, debugger=debugger)
+        recompute_perfs = [0] * cfg.p
+    if ccfg.retype in {RecType.COMM_ONLY, RecType.WITH}:
+        comm_perfs, recomm_perfs = estimate_comm(cfg, ccfg, stages, device_type, debugger=debugger, both=True)
+    else:
+        comm_perfs = estimate_comm(cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger)
+        recomm_perfs = [0] * cfg.p
     return compute_perfs, recompute_perfs, comm_perfs, recomm_perfs
 
 

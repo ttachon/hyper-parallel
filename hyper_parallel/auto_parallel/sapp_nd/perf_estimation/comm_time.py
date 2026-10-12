@@ -549,9 +549,11 @@ def _fsdp_rounds(cfg) -> tuple:
 def _accumulate_stage_comm(param, stage, stage_id):
     """Sum the per-layer DP, TP, EP and CP communication volumes of one stage.
 
-    With ``param["with_recomp"]``, a recomputed layer also adds the volume its
-    recompute transfers again, the way the compute estimate counts a
-    recomputed op twice.
+    With ``param["with_recomp"]`` or ``param["both"]``, the walk also keeps
+    the same sums with the volume each recomputed layer's recompute transfers
+    again added, the way the compute estimate counts a recomputed op twice.
+    Both sums take every term in the same order as a walk keeping one of
+    them, so each comes out as that walk's would.
 
     A body layer is priced on the walk's config, in its own kind; the
     embedding and the output layer on the model's config, as its family left
@@ -560,11 +562,14 @@ def _accumulate_stage_comm(param, stage, stage_id):
     move a micro-batch (:meth:`EvalLayerComm.fsdp_traffic`).
 
     Returns:
-        ``(comm, reduced)``: the volumes by dimension, and the part of the DP
-        volume the copies of a shard all-reduce
-        (:meth:`EvalLayerComm.fsdp_reduce_traffic`).
+        ``(comm, again, reduced)``: the volumes by dimension; the same with
+        each recomputed layer's traffic added again, or ``None`` where the
+        walk keeps no such sums; and the part of the DP volume the copies of
+        a shard all-reduce (:meth:`EvalLayerComm.fsdp_reduce_traffic`).
     """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
+    again = dict(comm) if param["with_recomp"] or param["both"] else None
+    sums = (comm,) if again is None else (comm, again)
     reduced = 0.0
     fsdp = bool(getattr(param["cfg"], "grad_shard_as_params", False))
     layer_gathers, root_gathers, reduces = _fsdp_rounds(param["cfg"]) if fsdp else (0, 0, 0)
@@ -585,36 +590,92 @@ def _accumulate_stage_comm(param, stage, stage_id):
                 logger.info("param ctx %s", param["ctx"])
                 if fsdp:
                     parts = EvalLayerComm.fsdp_layer_parts(cfg, param["ctx"])
-                    comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, parts, layer_gathers, reduces)
+                    _add(sums, Dim.DP, EvalLayerComm.fsdp_traffic(cfg, parts, layer_gathers, reduces))
                     reduced += EvalLayerComm.fsdp_reduce_traffic(cfg, parts, reduces)
                 else:
-                    comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, param["ctx"])
+                    _add(sums, Dim.DP, EvalLayerComm.dp_comm_layer(cfg, param["ctx"]))
             elif fsdp and not is_body:
                 parts = fsdp_root_parts(cfg, layer)
-                comm[Dim.DP] += EvalLayerComm.fsdp_traffic(cfg, parts, root_gathers, reduces)
+                _add(sums, Dim.DP, EvalLayerComm.fsdp_traffic(cfg, parts, root_gathers, reduces))
                 reduced += EvalLayerComm.fsdp_reduce_traffic(cfg, parts, reduces)
 
-            comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
+            _add(sums, Dim.TP, EvalLayerComm.tp_comm_layer(
                 cfg, param["ctx"], 1
-            )  # / 4 #* (param["cfg"].t - 1)
-            comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
+            ))  # / 4 #* (param["cfg"].t - 1)
+            _add(sums, Dim.EP, EvalLayerComm.ep_comm_layer(
                 cfg, param["ctx"], 1
-            )  # * param["cfg"].ep
+            ))  # * param["cfg"].ep
             if is_body:
-                comm[Dim.CP] += cp_comm_layer_detailed(
+                _add(sums, Dim.CP, cp_comm_layer_detailed(
                     cfg, param["ctx"]
-                ).comm_volume
+                ).comm_volume)
             # min(device_type.level_bound_number[0], param["cfg"].ep)
-            if param["with_recomp"] and layer in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER):
+            if again is not None and layer in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER):
                 tp_again, ep_again, cp_again = _recomputed_comm(cfg, param["ctx"], layer)
-                comm[Dim.TP] += tp_again
-                comm[Dim.EP] += ep_again
-                comm[Dim.CP] += cp_again
-    return comm, reduced
+                again[Dim.TP] += tp_again
+                again[Dim.EP] += ep_again
+                again[Dim.CP] += cp_again
+    return comm, again, reduced
+
+
+def _add(sums, dim, volume):
+    """Add *volume* to dimension *dim* of each of *sums*."""
+    for comm in sums:
+        comm[dim] += volume
+
+
+def _stage_comm_time(param, comm):
+    """Turn one stage's volumes into the walk's units, in place: the time model, the nodes, the overlap, A3."""
+    if param["ccfg"].ttype == PerformanceType.TIME:
+        for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
+            comm[dim] = estimate_comm_score(
+                param["cfg"],
+                comm[dim],
+                dim,
+                overlap=ov,
+                device=param["device_type"],
+            )
+
+    dev_per_node = param["device_type"].level_bound_number[0]
+    comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
+    comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
+    comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
+
+    # Transitional overlap correction.
+    # The search runs the FLOP path, which has no other overlap
+    # modeling; these factors are the only overlap correction on that
+    # path.  The TIME path's estimate_comm_score(overlap=...) call
+    # above is zeroed, so this is the single source of overlap for
+    # both paths.
+    # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
+    # test hacks: they made the model match real MindFormers step times.
+    # Re-validating for the hyper-parallel target is a follow-up.
+    # Follow-up: source from hardware, fix estimate_comm_score's dim
+    # list and add latency, then fold this into estimate_comm_score.
+    comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
+    comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
+
+    if param["device_type"].name == "A3":
+        logger.info("A3 ratio")
+        comm[Dim.DP] /= 2
+        comm[Dim.TP] /= 2
+        comm[Dim.EP] /= 2
+        comm[Dim.CP] /= 2
+
+
+def _stage_totals(comms):
+    """Each stage's volume over the four dimensions, from per-dimension lists."""
+    return [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i] for i, c in enumerate(comms[Dim.TP])]
 
 
 def estimate_from_mem_comm(*args, **kwargs):
-    """For memory estimation"""
+    """Each stage's communication, from the memory model's volumes.
+
+    With ``both``, one walk returns ``(plain, recomputed)``: each stage's
+    communication, then the same with each recomputed layer's traffic added
+    again, which ``with_recomp`` alone returns.  The debugger records the
+    plain parts.
+    """
 
     param = {
         "cfg": args[0],
@@ -628,6 +689,7 @@ def estimate_from_mem_comm(*args, **kwargs):
     param["with_recomp"] = kwargs.get(
         "with_recomp", args[4] if len(args) > 4 else False
     )
+    param["both"] = kwargs.get("both", False)
     param["ctx"] = prepare_context()
     # The layers' kinds go on a copy: the model's config leaves the walk as
     # it entered it, for the next walk and every read after.
@@ -638,54 +700,23 @@ def estimate_from_mem_comm(*args, **kwargs):
     param["kinds"] = dict(zip(get_model_order(param["cfg"], param["stages"]), layer_kinds(param["cfg"])))
     param["switches"] = get_layer_switches_by_position(param["cfg"], param["stages"])
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
+    recomms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
     # Each stage's all-reduce, the share of its DP time the copies of a shard
     # spend reducing it: estimate_pipeline takes it out of DP_COMM.
     reduces = []
     for stage_id, stage in enumerate(param["stages"]):
-        comm, reduced = _accumulate_stage_comm(param, stage, stage_id)
+        plain, again, reduced = _accumulate_stage_comm(param, stage, stage_id)
+        comm = again if param["with_recomp"] and not param["both"] else plain
         reduce_share = reduced / comm[Dim.DP] if comm[Dim.DP] else 0.0
 
-        if param["ccfg"].ttype == PerformanceType.TIME:
-            for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
-                comm[dim] = estimate_comm_score(
-                    param["cfg"],
-                    comm[dim],
-                    dim,
-                    overlap=ov,
-                    device=param["device_type"],
-                )
-
-        dev_per_node = param["device_type"].level_bound_number[0]
-        comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
-        comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
-        comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
-
-        # Transitional overlap correction.
-        # The search runs the FLOP path, which has no other overlap
-        # modeling; these factors are the only overlap correction on that
-        # path.  The TIME path's estimate_comm_score(overlap=...) call
-        # above is zeroed, so this is the single source of overlap for
-        # both paths.
-        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
-        # test hacks: they made the model match real MindFormers step times.
-        # Re-validating for the hyper-parallel target is a follow-up.
-        # Follow-up: source from hardware, fix estimate_comm_score's dim
-        # list and add latency, then fold this into estimate_comm_score.
-        comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
-        comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
-
-        if param["device_type"].name == "A3":
-            logger.info("A3 ratio")
-            comm[Dim.DP] /= 2
-            comm[Dim.TP] /= 2
-            comm[Dim.EP] /= 2
-            comm[Dim.CP] /= 2
-
-        comms[Dim.DP].append(comm[Dim.DP])
-        comms[Dim.TP].append(comm[Dim.TP])
-        comms[Dim.EP].append(comm[Dim.EP])
-        comms[Dim.CP].append(comm[Dim.CP])
+        _stage_comm_time(param, comm)
+        for dim, values in comms.items():
+            values.append(comm[dim])
         reduces.append(comm[Dim.DP] * reduce_share)
+        if param["both"]:
+            _stage_comm_time(param, again)
+            for dim, values in recomms.items():
+                values.append(again[dim])
 
     if param["debugger"] and param["debugger"].is_enabled():
         logger.info("DP_COMM = %s", comms[Dim.DP])
@@ -706,15 +737,13 @@ def estimate_from_mem_comm(*args, **kwargs):
             logger.info("CP_TOPOLOGY = %s", cp_comm_details.topology)
             logger.info("CP_BANDWIDTH = %s", cp_comm_details.effective_bandwidth)
 
-    res = []
-    for i, c in enumerate(comms[Dim.TP]):
-        res += [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i]]
-
-    return res
+    if param["both"]:
+        return _stage_totals(comms), _stage_totals(recomms)
+    return _stage_totals(comms)
 
 
 def estimate_comm(*args, **kwargs):
-    """wrapper"""
+    """wrapper; with ``both``, the plain and the recomputed communication from one walk"""
     cfg, ccfg, stages, device_type = args[0], args[1], args[2], args[3]
     with_recomp = kwargs.get(
         "with_recomp", args[4] if len(args) > 4 else False
@@ -730,6 +759,7 @@ def estimate_comm(*args, **kwargs):
         device_type,
         with_recomp=with_recomp,
         debugger=debugger,
+        both=kwargs.get("both", False),
     )
 
 

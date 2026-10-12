@@ -2475,9 +2475,16 @@ class TestSappNDRunND(unittest.TestCase):
         debugger.info.update({part: 1.0 for part in Debug.PerfParts})
         self.assertGreater(PerfEstimate.apply_regression_coefficients(coeffs, debugger, 10.0), 0)
 
+        def walk(per_stage: list) -> Any:
+            """A walk giving *per_stage*, plain and recomputed alike; both from one walk with ``both``."""
+            def priced(*_: Any, both: bool = False, **__: Any) -> Any:
+                """The walk's sums, plain then recomputed with ``both``."""
+                return (list(per_stage), list(per_stage)) if both else list(per_stage)
+            return priced
+
         with tempfile.TemporaryDirectory() as tmp_dir, \
-                patch.object(PerfEstimate, "estimate_comp", return_value=[10.0, 20.0]), \
-                patch.object(PerfEstimate, "estimate_comm", return_value=[1.0, 2.0]):
+                patch.object(PerfEstimate, "estimate_comp", side_effect=walk([10.0, 20.0])), \
+                patch.object(PerfEstimate, "estimate_comm", side_effect=walk([1.0, 2.0])):
             cfg_for_perf = object.__new__(PerfEstimate.CostModelConfig)
             cfg_for_perf.__dict__.update(vars(cfg))
             perf_debugger = Debug.Debug(
