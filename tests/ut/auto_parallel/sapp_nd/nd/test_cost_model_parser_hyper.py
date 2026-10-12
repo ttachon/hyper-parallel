@@ -1097,6 +1097,40 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(got, [(2, 2, 2, False), (2, 2, 2, False), (4, 4, 4, False), (2, 2, 2, True)])
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_the_compute_width_is_the_one_the_trainer_computes_in(self, mock_hf):
+        """
+        Feature: the width an AutoModels run computes in (D17).
+        Description: Over a checkpoint saved in bfloat16: float32 weights
+            FSDP gathers in bfloat16; bfloat16 weights model_init_dtype
+            casts to float32, with no FSDP precision; a model section stating
+            the legacy compute_dtype float32 beside torch_dtype, then alone.
+        Expectation: The trainer computes in FSDP's param_dtype, else in the
+            width model_init_dtype casts the weights to, else in the loaded
+            width, and reads no compute_dtype: 2, 4, 2 and 2 bytes, where
+            they were 4, 2, 2 and 4; a compute_dtype it does not read is
+            named, and only then.
+        """
+        mock_hf.return_value = self._hf_config(torch_dtype="bfloat16")
+        cases = (
+            {"model": {"torch_dtype": "float32"}},
+            {"model_init_dtype": "float32", "fsdp_config": {"mix_precision": None}},
+            {"model": {"compute_dtype": "float32"}},
+            {"model": {"torch_dtype": None, "compute_dtype": "float32"}, "fsdp_config": {"mix_precision": None}},
+        )
+        got = []
+        for case in cases:
+            config = _auto_models_config(**case)
+            for section in ("model", "fsdp_config"):
+                config[section] = {key: value for key, value in config[section].items() if value is not None}
+            with self.assertLogs(
+                "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper",
+                level="WARNING",
+            ) as said:
+                ccfg = _make_ccfg(config)
+            got.append((ccfg.bytes_compute, any("compute_dtype" in line for line in said.output)))
+        self.assertEqual(got, [(2, False), (4, False), (2, True), (2, True)])
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_head_dim_defaults_to_hidden_over_heads(self, mock_hf):
         """
         Feature: attention head dimension fallback.

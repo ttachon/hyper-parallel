@@ -50,6 +50,11 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 _FLAGS = ("attn_output_gate", "tie_word_embeddings", "qk_norm", "qkv_bias", "o_bias", "mlp_bias", "norm_bias",
           "shared_expert_gate")
 
+# The legacy keys that state a run's precision.  Refused as model facts like
+# any unknown key, but named with the keys a run reads instead: a description
+# stating one among its facts was once priced at the default width (D17).
+_RUN_PRECISION_KEYS = ("compute_dtype", "param_init_type")
+
 
 class ModelSpecError(ValueError):
     """A model spec is missing a required fact or contradicts itself.
@@ -621,10 +626,15 @@ class ModelSpec:
         """
         unknown = sorted(set(data) - MODEL_KEYS)
         if unknown:
+            precision = [key for key in unknown if key in _RUN_PRECISION_KEYS]
             raise ModelSpecError(
                 f"unknown model spec keys {unknown}: a model spec states the model only, "
                 "and a run's strategy, such as its offset or recompute, belongs in its "
-                "execution spec"
+                "execution spec" + (
+                    f"; {precision} state the run's precision, which a HyperParallel run takes from "
+                    "fsdp_config.mix_precision.param_dtype, else model_init_dtype, else model.torch_dtype"
+                    if precision else ""
+                )
             )
         kwargs: Dict[str, Any] = {}
         for key, value in data.items():

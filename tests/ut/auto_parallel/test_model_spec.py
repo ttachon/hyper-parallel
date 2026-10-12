@@ -247,6 +247,16 @@ class TestModelKeysOnly(unittest.TestCase):
         with self.assertRaisesRegex(ModelSpecError, "compute_dtype"):
             ModelSpec.from_dict(data)
 
+    def test_a_precision_key_is_refused_with_the_keys_a_run_reads(self):
+        """compute_dtype states the run's precision: the refusal says where a train yaml states it (D17)."""
+        data = _dense()
+        data["compute_dtype"] = "float32"
+        with self.assertRaisesRegex(ModelSpecError, r"mix_precision\.param_dtype, else model_init_dtype"):
+            ModelSpec.from_dict(data)
+        with self.assertRaises(ModelSpecError) as refused:
+            ModelSpec.from_dict(dict(_dense(), offset=[1, -1]))
+        self.assertNotIn("precision", str(refused.exception))
+
     def test_model_fields_takes_the_model_from_a_run(self):
         """A mapping that states the run too gives up only the model's keys."""
         data = dict(_dense(), local_batch_size=1, offset=[1, -1], compute_dtype="bfloat16")

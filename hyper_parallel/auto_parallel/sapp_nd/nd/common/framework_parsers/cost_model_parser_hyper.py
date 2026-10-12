@@ -92,6 +92,17 @@ from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH
 
 logger = logging.getLogger(__name__)
 
+# The legacy precision keys of a model section, which the AutoModels trainer
+# hands on to the model's Transformers config and never reads, by what it
+# reads instead.
+_UNREAD_PRECISION_KEYS = {
+    "param_init_type": "the run keeps its weights in model_init_dtype, else model.torch_dtype",
+    "compute_dtype": (
+        "the run computes in fsdp_config.mix_precision.param_dtype, else model_init_dtype, "
+        "else model.torch_dtype"
+    ),
+}
+
 
 class CostModelParserHyperV2(_CostModelParser):
     """Parser for HyperParallel native train.yaml configuration format.
@@ -833,29 +844,25 @@ class CostModelParserHyperV2(_CostModelParser):
             or self._model_dtype("param_init_type")
         )
 
-    def _model_dtype(self, legacy_key: str, cast: Any = None) -> str:
+    def _model_dtype(self, legacy_key: str) -> str:
         """The dtype the runtime loads the model's weights in, by name.
 
         ``model.torch_dtype`` where the section states one other than
-        ``auto``; else the legacy *legacy_key* (``param_init_type`` for the
-        parameters, ``compute_dtype`` for the compute); else *cast*, a dtype
-        the run casts the weights to before they compute; else the dtype the
-        spec states, which is the checkpoint's own, as the runtime loads the
-        weights under its default ``auto``; else bfloat16 (``_init_bytes``
-        warns).  A model stating none was priced in float32 parameters doing
-        bfloat16 arithmetic, where the runtime loads its checkpoint's, mostly
-        two bytes (I12).
+        ``auto``; else, in a legacy config, the legacy *legacy_key*
+        (``param_init_type`` for the parameters, ``compute_dtype`` for the
+        compute), which the AutoModels trainer does not read (D17); else the
+        dtype the spec states, which is the checkpoint's own, as the runtime
+        loads the weights under its default ``auto``; else bfloat16
+        (``_init_bytes`` warns).  A model stating none was priced in float32
+        parameters doing bfloat16 arithmetic, where the runtime loads its
+        checkpoint's, mostly two bytes (I12).
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         stated = self._get_cfg_attr(model_raw, "torch_dtype", None)
         if stated and stated != "auto":
             return str(stated)
-        return str(
-            self._get_cfg_attr(model_raw, legacy_key, None)
-            or cast
-            or getattr(self, "_spec_dtype", None)
-            or "bfloat16"
-        )
+        legacy = None if is_auto_models_schema(self.config) else self._get_cfg_attr(model_raw, legacy_key, None)
+        return str(legacy or getattr(self, "_spec_dtype", None) or "bfloat16")
 
     def _parse_recompute(self) -> Dict[str, Any]:
         """Parse recompute mode.
@@ -900,7 +907,9 @@ class CostModelParserHyperV2(_CostModelParser):
 
         ``model_init_dtype`` is a top-level AutoModels key applied after the
         weights are loaded, so it outranks ``model.torch_dtype`` for the
-        stored parameters but not an explicit FSDP ``param_dtype``.  Where
+        stored parameters but not an explicit FSDP ``param_dtype``, and the
+        run computes in the same width: FSDP gathers each parameter in its
+        ``param_dtype``, else in the width it is kept in (D17).  Where
         nothing states a dtype, the checkpoint's own is taken
         (:meth:`_model_dtype`), and bfloat16 with a warning where there is
         no checkpoint either.
@@ -915,17 +924,25 @@ class CostModelParserHyperV2(_CostModelParser):
             or init_dtype
             or self._model_dtype("param_init_type")
         )
-        stated = [self._get_cfg_attr(model_raw, key, None) for key in ("torch_dtype", "param_init_type")]
-        if not any(value and value != "auto" for value in stated) and not getattr(self, "_spec_dtype", None):
+        auto_models = is_auto_models_schema(self.config)
+        stated = [self._get_cfg_attr(model_raw, key, None)
+                  for key in (("torch_dtype",) if auto_models else ("torch_dtype", "param_init_type"))]
+        if (not any(value and value != "auto" for value in stated) and not init_dtype
+                and not getattr(self, "_spec_dtype", None)):
             logger.warning(
                 "neither the config nor a checkpoint states the model's dtype: its weights are priced in "
                 "bfloat16; state model.torch_dtype if they are held in another"
             )
+        for key, read_instead in _UNREAD_PRECISION_KEYS.items():
+            if auto_models and self._get_cfg_attr(model_raw, key, None):
+                logger.warning(
+                    "the AutoModels trainer reads no model.%s, and neither does ND: %s", key, read_instead,
+                )
         return {
             "param_bytes": param_bytes,
             # FSDP keeps each gradient in its parameter's dtype.
             "grad_bytes": param_bytes,
-            "compute_bytes": self._bytes_from_dtype(self._model_dtype("compute_dtype", param_dtype)),
+            "compute_bytes": self._bytes_from_dtype(param_dtype or init_dtype or self._model_dtype("compute_dtype")),
             "softmax_bytes": self._bytes_from_dtype(
                 self._get_cfg_attr(model_raw, "softmax_compute_type", "float32")),
         }
