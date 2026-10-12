@@ -181,6 +181,33 @@ class TestEstimatePerformance(unittest.TestCase):
         self.assertEqual(quiet, recorded, f"without a debugger {quiet}, with one {recorded}")
         self.assertNotEqual(quiet, raw, f"the ratios file left the raw score {raw}")
 
+    def test_a_ratios_file_is_read_again_once_it_changes(self):
+        """
+        Feature: estimate_performance with a ratios file.
+        Description: The parsed ratios are kept between estimates. Estimate DeepSeek with a ratios
+            file, rewrite the file in place with other ratios, as fit_ratios does, and estimate twice
+            more.
+        Expectation: Both later scores are the new ratios' score, the one a file holding them from
+            the start gives, and not the first.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        first = {"COMPUTE": 2.0, "DP_COMM": 0.5, "DP_REDUCE": 1.5, "MP_COMM": 1.0,
+                 "EP_COMM": 0.25, "CP_COMM": 1.0, "PP_COMM": 1.0, "BUBBLE": 1.0}
+        second = {part: ratio * 1.5 for part, ratio in first.items()}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path, fresh = os.path.join(tmp_dir, "ratios.json"), os.path.join(tmp_dir, "fresh.json")
+            for target, ratios in ((path, first), (fresh, second)):
+                with open(target, "w", encoding="utf-8") as handle:
+                    json.dump(ratios, handle)
+            before = estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A2, cache_file=path)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(second, handle)
+            after = [estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A2, cache_file=path)
+                     for _ in range(2)]
+            expected = estimate_performance(deepcopy(ccfg), device_type=Hard.Device_A2, cache_file=fresh)
+        self.assertNotEqual(before, expected)
+        self.assertEqual(after, [expected, expected])
+
     def test_a_vision_language_model_records_every_towers_communication(self):
         """
         Feature: estimate_performance on a multimodal model, its recorded parts.

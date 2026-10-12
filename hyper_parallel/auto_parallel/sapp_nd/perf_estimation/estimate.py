@@ -13,10 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """performance estimation"""
+import functools
 import json
 import math
+import os
 from copy import deepcopy
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 import numpy as np
 
@@ -874,6 +877,23 @@ def _user_hook(cfg: Any) -> Optional[Callable]:
     return next(iter(hooks.values()))
 
 
+def _ratios(cache_file):
+    """The ratios *cache_file* states, parsed again only when the file changes.
+
+    A search applies them to every candidate it orders: read and parsed for
+    each one, they cost 0.7 s on the Qwen3.5 example's 7216 candidates.
+    """
+    stat = os.stat(cache_file)
+    return _parsed_ratios(cache_file, stat.st_mtime_ns, stat.st_size)
+
+
+@functools.lru_cache(maxsize=8)
+def _parsed_ratios(cache_file, mtime_ns, size):  # pylint: disable=unused-argument
+    """The ratios file as one read-only mapping; *mtime_ns* and *size* only key the cache."""
+    with open(cache_file, 'r', encoding='utf-8') as f:
+        return MappingProxyType(json.load(f))
+
+
 def _finalize_perf(perf, cache_file, debugger, memory):
     """Apply cached regression coefficients and record debug info.
 
@@ -883,8 +903,7 @@ def _finalize_perf(perf, cache_file, debugger, memory):
     coeffs = None
     cache = False
     if cache_file is not None:
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            coeffs = json.load(f)
+        coeffs = _ratios(cache_file)
         cache = True
 
     if debugger and debugger.is_enabled():
