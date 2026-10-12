@@ -52,7 +52,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parent.parent
@@ -69,6 +69,10 @@ NODE_STATE_PATTERN = re.compile(r"^node(\d+)\s+(\S+)\s+([^|]+?)\s*\|", re.MULTIL
 LINES = "OFFLOAD_PROBE|HOST_LINK"
 IMPORTS = ('python -c "import torch, torch_npu; '
            'print(torch.__version__, torch_npu.__version__)"')
+# The kit's exec runs the nodes together by default, every line tagged [nodeN] in the node's colour; with -S it runs
+# them one at a time, each under a "===== nodeN (host) =====" header. What follows the tag is the node's answer.
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+NODE_TAG = re.compile(r"^\[node\d+\]\s*")
 
 
 @dataclass(frozen=True)
@@ -287,13 +291,17 @@ def environment(kit: Kit) -> bool:
     nodes run one at a time, so the node that cannot answer is named by the
     header above its error.
     """
-    code, text = kit.run("exec", IMPORTS)
-    answers = {line.strip() for line in text.splitlines()
-               if line.strip() and not line.startswith(("=====", "+ "))}
-    if code or len(answers) != 1:
+    code, text = kit.run("exec", "-S", IMPORTS)
+    if code or len(node_answers(text)) != 1:
         print("=== the nodes do not share one environment, so a launch would fail on the odd one", flush=True)
         return False
     return True
+
+
+def node_answers(text: str) -> Set[str]:
+    """The distinct lines the nodes printed to a kit exec, without the kit's headers, tags and colours."""
+    lines = (NODE_TAG.sub("", COLOUR.sub("", line)).strip() for line in text.splitlines())
+    return {line for line in lines if line and not line.startswith(("=====", "+ "))}
 
 
 def check(kit: Kit) -> None:
