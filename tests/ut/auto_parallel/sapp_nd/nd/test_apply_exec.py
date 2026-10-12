@@ -497,6 +497,21 @@ class TestStrategyGuard(unittest.TestCase):
         with self.assertRaises(AttributeError):
             self.ccfg.t = 8
 
+    def test_a_deep_copy_shares_the_parser_and_the_yaml(self):
+        """
+        Feature: CostModelConfig deep copy.
+        Description: Deep-copy a parsed config, as a search does twice a candidate.
+        Expectation: The copy shares the parser and the raw yaml, which no estimate writes, and
+            holds its own copy of what an estimate writes, such as the recompute switches and the
+            op counts.
+        """
+        clone = copy.deepcopy(self.ccfg)
+        self.assertIs(clone.parser, self.ccfg.parser)
+        self.assertIs(clone.config, self.ccfg.config)
+        self.assertIsNot(clone.rec_op, self.ccfg.rec_op)
+        self.assertIsNot(clone.op_counts, self.ccfg.op_counts)
+        self.assertEqual(clone.op_counts, self.ccfg.op_counts)
+
     def test_a_hook_is_guarded_for_its_length(self):
         """
         Feature: the strategy guard.

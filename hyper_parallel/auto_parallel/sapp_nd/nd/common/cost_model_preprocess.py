@@ -138,6 +138,10 @@ def unset_reads_report() -> List[str]:
 STRATEGY_GUARDED = frozenset(("d", "t", "ep", "p", "vp", "cp", "os_max_shard"))
 # Where a config keeps whether its guard is armed; a copy never takes it.
 _GUARD = "_strategy_guard"
+# What a deep copy shares with its original: the parser and the raw yaml, set
+# when the config is parsed and written by no estimate.  A search deep-copies
+# its config twice a candidate, and copying these was most of a copy's time.
+_SHARED_ON_COPY = frozenset(("parser", "config"))
 
 
 class CostModelConfig(PartitionGenerator):
@@ -203,7 +207,7 @@ class CostModelConfig(PartitionGenerator):
         res = object.__new__(type(self))
         for k, v in self.__dict__.items():
             if k != _GUARD:
-                setattr(res, k, deepcopy(v, memo))
+                setattr(res, k, v if k in _SHARED_ON_COPY else deepcopy(v, memo))
         return res
 
     def __getstate__(self) -> dict:

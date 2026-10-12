@@ -96,6 +96,10 @@ class LinearAttentionDims:
             dims[attr] = value
         return cls(**dims)
 
+    def __deepcopy__(self, _memo: Dict[int, Any]) -> "LinearAttentionDims":
+        """Frozen and made of immutable fields: a deep copy is the record itself."""
+        return self
+
 
 @dataclass(frozen=True)
 class StackGroup:
@@ -104,6 +108,10 @@ class StackGroup:
     kind: LayerKind
     count: int
     mtp: bool = False
+
+    def __deepcopy__(self, _memo: Dict[int, Any]) -> "StackGroup":
+        """Frozen and made of immutable fields: a deep copy is the record itself."""
+        return self
 
 
 @dataclass(frozen=True)
@@ -134,6 +142,10 @@ class LayerStack:
     def to_layers(self) -> Tuple[LayerGroup, ...]:
         """Return the stack in its serialised form, the groups of ``ModelSpec.layers``."""
         return tuple(LayerGroup(group.kind.name, group.count, group.mtp) for group in self.groups)
+
+    def __deepcopy__(self, _memo: Dict[int, Any]) -> "LayerStack":
+        """Frozen and made of immutable fields: a deep copy is the record itself."""
+        return self
 
 
 def _groups(kinds: Sequence[str]) -> Tuple[LayerGroup, ...]:

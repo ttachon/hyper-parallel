@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Tests for the layer stack: how a config's layers get their kinds, as data."""
+import copy
 import unittest
 
 from hyper_parallel.auto_parallel._hf_model_spec import resolve_hf_model_spec
@@ -214,6 +215,21 @@ class TestResolve(unittest.TestCase):
         """
         layers = _groups(("dense", 1), ("moe", 2), ("moe", 1, True))
         self.assertEqual(resolve_layers("deepseek", layers).to_layers(), layers)
+
+    def test_a_deep_copy_is_the_stack_itself(self):
+        """
+        Feature: deep copies of the frozen records.
+        Description: Deep-copy a resolved stack, each of its groups and kinds, a kind's op counts
+            and a set of linear-attention dimensions, as a search deep-copies the config holding
+            them twice a candidate.
+        Expectation: Each copy is the record itself, inside a copied container too.
+        """
+        stack = resolve_layers("deepseek", _groups(("dense", 1), ("moe", 2)))
+        kinds = stack.distinct_kinds()
+        records = (stack, *stack.groups, *kinds, kinds[0].ops, LinearAttentionDims.from_fields(_LINEAR))
+        for record in records:
+            self.assertIs(copy.deepcopy(record), record, type(record).__name__)
+        self.assertIs(copy.deepcopy({"stack": stack})["stack"], stack)
 
 
 class TestLinearDimensions(unittest.TestCase):
