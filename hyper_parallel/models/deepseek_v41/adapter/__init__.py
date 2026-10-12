@@ -16,4 +16,13 @@
 
 Providers are grouped by conversion, data, distributed execution, policies, and
 validation. ``registration`` is the only discovery entry point.
+
+Importing this package runs that entry point, as ``qwen3_moe``'s adapter package
+does, so a recipe naming a ``_target_`` factory inside it installs the adapter and
+the fused Lightning-Indexer provider. Without this the provider stayed unset: the
+registry reaches ``registration`` only through its lazy scan by model family, which
+a ``_target_`` factory never triggers, so every run took the reference selection
+and said nothing about it.
 """
+
+from hyper_parallel.models.deepseek_v41.adapter import registration  # noqa: F401  pylint: disable=unused-import
