@@ -31,7 +31,7 @@ Two scripts beside this one do the measuring:
 Usage, from the repository root on the control node::
 
     python examples/training_demo/offload_tests.py list           # the tests and their commands
-    python examples/training_demo/offload_tests.py check          # sync, then the scripts' md5 on every node
+    python examples/training_demo/offload_tests.py check          # sync, then each node's md5 and versions
     python examples/training_demo/offload_tests.py run all        # every test in turn, about 70 minutes
     python examples/training_demo/offload_tests.py run probe      # the probe's six, or bench for its four
     python examples/training_demo/offload_tests.py run probe-ep8 bench-groups
@@ -67,6 +67,8 @@ RUN_ID_PATTERN = re.compile(r"run id\s*:\s*(\S+)")
 # One status line per node: "node0   192.168.0.55   DEAD (exit 1) | <last line>".
 NODE_STATE_PATTERN = re.compile(r"^node(\d+)\s+(\S+)\s+([^|]+?)\s*\|", re.MULTILINE)
 LINES = "OFFLOAD_PROBE|HOST_LINK"
+IMPORTS = ('python -c "import torch, torch_npu; '
+           'print(torch.__version__, torch_npu.__version__)"')
 
 
 @dataclass(frozen=True)
@@ -263,6 +265,8 @@ def run(kit: Kit, names: Sequence[str], timeout: float, poll: float, guard: bool
     devices, and the next test would take them straight back.
     """
     index = OUT / "runs.json"
+    if guard and not environment(kit):
+        raise SystemExit("every node must answer the same versions; fix it or pass the flag no-guard")
     for name in chosen(names):
         record = run_test(kit, name, TESTS[name], timeout, poll, guard)
         records = json.loads(index.read_text(encoding="utf-8")) if index.exists() else []
@@ -274,12 +278,31 @@ def run(kit: Kit, names: Sequence[str], timeout: float, poll: float, guard: bool
     print(f"\ndone: python {Path(__file__).relative_to(REPO_ROOT).as_posix()} results", flush=True)
 
 
+def environment(kit: Kit) -> bool:
+    """Whether every node answers the same torch and torch_npu versions.
+
+    A node whose environment has drifted takes a launch with it: one node's
+    sympy too new for torch_npu ended every rank on it with exit 2 and no
+    traceback, which reads as a defect in whatever was being measured. The
+    nodes run one at a time, so the node that cannot answer is named by the
+    header above its error.
+    """
+    code, text = kit.run("exec", IMPORTS)
+    answers = {line.strip() for line in text.splitlines()
+               if line.strip() and not line.startswith(("=====", "+ "))}
+    if code or len(answers) != 1:
+        print("=== the nodes do not share one environment, so a launch would fail on the odd one", flush=True)
+        return False
+    return True
+
+
 def check(kit: Kit) -> None:
-    """Sync the tree to every node, then print each script's md5 here and on every node."""
+    """Sync the tree to every node, then print each script's md5, and check the environments."""
     kit.run("sync")
     for script in SCRIPTS:
         print(f"here   {hashlib.md5((REPO_ROOT / script).read_bytes()).hexdigest()}  {script}")
     kit.run("exec", "md5sum " + " ".join(SCRIPTS))
+    environment(kit)
 
 
 def show_list() -> None:
@@ -309,7 +332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--ssh", default="ssh", help="how to reach a node")
     steps = parser.add_subparsers(dest="step", required=True)
     steps.add_parser("list", help="the tests and their commands")
-    steps.add_parser("check", help="sync, then the scripts' md5 here and on every node")
+    steps.add_parser("check", help="sync, then each node's md5 and torch versions")
     run_step = steps.add_parser("run", help="the tests or groups named, one after another")
     run_step.add_argument("names", nargs="+", help=f"of {', '.join([*GROUPS, *TESTS])}")
     run_step.add_argument("--timeout", type=float, default=1800, help="seconds one test may take")
