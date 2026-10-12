@@ -40,6 +40,7 @@ import csv
 import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -47,7 +48,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parent.parent
@@ -63,6 +64,10 @@ SEARCH = ("nd/main d2d162b3 with Transformers 5.14.1, 12 October 2026: run_nd -f
           "-M 49.25GB -ar --recompute off full -c <the ratios the 30 September round fitted>; picks by the "
           "sweep's pick_nd_top, ranks in ND's whole order")
 IMPORTS = 'python -c "import torch, torch_npu; print(torch.__version__, torch_npu.__version__)"'
+# The kit's exec runs the nodes together by default, every line tagged [nodeN] in the node's colour; with -S it runs
+# them one at a time, each under a "===== nodeN (host) =====" header. What follows the tag is the node's answer.
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+NODE_TAG = re.compile(r"^\[node[0-9]+\]\s*")
 LOGGED_PLAN = "per layer in model.layers: .*"
 LOGGED_RULE = "delta_rule=hyperparallel: [0-9]+ linear-attention layers switched"
 FAILURE = r"Tried to allocate [^)]*\)|EL0004[^.]*|cannot import name '[^']*'"
@@ -206,12 +211,16 @@ def same_environment() -> bool:
     A node whose sympy had drifted ended every rank on it with exit 2 and no
     traceback on 12 October, which reads as a defect in the run.
     """
-    result = subprocess.run(kit("exec", IMPORTS), check=False, text=True,
+    result = subprocess.run(kit("exec", "-S", IMPORTS), check=False, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout or "", end="", flush=True)
-    answers = {line.strip() for line in (result.stdout or "").splitlines()
-               if line.strip() and not line.startswith(("=====", "+ "))}
-    return result.returncode == 0 and len(answers) == 1
+    return result.returncode == 0 and len(node_answers(result.stdout or "")) == 1
+
+
+def node_answers(text: str) -> Set[str]:
+    """The distinct lines the nodes printed to a kit exec, without the kit's headers, tags and colours."""
+    lines = (NODE_TAG.sub("", COLOUR.sub("", line)).strip() for line in text.splitlines())
+    return {line for line in lines if line and not line.startswith(("=====", "+ "))}
 
 
 def setup(pool: Path) -> None:

@@ -116,16 +116,22 @@ class TestLaunching(unittest.TestCase):
     """A round launches what has not run, on nodes that agree, and skips a busy one."""
 
     def test_nodes_that_disagree_are_refused(self):
-        """One answer from every node passes; two answers, or a kit that fails, do not."""
-        cases = (("===== node0\n2.7.1 2.7.1\n===== node1\n2.7.1 2.7.1\n", 0, True),
-                 ("===== node0\n2.7.1 2.7.1\n===== node1\nImportError: cannot import name\n", 0, False),
+        """One answer from every node passes, whichever way the kit lays it out; two answers, or a failure, do not."""
+        versions = "2.7.1+cpu 2.7.1.post4.dev20260402"
+        one_at_a_time = (f"===== node0 (192.168.0.143) =====\n{versions}\n"
+                         f"===== node1 (192.168.0.245) =====\n{versions}\n")
+        together = f"\x1b[34m[node0]\x1b[0m {versions}\n\x1b[32m[node1]\x1b[0m {versions}\n"
+        cases = ((one_at_a_time, 0, True), (together, 0, True),
+                 (one_at_a_time.replace(f"=====\n{versions}\n", "=====\nImportError: cannot import name\n", 1), 0,
+                  False),
                  ("", 1, False))
         for text, code, agree in cases:
             with self.subTest(text=text, code=code):
                 answer = subprocess.CompletedProcess([], code, stdout=text)
-                with (patch.object(Runner.subprocess, "run", return_value=answer),
+                with (patch.object(Runner.subprocess, "run", return_value=answer) as run,
                       contextlib.redirect_stdout(io.StringIO())):
                     self.assertIs(Runner.same_environment(), agree)
+                self.assertEqual(run.call_args.args[0][3:5], ["exec", "-S"])
 
     def test_a_kept_run_is_skipped_and_a_busy_device_skips_a_launch(self):
         """A run with a record is not launched again; a busy device skips the launch; --again renames."""
