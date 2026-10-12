@@ -16,13 +16,14 @@
 import contextlib
 import functools
 import importlib
+import importlib.util
 import os
 import sys
 import tempfile
 import textwrap
 import types
 import unittest
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from unittest.mock import patch
 
 import torch
@@ -40,11 +41,14 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     census_parameters,
     census_recomputed,
     census_saved_ops,
+    census_stack,
     census_traffic,
     replacement_specs,
+    _classes,
     _delta_rule_held,
     _matmul_flops,
     _measure,
+    _modeling,
     _positions,
     _RecomputedMatmuls,
     _selective_contexts,
@@ -207,8 +211,10 @@ class TestLayerCensus(unittest.TestCase):
             and hold the same bytes, where the census counted that graph as
             kept, its own pack hook holding it alive.
         """
-        def forward(graphed):
-            def run():
+        def forward(graphed: bool) -> Callable[[], torch.Tensor]:
+            """The forward, its selection recording a graph where *graphed*."""
+            def run() -> torch.Tensor:
+                """The projection gathered at the indices the selection picks."""
                 with contextlib.nullcontext() if graphed else torch.no_grad():
                     chosen = (hidden @ score.t()).float().relu().topk(8, dim=-1).indices
                 return (hidden @ weight.t()).gather(-1, chosen)
@@ -1044,7 +1050,6 @@ class TestV41SparseAttentionContract(unittest.TestCase):
             census is on none. Where the module is absent, as on the
             cost model's own lineage, it is a no-op that says so.
         """
-        import importlib  # pylint: disable=C0415
         from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
             npu_sparse_attention_with_scalar_sink,
             v41_attention_contract,
@@ -1075,7 +1080,6 @@ class TestV41SparseAttentionContract(unittest.TestCase):
             never what is computed, so the contract needs no shape declared.
             Where the module is absent it is a no-op that says so.
         """
-        import importlib  # pylint: disable=C0415
         from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
             _V41_SELECTION,
             v41_indexer_contract,
@@ -1173,7 +1177,6 @@ class TestTensorParallelConfig(unittest.TestCase):
             share was half the width it should be, the split derived from the
             pair came out too large, and ND over-rewarded tensor parallelism.
         """
-        from hyper_parallel.auto_parallel._layer_census import tp_config  # pylint: disable=C0415
         config = _deepseek_v4()
         self.assertEqual(config.intermediate_size, config.moe_intermediate_size)
         whole = config.moe_intermediate_size
@@ -1189,7 +1192,6 @@ class TestTensorParallelConfig(unittest.TestCase):
         Expectation: Both are halved, so de-duplicating the aliased pair does
             not stop a model that really has two widths from splitting both.
         """
-        from hyper_parallel.auto_parallel._layer_census import tp_config  # pylint: disable=C0415
         config = _qwen3_moe()
         self.assertNotEqual(config.intermediate_size, config.moe_intermediate_size)
         half = tp_config(config, 2)
@@ -1204,13 +1206,13 @@ class TestKernelContracts(unittest.TestCase):
         """
         Feature: census_layer on a DeepSeek-V4 config, the family the
             DeepSeek-V4.1 recipe's factory builds.
-        Expectation: The census refuses, and for the reason that is true of
-            this function: the family's layers cannot be priced one at a
-            time, because most of them consume what a source layer wrote
-            earlier in the same forward.  Before this it raised
-            AttributeError out of the rotary embedding, which no caller
-            catches, so the whole cost model stopped instead of falling back
-            to the formulas.
+        Expectation: The census of one layer refuses, and for the reason
+            that is true of it: the family's layers cannot be priced one at
+            a time, because most of them consume what a source layer wrote
+            earlier in the same forward, and the whole stack's census is
+            the route.  Before this it raised AttributeError out of the
+            rotary embedding, which no caller catches, so the whole cost
+            model stopped instead of falling back to the formulas.
         """
         with self.assertRaises(CensusUnavailable) as refusal:
             census_layer(_deepseek_v4(), 0, 128)
@@ -1218,18 +1220,27 @@ class TestKernelContracts(unittest.TestCase):
         self.assertIn("deepseek_v4", said)
         self.assertIn("one at a time", said)
         self.assertIn("whole stack", said)
-        self.assertIn("not as a bound", said)
+        self.assertIn("census_stack", said)
 
-    def test_the_whole_stack_of_kinds_is_refused_as_one(self):
+    def test_the_whole_stack_is_measured_as_one(self):
         """
         Feature: census_activations on the same config, the entry the model
-            spec calls.
-        Expectation: It refuses with the same reason, which the spec
-            catches, so a run asking for a census of this family is priced
-            by the formulas rather than stopped.
+            spec calls (D18).
+        Expectation: It runs the model's own forward over the whole stack
+            and states the kind's record, where it refused: what a layer
+            keeps and holds, a share tensor parallelism splits, and no
+            selective part.  With one record for the four layers, the record
+            gives back the stack's total at TP 1 to the byte.
         """
-        with self.assertRaises(CensusUnavailable):
-            census_activations(_deepseek_v4(), [{"kind": "decoder", "count": 4}], seq_length=128)
+        config = _deepseek_v4()
+        record = census_activations(config, [{"kind": "decoder", "count": 4}], seq_length=128)["decoder"]
+        self.assertGreater(record.saved, 0)
+        self.assertGreater(record.saved_tp, 0)
+        self.assertGreater(record.working, record.saved)
+        self.assertIsNone(record.selective)
+        stack = census_stack(config, 128)
+        self.assertEqual(len(stack), 4)
+        self.assertEqual((record.saved + record.saved_tp) * 128 * 4, sum(kept for kept, _ in stack))
 
     def test_the_parameters_of_such_a_layer_are_still_counted(self):
         """
@@ -1276,6 +1287,56 @@ class TestKernelContracts(unittest.TestCase):
                                       "activations": {"decoder": record}}}
         spec = resolve_hf_model_spec(model, census_seq_len=128)
         self.assertEqual(spec["activations"]["decoder"], record)
+
+
+def _qwen3():
+    """A two-layer Qwen3 config of width 64, whose layers run alone."""
+    from transformers import Qwen3Config  # pylint: disable=C0415
+    return Qwen3Config(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                       head_dim=16, intermediate_size=128, vocab_size=128)
+
+
+class TestStackCensus(unittest.TestCase):
+    """A census of the whole stack, for a family whose layers cannot run alone (D18)."""
+
+    def test_a_layer_of_the_stack_keeps_what_the_layer_census_measures(self):
+        """
+        Feature: census_stack on a model whose layers do run alone.
+        Description: A two-layer Qwen3 config of width 64 at 64 tokens, over
+            the whole stack and one layer at a time.
+        Expectation: The first layer keeps what the layer census measures of
+            it, to the byte.  The second keeps that less the positions'
+            embeddings, which the stack computes once for every layer and
+            counts toward the first that saves them, where the layer census
+            builds them for each layer it runs.
+        """
+        config = _qwen3()
+        (first, _), (second, _) = census_stack(config, 64)
+        alone = [census_layer(config, index, 64)[0] for index in (0, 1)]
+        self.assertEqual(first, alone[0])
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            _, rotary = _classes(_modeling(config))
+            hidden = torch.empty(1, 64, config.hidden_size, dtype=torch.bfloat16)
+            embedded = _positions(rotary(config=config), hidden, 64)[1]
+            positions = sum(tensor.untyped_storage().nbytes() for tensor in embedded)
+        self.assertEqual(alone[1] - second, positions)
+
+    @unittest.skipIf(importlib.util.find_spec("hyper_parallel.models.deepseek_v41") is not None,
+                     "this tree carries DeepSeek-V4.1")
+    def test_a_model_this_tree_does_not_carry_is_refused(self):
+        """
+        Feature: census_activations on a DeepSeek-V4 config naming
+            DeepSeek-V4.1's architecture, on a tree without that model.
+        Expectation: CensusUnavailable naming the architecture, which the
+            spec catches, so the run is priced by the formulas and told so.
+            Building Transformers' DeepSeek-V4 in its place would price a
+            different model.
+        """
+        config = _deepseek_v4()
+        config.architectures = ["DeepseekV41ForCausalLM"]
+        with self.assertRaises(CensusUnavailable) as refusal:
+            census_activations(config, [{"kind": "decoder", "count": 4}], seq_length=128)
+        self.assertIn("DeepseekV41ForCausalLM", str(refusal.exception))
 
 
 if __name__ == "__main__":

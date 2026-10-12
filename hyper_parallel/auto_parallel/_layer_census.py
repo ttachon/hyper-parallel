@@ -61,6 +61,13 @@ recomputes (:func:`census_recomputed`) stay on Transformers' own modules:
 both count the arithmetic the time model prices, which fusing a module
 does not change, and a fused kernel runs matmuls no dispatch sees.
 
+A model whose layers cannot run alone is measured over its whole stack
+(:func:`census_stack`): DeepSeek-V4.1's layers read what earlier layers
+wrote in the same forward, and carry a hyper-connection dimension and a
+mixing state between them.  The model the trainer builds runs its own forward
+and backward once, each save counting toward the layer that makes it, and a
+kind's record is the mean of its layers'.
+
 A layer's parameters are counted by part, as ND prices its parts: the
 attention's, the norms', the dense feed-forward's, the routed experts', the
 shared expert's and the router's (:func:`census_parameters`), for verify
@@ -78,6 +85,7 @@ import copy
 import functools
 import importlib
 import inspect
+import itertools
 import logging
 import weakref
 from typing import (
@@ -676,18 +684,11 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
 # contract in :mod:`~hyper_parallel.auto_parallel._npu_contracts` states what
 # its kernels save; stating one is what takes it out again.
 _NO_ACTIVATION_CONTRACT: Dict[str, str] = {
-    "deepseek_v4": (
-        "its layers cannot be priced one at a time. 31 of the DeepSeek-V4.1 crop's 40 layers consume "
-        "compressed keys and values, or an Indexer key, that a source layer wrote earlier in the same "
-        "forward, and refuse to run without it; its hidden state carries a hyper-connection dimension "
-        "and a mixing state this builds no path for; and its rotary embedding is a pair of flavours a "
-        "layer picks between. What it needs is a census of the whole stack at once, which measures "
-        "26.542 GiB a rank at 4096 tokens against a 37.6 GiB measured peak and is not this function. "
-        "The kernels' own contracts are stated and ready for it "
-        "(:func:`~hyper_parallel.auto_parallel._npu_contracts.v41_attention_contract`, "
-        ":func:`~hyper_parallel.auto_parallel._npu_contracts.v41_indexer_contract`); until the stack "
-        "census is here, state the records it measured as model.config_overrides.activations"
-    ),
+    # Empty while every family with kernels of its own has its contracts
+    # stated.  DeepSeek-V4 was the entry that forced this guard and now has
+    # them (:data:`_FAMILY_CONTRACTS`); the next family to arrive with a
+    # kernel and no contract belongs here rather than being priced from the
+    # path its run does not take.
 }
 
 # The families whose own modules call kernels this host has not got, with the
@@ -695,26 +696,35 @@ _NO_ACTIVATION_CONTRACT: Dict[str, str] = {
 # behaves; a family in :data:`_NO_ACTIVATION_CONTRACT` is refused instead.
 _FAMILY_CONTRACTS = ("deepseek_v4",)
 
+# The families whose layers a census cannot run one at a time, by model type,
+# with why.  Their census runs the model's own forward over the whole stack
+# (:func:`census_stack`), which calls each layer as the model calls it.
+_STACK_FAMILIES: Dict[str, str] = {
+    "deepseek_v4": (
+        "31 of the DeepSeek-V4.1 crop's 40 layers consume compressed keys and values, or an Indexer "
+        "key, that a source layer wrote earlier in the same forward and refuse to run without it; the "
+        "hidden state carries a hyper-connection dimension beside a mixing state; and the rotary "
+        "embedding is a pair of flavours the model picks between"
+    ),
+}
+
 
 @contextlib.contextmanager
 def _family_contracts(config: Any) -> Iterator[None]:
     """The contracts the modules of *config*'s family run under, for what runs inside.
 
-    DeepSeek-V4's attention and Indexer are chosen on the device the tensors
-    are on, so a census, whose tensors are fake and on none, would take the
-    reference beside each kernel and measure a layer no run builds (F53).
-    Both contracts stand in instead.
+    DeepSeek-V4.1's sparse attention is chosen on the device the tensors are
+    on, so a census, whose tensors are fake and on none, would take the
+    reference beside the kernel and measure a layer no run builds (F53): the
+    attention's contract stands in.  The Indexer's selection keeps nothing a
+    backward reads on either path, fused or reference, since a run frees its
+    scores' graph as soon as the indices are taken (D16); its contract runs
+    the selection without recording that graph, and the census measures the
+    same bytes with it as without.
 
-    The Indexer's is installed only where the config asks for the fused
-    selection, which is what ``v41_fused_indexer`` states and what a run
-    would try.  A run whose node cannot serve that operator falls back
-    silently and then keeps about 9 GiB a rank more than this prices, which
-    is a property of the runtime and not of the estimate, so it is said out
-    loud rather than guessed at.
-
-    Whether they can be installed at all is :func:`_no_contract`'s to
-    refuse, since a layer's parameters do not depend on which kernel runs it
-    and are counted from the same fake layer.
+    Whether this tree builds the model at all is the stack census's to
+    refuse (:func:`_model_class`): a layer's parameters do not depend on
+    which kernel runs it and are counted from the same fake layer.
     """
     if str(getattr(config, "model_type", "")) not in _FAMILY_CONTRACTS:
         yield
@@ -724,42 +734,19 @@ def _family_contracts(config: Any) -> Iterator[None]:
         v41_indexer_contract,
     )
     rope = int(getattr(config, "qk_rope_head_dim", 0) or 0)
-    fused = bool(getattr(config, "v41_fused_indexer", True))
-    with contextlib.ExitStack() as installed:
-        installed.enter_context(v41_attention_contract(rope))
-        if fused:
-            installed.enter_context(v41_indexer_contract())
-        else:
-            logger.info("census of a %s layer: the recipe asks for the reference Indexer "
-                        "selection, whose scores it keeps", config.model_type)
+    with v41_attention_contract(rope), v41_indexer_contract():
         yield
 
 
-def _contracts_install(config: Any) -> bool:
-    """Whether this tree carries the modules *config*'s family's contracts stand in for.
-
-    True for a family that needs none, so only a family with kernels of its
-    own can be refused for want of them.
-    """
-    from hyper_parallel.auto_parallel._npu_contracts import _V41_ATTENTION  # pylint: disable=C0415
-    carries = {"deepseek_v4": _V41_ATTENTION}
-    path = carries.get(str(getattr(config, "model_type", "")))
-    if path is None:
-        return True
-    try:
-        importlib.import_module(path)
-    except ImportError:
-        return False
-    return True
-
-
 def _no_contract(config: Any) -> None:
-    """Refuse a census of a model whose kernels no contract states.
+    """Refuse a census of one layer of a model whose kernels no contract states, or whose layers cannot run alone.
 
     Raises:
         CensusUnavailable: If *config*'s family is one of
-            :data:`_NO_ACTIVATION_CONTRACT`.  A layer's parameters do not
-            depend on which kernel runs it and are counted as ever
+            :data:`_NO_ACTIVATION_CONTRACT`, or one of
+            :data:`_STACK_FAMILIES`, whose census is the whole stack's
+            (:func:`census_stack`).  A layer's parameters do not depend on
+            which kernel runs it and are counted as ever
             (:func:`census_parameters`); what it keeps for its backward
             does, so this refuses rather than answer with the bytes of a
             layer the run does not build.
@@ -768,18 +755,14 @@ def _no_contract(config: Any) -> None:
     missing = _NO_ACTIVATION_CONTRACT.get(family)
     if missing is not None:
         raise CensusUnavailable(
-            f"no census of a {config.model_type} layer: {missing}. Or drop context.census and read "
-            f"the formulas' memory as an estimate, not as a bound"
+            f"no census of a {config.model_type} layer: {missing}; state the kernels' contracts, "
+            f"or drop context.census and read the formulas' memory as an estimate, not as a bound"
         )
-    if family in _FAMILY_CONTRACTS and not _contracts_install(config):
+    alone = _STACK_FAMILIES.get(family)
+    if alone is not None:
         raise CensusUnavailable(
-            f"no census of a {config.model_type} layer here: its sparse attention and Lightning "
-            f"Indexer run as NPU kernels whose contracts are stated, and this tree carries none of "
-            f"the modules to install them on, so a census would measure the reference beside each "
-            f"kernel instead. Measured that way on the DeepSeek-V4.1 crop at 4096 tokens it reads "
-            f"86.4 GiB a rank against a 37.6 GiB measured peak. Price it from a tree carrying the "
-            f"model, or drop context.census and read the formulas' memory as an estimate, not as a "
-            f"bound"
+            f"no census of one {family} layer, whose layers cannot be priced one at a time: {alone}. "
+            f"census_activations measures the whole stack instead (census_stack)"
         )
 
 
@@ -1377,6 +1360,229 @@ def census_output_activations(config: Any, seq_length: int = 4096,
     )
 
 
+class _FakeScalars(TorchDispatchMode):
+    """A scalar read of a fake tensor answered with zero, as :class:`_LiveBytes` answers it.
+
+    A model can read a value out of a tensor while it builds, as
+    DeepSeek-V4.1's Engram reads its token map's pad entry to build its hash
+    mapping, which a fake tensor refuses.  The value settles a padding id,
+    never a shape the census counts.
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        if func is _SCALAR_READ and isinstance(args[0], FakeTensor):
+            return 0
+        return func(*args, **(kwargs or {}))
+
+
+def _model_class(config: Any) -> Tuple[Any, bool]:
+    """What the trainer builds *config* as, by its ``from_config``: its family's own class, else Transformers'.
+
+    The trainer's builder discovers the family's registration, asks the
+    model registry for a class registered by the architecture the config
+    names, and builds Transformers' own model where none is.
+
+    Returns:
+        The class, and whether it is Transformers' own.
+
+    Raises:
+        CensusUnavailable: If the config names an architecture neither the
+            registry nor Transformers builds, as a DeepSeek-V4.1 config does
+            on a tree that does not carry that model: Transformers'
+            DeepSeek-V4 in its place would price a different model.
+    """
+    import transformers  # pylint: disable=C0415
+    from hyper_parallel.models._transformers.config_resolver import get_is_hf_model  # pylint: disable=C0415
+    from hyper_parallel.models.registry import _resolve_custom_model_cls  # pylint: disable=C0415
+
+    architecture = (getattr(config, "architectures", None) or [""])[0] or ""
+    if not get_is_hf_model(config):
+        return _resolve_custom_model_cls(architecture), False
+    if architecture and not hasattr(transformers, architecture):
+        raise CensusUnavailable(
+            f"the config names {architecture}, which neither this tree's model registry nor Transformers "
+            f"builds; price it from a tree carrying the model, or drop context.census and read the "
+            f"formulas' memory as an estimate, not as a bound"
+        )
+    return transformers.AutoModelForCausalLM, True
+
+
+class _Stack:
+    """Which layer of a stack runs, forward and backward, and where in a tracker's log each backward runs."""
+
+    def __init__(self, layers: Sequence[Any], clock: Callable[[], int]) -> None:
+        """Follow *layers* through both passes, placing their backwards by *clock*."""
+        self.running: List[int] = []
+        self.windows: Dict[int, List[int]] = {}
+        self.clock = clock
+        self.handles: List[Any] = []
+        for index, layer in enumerate(layers):
+            self.handles += [
+                layer.register_forward_pre_hook(functools.partial(self._enter, index)),
+                layer.register_forward_hook(self._leave),
+                layer.register_full_backward_pre_hook(functools.partial(self._enter_backward, index)),
+                layer.register_full_backward_hook(self._leave_backward),
+            ]
+        self.backward: List[int] = []
+
+    # A hook's return replaces what the module takes or gives, so each of
+    # these returns None.
+
+    def _enter(self, index: int, *_: Any) -> None:
+        """Note that the layer at *index* runs its forward."""
+        self.running.append(index)
+
+    def _leave(self, *_: Any) -> None:
+        """Note that the innermost layer running its forward has returned."""
+        if self.running:
+            self.running.pop()
+
+    def _enter_backward(self, index: int, *_: Any) -> None:
+        """Open the window of the layer at *index*, whose backward starts."""
+        self.backward.append(index)
+        self.windows.setdefault(index, [self.clock(), self.clock()])
+
+    def _leave_backward(self, *_: Any) -> None:
+        """Close the window of the layer whose backward has returned."""
+        if self.backward:
+            index = self.backward.pop()
+            self.windows[index][1] = self.clock()
+
+    @property
+    def layer(self) -> Optional[int]:
+        """The outermost layer running its forward, or None."""
+        return self.running[0] if self.running else None
+
+    def remove(self) -> None:
+        """Remove every hook this placed."""
+        for handle in self.handles:
+            handle.remove()
+
+
+def census_stack(config: Any, seq_length: int, replacements: Sequence[Any] = ()) -> List[Tuple[int, int]]:
+    """What each layer of *config* keeps for its backward, and the most its backward holds, from one pass of the stack.
+
+    For a model whose layers cannot run alone (:data:`_STACK_FAMILIES`): the
+    model the trainer builds (:func:`_model_class`), on fake tensors and
+    under its family's contracts, runs its own forward over a micro-batch of
+    one sequence and then its backward, so each layer is called as its model
+    calls it, with what earlier layers wrote, its hidden and mixing states
+    and the rotary flavours the model computes.  Each save counts toward the
+    layer whose forward makes it first, and a layer keeps those of its saves
+    still live when the forward ends (:func:`_measure`'s rule).  Its backward
+    holds what it keeps and the most it holds beyond every layer's saves,
+    the parameters and their gradients while it runs.  The embedding's and
+    the final norm's saves count toward no layer: the output layer's census
+    prices the end of the model.
+
+    Args:
+        config: The language model's Transformers config.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
+
+    Returns:
+        ``(kept, held)`` bytes of each decoder layer, in model order.
+
+    Raises:
+        CensusUnavailable: If this tree cannot build the model the config
+            names (:func:`_model_class`), or a module a replacement installs
+            (:func:`_replaced`).
+    """
+    model_cls, native = _model_class(config)
+    config = copy.deepcopy(config)
+    if native:
+        # Transformers' own model runs its attention through the interface,
+        # as _fake_layer's layer does, so it runs the kernel's contract.
+        config._attn_implementation = _FLASH  # pylint: disable=protected-access
+        _modeling(config).ALL_ATTENTION_FUNCTIONS.register(_FLASH, _flash_attention)
+    with npu_contracts() if replacements else contextlib.nullcontext(), _family_contracts(config), \
+            FakeTensorMode(allow_non_fake_inputs=True), _FakeScalars():
+        default = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            model = model_cls.from_config(config)
+        finally:
+            torch.set_default_dtype(default)
+        # The experts run as grouped matmuls, as every layer _fake_layer
+        # builds does.  Transformers falls back to its eager experts for a
+        # class whose module it does not know, a loop over the experts with
+        # token counts no fake tensor has; the experts read this per call.
+        model.config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
+        if replacements:
+            _replaced(model, replacements)
+        model.train()
+        backbone = model.get_decoder()
+        params = list(model.parameters())
+        stored = {p.untyped_storage()._cdata for p in params}  # pylint: disable=protected-access
+        live = _LiveBytes()
+        follow = _Stack(backbone.layers, lambda: len(live.events))
+        saved_by: Dict[Tuple[int, int], int] = {}
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            """Count a tensor autograd saves, unless it is a parameter's, toward the layer saving it first."""
+            if tensor.untyped_storage()._cdata not in stored and follow.layer is not None:  # pylint: disable=W0212
+                saved_by.setdefault(live.key(tensor), follow.layer)
+            # Detached, as _measure returns it: a graph the forward drops is freed.
+            return tensor.detach()
+
+        grads: List[Tuple[int, int]] = []
+        handles = [p.register_hook(lambda grad: grads.append(live.key(grad))) for p in params]
+        kept = [0] * len(backbone.layers)
+        try:
+            with live, torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                out = backbone(input_ids=torch.zeros(1, seq_length, dtype=torch.long)).last_hidden_state
+                for key, index in saved_by.items():
+                    kept[index] += live.sizes.get(key, 0)
+                out.sum().backward()
+        finally:
+            follow.remove()
+            for handle in handles:
+                handle.remove()
+        grads += [live.key(p.grad) for p in params if p.grad is not None]
+    # What every layer keeps, the gradients and the parameters left out, the
+    # rest is what a layer's backward holds beyond them while it runs.
+    excluded = set(saved_by) | set(grads) | {key for key, _ in live.events if key[0] in stored}
+    beyond = list(itertools.accumulate(0 if key in excluded else delta for key, delta in live.events))
+    held = []
+    for index, size in enumerate(kept):
+        begin, end = follow.windows.get(index, (0, 0))
+        held.append(size + max(beyond[begin:end], default=0))
+    return list(zip(kept, held))
+
+
+def _stack_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int,
+                       replacements: Sequence[Any] = ()) -> Dict[str, KindActivations]:
+    """What a layer of each kind of *layers* keeps and holds, per token, from the stack at TP 1 and TP 2.
+
+    A kind's record is the mean of its layers', which is what the memory
+    model applies to each of them: with one record a kind, the stack's total
+    comes back whole.  The parts tensor parallelism splits follow from the
+    pair as :func:`census_activations` derives them.  No selective part is
+    stated: a selective layer of these kinds is priced by the formulas.
+    """
+    kinds = [str(group["kind"]) for group in layers if not group.get("mtp") for _ in range(int(group["count"]))]
+    logger.info("census of the whole stack of %d layers at %d tokens, at TP 1 and TP 2: a %s layer "
+                "cannot run alone", len(kinds), seq_length, config.model_type)
+    one, two = (census_stack(tp_config(config, tp), seq_length, replacements) for tp in (1, 2))
+    if len(one) != len(kinds):
+        raise ValueError(f"the model builds {len(one)} decoder layers, where its spec states {len(kinds)}")
+    out: Dict[str, KindActivations] = {}
+    for kind in dict.fromkeys(kinds):
+        members = [index for index, each in enumerate(kinds) if each == kind]
+        (kept_1, held_1), (kept_2, held_2) = (
+            tuple(sum(stack[index][part] for index in members) / len(members) for part in (0, 1))
+            for stack in (one, two))
+        out[kind] = KindActivations(
+            saved=max(0.0, 2 * kept_2 - kept_1) / seq_length,
+            saved_tp=max(0.0, 2 * (kept_1 - kept_2)) / seq_length,
+            working=max(0.0, 2 * held_2 - held_1) / seq_length,
+            working_tp=max(0.0, 2 * (held_1 - held_2)) / seq_length,
+            seq_length=int(seq_length),
+        )
+    return out
+
+
 def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int = 4096,
                        replacements: Sequence[Any] = (),
                        gdn_backend: str = _EAGER_GDN) -> Dict[str, KindActivations]:
@@ -1396,8 +1602,16 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
         holds, the part TP splits is half the part at TP 1; what it keeps
         under HyperParallel's selective activation checkpointing too, the
         shares of its matmul FLOPs that recomputes, and what it keeps for
-        each op, its records per op.
+        each op, its records per op.  A family whose layers cannot run
+        alone (:data:`_STACK_FAMILIES`) is measured over its whole stack
+        instead (:func:`census_stack`), and its records state the plain
+        layer's bytes only.
+
+    Raises:
+        CensusUnavailable: If this tree cannot build what the run builds.
     """
+    if str(getattr(config, "model_type", "")) in _STACK_FAMILIES:
+        return _stack_activations(config, layers, seq_length, replacements)
     firsts: Dict[str, int] = {}
     index = 0
     for group in layers:
