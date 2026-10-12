@@ -414,9 +414,13 @@ def _census_file(key: Tuple[Any, ...]) -> Optional[str]:
 
 
 def _source_digest(path: str) -> str:
-    """The SHA-256 of the file at *path*."""
+    """The SHA-256 of the file at *path*, its line endings read as Python reads them.
+
+    Two checkouts of one commit can hold a file with Windows line endings in
+    one and Unix ones in the other, which is the same code.
+    """
     with open(path, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()
+        return hashlib.sha256(handle.read().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def _census_sources() -> Dict[str, str]:

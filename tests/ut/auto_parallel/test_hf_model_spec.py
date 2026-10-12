@@ -484,6 +484,23 @@ class TestKeptCensus(unittest.TestCase):
         self.assertIn("auto_parallel/_hf_model_spec.py", sources)
         self.assertFalse([source for source in sources if source.startswith("auto_parallel/sapp_nd/")])
 
+    def test_line_endings_do_not_change_a_file(self) -> None:
+        """
+        Feature: the kept census's file digests.
+        Description: The same code with Windows and with Unix line endings, as two checkouts of one
+            commit can hold it, and one line changed.
+        Expectation: The first two are one file to the census, the third another.
+        """
+        digests = []
+        for name, text in (("crlf.py", b"x = 1\r\ny = 2\r\n"), ("lf.py", b"x = 1\ny = 2\n"),
+                           ("other.py", b"x = 1\ny = 3\n")):
+            path = os.path.join(self.folder, name)
+            with open(path, "wb") as handle:
+                handle.write(text)
+            digests.append(spec_mod._source_digest(path))  # pylint: disable=protected-access
+        self.assertEqual(digests[0], digests[1])
+        self.assertNotEqual(digests[1], digests[2])
+
     def test_off_keeps_none(self) -> None:
         """
         Feature: ND_CENSUS_CACHE=off.
