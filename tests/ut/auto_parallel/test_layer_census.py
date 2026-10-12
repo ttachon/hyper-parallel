@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Tests for the layer census, the activations it states in the model spec, and their pricing."""
+import contextlib
 import functools
 import importlib
 import os
@@ -192,6 +193,35 @@ class TestLayerCensus(unittest.TestCase):
             saved, working = _measure([weight], (hidden,), lambda: hidden @ weight.t(),
                                       lambda out: out.backward(torch.ones_like(out)))
         self.assertEqual((saved, working), (size, 3 * size))
+
+    def test_a_graph_the_forward_drops_is_not_kept(self):
+        """
+        Feature: _measure, which counts what a forward still holds (D16).
+        Description: A projection of a 64-wide input of 64 tokens whose
+            output is gathered at indices a selection picks, the selection
+            scoring the input through a second weight in float32 and keeping
+            only the top indices, as V4.1's Indexer does; then the same
+            forward with the selection under no_grad.
+        Expectation: No backward reaches the scores, so the forward drops
+            their graph once the indices are taken and both forwards keep
+            and hold the same bytes, where the census counted that graph as
+            kept, its own pack hook holding it alive.
+        """
+        def forward(graphed):
+            def run():
+                with contextlib.nullcontext() if graphed else torch.no_grad():
+                    chosen = (hidden @ score.t()).float().relu().topk(8, dim=-1).indices
+                return (hidden @ weight.t()).gather(-1, chosen)
+            return run
+
+        got = []
+        for graphed in (True, False):
+            with FakeTensorMode():
+                weight, score = (torch.nn.Parameter(torch.empty(64, 64, dtype=torch.bfloat16)) for _ in range(2))
+                hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
+                got.append(_measure([weight, score], (hidden,), forward(graphed),
+                                    lambda out: out.backward(torch.ones_like(out))))
+        self.assertEqual(got[0], got[1])
 
     def test_selective_checkpointing_keeps_every_other_matmul(self):
         """

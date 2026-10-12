@@ -331,8 +331,11 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
             ``ops.saved``, which then sums to the bytes returned.
 
     Returns:
-        The bytes the forward saves, its inputs included, and the bytes of
-        activations live when the backward peaks, its output left out.  A
+        The bytes the forward saves and still holds once it has run, its
+        inputs included, and the bytes of activations live when the
+        backward peaks, its output left out.  A graph the forward drops
+        before it ends, as a selection that keeps only the indices it picks
+        drops its scores, is freed then in a run and is no backward's.  A
         checkpointed forward keeps what is live once it has run, but for
         the *shared* tensors: its inputs and the outputs its policy saves.
         The parameters, which the forward's views of them bring into the
@@ -363,7 +366,13 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
             if op is not None:
                 saved_op.setdefault(key, op)
             saved[key] = tensor.untyped_storage().nbytes()
-        return tensor
+        # Detached, so a graph holds the bytes it saves and not the tensor: an
+        # op saving its own output would otherwise hold itself through that
+        # output's grad_fn, a cycle no collector sees, which kept every graph
+        # a forward drops alive into the backward.  On the DeepSeek-V4.1 crop
+        # at 4096 tokens that was the Indexer selection's scores, 8.9 GiB a
+        # rank a run frees as soon as the indices are taken (D16).
+        return tensor.detach()
 
     live = _LiveBytes()
     grads: List[Tuple[int, int]] = []
@@ -378,6 +387,7 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
             left_out = {live.key(out), *(live.key(p) for p in params)}
             not_kept = left_out | {live.key(tensor) for tensor in shared}
             kept = sum(size for key, size in live.sizes.items() if key not in not_kept)
+            held = {key: size for key, size in saved.items() if key in live.sizes}
             for tensor in grad_inputs:
                 live.track(tensor)
             backward(out)
@@ -387,12 +397,12 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
     # A storage's bytes count toward the op that first saved it, read from the
     # same record as the total, so the two agree whatever a fake tensor does
     # with a storage address it has freed.
-    for address, size in saved.items():
+    for address, size in held.items():
         op = saved_op.get(address)
         if op is not None:
             ops.saved[op] = ops.saved.get(op, 0) + size
     grads += [live.key(p.grad) for p in params if p.grad is not None]
-    return kept if checkpointed else sum(saved.values()), live.peak(start, left_out, grads)
+    return kept if checkpointed else sum(held.values()), live.peak(start, left_out, grads)
 
 
 # The ops a matmul runs as.
@@ -445,8 +455,9 @@ class _SavedOps(TorchDispatchMode):
         self.running.pop()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
-        # A tensor's metadata is read through prims, between an op and its saves.
-        if func.namespace != "prim":
+        # A tensor's metadata is read through prims, and _measure detaches
+        # each save, both between an op and its saves.
+        if func.namespace != "prim" and func is not torch.ops.aten.detach.default:
             self.func = func
         return func(*args, **(kwargs or {}))
 

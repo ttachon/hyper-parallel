@@ -496,23 +496,20 @@ def v41_indexer_contract() -> Iterator[bool]:
     shape declared, because ``no_grad`` changes whether a graph is kept and
     never what is computed: the indices are the same indices.
 
-    Install it only for a run that takes the fused selection.  A run that
-    falls back to the reference really does keep those bytes, measured at
-    4.36 GiB a rank on the validation crop at 2048 tokens across the eight
-    layers that carry an Indexer, so for that run the bytes are not an
-    artefact and a census must count them.  Which path a run takes is settled
-    by a probe at runtime and recorded nowhere
-    (``v41_fused_indexer`` reaches the selection as ``use_provider``, whose
-    contract is to fall back silently), so this cannot be inferred from the
-    recipe.
+    It holds on either path.  The reference selection records a graph behind
+    its fp32 scores, but that graph ends at the int32 indices, so a run frees
+    it as soon as they are taken and holds the same bytes whichever path it
+    takes.  The census once counted that graph, 8.9 GiB a rank on the
+    validation crop at 4096 tokens across the eight layers that carry an
+    Indexer, because its own pack hook held every graph a forward drops
+    alive (D16, fixed in ``_measure``).  Measured since on that crop, the
+    reference path holds 26.542 GiB a rank at 4096 tokens with this contract
+    and without it, so it changes no figure the census reports and only
+    spares the census recording a graph no run keeps.
 
     Of the four, ``compressed_causal_topk`` already carries
-    ``@torch.no_grad()`` and is wrapped here only for uniformity.  That the
-    other three do not is a defect in the runtime rather than in the cost
-    model: on the reference path they hold an fp32 score of one sequence by
-    another that no backward reads, which three decorators would free.  That
-    change belongs to the model's owners, so the census states the contract
-    and does not alter what a run keeps.
+    ``@torch.no_grad()``.  The other three record the graph and drop it,
+    which costs a run nothing it holds once the selection returns.
 
     Yields:
         Whether the selection was there to wrap, which is False on a tree
