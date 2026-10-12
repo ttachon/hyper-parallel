@@ -17,7 +17,10 @@
 How to run this:
     pytest tests/ut/auto_parallel/test_hf_model_spec.py -v
 """
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from types import SimpleNamespace
@@ -391,6 +394,130 @@ class TestFromConfigRecipe(unittest.TestCase):
         message = str(raised.exception)
         for key in ("pretrained_model_name_or_path", "config_path", "config_overrides"):
             self.assertIn(key, message)
+
+
+class _Record:
+    """A census record as the census returns one."""
+
+    def __init__(self, saved: float) -> None:
+        """Keep *saved* bytes per token."""
+        self.saved = saved
+
+    def to_dict(self) -> dict:
+        """The record's plain form."""
+        return {"saved": self.saved, "seq_length": 256}
+
+
+class TestKeptCensus(unittest.TestCase):
+    """A census is kept on disk and read back while nothing it ran on has changed."""
+
+    _LAYERS = ({"kind": "decoder", "count": 2},)
+
+    def setUp(self) -> None:
+        """An empty census folder of the test's own, and no census run in this process yet."""
+        folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.addCleanup(folder.cleanup)
+        self.folder = folder.name
+        for patcher in (patch.dict(os.environ, {"ND_CENSUS_CACHE": self.folder}),
+                        patch.dict(spec_mod._CENSUSES, clear=True)):  # pylint: disable=protected-access
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.config = SimpleNamespace(to_json_string=lambda: '{"hidden_size": 64}')
+
+    def _run(self, saved: float = 1.0) -> tuple:
+        """The spec's census as a new process gets it, the census itself stubbed, and how often it ran."""
+        spec_mod._CENSUSES.clear()  # pylint: disable=protected-access
+        with patch.object(spec_mod, "census_activations", return_value={"decoder": _Record(saved)}) as kinds, \
+                patch.object(spec_mod, "census_output_activations", return_value=_Record(saved / 2)):
+            census = spec_mod._census(self.config, self._LAYERS, 256)  # pylint: disable=protected-access
+        return census, kinds.call_count
+
+    def _kept(self) -> list:
+        """The files the folder holds."""
+        return [os.path.join(self.folder, name) for name in os.listdir(self.folder)]
+
+    def test_a_later_run_reads_the_kept_census(self) -> None:
+        """
+        Feature: the kept census.
+        Description: Run the census of one model twice, as two runs of a search do.
+        Expectation: The first run measures and keeps it, the second reads the same census back
+            without measuring.
+        """
+        first, measured = self._run()
+        second, measured_again = self._run(saved=2.0)
+        self.assertEqual((measured, measured_again), (1, 0))
+        self.assertEqual(second, first)
+        self.assertEqual(first["activations"]["decoder"]["saved"], 1.0)
+
+    def test_a_changed_file_measures_again(self) -> None:
+        """
+        Feature: the kept census.
+        Description: Keep a census, then change the digest it holds of the census's own code, as
+            an edit to that file would.
+        Expectation: The next run measures again and keeps the new census, which the run after
+            reads back.
+        """
+        self._run()
+        path, = self._kept()
+        with open(path, encoding="utf-8") as handle:
+            kept = json.load(handle)
+        kept["sources"]["auto_parallel/_layer_census.py"] = "0" * 64
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(kept, handle)
+        census, measured = self._run(saved=2.0)
+        self.assertEqual(measured, 1)
+        self.assertEqual(census["activations"]["decoder"]["saved"], 2.0)
+        self.assertEqual(self._run(saved=3.0), (census, 0))
+
+    def test_the_kept_census_names_the_code_it_ran_on(self) -> None:
+        """
+        Feature: the kept census.
+        Description: Keep a census and read the files it is checked against.
+        Expectation: The census's own code and the spec resolver are among them, and none of the
+            search's code, whose changes cannot change a census.
+        """
+        self._run()
+        path, = self._kept()
+        with open(path, encoding="utf-8") as handle:
+            sources = json.load(handle)["sources"]
+        self.assertIn("auto_parallel/_layer_census.py", sources)
+        self.assertIn("auto_parallel/_hf_model_spec.py", sources)
+        self.assertFalse([source for source in sources if source.startswith("auto_parallel/sapp_nd/")])
+
+    def test_off_keeps_none(self) -> None:
+        """
+        Feature: ND_CENSUS_CACHE=off.
+        Description: Run the census twice with the cache off.
+        Expectation: Both runs measure, and nothing is written.
+        """
+        with patch.dict(os.environ, {"ND_CENSUS_CACHE": "off"}):
+            measured = [self._run()[1] for _ in range(2)]
+        self.assertEqual(measured, [1, 1])
+        self.assertEqual(self._kept(), [])
+
+    def test_a_damaged_file_measures_again(self) -> None:
+        """
+        Feature: the kept census.
+        Description: Keep a census, then cut its file short, as a run stopped mid-write would
+            leave it were it written in place.
+        Expectation: The next run measures again without an error.
+        """
+        self._run()
+        path, = self._kept()
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"sources": {')
+        self.assertEqual(self._run(saved=2.0)[1], 1)
+
+    def test_a_refused_census_is_not_kept(self) -> None:
+        """
+        Feature: the kept census.
+        Description: A census this host cannot run, as one that needs a native kernel.
+        Expectation: Nothing is kept, so a host that can run it measures it.
+        """
+        spec_mod._CENSUSES.clear()  # pylint: disable=protected-access
+        with patch.object(spec_mod, "census_activations", side_effect=spec_mod.CensusUnavailable("no kernel")):
+            self.assertEqual(spec_mod._census(self.config, self._LAYERS, 256), {})  # pylint: disable=protected-access
+        self.assertEqual(self._kept(), [])
 
 
 if __name__ == "__main__":

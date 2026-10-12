@@ -103,6 +103,14 @@ spec states recompute as ranges of layers in model order, the body layers
 first and the MTP layers last, so a search can give each layer its own
 option; `{option: full}` alone recomputes every layer.
 
+A configuration that states `context.census` has each layer kind measured on
+a fake layer, the layer census, which takes tens of seconds on a laptop. A
+census is kept in `~/.cache/hyper_parallel/census` and read back by later
+runs of the same model, length and module replacements on the same torch and
+Transformers, until a file of the package it ran on changes; ND's own search
+code is not one of them. `ND_CENSUS_CACHE` names another folder, or `off`
+keeps none.
+
 ## Workflow
 
 1. Construct the model.
