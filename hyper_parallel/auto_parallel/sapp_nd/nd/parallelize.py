@@ -389,7 +389,7 @@ class ParallelizeLayer:
         verbose = logger.level < logging.INFO
         self.mem_eval.set_config(self.priced())
         # self.mem_eval = EvaluatorV2(self.config)
-        logger.debug("ccfg = %s", str(self.config.ccfg))
+        logger.debug("ccfg = %s", self.config.ccfg)
         peak = self.mem_eval.estimate_peak(
             verbose=verbose
         )  # (logger.level>2))
@@ -573,7 +573,7 @@ class ParallelizeLayer:
         parallel_config = self.config.make_parallel_config(
             dtpc_p, mbsn, evos_p
         )
-        logger.info("test config %d : %s", size, str(parallel_config))
+        logger.info("test config %d : %s", size, parallel_config)
         size += 1
 
         if self.is_valid(parallel_config) and self.config.set_parallel_config(
@@ -678,7 +678,7 @@ class ParallelizeLayer:
                 scored_space.append((config, mem, score, values))
 
                 if not multiproc:
-                    logger.info("config %s has score %f", str(config), score)
+                    logger.info("config %s has score %f", config, score)
 
             if multiproc:
                 new_scored_space = []

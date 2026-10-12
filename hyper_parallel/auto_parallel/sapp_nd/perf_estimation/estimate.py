@@ -1018,7 +1018,7 @@ def estimate_performance(*args, **kwargs):
         cfg.m,
     )
 
-    logger.info(str(cfg))
+    logger.info("%s", cfg)
     logger.info(stages)
     logger.info(ccfg)
 
