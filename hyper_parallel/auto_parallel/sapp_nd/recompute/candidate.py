@@ -69,6 +69,7 @@ per stage, and with two, the largest share of the chunks'.
 """
 import itertools
 import math
+from collections import Counter
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
@@ -92,6 +93,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.front import (
 )
 from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import (
     MEGABYTE,
+    Assignment,
     Layers,
     Stage,
     StageChoice,
@@ -518,6 +520,33 @@ def _assign(layers: Sequence[_Layer], choices: Sequence[StageChoice]) -> Dict[in
             for _ in range(assignment.count):
                 chosen[waiting.pop(0)] = assignment.option
     return chosen
+
+
+def _assign_counted(layers: Sequence[_Layer], chosen: Mapping[int, LayerOption]) -> Dict[int, LayerOption]:
+    """Assign a group's option counts in the same order as the normal optimizer."""
+    group = Layers(layers[0].key, len(layers), layers[0].in_flight)
+    counts = Counter(chosen[layer.index] for layer in layers)
+    assignments = tuple(
+        Assignment(group, option, count)
+        for option, count in sorted(counts.items(), key=lambda item: -_time(item[0]))
+    )
+    choice = StageChoice(
+        assignments,
+        sum(count * _kept(option, group.in_flight) for option, count in counts.items()),
+        sum(count * _time(option) for option, count in counts.items()),
+    )
+    return _assign(layers, [choice])
+
+
+def _equivalent_cost(left: RecomputeChoice, right: RecomputeChoice) -> bool:
+    """Whether identical mode counts also have equal stage peaks and time deltas."""
+    return all(
+        math.isclose(first, second, rel_tol=1e-12, abs_tol=1e-9)
+        for first, second in zip(left.stage_memory, right.stage_memory)
+    ) and all(
+        math.isclose(first, second, rel_tol=_ROUNDING, abs_tol=1e-9)
+        for first, second in zip(left.stage_savings, right.stage_savings)
+    )
 
 
 def _ranges(
@@ -1070,7 +1099,7 @@ def choose_recompute(
 
 
 class RecomputeAnalysis:
-    """Cache layer costs for scoring recompute alternatives at one fixed strategy."""
+    """Cache layer costs for grouped recompute alternatives under a fixed memory limit."""
 
     def __init__(
         self,
@@ -1080,7 +1109,7 @@ class RecomputeAnalysis:
         selective: Optional[Mapping[str, int]] = None,
         dimensions: Tuple[Tuple[str, int], ...] = (),
     ) -> None:
-        """Prepare the memory model once for a sequence of recompute changes.
+        """Price the layer options and fixed stage memory once for a strategy.
 
         Args:
             evaluator: Evaluator already set to the fixed parallel strategy.
@@ -1101,6 +1130,7 @@ class RecomputeAnalysis:
         self._fronts = {}
         self._by_mode = {}
         self._own = {}
+        self._groups = []
         self._peaks = []
         self._capacity = self._config.device_capacity.to_mb().size
         if self._config.multimodal or self._config.pp_sched not in SCHEDULES or "full" not in modes:
@@ -1118,21 +1148,31 @@ class RecomputeAnalysis:
             return
         self._layers, self._fronts, self._by_mode, self._own = _charge_working_sets(*found, fronts, by_mode)
         _, self._peaks = _stages(evaluator, self._layers, self._fronts, self._own)
+        for stage_layers, peaks in zip(self._layers, self._peaks):
+            grouped = {}
+            for layer in stage_layers:
+                first_backward = peaks.backward is not None and layer.index == stage_layers[0].index
+                grouped.setdefault((layer.key, layer.in_flight, first_backward), []).append(layer)
+            self._groups.extend(grouped.values())
 
     def analyze_recompute_performance(
         self, current: RecomputeChoice, cache_file: Optional[str] = None
     ) -> List[RecomputeChoice]:
-        """Score fitting alternatives that change exactly one non-FULL layer to FULL.
+        """Score distinct grouped alternatives adding one FULL layer within the device limit.
 
-        The parallel strategy and every other layer's option remain fixed.
-        Reuse this analyzer while building a sequence for that strategy.
+        Reuse the normal optimizer's layer prices, fixed stage memory, peak
+        constraints and assignment order. For each group and starting mode,
+        convert one layer to FULL and assign the new counts to layer indices.
+        Equivalent index swaps within a group produce one candidate; different
+        kinds, stages, in-flight counts and peak boundaries remain distinct.
+        Every candidate is checked against the original device capacity.
 
         Args:
-            current: Defined per-layer recompute plan to extend.
+            current: Defined per-layer plan whose mode counts are extended.
             cache_file: Optional cache used by the performance estimate.
 
         Returns:
-            Scored alternatives; an empty list when no layer can be changed.
+            Scored fitting alternatives, or an empty list when no group can be extended.
 
         Raises:
             ValueError: A plan has different degrees, invalid layer coverage,
@@ -1160,42 +1200,43 @@ class RecomputeAnalysis:
                 raise ValueError("the recompute plan must use the fixed model's kinds and allowed modes")
             chosen[layer.index] = self._by_mode[layer.key][item.mode]
         results = []
-        for layer in every:
-            if defined[layer.index].mode == "full":
-                continue
-            changed = dict(chosen)
-            changed[layer.index] = self._by_mode[layer.key]["full"]
-            result = _result(self._layers, self._peaks, changed, None, self._fronts, self._own)
-            if result.memory > self._capacity:
-                continue
-            option = self._own.get(changed[layer.index], changed[layer.index])
-            ranges = _full_layer_ranges(current.ranges, layer.index, option)
-            debugger = Debug(None, PerfParts, enable=True)
-            score = estimate_performance(
-                self._config, device_type=self._device_type, memory=int(round(result.memory)),
-                stage_savings=result.stage_savings, cache_file=cache_file, debugger=debugger,
-            )
-            parts = tuple(debugger.info[part] for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY})
-            results.append(replace(
-                result, ranges=ranges, score=score, dimensions=self._dimensions, score_parts=parts,
-            ))
+        seen = {}
+        option_modes = _option_modes(self._by_mode)
+        for group in self._groups:
+            extended_modes = set()
+            for layer in group:
+                mode = defined[layer.index].mode
+                if mode == "full" or mode in extended_modes:
+                    continue
+                extended_modes.add(mode)
+                changed = dict(chosen)
+                changed[layer.index] = self._by_mode[layer.key]["full"]
+                changed.update(_assign_counted(group, changed))
+                result = _result(
+                    self._layers, self._peaks, changed, None, self._fronts, self._own,
+                    option_modes,
+                )
+                if result.memory > self._capacity:
+                    continue
+                counts = tuple(
+                    frozenset(Counter((layer.key[1], option_modes[changed[layer.index]]) for layer in stage).items())
+                    for stage in self._layers
+                )
+                if any(_equivalent_cost(result, previous) for previous in seen.get(counts, ())):
+                    continue
+                seen.setdefault(counts, []).append(result)
+                results.append(self._score(result, cache_file))
         return results
 
-
-def _full_layer_ranges(ranges: Sequence[LayerRange], index: int, option: LayerOption) -> Tuple[LayerRange, ...]:
-    """Split only the range containing *index*, preserving every other layer's defined mode."""
-    changed = []
-    for item in ranges:
-        end = item.first + item.count
-        if not item.first <= index < end:
-            changed.append(item)
-            continue
-        if item.first < index:
-            changed.append(replace(item, count=index - item.first))
-        changed.append(replace(item, first=index, count=1, option=option, mode="full"))
-        if index + 1 < end:
-            changed.append(replace(item, first=index + 1, count=end - index - 1))
-    return tuple(changed)
+    def _score(self, result: RecomputeChoice, cache_file: Optional[str]) -> RecomputeChoice:
+        """Score an assigned plan after its warm-up and backward peaks fit the fixed capacity."""
+        debugger = Debug(None, PerfParts, enable=True)
+        score = estimate_performance(
+            self._config, device_type=self._device_type, memory=int(round(result.memory)),
+            stage_savings=result.stage_savings, cache_file=cache_file, debugger=debugger,
+        )
+        parts = tuple(debugger.info[part] for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY})
+        return replace(result, score=score, dimensions=self._dimensions, score_parts=parts)
 
 
 def _option_modes(by_mode: Mapping[Hashable, Mapping[str, LayerOption]]) -> Dict[LayerOption, str]:

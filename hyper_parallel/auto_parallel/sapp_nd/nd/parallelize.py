@@ -714,7 +714,7 @@ class ParallelizeLayer:
         cache_file: Optional[str] = None,
         base_parts: Optional[Tuple[float, ...]] = None,
     ) -> list[RecomputeChoice]:
-        """Retain a sequence adding one FULL layer at a time at fixed parallel degrees.
+        """Retain grouped one-more-FULL alternatives at fixed degrees and memory capacity.
 
         Args:
             parallel_config: One memory-fitting configuration, without varying its degrees.
@@ -724,7 +724,8 @@ class ParallelizeLayer:
             base_parts: Already computed score components, reused for plotting.
 
         Returns:
-            The original plan followed by each fastest fitting one-layer extension.
+            The original plan followed by each fastest fitting one-more-FULL
+            extension, assigning equivalent layers as in choose_recompute.
             A whole-model fallback or an offload plan is retained without extensions.
             A baseline with no ranges or mode means the optimizer provided no plan.
 
@@ -757,8 +758,7 @@ class ParallelizeLayer:
                                    if part not in {Debug.PerfParts.TOTAL, Debug.PerfParts.MEMORY})
         kept = [replace(choice, score=base_score, dimensions=dimensions, score_parts=tuple(base_parts))]
         all_results = list(kept)
-        if (choice.mode is None and "full" in self.recompute_modes
-                and any(item.mode != "full" for item in choice.ranges)
+        if (choice.mode is None and choice.ranges and "full" in self.recompute_modes
                 and not any(item.option.link_bandwidth for item in choice.ranges)):
             self.mem_eval.set_config(self.config.ccfg)
             analyzer = RecomputeAnalysis(
@@ -1157,7 +1157,7 @@ class ParallelizeLayer:
         retained = [(entry[0], self.recompute_potentials[entry[0]]) for entry in top]
         following = recompute_next_plot_groups(scored_space, self.recompute_results, top_num)
         for groups, filename, description in (
-            (retained, "result_recompute_inc", "Retained recompute sequence"),
+            (retained, "result_recompute_inc", "Retained recompute sequence at the original memory limit"),
             (following, "result_recompute_full_next", "Recompute plans below the next score, plus the next best"),
         ):
             if groups:

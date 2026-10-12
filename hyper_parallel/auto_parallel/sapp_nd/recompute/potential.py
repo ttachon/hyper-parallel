@@ -17,6 +17,7 @@
 import csv
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -59,10 +60,10 @@ def keep_recompute_potential(
     kept: List[RecomputeChoice],
     results: Sequence[RecomputeChoice],
 ) -> Optional[RecomputeChoice]:
-    """Append and return the fastest unused plan adding exactly one FULL layer.
+    """Append and return the fastest unused plan adding one FULL layer by kind.
 
     Args:
-        current: Plan whose parallel degrees and other layers must be preserved.
+        current: Plan whose parallel degrees, kinds and other mode counts are preserved.
         kept: Retained plans; a qualifying result is appended in place.
         results: Scored recompute alternatives, which need not be sorted.
 
@@ -80,14 +81,16 @@ def keep_recompute_potential(
         proposed = _layer_settings(result)
         if proposed.keys() != defined.keys():
             continue
-        changed = [index for index in defined if defined[index] != proposed[index]]
-        if len(changed) != 1:
+        if any(proposed[index][0] != defined[index][0] or proposed[index][2].link_bandwidth for index in defined):
             continue
-        index = changed[0]
-        kind, mode, _ = defined[index]
-        new_kind, new_mode, new_option = proposed[index]
-        if (mode == "full" or new_mode != "full" or new_kind != kind
-                or new_option.recompute is not None or new_option.link_bandwidth):
+        before = Counter((kind, mode) for kind, mode, _ in defined.values())
+        after = Counter((kind, mode) for kind, mode, _ in proposed.values())
+        removed, added = before - after, after - before
+        if sum(removed.values()) != 1 or sum(added.values()) != 1:
+            continue
+        old_kind, old_mode = next(iter(removed))
+        new_kind, new_mode = next(iter(added))
+        if old_kind != new_kind or old_mode == "full" or new_mode != "full":
             continue
         if any(dimensions == result.dimensions and layers == proposed for dimensions, layers in previous):
             continue
@@ -105,7 +108,7 @@ def recompute_next_plot_groups(
 
     Args:
         scored_space: Parallel configurations in the search's performance order.
-        results: Every scored one-layer alternative, including each baseline.
+        results: Scored grouped one-more-FULL alternatives, including each baseline.
         top_num: Number of parallel configurations to display; defaults to twenty.
 
     Returns:
@@ -164,7 +167,7 @@ def recompute_plot_data(
 
 
 def write_recompute_csv(potentials: Mapping[Dimensions, Sequence[RecomputeChoice]], path: str) -> None:
-    """Replace a CSV with each fixed strategy's retained recompute sequence.
+    """Replace a CSV with each fixed strategy's optimized recompute sequence.
 
     Args:
         potentials: Retained plans in sequence order, grouped by parallel configuration.
@@ -195,7 +198,7 @@ def write_recompute_csv(potentials: Mapping[Dimensions, Sequence[RecomputeChoice
                 row.update({
                     "TOP": config.rank,
                     "step": step,
-                    "changed_layer": changed[0] if changed else "",
+                    "changed_layer": ",".join(map(str, changed)),
                     "full_layers": sum(item.count for item in choice.ranges if item.mode == "full")
                     if choice.ranges else "",
                     "memory_mb": choice.memory,
