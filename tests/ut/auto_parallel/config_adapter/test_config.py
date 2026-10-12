@@ -1525,6 +1525,44 @@ class TestWriter(unittest.TestCase):
             self.assertEqual(yaml.safe_load(fh)["context"], {"census": True})
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_shards_experts_over_the_priced_group(self) -> None:
+        """
+        Feature: write_resolved_yaml, context.expert_shard.
+        Description: The Qwen3.5 template's shape, EP 8 with an expert shard
+            of 2 and context.expert_shard: group, resolved to DP 16, CP 2,
+            TP 2 and EP 2 on 64 dies; then to EP 1; then the EP 2 search over
+            the same train.yaml stating no rule.
+        Expectation: Under expert parallelism edp_shard_size becomes the
+            group the search priced, DP x CP x TP / EP = 32, and the change
+            is logged; at EP 1 the trainer builds no expert mesh and the
+            stated shard is kept; without the rule the stated shard is what
+            was priced, and is kept too.
+        """
+        template = {"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                    "accelerator": {"ep_size": 8}, "fsdp_config": {"dp_shard_size": 16, "edp_shard_size": 2}}
+        with_rule = os.path.join(self.tmpdir, "auto_models_expert_group.yaml")
+        with open(with_rule, "w", encoding="utf-8") as fh:
+            yaml.dump({**template, "context": {"expert_shard": "group"}}, fh)
+        without = os.path.join(self.tmpdir, "auto_models_expert_shard.yaml")
+        with open(without, "w", encoding="utf-8") as fh:
+            yaml.dump(template, fh)
+        config = _make_full_config()
+        out = os.path.join(self.tmpdir, "resolved_expert_group.yaml")
+
+        def written(path: str, **strategy: int) -> Dict[str, Any]:
+            """The fsdp_config the resolved yaml states for *path*, under a search that chose *strategy*."""
+            config.resolved_strategy = {"dp": 16, "dp_shard": 32, "tp": 2, "pp": 1, "cp": 2, **strategy}
+            write_resolved_yaml(config, path, out)
+            with open(out, "r", encoding="utf-8") as fh:
+                return yaml.safe_load(fh)["fsdp_config"]
+
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            self.assertEqual(written(with_rule, ep=2), {"dp_shard_size": 32, "edp_shard_size": 32})
+        self.assertIn("edp_shard_size 2 in the train yaml, the whole expert group of 32", " ".join(logs.output))
+        self.assertEqual(written(with_rule, ep=1)["edp_shard_size"], 2)
+        self.assertEqual(written(without, ep=2)["edp_shard_size"], 2)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
         """A strategy that contradicts the trainer batch derivation is refused."""
         original_yaml_path = os.path.join(self.tmpdir, "auto_models_batch.yaml")
