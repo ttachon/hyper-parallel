@@ -1430,38 +1430,38 @@ class TestDescribe(unittest.TestCase):
 class TestTrainerPlan(unittest.TestCase):
     """A choice of a mode per layer, as HyperParallel's trainer states it."""
 
-    def test_the_layers_that_do_not_run_the_mode_by_range_whatever_their_kinds(self):
+    def test_recomputed_layers_by_range_whatever_their_kinds(self):
         """
         Feature: trainer_plan.
         Description: Eight layers, full attention at 3 and 7: the first three
             fully recomputed and the last five off, ranges split by kind.
-        Expectation: Full, the only mode that recomputes though fewer layers
-            run it, and one entry for layers 3 to 7.
+        Expectation: Off as the default and one FULL entry for layers 0 to 2.
         """
         choice = _per_layer((0, 3, "linear_attention", "full"), (3, 1, "full_attention", "off"),
                             (4, 3, "linear_attention", "off"), (7, 1, "full_attention", "off"))
-        self.assertEqual(trainer_plan(choice), ("full", {"3-7": "off"}))
+        self.assertEqual(trainer_plan(choice), ("off", {"0-2": "full"}))
         self.assertEqual(_plan_modes(*trainer_plan(choice), 8), ["full"] * 3 + ["off"] * 5)
 
-    def test_a_tie_between_the_modes_that_recompute_goes_to_full(self):
+    def test_full_and_selective_layers_are_explicit_with_off_default(self):
         """
         Feature: trainer_plan.
         Description: Two layers selective, two fully recomputed, one off.
-        Expectation: Full, and each other layer by its own index.
+        Expectation: Off, with each FULL and SELECTIVE range explicitly listed.
         """
         choice = _per_layer((0, 1, None, "selective"), (1, 2, None, "full"), (3, 1, None, "off"),
                             (4, 1, None, "selective"))
-        self.assertEqual(trainer_plan(choice), ("full", {"0": "selective", "3": "off", "4": "selective"}))
+        self.assertEqual(trainer_plan(choice), ("off", {"0": "selective", "1-2": "full", "4": "selective"}))
 
-    def test_one_mode_states_no_layers(self):
+    def test_uniform_per_layer_and_whole_model_plans(self):
         """
         Feature: trainer_plan.
         Description: Every layer off per layer, every layer selective per
             layer, and one mode chosen for every layer.
-        Expectation: The mode alone each time.
+        Expectation: Per-layer choices default to OFF with recomputed layers
+            explicitly listed; a whole-model choice keeps its global mode.
         """
         self.assertEqual(trainer_plan(_per_layer((0, 2, "a", "off"), (2, 2, "b", "off"))), ("off", {}))
-        self.assertEqual(trainer_plan(_per_layer((0, 4, None, "selective"))), ("selective", {}))
+        self.assertEqual(trainer_plan(_per_layer((0, 4, None, "selective"))), ("off", {"0-3": "selective"}))
         one = RecomputeChoice(ranges=(LayerRange(0, 4, None, _option(None)),), stage_memory=(1.0,),
                               stage_savings=(0.0,), mode="full")
         self.assertEqual(trainer_plan(one), ("full", {}))

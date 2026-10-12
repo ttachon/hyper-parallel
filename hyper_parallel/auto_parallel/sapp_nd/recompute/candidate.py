@@ -69,7 +69,6 @@ per stage, and with two, the largest share of the chunks'.
 """
 import itertools
 import math
-from collections import Counter
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
@@ -1329,11 +1328,10 @@ def to_records(choice: RecomputeChoice) -> List[Dict[str, Any]]:
 def trainer_plan(choice: RecomputeChoice) -> Tuple[str, Dict[str, str]]:
     """The choice as HyperParallel's trainer states it: ``activation_checkpoint.mode`` and ``.layers``.
 
-    The trainer runs every layer its mode but those its plan names, by index
-    or by an inclusive range ``"first-last"``. The mode is the one most
-    layers run of those that recompute, full on a tie, or off where none
-    recomputes; the plan names the other layers, consecutive layers of one
-    mode in one entry whatever their kinds.
+    A per-layer choice uses off as the global mode and explicitly names the
+    layers running full or selective recompute, by index or by an inclusive
+    range ``"first-last"``. Consecutive layers of one mode share an entry
+    whatever their kinds. A whole-model choice keeps its global mode.
 
     The indices are the choice's, which count the body layers in model order,
     MTP's after the decoder's: the indices of the trainer's blocks, for a
@@ -1344,7 +1342,8 @@ def trainer_plan(choice: RecomputeChoice) -> Tuple[str, Dict[str, str]]:
             (:func:`choose_recompute` with *per_layer*).
 
     Returns:
-        ``(mode, layers)``, *layers* empty when every layer runs *mode*.
+        ``(mode, layers)``, with mode off for per-layer choices and layers
+        naming only the recomputed ranges. Whole-model choices have no overrides.
 
     Raises:
         ValueError: For a choice of options no mode stands for, each layer's
@@ -1355,23 +1354,16 @@ def trainer_plan(choice: RecomputeChoice) -> Tuple[str, Dict[str, str]]:
     if any(item.mode is None for item in choice.ranges):
         raise ValueError("the trainer runs a mode per layer, and this choice gives some layers options that are not "
                          "one; choose among its modes with per_layer")
-    counts = Counter()
-    for item in choice.ranges:
-        counts[item.mode] += item.count
-    recomputing = [mode for mode in ("full", "selective") if counts[mode]]
-    if not recomputing:
-        return "off", {}
-    mode = max(recomputing, key=lambda name: counts[name])
     runs: List[List[Any]] = []
     for item in sorted(choice.ranges, key=lambda item: item.first):
         if runs and runs[-1][2] == item.mode and runs[-1][1] + 1 == item.first:
             runs[-1][1] = item.first + item.count - 1
         else:
             runs.append([item.first, item.first + item.count - 1, item.mode])
-    return mode, {
+    return "off", {
         (str(first) if first == last else f"{first}-{last}"): run_mode
         for first, last, run_mode in runs
-        if run_mode != mode
+        if run_mode != "off"
     }
 
 
