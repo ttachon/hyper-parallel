@@ -1,0 +1,57 @@
+{
+  "_about": "How far ND's ranking was checked against timed runs, per template and cluster; '*' matches any. scripts/ask.py prints 'status. may_say' at the top of every answer, applies the cluster's ratios only where calibrated is true, and leaves exclude_modes out of a search that leaves the recompute mode open. scripts/answer.py checks the pick against region, the degree values the check covered (ND's column names, MP is tensor parallel); null means no region was checked.",
+  "qwen3_5_moe/a3": {
+    "status": "Back-tested",
+    "may_say": "The order of the layouts and which fit, inside the checked region. Not the size of a gain: ND said 14.4% for a recompute plan that measured 6.0%.",
+    "calibrated": true,
+    "region": {
+      "MP": [
+        "1"
+      ],
+      "CP": [
+        "1"
+      ],
+      "PP": [
+        "1"
+      ],
+      "EP": [
+        "1",
+        "2",
+        "4",
+        "8"
+      ],
+      "recompute": [
+        "full"
+      ]
+    },
+    "region_note": "Timed on the job's own step time: 16 layouts with EP 1 to 8 and shard groups 8 to 64 at full recompute, where ND's pick ran 2nd, 0.54% from the fastest, rank correlation +0.91 (ND f48da645); and 11 more at CP 1 with full recompute, +0.89, its pick 0.01% from the fastest (ND ec68a74c).",
+    "outside_note": "Eight layouts outside it were timed, all at CP 2 (ND ec68a74c): with full recompute ND's step ran 2.4% fast to 9.8% slow, order +0.45; with recompute off it priced them 4.8 to 18.2% fast and could not order them, 0.00. Searched with the region, its pick fell there and cost 7.3% against the fastest.",
+    "exclude_modes": {
+      "selective": "ND prices selective recompute 37 to 45% below its measured step on this family (15 layouts timed on 5 October)"
+    }
+  },
+  "qwen3_5_moe/*": {
+    "status": "No calibration",
+    "may_say": "The order only, as relative scores, and no step time. About five launches on the cluster give it a calibration.",
+    "calibrated": false,
+    "region": null,
+    "outside_note": "Nothing was timed on this cluster.",
+    "exclude_modes": {
+      "selective": "ND prices selective recompute 37 to 45% below its measured step on this family, on the A3"
+    }
+  },
+  "deepseek_v41/a3": {
+    "status": "Timed, not validated",
+    "may_say": "Which layouts fit. No recommendation on the expert degree, which ND prices backwards on this model, and no step time: the A3 ratios were fitted on Qwen3.5-MoE.",
+    "calibrated": false,
+    "region": null,
+    "outside_note": "Seven layouts timed on 16 dies: ND's order -0.39 against the measured steps; it priced EP2 22% and EP16 41% slower than EP1, where the runs measured them 4.7% and 1.2% faster."
+  },
+  "*/*": {
+    "status": "Never timed",
+    "may_say": "A ranking labelled not validated, after the model reader has checked what ND prices for each layer kind.",
+    "calibrated": false,
+    "region": null,
+    "outside_note": "No run of this family was timed."
+  }
+}

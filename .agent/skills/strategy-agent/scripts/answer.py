@@ -22,9 +22,12 @@ Every figure the answer gives is computed here from the ranking ND wrote with
 """
 import argparse
 import csv
+import json
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+TRUST = Path(__file__).resolve().parents[1] / "references" / "trust.json"
 # Degrees named as people say them; ND's CSV calls tensor parallelism MP.
 _NAMES = {"MP": "TP"}
 _SHOWN = ("DP", "MP", "CP", "PP", "VPP", "EP", "OP", "MB", "MBS")
@@ -90,17 +93,23 @@ def _versus(row: Dict[str, str], pick: Dict[str, str]) -> float:
     return 100.0 * (float(row["score"]) / float(pick["score"]) - 1.0)
 
 
-def _part_moves(row: Dict[str, str], pick: Dict[str, str], parts: Sequence[str], count: int = 3) -> str:
-    """The parts that move most from the pick to the row, forward and backward compute as one."""
+def _part_moves(row: Dict[str, str], pick: Dict[str, str], parts: Sequence[str], calibrated: bool,
+                count: int = 3) -> str:
+    """The parts that move most from the pick to the row, forward and backward compute as one.
+
+    In ms with a calibration; without one, in percent of the pick's score, since a raw score has no unit.
+    """
     if not parts or not row.get(parts[0]):
         return "parts not recorded"
     moves: Dict[str, float] = {}
+    scale = 1.0 if calibrated else 100.0 / float(pick["score"])
     for part in parts:
-        delta = float(row[part]) - float(pick[part])
+        delta = (float(row[part]) - float(pick[part])) * scale
         label = "compute" if part in _COMPUTE_PARTS else part.lower()
         moves[label] = moves.get(label, 0.0) + delta
     largest = sorted(moves.items(), key=lambda item: -abs(item[1]))[:count]
-    return ", ".join(f"{label} {delta:+.1f}" for label, delta in largest if abs(delta) >= 0.05) or "none"
+    unit = "" if calibrated else "%"
+    return ", ".join(f"{label} {delta:+.1f}{unit}" for label, delta in largest if abs(delta) >= 0.05) or "none"
 
 
 def _shared(rows: Sequence[Dict[str, str]], degrees: Sequence[str]) -> str:
@@ -112,8 +121,56 @@ def _shared(rows: Sequence[Dict[str, str]], degrees: Sequence[str]) -> str:
     return " ".join(same) or "nothing"
 
 
-def card(ranking: Ranking, calibrated: bool, spread: Optional[float], budget: Optional[str]) -> str:
-    """The answer in Markdown: the pick, the next two, what a near tie leaves firm, and why."""
+def trust_entry(family: str, cluster: str) -> Dict[str, Any]:
+    """How far ND was checked for a template on a cluster: its own record, else any cluster's, else any family's."""
+    records = json.loads(TRUST.read_text(encoding="utf-8"))
+    for key in (f"{family}/{cluster}", f"{family}/*", "*/*"):
+        if key in records:
+            return records[key]
+    return {"status": "Never timed", "may_say": "A ranking labelled not validated.", "calibrated": False,
+            "region": None}
+
+
+def _inside(row: Dict[str, str], region: Dict[str, Sequence[str]]) -> bool:
+    """Whether every degree the region names has one of the values it covers."""
+    return all(row.get(name) in values for name, values in region.items() if name in row)
+
+
+def recommended(rows: Sequence[Dict[str, str]], trust: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """The layout to launch: ND's pick, or the best inside the timed region when the pick lies outside it."""
+    region = (trust or {}).get("region")
+    if region is None or _inside(rows[0], region):
+        return rows[0]
+    return next((row for row in rows if _inside(row, region)), rows[0])
+
+
+def _trust_lines(ranking: Ranking, rows: Sequence[Dict[str, str]], trust: Dict[str, Any],
+                 calibrated: bool) -> List[str]:
+    """Whether the pick lies where ND was checked against timed runs, and the best layout that does."""
+    region = trust.get("region")
+    if region is None:
+        return [f"No region of this family and cluster was checked against timed runs: no layout here is "
+                f"validated. {trust.get('outside_note', '')}".strip()]
+    pick = rows[0]
+    checked = ", ".join(f"{_NAMES.get(name, name)} {' or '.join(values)}" for name, values in region.items())
+    if _inside(pick, region):
+        return [f"The pick is inside the region checked against timed runs ({checked}). "
+                f"{trust.get('region_note', '')}".strip()]
+    lines = [f"ND's pick is OUTSIDE the region checked against timed runs ({checked}). "
+             f"{trust.get('outside_note', '')}".strip()]
+    inside = next((row for row in rows if _inside(row, region)), None)
+    if inside is None:
+        lines.append("No layout that fits lies inside that region.")
+    else:
+        step = f"{float(inside['score']):.1f} ms" if calibrated else f"score {float(inside['score']):.4g}"
+        lines.append(f"The best layout inside it, the safer launch: {layout(inside, ranking.degrees)}, {step}, "
+                     f"{_versus(inside, pick):+.2f}% on ND's price, peak {_gib(inside):.1f} GiB.")
+    return lines
+
+
+def card(ranking: Ranking, calibrated: bool, spread: Optional[float], budget: Optional[str],
+         trust: Optional[Dict[str, Any]] = None) -> str:
+    """The answer in Markdown: the pick, the next two, where ND was checked, a near tie's firm part, and why."""
     rows = ranking.distinct()
     if not rows:
         return "ND kept no layout: none fits the budget, or the request leaves no valid layout.\n"
@@ -127,21 +184,39 @@ def card(ranking: Ranking, calibrated: bool, spread: Optional[float], budget: Op
         lines.append(f"| {place} | {layout(row, ranking.degrees)} | {score} | {versus} | {_gib(row):.1f} |")
     if budget:
         lines += ["", f"Budget: {budget} a die. The pick's peak is {_gib(pick):.1f} GiB."]
+    if trust is not None:
+        lines += [""] + _trust_lines(ranking, rows, trust, calibrated)
     if spread is not None and calibrated:
-        close = [row for row in rows if _versus(row, pick) < spread]
-        if len(close) > 1:
-            lines += ["", f"{len(close)} layouts are within {spread}% of the pick, the spread one layout's step "
-                      "showed between two rounds on this cluster: one round cannot order them. "
-                      f"What they all share is the firm part of the answer: {_shared(close, ranking.degrees)}."]
-    lines += ["", "Why, from ND's parts: the best layout with another value of each degree that varies.", ""]
+        lines += _near_tie(rows, ranking.degrees, spread, trust)
+    lines += ["", "Why ND ranks its pick first, from its parts: the best layout with another value of each "
+              "degree that varies.", ""]
     lines += _why(ranking, rows, calibrated)
     return "\n".join(lines) + "\n"
+
+
+def _near_tie(rows: Sequence[Dict[str, str]], degrees: Sequence[str], spread: float,
+              trust: Optional[Dict[str, Any]]) -> List[str]:
+    """The layouts one round cannot tell from the layout to launch, and what they share.
+
+    Anchored on the layout the answer launches; when that is not ND's pick, only layouts inside the timed
+    region count, since outside it ND's order was not checked.
+    """
+    anchor = recommended(rows, trust)
+    region = (trust or {}).get("region")
+    pool = rows if anchor is rows[0] or region is None else [row for row in rows if _inside(row, region)]
+    close = [row for row in pool if _versus(row, anchor) < spread]
+    if len(close) < 2:
+        return []
+    which = "the pick" if anchor is rows[0] else "the layout to launch"
+    return ["", f"{len(close)} layouts are within {spread}% of {which}, the spread one layout's step showed "
+            "between two rounds on this cluster: one round cannot order them. What they all share is the firm "
+            f"part of the answer: {_shared(close, degrees)}."]
 
 
 def _why(ranking: Ranking, rows: Sequence[Dict[str, str]], calibrated: bool) -> List[str]:
     """One table line per varying degree: its best other layout and the parts that move most."""
     pick = rows[0]
-    unit = "ms" if calibrated else "score"
+    unit = "ms" if calibrated else "% of the pick's score"
     lines = [f"| Degree | The pick | Best other | That layout | vs the pick | Largest part moves ({unit}) |",
              "|---|---|---|---|---|---|"]
     varying = [name for name in _SHOWN if name in ranking.degrees and len({row[name] for row in rows}) > 1]
@@ -154,10 +229,10 @@ def _why(ranking: Ranking, rows: Sequence[Dict[str, str]], calibrated: bool) -> 
         groups.setdefault(place, []).append(name)
     for place, names in groups.items():
         other = rows[place]
-        versus = f"{_versus(other, pick):+.2f}%" if calibrated else "n/a"
+        moves = _part_moves(other, pick, ranking.parts, calibrated)
         lines.append(f"| {', '.join(_NAMES.get(name, name) for name in names)} "
                      f"| {' '.join(pick[name] for name in names)} | {' '.join(other[name] for name in names)} "
-                     f"| {layout(other, ranking.degrees)} | {versus} | {_part_moves(other, pick, ranking.parts)} |")
+                     f"| {layout(other, ranking.degrees)} | {_versus(other, pick):+.2f}% | {moves} |")
     return lines
 
 
@@ -202,12 +277,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--spread", type=float, default=None, help="the cluster's re-measure spread, in percent")
     parser.add_argument("--budget", default=None, help="the memory budget the search ran with, as given to -M")
     parser.add_argument("--compare", default=None, help='named candidates, for example "EP=2,OP=32;EP=1,OP=64"')
+    parser.add_argument("--trust", default=None, help="template/cluster whose record to check the pick against, "
+                                                       "for example qwen3_5_moe/a3")
     args = parser.parse_args(argv)
     ranking = Ranking(args.ranking)
     if args.compare:
         sys.stdout.write(compare(ranking, args.compare, args.calibrated))
     else:
-        sys.stdout.write(card(ranking, args.calibrated, args.spread, args.budget))
+        trust = trust_entry(*args.trust.split("/", 1)) if args.trust else None
+        sys.stdout.write(card(ranking, args.calibrated, args.spread, args.budget, trust))
     return 0
 
 

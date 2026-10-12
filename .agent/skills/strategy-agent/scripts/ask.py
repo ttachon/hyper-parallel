@@ -25,6 +25,7 @@ lands in ``output/strategy-agent/<time>/``: the request, the yaml ND read, the c
 ND's log and ranking, and the answer, so that any answer can be checked or run again.
 """
 import argparse
+import copy
 import datetime
 import hashlib
 import importlib.metadata
@@ -90,27 +91,30 @@ def describe(args: argparse.Namespace) -> Dict[str, Any]:
             raise SystemExit(f"no template for {args.family!r} (templates: {known}); "
                              "pass the asker's trainer yaml with --yaml, after the model reader checked it")
         doc = yaml.safe_load(template.read_text(encoding="utf-8"))
-        doc["model"]["config_path"] = (template.parent / doc["model"]["config_path"]).as_posix()
+        if "config_path" in doc["model"]:  # a template may describe its model inline instead
+            doc["model"]["config_path"] = (template.parent / doc["model"]["config_path"]).as_posix()
     for name, path in FIELDS.items():
         if getattr(args, name) is not None:
-            _set(doc, path, getattr(args, name))
+            _set(doc, _where(doc, path), getattr(args, name))
     if len(args.recompute) == 1 and args.recompute[0] in MODES:
         _set(doc, ("activation_checkpoint", "mode"), args.recompute[0])
     return doc
 
 
-def _status(family: str, cluster: str) -> str:
-    """The status table's line for this family on this cluster, or the line for any other pairing."""
-    rows = []
-    for line in (SKILL / "references" / "status.md").read_text(encoding="utf-8").splitlines():
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if line.startswith("|") and len(cells) >= 5 and not set(cells[0]) <= set("-: "):
-            rows.append(cells)
-    for wanted in ((family, cluster), (family, "*"), ("*", "*")):
-        for cells in rows[1:]:
-            if (cells[0].strip("`"), cells[1].strip("`")) == wanted:
-                return f"{cells[2]}. {cells[4]}"
-    return "No status line for this pairing: treat the ranking as not validated."
+def _where(doc: Dict[str, Any], path: Sequence[str]) -> Sequence[str]:
+    """Where this yaml states a field: a model described inline states its shape under config_overrides."""
+    if path[0] == "model" and _get(doc, ("model", "config_overrides", *path[1:])) is not None:
+        return ("model", "config_overrides", *path[1:])
+    return path
+
+
+def _modes(asked: Sequence[str], trust: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """The recompute modes to search, and why any the trust record names were left out or kept."""
+    excluded = trust.get("exclude_modes") or {}
+    if list(asked) == ["auto"]:
+        modes = [mode for mode in MODES if mode not in excluded]
+        return modes, [f"Left out of the search: {mode}, because {why}." for mode, why in excluded.items()]
+    return list(asked), [f"{mode} was asked for; mind that {why}." for mode, why in excluded.items() if mode in asked]
 
 
 def _versions(repo: Path, ratios: Optional[Path]) -> Dict[str, Any]:
@@ -163,26 +167,37 @@ def _arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     return args
 
 
-def _cluster(name: str) -> Dict[str, Any]:
-    """The cluster's record, its ratios file as a path; a bare record for a cluster with no calibration."""
+def _cluster(name: str, trust: Dict[str, Any], budget: Optional[str]) -> Dict[str, Any]:
+    """The cluster's record: its ratios only where the trust record says they hold for this family, its budget."""
     clusters = json.loads((SKILL / "calibration" / "clusters.json").read_text(encoding="utf-8"))
     record = dict(clusters.get(name, {}))
-    record["ratios"] = SKILL / "calibration" / record["ratios"] if record.get("ratios") else None
+    calibrated = bool(trust.get("calibrated")) and bool(record.get("ratios"))
+    record["ratios"] = SKILL / "calibration" / record["ratios"] if calibrated else None
+    record["budget"] = budget or record.get("budget")
     record.setdefault("device", name.upper())
     return record
 
 
-def _command(doc: Dict[str, Any], run: Path, recompute: Sequence[str], cluster: Dict[str, Any],
-             budget: Optional[str]) -> List[str]:
+def _run_folder(args: argparse.Namespace, repo: Path, doc: Dict[str, Any]) -> Path:
+    """The folder that keeps this answer, with the yaml ND reads and the request."""
+    stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"  # two askers in one second stay apart
+    run = Path(args.out) if args.out else repo / "output" / "strategy-agent" / stamp
+    run.mkdir(parents=True, exist_ok=False)
+    (run / "run.yaml").write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    (run / "request.md").write_text(args.request + "\n", encoding="utf-8")
+    return run
+
+
+def _command(doc: Dict[str, Any], run: Path, modes: Sequence[str], cluster: Dict[str, Any]) -> List[str]:
     """The ND command that prices the run ``run/run.yaml`` describes."""
     command = [
         sys.executable, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", "-f", "hyper_v2",
         "-y", str(run / "run.yaml"), "-d", str(_get(doc, FIELDS["dies"])), "-A", cluster["device"],
         "-b", str(_get(doc, FIELDS["global_batch"])), "-v", "2", "-o", str(run / "nd_out"),
-        "--ranking_csv", str(run / "nd_rank.csv"), "--recompute", *recompute,
+        "--ranking_csv", str(run / "nd_rank.csv"), "--recompute", *modes,
     ]
-    if budget:
-        command += ["-M", budget]
+    if cluster["budget"]:
+        command += ["-M", cluster["budget"]]
     if cluster["ratios"]:
         command += ["-c", str(cluster["ratios"])]
     return command
@@ -200,23 +215,73 @@ def _price(command: Sequence[str], repo: Path, run: Path, timeout: int) -> Tuple
     return result.returncode, time.monotonic() - started, lines
 
 
-def _report(args: argparse.Namespace, run: Path, versions: Dict[str, Any], cluster: Dict[str, Any],
-            budget: Optional[str], seconds: float, lines: Sequence[str]) -> List[str]:
+def launch_yaml(doc: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
+    """The trainer yaml for one of ND's layouts: the run's own, with the layout's degrees where the trainer reads them.
+
+    The trainer refuses ND's ``context`` section, so it is left out. Under expert parallelism, every layout ND
+    prices with ``context.expert_shard: group``, and every run the sweep launched, shards a routed expert over its
+    whole expert data-parallel group, DP x CP x TP / EP ranks. The trainer reads that as
+    ``fsdp_config.edp_shard_size``, which ND's own resolved yaml leaves as the template states it.
+    """
+    out = copy.deepcopy(doc)
+    context = out.pop("context", None) or {}
+    accelerator = out.setdefault("accelerator", {})
+    for degree, field in (("MP", "tp_size"), ("CP", "cp_size"), ("EP", "ep_size"), ("PP", "pp_size")):
+        accelerator[field] = int(row[degree])
+    if int(row["MP"]) > 1:
+        accelerator["sequence_parallel"] = row.get("SP") == "True"
+    fsdp = out.setdefault("fsdp_config", {})
+    fsdp["dp_shard_size"] = int(row["OP"])
+    if context.get("expert_shard") == "group":  # at EP 1 the trainer reads none of it, but the runs state it
+        fsdp["edp_shard_size"] = int(row["DP"]) * int(row["CP"]) * int(row["MP"]) // int(row["EP"])
+    out.setdefault("training", {})["micro_batch_size"] = int(row["MBS"])
+    if row.get("recompute"):
+        out.setdefault("activation_checkpoint", {})["mode"] = row["recompute"]
+    return out
+
+
+def _write_launches(run: Path, doc: Dict[str, Any], trust: Dict[str, Any]) -> List[str]:
+    """The trainer yaml of the layout to launch, and of ND's own pick when that differs: lines naming them."""
+    rows = answer.Ranking(str(run / "nd_rank.csv")).distinct()
+    if not rows:
+        return []
+    if trust.get("region") is None:  # nothing was timed for this family here, so nothing is the layout to launch
+        files, chosen = [("launch_nd_pick.yaml", rows[0])], None
+    else:
+        chosen = answer.recommended(rows, trust)
+        files = [("launch.yaml", chosen)] + ([("launch_nd_pick.yaml", rows[0])] if chosen is not rows[0] else [])
+    lines = []
+    for name, row in files:
+        text = yaml.safe_dump(launch_yaml(doc, row), sort_keys=False, allow_unicode=True)
+        (run / name).write_text(text, encoding="utf-8")
+        what = ("the layout to launch" if row is chosen else
+                "ND's own pick, which nothing validates" if chosen is None else
+                "ND's own pick, outside the timed region")
+        lines.append(f"Trainer yaml for {what}: {run / name}; set its tokenizer and data paths on the cluster.")
+        if int(row.get("VPP", "1")) > 1:
+            lines.append(f"Its virtual pipeline degree, VPP {row['VPP']}, is not written there: set it by hand.")
+    return lines
+
+
+def _report(args: argparse.Namespace, run: Path, facts: Dict[str, Any], lines: Sequence[str]) -> List[str]:
     """The answer: the status line, what priced it, the card, ND's notices and where the run is kept."""
+    cluster, trust, versions = facts["cluster"], facts["trust"], facts["versions"]
     notices = [line.strip() for line in lines if any(word in line for word in NOTICES)]
     card = answer.card(answer.Ranking(str(run / "nd_rank.csv")), calibrated=cluster["ratios"] is not None,
-                       spread=cluster.get("remeasure_spread_pct"), budget=budget)
+                       spread=cluster.get("remeasure_spread_pct"), budget=cluster["budget"], trust=trust)
     changed = " (with local changes)" if versions["nd_tree_changed"] else ""
-    scale = "calibrated" if cluster["ratios"] else "no calibration: relative scores only"
+    scale = "calibrated" if cluster["ratios"] else "no calibration for this family here: relative scores only"
     return [
-        f"Status: {_status(args.family or '*', args.cluster)}",
+        f"Status: {trust['status']}. {trust['may_say']}",
         f"Priced by ND {versions['nd_commit'][:8]}{changed}, Transformers {versions['transformers']}, "
-        f"cluster {args.cluster} ({scale}), in {seconds:.0f} s.",
+        f"cluster {args.cluster} ({scale}), in {facts['seconds']:.0f} s.",
+        *facts["notes"],
         "",
         card,
         "ND's notices, verbatim:" if notices else "ND printed no notice.",
         *[f"- {line}" for line in notices],
         "",
+        *facts["launches"],
         f"Run kept in {run}",
     ]
 
@@ -225,15 +290,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Describe the run, price it with ND, keep everything, print the answer."""
     args = _arguments(argv)
     repo = repo_root()
-    cluster = _cluster(args.cluster)
-    budget = args.budget or cluster.get("budget")
+    trust = answer.trust_entry(args.family or "*", args.cluster)
+    cluster = _cluster(args.cluster, trust, args.budget)
+    args.recompute, notes = _modes(args.recompute, trust)
     doc = describe(args)
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run = Path(args.out) if args.out else repo / "output" / "strategy-agent" / stamp
-    run.mkdir(parents=True, exist_ok=False)
-    (run / "run.yaml").write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    (run / "request.md").write_text(args.request + "\n", encoding="utf-8")
-    command = _command(doc, run, args.recompute, cluster, budget)
+    run = _run_folder(args, repo, doc)
+    command = _command(doc, run, args.recompute, cluster)
     versions = _versions(repo, cluster["ratios"])
     (run / "versions.json").write_text(json.dumps(versions, indent=2) + "\n", encoding="utf-8")
     (run / "command.txt").write_text(f"cd {repo}\n" + " ".join(command) + "\n", encoding="utf-8")
@@ -243,7 +305,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sys.stdout.write(f"ND failed (exit {code}) after {seconds:.0f} s; the last lines of {run / 'nd.log'}:\n")
         sys.stdout.write("\n".join(lines[-25:]) + "\n")
         return 1
-    report = _report(args, run, versions, cluster, budget, seconds, lines)
+    facts = {"cluster": cluster, "trust": trust, "versions": versions, "seconds": seconds, "notes": notes,
+             "launches": _write_launches(run, doc, trust)}
+    report = _report(args, run, facts, lines)
     (run / "answer.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     sys.stdout.write("\n".join(report) + "\n")
     return 0

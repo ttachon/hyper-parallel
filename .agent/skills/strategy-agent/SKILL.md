@@ -31,21 +31,28 @@ that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU.
 1. **Read the request.** Collect the model (a template name, or the asker's trainer yaml), the layers,
    the tokens a sequence, the global batch, the micro-batch, the recompute mode if stated, the total
    dies, the cluster and a memory budget if stated. Where a value is missing, use the template's and
-   say so. Templates: `templates/*.yaml`, one per model family.
-2. **Check what can be trusted** in `references/status.md`; `ask.py` prints the matching line too.
+   say so. Templates: `templates/qwen3_5_moe.yaml` (Qwen3.5-35B-A3B and its layer crops) and
+   `templates/deepseek_v41.yaml` (the DeepSeek-V4.1 validation crop, described inline).
+2. **Check what can be trusted.** `references/trust.json` says, for each template on each cluster, how
+   far ND was checked against timed runs; `references/status.md` explains it. `ask.py` applies it: it
+   prints the status line, uses the cluster's calibration only where it holds for the family, leaves
+   out of an open search the recompute modes ND misprices, and checks the pick against the region
+   that was timed.
    - No template and no yaml from the asker: ask for their trainer yaml; nothing can be priced.
-   - A yaml whose family the table does not list: run the model reader (step 5) before ranking, and
-     say the ranking is not validated.
-3. **Run ND once**, from the repository root:
+   - A yaml of a family with no record: run the model reader (step 5) before ranking, and say the
+     ranking is not validated.
+3. **Run ND once**, through the script beside this file. It finds the checkout it belongs to and runs ND
+   there, so it works from any folder, also through a link to this skill:
 
    ```bash
-   python .agent/skills/strategy-agent/scripts/ask.py --family qwen3_5_moe --cluster a3 \
+   python <this skill's folder>/scripts/ask.py --family qwen3_5_moe --cluster a3 \
        --layers 8 --seq 8192 --global-batch 64 --micro-batch 1 --dies 64 --recompute full \
        --request "<the request, in the asker's words>"
    ```
 
    `--recompute` takes the mode the run uses (`off`, `selective`, `full`), several to compare them,
-   or `auto` for all three when the request leaves it open (the default). With the asker's yaml, use
+   or `auto` when the request leaves it open (the default): every mode the family's record does not
+   exclude, and the answer says which were left out and why. With the asker's yaml, use
    `--yaml <file>` and keep `--family` when the model belongs to a listed family. Never run ND by hand:
    `ask.py` passes the recompute mode, the cluster's calibration and its budget, which ND otherwise
    prices as full recompute, drops, or reads as 64 GB.
@@ -54,18 +61,28 @@ that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU.
    degree, read out in words from its part moves), the status line, ND's notices verbatim, and the
    run folder. When several layouts sit within the cluster's re-measure spread, the firm answer is
    what they share: say one round cannot order them, and offer to time the two that differ most.
+   **When the answer says ND's pick lies outside the region that was timed, the layout to launch is
+   the best one inside it**, which the answer names; give ND's pick as the candidate worth timing, with
+   the reason the answer quotes. With no region at all, recommend nothing ND alone decides: say what
+   fits, and which layouts are worth timing.
 5. **The model reader**, for a model ND has not been checked on:
    `python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd -f hyper_v2 -y <yaml> -V` sets, for each
    layer kind, the parameters and FLOPs ND prices beside what the model's own layers hold. Report every
    part that differs; a part ND prices at zero is a part the ranking ignores.
-6. **Named candidates**: `python .agent/skills/strategy-agent/scripts/answer.py <run>/nd_rank.csv
+6. **Named candidates**: `python <this skill's folder>/scripts/answer.py <run>/nd_rank.csv
    --calibrated --compare "EP=2,OP=32;EP=1,OP=64"` gives each one's place, step and peak. A candidate
    with no row did not fit the budget or is outside ND's search; say which you cannot tell apart.
 
 ND's degrees, as the answer names them: DP data parallel, TP tensor parallel, CP context parallel,
 PP pipeline stages (VPP virtual stages), EP expert parallel, OP the FSDP shard group of the
-non-expert parameters, MB micro-batches a step, MBS sequences a micro-batch. Writing the pick into a
-launch yaml is not built yet: give the degrees and let the asker set them in their trainer yaml.
+non-expert parameters, MB micro-batches a step, MBS sequences a micro-batch.
+
+The run folder also holds the trainer yaml to launch: `launch.yaml` for the layout the answer recommends,
+and `launch_nd_pick.yaml` for ND's own pick when that differs or nothing validates it. They are the
+request's yaml with the degrees written where the trainer reads them, the expert shard group included
+(`edp_shard_size`, the whole expert group, as ND priced it and as every timed run was launched), and
+without ND's `context` section, which the trainer refuses. Tell the asker to set the tokenizer and data
+paths for their cluster; a virtual pipeline degree, when one is picked, is not written.
 
 ## Rules
 
