@@ -117,7 +117,7 @@ def _modes(asked: Sequence[str], trust: Dict[str, Any]) -> Tuple[List[str], List
     return list(asked), [f"{mode} was asked for; mind that {why}." for mode, why in excluded.items() if mode in asked]
 
 
-def _versions(repo: Path, ratios: Optional[Path]) -> Dict[str, Any]:
+def library_versions(repo: Path, ratios: Optional[Path]) -> Dict[str, Any]:
     """What the answer depends on besides the request: the ND tree, the libraries, the ratios."""
     def git(*command: str) -> str:
         """What a git command prints in the checkout, empty when git fails."""
@@ -143,9 +143,8 @@ def _versions(repo: Path, ratios: Optional[Path]) -> Dict[str, Any]:
     }
 
 
-def _arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
-    """The request's values, from the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    """The flags that describe a run, shared by ask.py and plan.py."""
     parser.add_argument("--family", default=None,
                         help="template name, for example qwen3_5_moe; with --yaml it only picks the status line")
     parser.add_argument("--yaml", default=None, help="the asker's trainer yaml, instead of the family's template")
@@ -155,19 +154,25 @@ def _arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--global-batch", dest="global_batch", type=int, default=None, help="sequences a step")
     parser.add_argument("--micro-batch", dest="micro_batch", type=int, default=None, help="sequences a die")
     parser.add_argument("--dies", type=int, default=None, help="total dies")
-    parser.add_argument("--recompute", nargs="+", default=["auto"], choices=MODES + ("auto",),
-                        help="the activation checkpoint mode the run uses, several to compare, auto for all three")
-    parser.add_argument("--budget", default=None, help="memory budget a die, for example 58GB")
     parser.add_argument("--request", default="", help="the request in the asker's words, kept with the run")
     parser.add_argument("--out", default=None, help="run folder (default output/strategy-agent/<time>)")
     parser.add_argument("--timeout", type=int, default=1800, help="seconds ND may take")
+
+
+def _arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+    """The request's values, from the command line."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    add_run_arguments(parser)
+    parser.add_argument("--recompute", nargs="+", default=["auto"], choices=MODES + ("auto",),
+                        help="the activation checkpoint mode the run uses, several to compare, auto for all three")
+    parser.add_argument("--budget", default=None, help="memory budget a die, for example 58GB")
     args = parser.parse_args(argv)
     if not (args.family or args.yaml):
         parser.error("give --family, or --yaml with the asker's trainer yaml")
     return args
 
 
-def _cluster(name: str, trust: Dict[str, Any], budget: Optional[str]) -> Dict[str, Any]:
+def cluster_record(name: str, trust: Dict[str, Any], budget: Optional[str]) -> Dict[str, Any]:
     """The cluster's record: its ratios only where the trust record says they hold for this family, its budget."""
     clusters = json.loads((SKILL / "calibration" / "clusters.json").read_text(encoding="utf-8"))
     record = dict(clusters.get(name, {}))
@@ -178,7 +183,7 @@ def _cluster(name: str, trust: Dict[str, Any], budget: Optional[str]) -> Dict[st
     return record
 
 
-def _run_folder(args: argparse.Namespace, repo: Path, doc: Dict[str, Any]) -> Path:
+def run_folder(args: argparse.Namespace, repo: Path, doc: Dict[str, Any]) -> Path:
     """The folder that keeps this answer, with the yaml ND reads and the request."""
     stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"  # two askers in one second stay apart
     run = Path(args.out) if args.out else repo / "output" / "strategy-agent" / stamp
@@ -203,7 +208,7 @@ def _command(doc: Dict[str, Any], run: Path, modes: Sequence[str], cluster: Dict
     return command
 
 
-def _price(command: Sequence[str], repo: Path, run: Path, timeout: int) -> Tuple[int, float, List[str]]:
+def price(command: Sequence[str], repo: Path, run: Path, timeout: int) -> Tuple[int, float, List[str]]:
     """Run ND from the checkout, its log kept in the run folder: exit code, seconds, log lines."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     env["PYTHONPATH"] = os.pathsep.join([str(repo)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
@@ -263,6 +268,17 @@ def _write_launches(run: Path, doc: Dict[str, Any], trust: Dict[str, Any]) -> Li
     return lines
 
 
+def version_notes(trust: Dict[str, Any], versions: Dict[str, Any]) -> List[str]:
+    """A warning for each library installed at another version than the one the trust record was checked with."""
+    notes = []
+    for name, checked in (trust.get("checked_with") or {}).items():
+        installed = versions.get(name)
+        if installed and installed != checked:
+            notes.append(f"{name} {installed} is installed here, and the region was checked with {checked}: ND's "
+                         "census follows the installed library, so this ranking may differ from the checked one.")
+    return notes
+
+
 def _report(args: argparse.Namespace, run: Path, facts: Dict[str, Any], lines: Sequence[str]) -> List[str]:
     """The answer: the status line, what priced it, the card, ND's notices and where the run is kept."""
     cluster, trust, versions = facts["cluster"], facts["trust"], facts["versions"]
@@ -276,6 +292,7 @@ def _report(args: argparse.Namespace, run: Path, facts: Dict[str, Any], lines: S
         f"Priced by ND {versions['nd_commit'][:8]}{changed}, Transformers {versions['transformers']}, "
         f"cluster {args.cluster} ({scale}), in {facts['seconds']:.0f} s.",
         *facts["notes"],
+        *version_notes(trust, versions),
         "",
         card,
         "ND's notices, verbatim:" if notices else "ND printed no notice.",
@@ -291,16 +308,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _arguments(argv)
     repo = repo_root()
     trust = answer.trust_entry(args.family or "*", args.cluster)
-    cluster = _cluster(args.cluster, trust, args.budget)
+    cluster = cluster_record(args.cluster, trust, args.budget)
     args.recompute, notes = _modes(args.recompute, trust)
     doc = describe(args)
-    run = _run_folder(args, repo, doc)
+    run = run_folder(args, repo, doc)
     command = _command(doc, run, args.recompute, cluster)
-    versions = _versions(repo, cluster["ratios"])
+    versions = library_versions(repo, cluster["ratios"])
     (run / "versions.json").write_text(json.dumps(versions, indent=2) + "\n", encoding="utf-8")
     (run / "command.txt").write_text(f"cd {repo}\n" + " ".join(command) + "\n", encoding="utf-8")
 
-    code, seconds, lines = _price(command, repo, run, args.timeout)
+    code, seconds, lines = price(command, repo, run, args.timeout)
     if code != 0 or not (run / "nd_rank.csv").is_file():
         sys.stdout.write(f"ND failed (exit {code}) after {seconds:.0f} s; the last lines of {run / 'nd.log'}:\n")
         sys.stdout.write("\n".join(lines[-25:]) + "\n")

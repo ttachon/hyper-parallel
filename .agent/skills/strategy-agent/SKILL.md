@@ -72,6 +72,11 @@ that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU.
 6. **Named candidates**: `python <this skill's folder>/scripts/answer.py <run>/nd_rank.csv
    --calibrated --compare "EP=2,OP=32;EP=1,OP=64"` gives each one's place, step and peak. A candidate
    with no row did not fit the budget or is outside ND's search; say which you cannot tell apart.
+7. **Which layers can skip recompute**, for a layout already chosen: `python <this skill's folder>/scripts/plan.py`
+   with the same run flags plus `--layout "EP=2,OP=32"` (TP, CP and PP are 1 unless given). It states the
+   budget from the cluster's measured reserve, since ND prices allocated memory and a run dies on reserved,
+   lets ND choose each layer's mode, and writes the plan into `launch.yaml` (`activation_checkpoint.layers`).
+   Give the plan, the budget and how it was derived, and the allocator note it prints; never the gain.
 
 ND's degrees, as the answer names them: DP data parallel, TP tensor parallel, CP context parallel,
 PP pipeline stages (VPP virtual stages), EP expert parallel, OP the FSDP shard group of the

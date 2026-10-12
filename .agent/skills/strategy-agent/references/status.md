@@ -10,6 +10,8 @@ any), and `scripts/ask.py` applies it to every answer, so the language model nev
 | `calibrated` | Whether the cluster's ratios turn ND's score into milliseconds for this family. The A3 ratios were fitted on Qwen3.5-MoE; on another family the answer gives relative scores |
 | `region` | The degree values the timed runs covered. A pick outside it is flagged, and the best layout inside it is named as the launch |
 | `exclude_modes` | Recompute modes a search that leaves the mode open does not try, with the reason the answer prints |
+| `per_layer` | How far a plan of recompute per layer (`scripts/plan.py`) was checked, and the allocator it holds for |
+| `checked_with` | The library versions the region was checked with. ND's census follows the installed Transformers (5.17's delta rule keeps 42% less in a Qwen3.5 linear-attention layer than 5.14.1's), so another version gets a warning |
 
 What the records hold today:
 
