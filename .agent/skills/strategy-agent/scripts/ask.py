@@ -57,7 +57,8 @@ SEQ_PLACES = (("dataset", "data_transform", "max_seq_len"), ("dataset", "data_co
 # <family>_description.yaml: the family's model described by hand, for a checkout that cannot build the template's.
 DESCRIBED = "_description"
 # ND log lines the answer must pass on: a part it did not price, a field it priced as 0, what it refused.
-NOTICES = ("MTP layer", "no parser set", "priced fully recomputed", "refus", "Error", "WARNING")
+NOTICES = ("MTP layer", "no parser set", "priced fully recomputed", "refus", "does not declare", "Error",
+           "WARNING")
 
 
 def repo_root() -> Path:
@@ -326,13 +327,15 @@ def _write_launches(run: Path, doc: Dict[str, Any], trust: Dict[str, Any]) -> Li
 
 
 def version_notes(trust: Dict[str, Any], versions: Dict[str, Any]) -> List[str]:
-    """A warning for each library installed at another version than the one the trust record was checked with."""
+    """A warning for each library installed at a version the trust record was not checked with."""
     notes = []
     for name, checked in (trust.get("checked_with") or {}).items():
+        known = [checked] if isinstance(checked, str) else list(checked)
         installed = versions.get(name)
-        if installed and installed != checked:
-            notes.append(f"{name} {installed} is installed here, and the region was checked with {checked}: ND's "
-                         "census follows the installed library, so this ranking may differ from the checked one.")
+        if installed and installed not in known:
+            notes.append(f"{name} {installed} is installed here, and the region was checked with "
+                         f"{' and '.join(known)}: ND's census follows the installed library, so this ranking may "
+                         "differ from the checked one.")
     return notes
 
 
