@@ -60,11 +60,48 @@ constraint:
 recompute: "full"
 ```
 
+`recompute` sets how the search treats activation checkpointing. `auto`
+chooses one of the trainer's modes for every layer of each candidate.
+`per_layer` chooses one for each layer, and `resolved.yaml` states that
+plan as `activation_checkpoint.mode` and `activation_checkpoint.layers`
+(`{mode: full, layers: {3-7: off}}`). Either way the search chooses among
+off and full, plus the trainer's selective policy where the train.yaml asks
+for a census; `recompute_modes: [off, full]` narrows that list. Any other
+value prices every layer fully recomputed. The choice fills
+`memory_limit_gb`, which is compared with the memory ND estimates a run
+allocates. A run also holds what its allocator reserves beyond that, 7 to
+16 GiB a rank on the Qwen3.5-MoE crop at 8192 tokens, so set the limit below
+what the device leaves by that much.
+
 Both are run the same way:
 
 ```bash
 python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd     -y train.yaml -s search.yaml -f hyper_v2     -d 64 -b 128 -A A3 -M 58GB -o out
 ```
+
+### The model spec and the run spec
+
+Whatever the input format, ND prices a model from two typed specs:
+
+- The model spec (`auto_parallel/_model_spec.py`, `ModelSpec`) states the
+  model under any strategy: its dimensions, its experts, its layer stack
+  (`layers`), its family (`arch`) and, where they differ from the family's,
+  its op counts per layer kind (`ops`). A Transformers config resolves into
+  one, and `model.config_overrides` states its fields offline.
+- The run spec (`auto_parallel/_exec_spec.py`, `ExecSpec`) states how the
+  model is trained: the parallel degrees, the pipeline layout, the batch,
+  the optimizer and gradient sharding, the recompute, the precisions, the
+  kernels, the sequence length and the device memory. A HyperParallel
+  configuration states it in the train.yaml; `offset`, `full_rec`,
+  `sel_rec`, `capacity_factor`, `use_gmm` and `seq_length` in
+  `config_overrides` belong to it.
+
+Every other field is derived from the two. What neither states comes from
+the model's family, in its op profile (`auto_parallel/op_profiles/<arch>.yaml`):
+its op counts per layer kind, and defaults such as its byte widths. A run
+spec states recompute as ranges of layers in model order, the body layers
+first and the MTP layers last, so a search can give each layer its own
+option; `{option: full}` alone recomputes every layer.
 
 ## Workflow
 
@@ -123,9 +160,17 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-v VERBOSITY]
     [-A DEVICE_TYPE]
     [-mppb | --manual_pipeline_balance]
+    [-ar | --auto_recompute]
+    [-ao | --auto_offload]
+    [--host_link_gibps GIB_PER_S]
+    [--sustained_tflops TFLOPS]
     [-t TOP_CONFIG_NUMBER]
+    [-e N | --exhaustive N]
+    [-ee N | --force_exhaustive N]
+    [-eee N | --fforce-exhaustive N]
     [-mem MEM_FOR_PPB]
-    [--real_csv REAL_CSV [-o OUTPUT_DIR]]
+    [-o OUTPUT_DIR]
+    [--real_csv REAL_CSV]
     [--ranking_csv RANKING_CSV]
 ```
 
@@ -134,13 +179,113 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
 - `-b`, `--global_batch_size`: global batch size. If omitted, ND uses the yaml value.
 - `-m`, `--model`: model name. If omitted, ND uses the yaml value.
 - `-l`, `--dimensions`: parallel dimensions to vary.
-- `-v`, `--verbosity`: verbosity in range `[0, 6]`.
+- `-v`, `--verbosity`: verbosity in range `[0, 6]`, default `2`. Plots and
+  debug CSV files are generated from level `2`.
 - `-A`, `--device_type`: device type, such as `A2` or `A3`.
 - `-mppb`, `--manual_pipeline_balance`: read offset and recompute from yaml.
+- `-ar`, `--auto_recompute`: give every layer of each configuration the
+  fastest recompute option that fits, instead of scoring it fully recomputed.
+- `-ao`, `--auto_offload`: with `-ar`, let each pipeline stage's first layers
+  offload their activations to the host instead of recomputing them, over the
+  device's host link (see Hardware). Priced at one chunk per stage; not with a
+  search config, whose trainer runs no offload.
+- `--host_link_gibps`, `--sustained_tflops`: the host link's copy bandwidth
+  and the device's sustained throughput `-ao` prices with, replacing the
+  device's placeholders.
 - `-t`, `--top_config_number`: number of top configurations to print and plot.
+- `-e N`, `--exhaustive N`: ensure at least `N` plotted configurations have
+  degree greater than `1` for each requested dimension, counting the normal
+  top results. Default `0`.
+- `-ee N`, `--force_exhaustive N`: request at least `N` additional
+  configurations per requested dimension with degree greater than `1`. When
+  combined with a larger `-e`, also fill its minimum. Default `0`.
+- `-eee N`, `--fforce-exhaustive N`: request `N` distinct additional
+  configurations per requested dimension with degree greater than `1`;
+  reserve each addition for one dimension. A positive value takes precedence
+  over `-e` and `-ee`. Default `0`.
 - `-mem`, `--mem_for_ppb`: memory reserved for pipeline balancing.
-- `--real_csv`: instead of searching, compare ND's estimate with the configurations measured in a classified profiling CSV, see below. With `-o`, `--output-dir`, ND's real-versus-estimate plots and its estimates are written there.
-- `--ranking_csv`: also write every configuration the search keeps, in ND's order, to a CSV: rank, degrees, peak memory in MB, score and the parts of the score. Scores keep full precision, so configurations ND cannot tell apart show as ties. This is what a sweep reads to profile ND's best configurations.
+- `-o`, `--output-dir`: directory for the standard search's `results.pdf`,
+  `debug.csv`, and `debug_mem.csv`; also controls resolved search-config
+  output and real-versus-estimate output. Without it, standard search debug
+  artifacts go to `nd/output/` inside the SAPP-ND package.
+- `--real_csv`: instead of searching, compare ND's estimate with the
+  configurations measured in a classified profiling CSV, see below. With
+  `-o`, `--output-dir`, ND's real-versus-estimate plots and its estimates are
+  written there.
+- `--ranking_csv`: also write every configuration the search keeps, in ND's
+  order, to a CSV: rank, degrees, peak memory in MB, score and the parts of
+  the score. Scores keep full precision, so configurations ND cannot tell
+  apart show as ties. This is what a sweep reads to profile ND's best
+  configurations.
+
+### Exhaustive plot selection
+
+The three exhaustive options cover the dimensions requested with `-l`. For
+each dimension `D`, a configuration qualifies when its degree for `D` is
+greater than `1`. Each option accepts a non-negative integer; `0` disables
+that option. They apply to the standard ND search and cannot be combined
+with `--real_csv`, `-s`/`--search-config`, or `-V`/`--verify` when nonzero.
+
+The normal plot contains the top `-t M` configurations, subject to its cutoff
+at twenty times the best score. When `-t` is omitted, the console lists all
+fitting configurations and the normal plot contains at most twenty. Exhaustive
+additions are chosen from the remaining configurations in performance order,
+after memory filtering, and can extend beyond the normal score cutoff.
+
+Let `P` be the number of normal plotted results with `D > 1`, `E` the value
+of `-e`, and `F` the value of `-ee`:
+
+| Options | Additional qualifying results selected for `D` |
+| --- | --- |
+| `-e E` alone | `max(0, E - P)` |
+| `-ee F` with `F >= E` | `F`; forced additions take precedence |
+| `-ee F` with `F < E` | `max(F, E - P)`; force `F` additions, then fill the `-e` minimum |
+| `-eee N` with `N > 0` | `N` distinct additions reserved for `D`; `-e` and `-ee` are ignored |
+
+For example, with `-e 5 -ee 2`, a dimension present above degree one in four
+normal results still gets two additions, while one present in only one
+normal result gets four additions. With `-e 2 -ee 2`, every dimension gets
+two additional qualifying results regardless of its count in the normal plot.
+
+For `-e` and `-ee`, an additional configuration can satisfy several dimensions
+and is plotted once. Consequently, five dimensions with `-ee 2` can yield fewer
+than ten unique additions. If the top five already have DP, EP, CP and OP
+greater than one, but all have MP equal to one, `-e 2` needs only two additions
+with MP greater than one.
+
+Use `-eee 2` to request ten unique additions for five dimensions. ND processes
+dimensions in the order supplied to `-l`, choosing the best remaining unused
+configurations for each one. Ten additions require two unused qualifying
+configurations to remain for every dimension when it is processed. Each option
+returns fewer additions when the candidates are exhausted; `-eee` logs a
+shortfall warning, visible from verbosity `3`.
+
+From the repository root, this plots five top results and up to two distinct
+additions for each of DP, EP, MP, CP and OP:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
+    -y train.yaml -f hyper_v2 -d 64 -t 5 \
+    -l DP EP MP CP OP -eee 2 -o output/nd_perf
+```
+
+The console prints `Additional exhaustive configurations` after the top
+results when `-t` is supplied, followed by the number of unique plot additions.
+The plot retains performance order and draws a black vertical divider between
+the normal results and the additions when both groups are present. The divider
+is omitted when there are no additions. The first table row, `TOP`, shows each
+configuration's one-based position in the full performance ranking of all
+configurations that fit memory. The CLI tables also start with a `TOP` column
+using the same global positions for both the top and additional results.
+Additions retain their global ranks even when intermediate results are skipped
+in the plot or additional-results table. Each column's estimated peak memory
+appears in the `MEM` row below the performance bars.
+
+Use a fresh output directory for each run: `debug.csv` and `debug_mem.csv`
+append rows to existing files, while `results.pdf` is replaced. The full
+ranking of configurations that fit memory remains available through
+`--ranking_csv`, independently of the displayed selection. Its `rank` column
+contains the same global positions as `TOP` in the CLI and plot.
 
 ## Comparing with a Profiled Run
 
@@ -214,9 +359,11 @@ sapp_nd/
 ### Models
 
 - Transformer dense models, including Llama-series and Qwen-series up to Qwen 2.5.
-- Qwen3-series, including MoE variants. Models whose layers are not all the
-  same attention flavour (Qwen3.5's linear/full alternation) are costed as if
-  every layer were full attention.
+- Qwen3-series, including MoE variants, and Qwen3.5, whose stack alternates
+  linear and full attention: the model's `layer_types` names each layer's
+  kind, and each layer is priced as its kind. A model that states no
+  `layer_types`, or names a kind its op profile lacks, is priced as the
+  profile's default kind throughout.
 - Mixture-of-Experts models, including DeepSeekV3.
 - Multimodal models are in progress.
 
@@ -225,6 +372,17 @@ sapp_nd/
 - Ascend A2.
 - Ascend A3.
 - Other Ascend variants and GPU support are future work.
+
+Offload (`-ao`) prices each copy to the host with two figures per device,
+`HostLink` in `nd/common/hardware.py`: the copy bandwidth to pinned host
+memory, in GiB/s, and the sustained dense throughput, in TFLOP/s, which turns
+a copy's seconds into the estimate's units. The figures there are
+placeholders, not measurements: 16 GiB/s is hyper_offload's own default
+before it profiles the link, and the throughputs are about half of each
+device's dense peak. Measure the link on the target with hyper_offload's
+`profile_transfer_bandwidth`, and the throughput from a profiled training
+step, or take the vendor's figures; then state them in `hardware.py` or pass
+`--host_link_gibps` and `--sustained_tflops`.
 
 ### Parallel Dimensions
 
@@ -238,7 +396,11 @@ sapp_nd/
 - `MB`: micro-batch number.
 - `MBS`: micro-batch size.
 - `VPP`: virtual pipeline parallelism.
-- `CP`: context parallelism is planned.
+- `CP`: context parallelism. Its time is what the algorithm exchanges each
+  layer: the keys and values ring and hybrid CP gather, the query, key, value
+  and output Ulysses all-to-alls, or a linear-attention layer's recurrent
+  state. Its memory is a rank's share of the sequence, plus the other ranks'
+  keys and values where the algorithm gathers them.
 
 ## Notes
 

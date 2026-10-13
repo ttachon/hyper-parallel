@@ -16,69 +16,58 @@
 
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    runs_hyper_selective,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, apply_layer_kind, layer_groups
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import runs_hyper_selective
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import get_model_order, layer_switches
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 
 
-# Configs are updated depending on the type of the transformer layer
-def get_layer_custom_configs(cfg):
-    """Stores each configuration along with how many layers are affected by it
-    in ascending order of execution in a forward pass
-    """
+def get_layer_group_configs(cfg):
+    """Return each group of layers' config and layer count, in model order.
 
-    if cfg.layer_custom_config is None or any(
-        func is None for (_, func) in cfg.layer_custom_config
-    ):
+    A config whose layers run on it as it stands is one group, priced with
+    ``cfg`` itself.  Otherwise each kind is applied once, to a copy of
+    ``cfg`` that every group of that kind shares.
+    """
+    groups = layer_groups(cfg)
+    if all(kind is None for kind, _ in groups):
         return [(cfg, cfg.n_lay)]
-
-    lccfgs = []
-    for nb_layers, func in cfg.layer_custom_config:
-        lccfg = deepcopy(cfg)
-        func(lccfg)
-        lccfgs.append((lccfg, nb_layers))
-
-    return lccfgs
-
-
-def get_model_order(cfg: Any, stages: List) -> List[Tuple[int, int, int]]:
-    """Positions ``(stage, chunk, index)`` of the regular layers, in model order.
-
-    Model order runs chunk by chunk across the stages, and back up them in
-    the second chunk of a V schedule; walking the stages one at a time is
-    only the same order without interleaving.  This is the order the memory
-    backbone gives layers their groups in.
-    """
-    positions = [
-        (stage_id, chunk_id, lay_id)
-        for chunk_id in range(cfg.vp)
-        for stage_id in range(cfg.p)
-        for lay_id, layer in enumerate(stages[stage_id][chunk_id])
-        if layer not in (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER)
-    ]
-    if cfg.pp_sched == "zero_bubble_v":
-        # First-chunk entries less the embedding, as the memory backbone counts.
-        first = sum(len(stage[0]) for stage in stages) - 1
-        positions = positions[:first] + positions[first:][::-1]
-    return positions
+    configs = {}
+    for kind, _ in groups:
+        if kind.name not in configs:
+            configs[kind.name] = deepcopy(cfg)
+            apply_layer_kind(CWrap(configs[kind.name]), kind)
+    return [(configs[kind.name], count) for kind, count in groups]
 
 
 def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int, int], Any]:
     """Map each regular layer's position to the config it is priced with.
 
-    Each group of ``layer_custom_config`` covers exactly its own count of
-    layers in model order; layers past the declared counts keep the last
-    group, as a configuration with no custom groups keeps ``cfg``.
+    Each group of the layer stack covers exactly its own count of layers in
+    model order; layers past the stack's count keep the last group, as a
+    config whose layers need no kind keeps ``cfg``.
     """
-    lccfgs = get_layer_custom_configs(cfg)
+    lccfgs = get_layer_group_configs(cfg)
     per_layer = [lccfg for lccfg, count in lccfgs for _ in range(count)]
     last = lccfgs[-1][0]
     return {
         position: per_layer[idx] if idx < len(per_layer) else last
         for idx, position in enumerate(get_model_order(cfg, stages))
     }
+
+
+def get_layer_switches_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int, int], Any]:
+    """Map each regular layer's position to its own recompute switches, where its config's ranges state several.
+
+    Empty where the config's ``rec_op`` holds the one setting every
+    selective layer runs (:func:`layer_switches`).
+    """
+    switches = layer_switches(cfg)
+    if switches is None:
+        return {}
+    return {position: switches[idx] for idx, position in enumerate(get_model_order(cfg, stages))
+            if idx < len(switches)}
 
 
 # The switch an op answers to where it has none of its own: a QK-norm is a norm.
@@ -89,50 +78,82 @@ _SWITCH_OF = {"qknorm": "normOp"}
 _CENSUS_SHARES = {"attMM": "selective_attention_mm", "ffMM": "selective_ffn_mm"}
 
 
-def selective_shares(lccfg, layer):
-    """The share of each matmul op's FLOPs a selective layer runs again, as its kind's census measured it.
+def mla_weights(cfg: Any) -> Tuple[Any, Any]:
+    """An MLA layer's projection weights, all of them and its up-projections', as the time model prices them.
 
-    Only for a layer of HyperParallel's selective policy, whose switches it
-    has (:func:`runs_hyper_selective`): the policy recomputes every other
-    matmul, which no switch covers.  Empty otherwise, and the switches
-    price every op.
+    The queries' latent and its up-projection, or one projection to every
+    head; the keys' and values' shared down-projection beside the rotary
+    key; their up-projections, a head's key at its own width and its value
+    at the value heads'; the output projection.  The up-projections build
+    the queries' heads from their latent, where they have one, and the
+    keys' and values' from theirs.
+
+    Returns:
+        ``(weights, up)``.
     """
-    census = getattr(lccfg, "kind_activations", None)
-    if layer != LayerType.SEL_REC_LAYER or census is None or not runs_hyper_selective(lccfg):
+    d_nope = getattr(cfg, "qk_nope_head_dim", None) or cfg.dh
+    heads = cfg.a * (d_nope + cfg.dhr)
+    query = cfg.dc_q * (cfg.h + heads) if cfg.dc_q else cfg.h * heads
+    weights = (query + cfg.h * (cfg.dc_kv + cfg.dhr) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+               + cfg.a * cfg.dh * cfg.h)
+    up = (cfg.dc_q * heads if cfg.dc_q else 0) + cfg.dc_kv * cfg.n_kv * (d_nope + cfg.dh)
+    return weights, up
+
+
+def selective_shares(lccfg, layer, switches=None):
+    """The share of each matmul op's FLOPs a selective layer runs again, where no switch prices it.
+
+    A layer of HyperParallel's selective policy, whose switches it has
+    (:func:`runs_hyper_selective`), *switches* where the layer has its own,
+    runs again the shares its kind's census measured: the policy recomputes
+    every other matmul, which no switch covers.  An MLA layer whose
+    ``attUp`` switch is 0 runs its up-projections again, their share of its
+    projections' FLOPs.  Empty otherwise, and the switches price every op.
+    """
+    if layer != LayerType.SEL_REC_LAYER:
         return {}
-    return {op: getattr(census, name) for op, name in _CENSUS_SHARES.items()
-            if getattr(census, name, None) is not None}
+    census = getattr(lccfg, "kind_activations", None)
+    if census is not None and runs_hyper_selective(lccfg, switches):
+        return {op: getattr(census, name) for op, name in _CENSUS_SHARES.items()
+                if getattr(census, name, None) is not None}
+    if not getattr(lccfg, "dc_kv", 0):
+        return {}
+    stated = switches if switches is not None else vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
+    if stated.get("attUp", 1):
+        return {}
+    weights, up = mla_weights(lccfg)
+    return {"attMM": up / weights}
 
 
-
-
-def get_recomp_factor(lccfg, layer, op_name):
+def get_recomp_factor(lccfg, layer, op_name, switches=None):
     """Whether a layer of this type runs the op again in its backward pass.
 
     A selective layer recomputes exactly the ops whose switch in
     ``lccfg.rec_op`` is 0. A switch at 1 keeps the op's activation, which is
     how the memory model's ``EvalUtils.rec_coeff`` reads it, and an op with no
     switch is kept. The switches are read from ``vars`` because a ``Config``
-    answers 0 for any attribute it lacks.
+    answers 0 for any attribute it lacks.  *switches*, a layer's own where
+    it has them, stand for the config's.
     """
     if layer == LayerType.FULL_REC_LAYER:
         return 1
     if layer == LayerType.NOT_REC_LAYER:
         return 0
     if layer == LayerType.SEL_REC_LAYER:
-        switches = vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
+        if switches is None:
+            switches = vars(lccfg.rec_op) if lccfg.rec_op is not None else {}
         return int(not switches.get(_SWITCH_OF.get(op_name, op_name), 1))
     logger.warning("Unrecognized recompute type %s", layer)
     return 0
 
 
-def get_table_quantity(lccfg, table, layer, with_recomp, shares=None):
-    """op compute load from given table; *shares* sets the recompute factor of the ops it names"""
+def get_table_quantity(lccfg, table, layer, with_recomp, shares=None, switches=None):
+    """op compute load from given table; *shares* sets the recompute factor of the ops it names, *switches* the rest"""
     shares = shares or {}
     qt_layer = 0
     for op, quantity in table.items():
         op_name = op[2:]
-        factor = shares[op_name] if op_name in shares else get_recomp_factor(lccfg, layer, op_name)
+        factor = shares[op_name] if op_name in shares else get_recomp_factor(lccfg, layer, op_name, switches)
 
         qt_layer += (
             (1 + with_recomp * factor)

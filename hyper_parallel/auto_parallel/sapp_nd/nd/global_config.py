@@ -15,7 +15,7 @@
 """One configuration interface for parallelization"""
 
 import copy
-from math import gcd
+from typing import Optional
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -109,6 +109,18 @@ class GlobalConfig:
         """Adapt configuration to different parallel config"""
         return self.adapt_config_balancing(pp, vpp)
 
+    def state_recompute(self, full: Optional[bool]) -> None:
+        """Give every candidate *full* as its full recompute, on every config of its pipeline.
+
+        Args:
+            full: The full recompute a recompute dimension's mode states, or
+                None for the recompute each candidate's balancing derives.
+        """
+        self.balancing.stated_recompute = full
+        for _, balancing in self.siblings:
+            if balancing is not None:
+                balancing.stated_recompute = full
+
     def write(self, folder, parallel_config):
         """Dump config into a yaml file"""
         if folder:
@@ -116,22 +128,38 @@ class GlobalConfig:
             self.ccfg.config.dump(file_name, folder)
 
     def moe_valid(self, parallel_config):
-        """Check whether  the model is MoE"""
+        """Whether a MoE model's EP fits its experts and the ranks they spread over (:meth:`max_ep`)."""
         expert_num = self.ccfg.n_exp
         if expert_num > 1:
             ep = self.dim_val(Dim.EP, parallel_config)
             dp = self.dim_val(Dim.DP, parallel_config)
             mp = self.dim_val(Dim.TP, parallel_config)
+            cp = self.dim_val(Dim.CP, parallel_config)
             logger.debug(
-                "moe valid ? EP %d <= E %d & EP %d <= DP %d * MP %d",
+                "moe valid ? EP %d <= E %d & EP %d <= %d, DP %d MP %d CP %d",
                 ep,
                 expert_num,
                 ep,
+                self.max_ep(dp, mp, cp),
                 dp,
                 mp,
+                cp,
             )
-            return ep <= min(expert_num, dp * mp)
+            return ep <= min(expert_num, self.max_ep(dp, mp, cp))
         return True
+
+    def max_ep(self, dp: int, tp: int, cp: int = 1) -> int:
+        """Compute bound for dimension EP: the ranks a stage spreads its experts over.
+
+        They are its DP x TP ranks, and under HyperParallel its DP x CP x TP
+        ranks: it builds its expert mesh ``(edp_replicate, edp_shard, ep)``
+        over the whole ``(dp, cp, tp)`` device mesh
+        (``MeshContext._build_expert_parallel_mesh``), the domain its FSDP
+        shard spans as well (``shard_spans_cp``).  Bounded by DP x TP, a
+        strategy under CP could not spread its experts over CP's ranks,
+        though the runtime does (F3).
+        """
+        return dp * tp * (cp if getattr(self.ccfg, "shard_spans_cp", False) else 1)
 
     def ep_constraints_valid(self, parallel_config):
         """Check EP-specific divisibility constraints (C1, C2).
@@ -190,10 +218,11 @@ class GlobalConfig:
         for dim in self.dimensions:
             dims.append((dim, kwargs.get(dim.lname())))
 
-        has_mbn_not_in = Dim.MBN not in self.dimensions
-        has_pp_in = Dim.PP in self.dimensions
-        has_dp_or_mbs_in = Dim.DP in self.dimensions or Dim.MBS in self.dimensions
-        if has_mbn_not_in and has_pp_in and has_dp_or_mbs_in:
+        # The micro-batch count is the search's own, the global batch over DP
+        # and MBS, whatever -l names. Kept from the yaml where -l left it out,
+        # every DP but the yaml's own made another batch, so the search
+        # refused every candidate or kept a single DP (M6).
+        if Dim.MBN not in self.dimensions:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)
         return Dim.Dimensions(dims, all_dims=self.dimensions, accumulates=self.accumulates_grads())
@@ -328,22 +357,31 @@ class GlobalConfig:
             return [False, True]
         return [dim.from_config(self.ccfg)]
 
-    def max_op(self, dp, tp, ep):
-        """Compute bound for dimension OP"""
-        if (
-            isinstance(self.ccfg.optimizer, str)
-            and "muon" not in self.ccfg.optimizer.lower()
-        ):
-            return dp
-        if self.ccfg.n_exp and self.ccfg.n_exp > 1:
-            exp_gcd = gcd(dp * tp // max(tp, ep), self.ccfg.n_exp)
-        else:
-            exp_gcd = dp
+    def max_op(self, dp, tp, ep, cp=1):
+        """Compute bound for dimension OP.
 
-        dc_kv_valid = self.ccfg.dc_kv and self.ccfg.dc_kv > 1
-        dhr_valid = self.ccfg.dhr and self.ccfg.dhr > 1
-        if dc_kv_valid and dhr_valid:
-            att_gcd = gcd(self.ccfg.h, self.ccfg.dc_kv + self.ccfg.dhr)
-        else:
-            att_gcd = self.ccfg.h
-        return gcd(exp_gcd, att_gcd)
+        OP is the runtime's ``dp_shard_size``, and all the runtime asks of it
+        is that the data-parallel group divide into a replicate axis and a
+        shard axis (``distributed/mesh.py``, ``MeshContext.build_meshs``), so
+        every divisor of DP is reachable.  HyperParallel's group is DP times
+        CP, its FSDP domain, where a shard spans CP's ranks
+        (``shard_spans_cp``): bounded by DP alone, a strategy under CP could
+        not be sharded wider than DP, though the runtime shards it over the
+        whole domain.
+
+        Under Muon this used to narrow to a greatest common divisor over the
+        expert count and the attention widths.  Nothing in the runtime asks
+        for that: Newton-Schulz runs on a matrix's last two dimensions and the
+        optimizer all-gathers them whenever the shard falls there, running
+        locally when it does not (``core/optimizer/muon.py``,
+        ``_classify_parameters_for_step``; ``core/optimizer/
+        sharding_category.py``, ``is_last2d_sharded``), and a width that does
+        not divide a parameter is only logged, never refused.  The cap came in
+        with the original search import and cost the strategies engineers run:
+        at 64 devices with EP 16 it allowed no shard wider than 4, and at 16
+        devices with EP 16 none at all.  What Muon does change, one momentum
+        per matrix in place of two moments, the parser carries as
+        ``optimizer_states``.
+        """
+        del tp, ep  # the shard is bounded by the data-parallel group alone
+        return dp * cp if getattr(self.ccfg, "shard_spans_cp", False) else dp

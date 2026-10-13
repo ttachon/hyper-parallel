@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,27 @@ from scipy.stats import pearsonr
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_recompute_modes
+
+# The column a configuration's activation checkpoint mode goes in, written by a
+# search with a recompute dimension and read from a measured CSV that states it.
+RECOMPUTE_COLUMN = "recompute"
+
+
+def _recompute_of(row: dict) -> Optional[str]:
+    """Take a measured row's activation checkpoint mode out of it, None where the CSV states none."""
+    stated = (row.pop(RECOMPUTE_COLUMN, None) or "").strip()
+    if not stated:
+        return None
+    modes = read_recompute_modes(stated, f"the {RECOMPUTE_COLUMN} column")
+    if len(modes) != 1:
+        raise ValueError(f"the {RECOMPUTE_COLUMN} column: a measured run ran one mode, not {stated!r}")
+    return modes[0]
+
+
+def _has_recompute(entries: list) -> bool:
+    """Whether any entry's configuration states an activation checkpoint mode."""
+    return any(getattr(entry[0], "recompute", None) for entry in entries)
 
 
 # Where the CSVs and the plots go. Defaults to a directory beside this file,
@@ -118,6 +139,15 @@ class RealParts(Enum):
 
     def __str__(self):
         return self.name.lower()
+
+
+# An optional column of a classified CSV, and the key it is read into: the
+# trainer's own step time in milliseconds, measured on steps the profiler left
+# alone. It is not a RealParts member, so every consumer that walks that enum
+# ignores it. ``examples/training_demo/sweep_qwen3_5_moe.py`` writes the column
+# and spells the name again rather than importing it, because that launcher
+# runs on the cluster's control node with nothing but the standard library.
+TRAINER_STEP = "step_trainer"
 
 
 class MemParts(Enum):
@@ -335,10 +365,20 @@ class Plot:
     dbg_cols: list[str]
     top: int
 
-    def __init__(self, title, rows, debug_parts, top=None):
+    def __init__(
+        self,
+        title: Optional[str],
+        rows: list,
+        debug_parts: list,
+        top: Optional[int] = None,
+        show_top: bool = False,
+    ) -> None:
+        """Initialize the plot table, optionally displaying each configuration's rank."""
         self.title = title
         self.top = top if top is not None else 20
         self.row_title = rows + ["MEM"]
+        if show_top:
+            self.row_title.insert(0, "TOP")
         self.dbg_cols = list(map(str, debug_parts))
         self.col_title = []
         self.cell_text = []
@@ -403,10 +443,14 @@ class Plot:
         """Parse test data for plot"""
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
+        include_all = kwargs.get("include_all", False)
         min_e = configs_estimated[0][2]
         i = 0
-        for cfg_e in configs_estimated:
-            self.cell_text.append(cfg_e[0].values() + [cfg_e[1]])
+        for index, cfg_e in enumerate(configs_estimated):
+            cells = cfg_e[0].values() + [cfg_e[1]]
+            if self.row_title[0] == "TOP":
+                cells.insert(0, cfg_e[0].rank or index + 1)
+            self.cell_text.append(cells)
             self.col_title.append("")
             try:
                 self.data.append(
@@ -417,21 +461,58 @@ class Plot:
                     real_data.append(tuple(measured_bars(cfg_e[5], plot_idle)))
             except IndexError:
                 score = cfg_e[2]
-                if i >= self.top or (min_e is not None and score > min_e * 20):
+                if not include_all and (
+                    i >= self.top or (min_e is not None and score > min_e * 20)
+                ):
                     self.cell_text.pop()
                     break
                 self.data.append(tuple([cfg_e[0], score] + cfg_e[3]))
                 i += 1
 
 
+def top_plot_configs(configs_estimated: list, max_num: Optional[int] = None) -> list:
+    """Return the configurations the standard ND plot would include."""
+    if not configs_estimated:
+        return []
+    top = max_num if max_num is not None else 20
+    if top <= 0:
+        return []
+    best_score = configs_estimated[0][2]
+    selected = []
+    for config in configs_estimated:
+        if len(selected) >= top or config[2] > best_score * 20:
+            break
+        selected.append(config)
+    return selected
+
+
 def plot_nd(
-    configs_estimated, output_path, debug_parts, title=None, max_num=None
-):
-    """Plot estimation"""
+    configs_estimated: list,
+    output_path: str,
+    debug_parts: list,
+    title: Optional[str] = None,
+    max_num: Optional[int] = None,
+    include_all: bool = False,
+    top_result_count: Optional[int] = None,
+) -> None:
+    """Plot estimation with a divider before any additional configurations.
+
+    Args:
+        configs_estimated: Ranked configurations with memory, score and its parts.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
+        output_path: Directory in which to save results.pdf.
+        debug_parts: Performance components to plot.
+        title: Optional plot title.
+        max_num: Maximum number of configurations in the normal plot.
+        include_all: Include every supplied configuration without normal plot limits.
+        top_result_count: Number of normal results preceding the additions.
+    """
     plot = Plot(
-        title, configs_estimated[0][0].keys(), debug_parts, top=max_num
+        title, configs_estimated[0][0].keys(), debug_parts,
+        top=max_num, show_top=True,
     )
-    plot.parse_data(configs_estimated)
+    plot.parse_data(configs_estimated, include_all=include_all)
 
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "estim"] + plot.dbg_cols)
@@ -441,6 +522,8 @@ def plot_nd(
     )
     axis.set_ylim(ymin=1)
     axis.legend(loc="upper left", bbox_to_anchor=(1, 1))
+    if top_result_count is not None and 0 < top_result_count < len(plot.data):
+        axis.axvline(top_result_count - 0.5, color="black", linewidth=1.5)
 
     plot.make_table()
     plot.close(output_path, "results")
@@ -462,32 +545,38 @@ def write_ranking_csv(scored_space: list, path: str) -> None:
     """Write a search's configurations in ND's order, best first.
 
     One row per configuration that fits memory: its rank, its degrees, the
-    peak memory in MB, the score and the parts the score splits into, which
-    are blank when the search ran without debug output. Scores keep full
-    precision so that a reader can tell a tie from a near miss.
+    activation checkpoint mode where the search had a recompute dimension,
+    the peak memory in MB, the score and the parts the score splits into,
+    which are blank when the search ran without debug output. Scores keep
+    full precision so that a reader can tell a tie from a near miss.
 
     Args:
         scored_space: ``(config, memory, score, parts)`` entries, as
-            ``ParallelizeLayer.order_search_space`` sorts them.
+            ``ParallelizeLayer.order_search_space`` sorts them. Stored ranks
+            are preserved; unranked configurations use their input positions.
         path: CSV file to write; its directory is created when missing.
     """
     parts = _score_parts()
     _make_parent(path)
     dims = [str(dim) for dim in scored_space[0][0].keys()] if scored_space else []
+    moded = _has_recompute(scored_space)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["rank"] + dims + ["memory_mb", "score"] + [str(part) for part in parts])
+        writer.writerow(["rank"] + dims + ([RECOMPUTE_COLUMN] if moded else []) + ["memory_mb", "score"]
+                        + [str(part) for part in parts])
         for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
             split = [repr(float(value)) for value in values] if values else [""] * len(parts)
-            writer.writerow([rank] + config.values() + [memory, repr(float(score))] + split)
+            writer.writerow([config.rank or rank] + config.values() + ([config.recompute] if moded else [])
+                            + [memory, repr(float(score))] + split)
 
 
 def write_estimates_csv(configs_estimated: list, path: str) -> None:
     """Write ND's estimate of every configuration of a classified comparison.
 
     One row per measured configuration, in the comparison's order: its
-    degrees, the measured step, ND's peak memory in MB, its score and the
-    parts of the score. The plots show these only as bars; a sweep needs ND's
+    degrees, the activation checkpoint mode where the measured CSV states
+    one, the measured step, ND's peak memory in MB, its score and the parts
+    of the score. The plots show these only as bars; a sweep needs ND's
     memory as a number, to set it beside the peak the trainer logged.
 
     Args:
@@ -499,12 +588,15 @@ def write_estimates_csv(configs_estimated: list, path: str) -> None:
     parts = _score_parts()
     _make_parent(path)
     dims = [str(dim) for dim in configs_estimated[0][0].keys()] if configs_estimated else []
+    moded = _has_recompute(configs_estimated)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(dims + ["time", "memory_mb", "score"] + [str(part) for part in parts])
+        writer.writerow(dims + ([RECOMPUTE_COLUMN] if moded else []) + ["time", "memory_mb", "score"]
+                        + [str(part) for part in parts])
         for config, memory, step, score, values, _ in configs_estimated:
             split = [repr(float(value)) for value in values[:len(parts)]]
-            writer.writerow(config.values() + [step, memory, repr(float(score))] + split)
+            writer.writerow(config.values() + ([config.recompute] if moded else [])
+                            + [step, memory, repr(float(score))] + split)
 
 
 def busy_time(entry: tuple) -> float:
@@ -620,6 +712,7 @@ def get_real_data(csv_f):
             row_num += 1
             logger.info(row)
             real_time = float(row.pop("time"))
+            recompute = _recompute_of(row)
             config = []
             for dim_str, value in row.items():
                 try:
@@ -628,7 +721,7 @@ def get_real_data(csv_f):
                     config.append((dim, dim.from_str(value)))
                 except ValueError:
                     pass
-            configs.append((Dim.Dimensions(config), real_time))
+            configs.append((Dim.Dimensions(config, recompute=recompute), real_time))
     return configs, row_num
 
 
@@ -648,13 +741,30 @@ def get_diff_dims(csv_f):
 
 
 def get_comm_classified_data(csv_f, plot_idle=False):
-    """Read time components of different configurations on a given csv file"""
+    """Read time components of different configurations on a given csv file.
+
+    ``time`` is the mean of the PROFILED steps, which is what the instrument
+    read and not what the model costs: on Ascend the profiler adds 0.33 to
+    0.84 s a step at EP 1 and 0.01 to 0.10 at EP 8, which is enough to reverse
+    a ranking. A CSV may therefore carry ``step_trainer`` as well, the
+    trainer's own step time over steps it did not profile, and this reads it
+    into the parts under the same name for whoever ranks the round.
+
+    It is deliberately NOT substituted for ``time`` here. The parts carry the
+    profiler's cost too, so the step less its parts goes negative against the
+    honest total on 4 of the 15 points of the 2 October round, to -499 ms at
+    EP 1, where against the profiled step the same residual is +96 to +454.
+    Idle stays a profiled quantity until the parts have a correction of their
+    own; only the total is honest enough to rank on.
+    """
     configs = []
     with open(csv_f, newline="", encoding="utf-8") as csv_file:
         rows = csv.DictReader(csv_file)
         for row in rows:
             logger.info(row)
             time = float(row.pop("time"))
+            trainer_step = (row.pop(TRAINER_STEP, "") or "").strip()
+            recompute = _recompute_of(row)
             config = []
             comm_wait_time_classified = {}
             total_wait = 0
@@ -677,6 +787,8 @@ def get_comm_classified_data(csv_f, plot_idle=False):
                     dim = Dim.get_dim(component)
                     config.append((dim, dim.from_str(value_str)))
             comm_wait_time_classified["BUBBLE"] = comm_wait_time_classified.get(str(RealParts.PP_WAIT))
+            if trainer_step:
+                comm_wait_time_classified[TRAINER_STEP] = float(trainer_step)
             if plot_idle:
                 comm_wait_time_classified["IDLE"] = time - total_wait
                 logger.info(
@@ -685,7 +797,7 @@ def get_comm_classified_data(csv_f, plot_idle=False):
                     total_wait,
                 )
             configs.append(
-                (Dim.Dimensions(config), time, comm_wait_time_classified)
+                (Dim.Dimensions(config, recompute=recompute), time, comm_wait_time_classified)
             )
     return configs
 

@@ -20,7 +20,7 @@ import textwrap
 import inspect
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import strategy_guarded
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
@@ -345,21 +345,8 @@ class _HookManager(_Backbone):
     def set_ccfg(self, hook):
         """overwrite cost model variable (except strategy)"""
         if hook and callable(hook):
-
-            def custom_setter(self, name, value):
-                strat_vars = ["d", "t", "ep", "p", "vp", "cp", "os_max_shard"]
-                if name in strat_vars:
-                    raise AttributeError(
-                        f"Cannot directly modify {name}, use set_strategy()"
-                    )
-                self.__dict__[name] = value
-
-            original_setter = CostModelConfig.__setattr__
-            CostModelConfig.__setattr__ = custom_setter
-            try:
+            with strategy_guarded(self._ccfg):
                 hook(self._ccfg)
-            finally:
-                CostModelConfig.__setattr__ = original_setter
 
     def __wrap_mem_counter(self, mem_type: MemType, fun: Callable) -> None:
         """Wrap formula calls to accumulate memory by type."""

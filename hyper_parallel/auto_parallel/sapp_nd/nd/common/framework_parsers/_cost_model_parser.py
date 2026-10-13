@@ -14,36 +14,28 @@
 # ============================================================================
 """cost model parser module"""
 from __future__ import annotations
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Tuple
 
-import math
+import logging
 from abc import ABC
 from abc import abstractmethod
 
+from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
+from hyper_parallel.auto_parallel._op_profiles import infer_arch, load_op_profile, resolve_ops
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+
+# What a parse says a run should read: the memory logger is off below -v 4.
+parse_logger = logging.getLogger(__name__)
+
+# The optimizer a config that states none is priced as, with a warning: the
+# shipped recipes state AdamW and Muon both, so none is assumed silently.
+DEFAULT_OPTIMIZER = "adamw"
+
 if TYPE_CHECKING:
+    from typing import Mapping, Optional
+    from hyper_parallel.auto_parallel._layer_stack import LayerStack
+    from hyper_parallel.auto_parallel._model_spec import OpCounts
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
-
-# The recompute switches of HyperParallel's selective activation checkpointing
-# (hyper_parallel/distributed/activation_checkpoint.py). It keeps the outputs of
-# matmul and attention kernels and of reduce-scatter, all-to-all and all-reduce,
-# and recomputes everything else, all-gathers included. A switch at 1 keeps the
-# op's activation and 0 recomputes it. The policy also recomputes every other
-# projection matmul, which has no switch, so that part is not priced.
-HYPER_SELECTIVE_REC_OP = {
-    "attBMM": 1,
-    "headCast": 0,
-    "dropout": 0,
-    "softmax": 0,
-    "normOp": 0,
-    "gather": 0,
-    "ffAct": 0,
-}
-
-
-def runs_hyper_selective(ccfg: Any) -> bool:
-    """Whether *ccfg*'s selective layers run HyperParallel's policy: their switches are its switches."""
-    switches = vars(ccfg.rec_op) if getattr(ccfg, "rec_op", None) is not None else {}
-    return all(switches.get(name) == state for name, state in HYPER_SELECTIVE_REC_OP.items())
 
 
 class _CostModelParser(ABC):
@@ -62,89 +54,67 @@ class _CostModelParser(ABC):
         """
 
     @staticmethod
-    def hyper_rec_op(selective: bool | list) -> dict[str, int]:
-        """Recompute switches for a HyperParallel activation checkpoint mode.
+    def stated_optimizer(stated: Any) -> Tuple[str, int]:
+        """Name the optimizer a config states, and the states it keeps a parameter, which its name decides.
 
-        Args:
-            selective: The parsed ``sel_rec``: truthy when the run uses
-                selective activation checkpointing.
+        Muon keeps one momentum a matrix and AdamW two moments a parameter.
+        A config that states no optimizer is priced as AdamW, and the parser
+        says so: the HyperParallel parser named one silently and charged its
+        two states, which a Muon run described without its optimizer does
+        not keep, and the MindFormers parser failed on the missing section
+        (M3). The name is what the state count is read from (M5).
 
         Returns:
-            The switches for ``ccfg.rec_op``: :data:`HYPER_SELECTIVE_REC_OP`
-            for a selective run, and every op kept otherwise.
+            The optimizer's name and the states it keeps a parameter.
         """
-        if selective:
-            return dict(HYPER_SELECTIVE_REC_OP)
-        return dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1)
-
-    @staticmethod
-    def state_qk_norm(ccfg, qk_norm):
-        """State whether the model normalizes each head's queries and keys, and the QK-norm each layer runs.
-
-        A layer group whose attention has none, a linear one, states 0 instead.
-        """
-        ccfg.qk_norm = bool(qk_norm)
-        ccfg.n_qknorm = 1 if ccfg.qk_norm else 0
-
-    @staticmethod
-    def optimizer_ranks(ccfg):
-        """How many data-parallel ranks the optimizer shards a parameter over.
-
-        ``os_max_shard`` counts them, as MindSpore's ``optimizer_weight_shard_size``
-        and HyperParallel's ``dp_shard`` do, on top of TP's sharding.  A count
-        that does not divide DP shards over all of it, as MindSpore does.
-        """
-        ranks = int(ccfg.os_max_shard or 0)
-        return ranks if ranks >= 1 and ccfg.d % ranks == 0 else ccfg.d
-
-    @staticmethod
-    def routed_expert_shard(ccfg, ranks):
-        """How many ranks a routed expert's parameters and optimizer states are sharded over.
-
-        A run that states its expert shard, as HyperParallel's ``edp_shard_size``,
-        shards an expert under expert parallelism over as many ranks of its expert
-        data-parallel group: the stage's ranks over EP, whatever their DP, CP or
-        TP, the group of ranks that hold the same experts.  Without expert
-        parallelism its FSDP shards the experts with the other parameters, over
-        the optimizer's *ranks*.  Stated by no one, the optimizer shards them over
-        the whole group.  A run that shards each strategy's experts over its
-        whole group (``expert_shard_group``) does so under expert parallelism
-        whatever shard it states, since the group changes with the strategy.
-        """
-        stated = getattr(ccfg, "expert_shard", None)
-        if getattr(ccfg, "expert_shard_group", False) and ccfg.ep > 1:
-            return max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep)
         if not stated:
-            return (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
-        if ccfg.ep > 1:
-            return math.gcd(int(stated), max(1, ccfg.d * ccfg.cp * ccfg.t // ccfg.ep))
-        return ranks * ccfg.cp * ccfg.t_exp
+            parse_logger.warning("the config states no optimizer: it is priced as %s, two states a parameter",
+                                 DEFAULT_OPTIMIZER)
+            stated = DEFAULT_OPTIMIZER
+        name = str(stated)
+        return name, 1 if "muon" in name.lower() else 2
 
-    def config_optimizer_shard(self, ccfg):
-        """OP related variables; a routed expert is sharded as :meth:`routed_expert_shard` says."""
-        # With optimizer sharding, a parameter is sharded over TP and then
-        # over the optimizer's data-parallel ranks.
-        ranks = _CostModelParser.optimizer_ranks(ccfg) if ccfg.has_op else 1
-        # Non expert params
-        ccfg.shard_p_os_non_exp_partial = ranks * ccfg.t * ccfg.cp
-        ccfg.shard_p_os_non_exp = (
-            (ccfg.d if ccfg.has_op else 1) * ccfg.cp * ccfg.t
-        )
+    @staticmethod
+    def state_optimizer(ccfg: Any, stated: Any) -> None:
+        """Set the optimizer a config states and its state count on *ccfg* (``stated_optimizer``)."""
+        ccfg.optimizer, ccfg.optimizer_states = _CostModelParser.stated_optimizer(stated)
 
-        # Expert params
-        ccfg.shard_p_os_exp_partial = math.gcd(ccfg.n_exp, ranks * ccfg.t_exp)
-        ccfg.shard_p_os_exp = _CostModelParser.routed_expert_shard(ccfg, ranks)
+    def config_op_counts(
+        self,
+        ccfg: _CostModVar,
+        arch: Optional[str] = None,
+        ops: Optional[Mapping[str, OpCounts]] = None,
+    ) -> None:
+        """Settle the op profile the model is priced with.
 
-        # Gradients: as the parameters are when FSDP holds them so, over the
-        # whole optimizer shard under gradient sharding, over TP alone
-        # otherwise.
-        if getattr(ccfg, "grads_as_params", False):
-            grads = (ccfg.shard_p_os_non_exp_partial, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
-        elif ccfg.has_grad_shard:
-            grads = (ccfg.shard_p_os_non_exp, ccfg.shard_p_os_exp, ccfg.shard_p_os_exp_partial)
-        else:
-            grads = (ccfg.t, ccfg.t_exp, ccfg.t_exp)
-        ccfg.shard_grad_non_exp, ccfg.shard_grad_exp, ccfg.shard_grad_exp_partial = grads
+        A parser that reads a declared arch passes it, with any op counts the
+        spec declares; one that has only a model name leaves the family to
+        :func:`infer_arch`.
+        """
+        ccfg.arch = arch or infer_arch(ccfg.model_name)
+        ccfg.op_counts = resolve_ops(ccfg.arch, ops)
+
+    @staticmethod
+    def config_layer_stack(ccfg: _CostModVar, stack: Optional[LayerStack] = None) -> None:
+        """Settle the layer stack the estimators price.
+
+        Args:
+            ccfg: The config, with its arch, op counts and layer counts parsed.
+            stack: The stack the model states.  By default, the one its layer
+                counts imply: dense layers first, two halves, or one kind.
+        """
+        if stack is None:
+            layers = derive_layers(
+                load_op_profile(ccfg.arch), int(ccfg.n_lay), int(ccfg.n_mtp or 0),
+                first_k_dense=int(ccfg.k_1st_dense or 0),
+            )
+            stack = resolve_layers(ccfg.arch, layers, ccfg.op_counts)
+        ccfg.layer_stack = stack
+        if len(stack.groups) > 1:
+            logger.info(
+                "%s layer stack: %s", ccfg.model_name,
+                ", ".join(f"{group.count}x{group.kind.name}" for group in stack.groups),
+            )
 
     # def config_op_level(self, ccfg, strategy):
     #     def full_partial():
@@ -179,48 +149,3 @@ class _CostModelParser(ABC):
         hff = int(2 * hff / 3)
         hff = multiple_of * ((hff + multiple_of - 1) // multiple_of)
         return hff
-
-    def config_comm_flag(self, ccfg):
-        """comm flag variables"""
-        ccfg.comm_d_non_exp = (
-            0
-            if ((ccfg.d == 1) or not ccfg.has_op)
-            else (2 if not ccfg.has_grad_shard else 3)
-        )  # data parallel comm factor
-        ccfg.comm_d_exp = (
-            0
-            if ((ccfg.d_exp == 1) or not ccfg.has_op)
-            else (2 if not ccfg.has_grad_shard else 3)
-        )  # data parallel comm factor
-        ccfg.comm_t = float(ccfg.t > 1)  # tensor parallel comm factor
-        ccfg.comm_ep = float(
-            ccfg.ep > 1 or ccfg.n_exp > 1
-        )  # expert parallel comm factor
-        ccfg.comm_cp = float(ccfg.cp > 1)  # context parallel comm factor
-        ccfg.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
-        ccfg.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
-
-    def config_dp_tp_exp(self, ccfg):
-        """MoE strategy variables"""
-        if ccfg.etp > 1:
-            ccfg.t_exp = ccfg.etp
-            # d * t = inner dp * outer dp * etp
-            # inner dp = EP, outer dp = the rest
-            ccfg.d_exp = ccfg.d * ccfg.t * ccfg.cp // ccfg.t_exp // ccfg.ep
-        else:
-            ccfg.t_exp = ccfg.t
-            if ccfg.d >= ccfg.ep:
-                ccfg.d_exp = ccfg.d // ccfg.ep
-            else:
-                ccfg.d_exp = ccfg.d * ccfg.t // ccfg.ep
-            if ccfg.t_exp * ccfg.ep > ccfg.d * ccfg.t:
-                ccfg.t_exp = 1
-
-        exp_group1_invalid = ccfg.d_exp < 1 or ccfg.t_exp < 1
-        exp_group2_invalid = ccfg.hff_exp < 1 or ccfg.n_exp < 1
-        if exp_group1_invalid or exp_group2_invalid:
-            raise TypeError(
-                f"MoE parsing error: d_exp({ccfg.d_exp})/t_exp({ccfg.t_exp})/"
-                f"hff_exp({ccfg.hff_exp})/n_exp({ccfg.n_exp})/"
-                f"DP = {ccfg.d}, TP = {ccfg.t}, EP = {ccfg.ep}/"
-            )

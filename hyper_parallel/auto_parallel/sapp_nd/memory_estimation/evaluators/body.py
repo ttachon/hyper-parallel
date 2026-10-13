@@ -15,7 +15,8 @@
 """Body module"""
 from __future__ import annotations
 from typing import TYPE_CHECKING, NamedTuple
-from hyper_parallel.auto_parallel._layer_census import KindActivations
+from hyper_parallel.auto_parallel._model_spec import KindActivations
+from hyper_parallel.auto_parallel._op_records import load_op_records
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
@@ -29,15 +30,13 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
     detect_attention_type,
     compute_kv_dim,
 )
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    runs_hyper_selective,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import runs_hyper_selective
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
-    from typing import Tuple
+    from typing import Optional, Tuple
 
 # Bytes per element of the attention tensors that CP shards.
 _CP_ATTENTION_SCORES_BYTES = 4
@@ -182,8 +181,8 @@ class EvalBody:
         """activations"""
         census = getattr(ccfg, "kind_activations", None)
         if isinstance(census, KindActivations) and (
-                ctx.current_node != LayerType.SEL_REC_LAYER
-                or census.selective is not None and runs_hyper_selective(ccfg)):
+                ctx.current_node != LayerType.SEL_REC_LAYER or census.ops is not None
+                or census.selective is not None and runs_hyper_selective(ccfg, EvalUtils.switches(ccfg, ctx))):
             return EvalBody.census_activ(ccfg, ctx, census)
         attn_size = sum(
             [
@@ -207,22 +206,65 @@ class EvalBody:
         set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
         of the sequence: TP splits one part, sequence parallelism the
         other, and CP that gathers keys and values leaves them whole
-        (:meth:`EvalAttn.kv_shards`).  A selective layer keeps what the
-        census measured under HyperParallel's selective checkpointing, whose
-        switches it has (:func:`runs_hyper_selective`): other switches drop
-        parts the census does not tell apart, and its formulas price it.
+        (:meth:`EvalAttn.kv_shards`).  A selective layer keeps what
+        :meth:`census_kept` says, and its backward holds what the plain
+        layer's does.
         """
         tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
         held = census.working / max(1, ccfg.sp) + census.working_tp / max(1, ccfg.t)
         # A census counts a rank's share of the keys and values; where CP
-        # gathers them the attention keeps the rest of the sequence's too,
-        # but for a selective layer, which gathers them again to recompute.
+        # gathers them the attention keeps the rest of the sequence's too.
         gathered = EvalAttn.gathered_kv_bytes(ccfg)
         if ctx.current_node == LayerType.SEL_REC_LAYER:
-            kept = census.selective / max(1, ccfg.sp) + census.selective_tp / max(1, ccfg.t)
-            return EvalUtils.census_bytes(ctx, tokens, kept, held + gathered)
+            return EvalUtils.census_bytes(ctx, tokens, EvalBody.census_kept(ccfg, ctx, census), held + gathered)
         kept = census.saved / max(1, ccfg.sp) + census.saved_tp / max(1, ccfg.t)
         return EvalUtils.census_bytes(ctx, tokens, kept + gathered, held + gathered)
+
+    @staticmethod
+    def census_kept(ccfg: CostModelConfig, ctx: Context, census: KindActivations) -> float:
+        """What a selective layer of a kind *census* prices keeps, bytes per token of a CP rank's share.
+
+        Under HyperParallel's selective checkpointing, whose switches it has
+        (:func:`runs_hyper_selective`), what the census measured under it;
+        the keys and values CP gathers it gathers again to recompute.  Under
+        other switches, what the census's records per op state for each op
+        they keep (:func:`load_op_records`): an op no switch names, and the
+        census's ``other``, whatever they say; the keys and values CP
+        gathers where the attention's batched matmuls are kept.  Split as
+        what the plain layer keeps (:meth:`census_activ`).
+        """
+        if census.selective is not None and runs_hyper_selective(ccfg, EvalUtils.switches(ccfg, ctx)):
+            return census.selective / max(1, ccfg.sp) + census.selective_tp / max(1, ccfg.t)
+        records = load_op_records().ops
+
+        def keeps(op: str) -> bool:
+            """Whether the layer keeps what the census states for *op*."""
+            switch = records[op].switch if op in records else None
+            return switch is None or bool(EvalUtils.switch(ccfg, ctx, switch))
+
+        kept = sum(size for op, size in census.ops.items() if keeps(op)) / max(1, ccfg.sp)
+        kept += sum(size for op, size in census.ops_tp.items() if keeps(op)) / max(1, ccfg.t)
+        return kept + (EvalAttn.gathered_kv_bytes(ccfg) if keeps("attBMM") else 0)
+
+    @staticmethod
+    def census_working_terms(ccfg: CostModelConfig, ctx: Context) -> Optional[Tuple[float, float]]:
+        """What a selective layer priced by its census's records per op keeps, and what its backward holds.
+
+        In bytes, at one micro-batch: the two terms of its working set as
+        warm-up ends (:meth:`EvalUtils.census_bytes`), which is not the sum
+        of its ops' where the layer keeps more than its backward holds.
+        ``None`` for a layer its census does not price so: plain, fully
+        recomputed, under HyperParallel's policy, or without a census's
+        records per op.
+        """
+        census = getattr(ccfg, "kind_activations", None)
+        if (not isinstance(census, KindActivations) or census.ops is None
+                or ctx.current_node != LayerType.SEL_REC_LAYER
+                or census.selective is not None and runs_hyper_selective(ccfg, EvalUtils.switches(ccfg, ctx))):
+            return None
+        tokens = ccfg.s * ccfg.b / max(1, ccfg.cp)
+        held = census.working / max(1, ccfg.sp) + census.working_tp / max(1, ccfg.t)
+        return tokens * EvalBody.census_kept(ccfg, ctx, census), tokens * (held + EvalAttn.gathered_kv_bytes(ccfg))
 
     # Full recompute
 

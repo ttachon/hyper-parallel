@@ -21,7 +21,7 @@ Reads Search Config (``search.yaml``) and HyperParallel training config
 import copy
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 try:
     import yaml  # type: ignore[import-untyped]  # pylint: disable=C0415
@@ -29,13 +29,21 @@ except ImportError:
     yaml = None  # pragma: no cover
 
 from hyper_parallel.auto_parallel._hf_model_spec import (
+    exec_overrides,
     is_auto_models_schema,
     resolve_hf_model_spec,
 )
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_activation_checkpoint_mode
 
 logger = logging.getLogger(__name__)
+
+
+def _recompute_strategy(stated: Any, where: str) -> str:
+    """The estimator's recompute strategy for an activation checkpoint mode a yaml states, which says off as none."""
+    mode = read_activation_checkpoint_mode(stated, where)
+    return "none" if mode == "off" else mode
 
 # Mapping from HuggingFace-style config_overrides keys to internal names.
 # After field-name alignment, most HP YAML keys already match the internal
@@ -103,10 +111,11 @@ _MODEL_RUN_KEYS = ("_target_", "torch_dtype", "param_init_type", "compute_dtype"
 _RUN_SECTIONS = ("model_init_dtype", "accelerator", "fsdp_config", "training", "optimizer", "plan_overrides")
 
 # The ``context`` keys of a train.yaml that state how the cost model prices
-# the run: a census of the layers, a vision tower's token count, and a
-# launcher that shards each strategy's experts over its whole expert group.
-# The device count and the memory budget are a search's own.
-_RUN_CONTEXT_KEYS = ("census", "visual_seq_len", "expert_shard")
+# the run: a census of the layers, the census's spec of the model, a vision
+# tower's token count, a launcher that shards each strategy's experts over
+# its whole expert group, and what a MoE layer's token dispatch costs on this
+# cluster.  The device count and the memory budget are a search's own.
+_RUN_CONTEXT_KEYS = ("census", "census_spec", "visual_seq_len", "expert_shard", "moe_dispatch")
 
 # The keys of a legacy train.yaml's ``train`` section that are not its
 # training settings: recompute, the search's, and precision, which the cost
@@ -152,15 +161,18 @@ def _load_auto_models_model_spec(
     model_raw: Dict[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    census_spec: bool = False,
     replacements: tuple = (),
 ) -> Dict[str, Any]:
     """Resolve model dimensions through the shared AutoModels path.
 
     Delegates to :func:`resolve_hf_model_spec` so this reader and the
-    SAPP-ND parser cannot disagree about field names or fallbacks.
+    SAPP-ND parser cannot disagree about field names or fallbacks.  The run
+    keys of ``config_overrides`` ride along, as the adapter hands them on.
     """
-    return _normalize_model_spec(
-        resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, replacements))
+    spec = resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, census_spec, replacements)
+    spec.update(exec_overrides(model_raw))
+    return _normalize_model_spec(spec)
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -201,7 +213,7 @@ def _load_yaml(path: str) -> Dict[str, Any]:
 
 def _parse_unified_parallelism(
     para_raw: Dict[str, Any],
-) -> Tuple[Dict[str, List[int]], Dict[str, Any], Set[str]]:
+) -> Tuple[Dict[str, List[int]], Dict[str, Any]]:
     """Convert the unified parallelism declaration into search_space + constraint.
 
     Rules:
@@ -219,7 +231,7 @@ def _parse_unified_parallelism(
     """
     search_space: Dict[str, List[int]] = {}
     constraint: Dict[str, Any] = {}
-    auto: Set[str] = set()
+    auto: set = set()
 
     for short_key, canonical_key in _UNIFIED_DIM_MAP.items():
         if short_key not in para_raw:
@@ -274,6 +286,76 @@ def _describe_parallelism(
             state = f"searched over {candidates}"
         parts.append(f"{short_key}={state}")
     return "; ".join(parts)
+
+
+def _stated_recompute_modes(raw: Dict[str, Any]) -> Dict[str, Tuple[str, ...]]:
+    """Return the trainer modes ``recompute_modes`` lets a search choose among, as the estimator's entry.
+
+    Under ``recompute: auto`` or ``per_layer`` the search chooses among the
+    trainer's activation checkpoint modes: off and full, and its selective
+    policy where a census prices it. ``recompute_modes`` narrows them. YAML
+    reads an unquoted ``off`` as False.
+
+    Returns:
+        ``{"recompute_modes": modes}``, or an empty dict where the search
+        config states none.
+
+    Raises:
+        ValueError: For an empty list, or a mode the trainer does not run.
+    """
+    stated = raw.get("recompute_modes")
+    if stated is None:
+        return {}
+    listed = list(stated) if isinstance(stated, (list, tuple)) else [stated]
+    modes = tuple("off" if mode is False else str(mode) for mode in listed)
+    unknown = sorted(set(modes) - {"off", "selective", "full"})
+    if unknown or not modes:
+        raise ValueError(f"recompute_modes {listed}: expected some of off, selective and full")
+    return {"recompute_modes": modes}
+
+
+def _stated_recompute(raw: Dict[str, Any], parallelism_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the estimator's recompute entries, from ``parallelism.recompute`` where it is stated.
+
+    ``parallelism.recompute`` states recompute as a degree is stated: one
+    mode, a list of modes, or ``auto`` for every mode the trainer runs that
+    the search can price. The search then chooses among them for each
+    strategy, as ``recompute: auto`` with ``recompute_modes`` does, or for each
+    layer where the top-level ``recompute`` says ``per_layer``. A mode left
+    out is never chosen.
+
+    Returns:
+        ``recompute_strategy``, and ``recompute_modes`` where a list narrows
+        the modes.
+
+    Raises:
+        ValueError: For a mode the trainer does not run, or when recompute
+            is stated twice: the dimension beside ``recompute_modes``, or
+            beside a top-level ``recompute`` that fixes one mode.
+    """
+    stated = parallelism_raw.get("recompute")
+    strategy = str(raw.get("recompute", "none"))
+    if stated is None:
+        return {"recompute_strategy": strategy, **_stated_recompute_modes(raw)}
+    if "recompute_modes" in raw:
+        raise ValueError("recompute modes are stated twice, in parallelism.recompute and recompute_modes: "
+                         "keep parallelism.recompute")
+    if strategy not in ("none", "auto", "per_layer"):
+        raise ValueError("recompute is stated twice: parallelism.recompute searches it as a dimension and the "
+                         f"top-level recompute fixes {strategy}; keep parallelism.recompute, with recompute: "
+                         "per_layer for a mode per layer")
+    chosen = "per_layer" if strategy == "per_layer" else "auto"
+    if not isinstance(stated, (list, tuple)) and str(stated).strip().lower() == "auto":
+        return {"recompute_strategy": chosen}
+    return {"recompute_strategy": chosen, **_stated_recompute_modes({"recompute_modes": stated})}
+
+
+def _describe_recompute(estimator: Dict[str, Any]) -> str:
+    """Report how a recompute dimension was resolved, as :func:`_describe_parallelism` reports a degree."""
+    modes = estimator.get("recompute_modes")
+    among = f"among {list(modes)}" if modes else "among every mode it can price"
+    per_layer = " per layer" if estimator["recompute_strategy"] == "per_layer" else ""
+    return f"recompute=chosen{per_layer} {among}"
 
 
 def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
@@ -354,7 +436,7 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
 
     estimator: Dict[str, Any] = {
         "type": "symbolic",
-        "recompute_strategy": str(raw.get("recompute", "none")),
+        **_stated_recompute(raw, parallelism_raw),
         "enable_profiling_calibration": False,
     }
 
@@ -367,6 +449,8 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     summary = _describe_parallelism(
         search_space, auto_dims, parallelism_raw, bool(base_config)
     )
+    if parallelism_raw.get("recompute") is not None:
+        summary += "; " + _describe_recompute(estimator)
     logger.info("parallelism resolved: %s", summary)
 
     return NormalizedConfig(
@@ -446,30 +530,50 @@ _AUTO_MODELS_ACCEL_TO_SEARCH = {
 }
 
 
-def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Load model dimensions and training attributes from AutoModels YAML."""
+def _census_replacements(raw: Dict[str, Any], census_seq_len: int) -> tuple:
+    """The module replacements a census runs its layers with: the ones the train.yaml's plan_overrides install."""
+    if not census_seq_len:
+        return ()
+    return replacement_specs(raw.get("plan_overrides") or ())
+
+
+def _training_seq_len(raw: Dict[str, Any]) -> Any:
+    """Return the training sequence length an AutoModels YAML states, or None.
+
+    Reads the three spellings the SAPP-ND parser accepts, in its order, so the
+    two halves of the cost model agree on where the length comes from: the
+    Online path's, an Indexed Dataset's, the legacy one.
+    """
+    dataset_raw = _get_dict(raw, "dataset")
+    return (_get_dict(dataset_raw, "data_transform").get("max_seq_len")
+            or _get_dict(dataset_raw, "data_config").get("seq_length")
+            or _get_dict(raw, "data").get("max_seq_len"))
+
+
+def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
+    """Construct a normalized config from the current AutoModels schema."""
     model_raw = _get_dict(raw, "model")
     training_raw = _get_dict(raw, "training")
-    dataset_raw = _get_dict(raw, "dataset")
-    data_transform_raw = _get_dict(dataset_raw, "data_transform")
-    context_raw = _get_dict(raw, "context")
+    accelerator_raw = _get_dict(raw, "accelerator")
+    fsdp_raw = _get_dict(raw, "fsdp_config")
+    activation_raw = _get_dict(raw, "activation_checkpoint")
 
-    # Both spellings the SAPP-ND parser accepts, so the two halves of the
-    # cost model agree on where the training sequence length comes from.
-    seq_len = data_transform_raw.get("max_seq_len") or _get_dict(raw, "data").get("max_seq_len")
+    context_raw = _get_dict(raw, "context")
+    seq_len = _training_seq_len(raw)
     # A census builds its layers from the checkpoint's config, which only
     # this reader resolves: the search hands ND the spec, its records in it.
     census_seq_len = int(seq_len or 4096) if context_raw.get("census") else 0
     model_spec = _load_auto_models_model_spec(
-        model_raw, context_raw.get("visual_seq_len"), census_seq_len, _census_replacements(raw, census_seq_len),
+        model_raw, context_raw.get("visual_seq_len"), census_seq_len, bool(context_raw.get("census_spec")),
+        _census_replacements(raw, census_seq_len),
     )
     if seq_len:
         model_spec["max_position_embeddings"] = seq_len
     else:
         logger.warning(
-            "no dataset.data_transform.max_seq_len (nor data.max_seq_len): costing "
-            "the model's context limit of %s tokens, which for a long-context model "
-            "puts every candidate out of memory",
+            "no dataset.data_transform.max_seq_len, dataset.data_config.seq_length "
+            "nor data.max_seq_len: costing the model's context limit of %s tokens, "
+            "which for a long-context model puts every candidate out of memory",
             model_spec.get("max_position_embeddings", 4096),
         )
         model_spec.setdefault("max_position_embeddings", 4096)
@@ -477,17 +581,8 @@ def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any
         model_spec["device_num"] = int(context_raw["device_num"])
     model_spec["local_batch_size"] = training_raw.get("micro_batch_size", 1)
     model_spec["compute_dtype"] = model_raw.get("torch_dtype", "bfloat16")
-    return model_spec
 
-
-def _load_auto_models_parallelism(
-    raw: Dict[str, Any],
-) -> Tuple[Dict[str, List[int]], int, int]:
-    """Load fixed parallelism degrees from AutoModels YAML."""
-    accelerator_raw = _get_dict(raw, "accelerator")
-    fsdp_raw = _get_dict(raw, "fsdp_config")
     search_space: Dict[str, List[int]] = {}
-
     dp_shard_size = fsdp_raw.get("dp_shard_size")
     if dp_shard_size is not None:
         search_space["data_parallel_shard_degree"] = [int(dp_shard_size)]
@@ -496,41 +591,18 @@ def _load_auto_models_parallelism(
         if value is not None:
             search_space[search_name] = [int(value)]
 
-    data_parallel_size = int(dp_shard_size or 1)
-    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
-    return search_space, data_parallel_size, pp_degree
-
-
-def _census_replacements(raw: Dict[str, Any], census_seq_len: int) -> tuple:
-    """The module replacements a census runs its layers with: the ones the train.yaml's plan_overrides install."""
-    if not census_seq_len:
-        return ()
-    return replacement_specs(raw.get("plan_overrides") or ())
-
-
-def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
-    """Construct a normalized config from the current AutoModels schema."""
-    model_spec = _load_auto_models_model_spec_from_yaml(raw)
-    search_space, data_parallel_size, pp_degree = _load_auto_models_parallelism(raw)
-    training_raw = _get_dict(raw, "training")
-    activation_raw = _get_dict(raw, "activation_checkpoint")
-
     global_batch_size = int(training_raw.get("global_batch_size", 0) or 0)
     local_batch_size = int(model_spec["local_batch_size"] or 1)
+    data_parallel_size = int(dp_shard_size or 1)
     micro_batch_num = (
         global_batch_size // (local_batch_size * data_parallel_size)
         if global_batch_size
         and global_batch_size % (local_batch_size * data_parallel_size) == 0
         else 1
     )
+    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
 
-    mode = str(activation_raw.get("mode", "off"))
-    recompute_map = {
-        "off": "none",
-        "none": "none",
-        "full": "full",
-        "selective": "selective",
-    }
+    recompute_strategy = _recompute_strategy(activation_raw.get("mode"), "activation_checkpoint.mode")
     return NormalizedConfig(
         model_spec=model_spec,
         cluster_spec={},
@@ -541,7 +613,7 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
         },
         estimator={
             "type": "symbolic",
-            "recompute_strategy": recompute_map.get(mode, "none"),
+            "recompute_strategy": recompute_strategy,
         },
         pp_config={
             "pp_degree": pp_degree,
@@ -617,11 +689,11 @@ def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     }
 
     # --- estimator from gradient_checkpointing ---
-    ac_mode = str(gc_raw.get("activation_checkpoint", "none"))
-    recompute_map = {"none": "none", "full": "full", "selective": "selective"}
     estimator: Dict[str, Any] = {
         "type": "symbolic",
-        "recompute_strategy": recompute_map.get(ac_mode, "none"),
+        "recompute_strategy": _recompute_strategy(
+            gc_raw.get("activation_checkpoint"), "train.gradient_checkpointing.activation_checkpoint"
+        ),
     }
 
     model_spec = _normalize_model_spec(model_spec)

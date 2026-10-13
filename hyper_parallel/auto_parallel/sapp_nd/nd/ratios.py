@@ -28,7 +28,7 @@ when fitted on the others.
 import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts
+from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, TRAINER_STEP
 
 # Each ratio of the file: the ND parts it scales and the measured columns it
 # is fitted to. The classifier's Ascend path files FSDP's gathers and
@@ -71,6 +71,19 @@ def _measured(entry: tuple, columns: Sequence[str]) -> float:
 def busy(entry: tuple) -> float:
     """The measured step of a comparison entry less idle: every column a ratio is fitted to."""
     return sum(_measured(entry, columns) for _, _, columns in FITS)
+
+
+def step(entry: tuple) -> float:
+    """The measured step of a comparison entry, the trainer's own where it has one.
+
+    ``entry[2]`` is the mean of the profiled steps, and the profiler is not free:
+    it costs 0.33 to 0.84 s a step at EP 1 against 0.01 to 0.10 at EP 8, so
+    ranking on it reversed EP 1 against EP 2 on the 2 October round. Where the
+    round harvested the trainer's own step time the comparison ranks on that
+    instead, while every part, and with it ``busy`` above, stays as the profile
+    measured it.
+    """
+    return entry[5].get(TRAINER_STEP) or entry[2]
 
 
 def fit_ratios(entries: Sequence[tuple]) -> Dict[str, float]:
@@ -164,7 +177,9 @@ def report(entries: Sequence[tuple], ratios: Dict[str, float]) -> List[str]:
 
     The corrected estimate leaves out idle, which ND does not price, so it is
     set beside the busy time; the cost of following the corrected ND is
-    measured on the whole step.
+    measured on the whole step, the trainer's own where the round harvested it
+    and the profiled one otherwise. The last line says which, because the two
+    disagree by enough to change the answer.
     """
     lines = ["Ratios, measured milliseconds per ND unit:"]
     lines += [f"  {key:10s} {value:.4e}" for key, value in ratios.items()]
@@ -174,12 +189,15 @@ def report(entries: Sequence[tuple], ratios: Dict[str, float]) -> List[str]:
     for estimate, out, entry in rows:
         held = f"{out:9.1f} {busy(entry):8.1f} {out / busy(entry) - 1:+7.1%}" if out is not None else \
             f"{'-':>9s} {busy(entry):8.1f} {'-':>7s}"
-        lines.append(f"  {label(entry[0]):22s} {estimate:9.1f} {held} {entry[2]:8.1f}")
-    pick, fastest = rows[0][2], min(entries, key=lambda entry: entry[2])
-    lines.append(f"Corrected, ND ranks {label(pick[0])} first: it measures {pick[2]:.1f} ms; the fastest, "
-                 f"{label(fastest[0])}, {fastest[2]:.1f}: following the corrected ND costs "
-                 f"{pick[2] / fastest[2] - 1:.1%}.")
-    correlation = spearman([estimate for estimate, _, _ in rows], [entry[2] for _, _, entry in rows])
+        lines.append(f"  {label(entry[0]):22s} {estimate:9.1f} {held} {step(entry):8.1f}")
+    pick, fastest = rows[0][2], min(entries, key=step)
+    lines.append(f"Corrected, ND ranks {label(pick[0])} first: it measures {step(pick):.1f} ms; the fastest, "
+                 f"{label(fastest[0])}, {step(fastest):.1f}: following the corrected ND costs "
+                 f"{step(pick) / step(fastest) - 1:.1%}.")
+    correlation = spearman([estimate for estimate, _, _ in rows], [step(entry) for _, _, entry in rows])
     if correlation is not None:
         lines.append(f"Rank correlation of the corrected estimate with the measured step: {correlation:+.2f}.")
+    harvested = sum(1 for entry in entries if entry[5].get(TRAINER_STEP))
+    lines.append(f"The step above is the trainer's own on {harvested} of {len(entries)} strategies and the mean "
+                 f"of the profiled steps on the rest; every part is the profile's either way.")
     return lines

@@ -33,7 +33,8 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_blo
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import NetworkLevel, PerformanceType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_group_configs,
+    get_layer_switches_by_position,
     get_model_order,
     get_table_quantity,
 )
@@ -42,6 +43,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
     CPAlgo,
     _resolve_cp_algo,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import apply_layer_kind, layer_kinds
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import param_cp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     detect_attention_type,
     AttentionType,
@@ -84,7 +87,11 @@ def _cp_comm_zero(ccfg):
 
 
 class _CPVolumes(NamedTuple):
-    """Algorithm-specific CP communication volumes of one layer."""
+    """Algorithm-specific CP communication volumes of one layer.
+
+    ``comm_volume`` is what :func:`cp_traffic` moves, the only field a score
+    reads; the others are logged.
+    """
 
     kv_volume_per_step: float
     total_kv_volume: float
@@ -115,50 +122,24 @@ def _cp_comm_cost_common(ccfg, volumes, attention_type, kv_dim, cp_algo,
     )
 
 
-def _cp_rec_factor(ccfg, ctx):
-    """Recompute coefficient, matching the old cp_comm_non_exp."""
-    rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
-    rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
-    return (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
-
-
-def _ulysses_cp_volumes(ccfg, rec_factor):
+def _ulysses_cp_volumes(ccfg):
     """Ulysses CP volumes: two All2All over (cp-1)/cp of the local shard."""
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
     t = max(1, ccfg.t)
     local_qkv = s * b * (ccfg.a / t) * ccfg.dh * 2
     a2a_vol = local_qkv * (cp - 1) / cp
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ulysses attention coeff = 0.5*rec_factor + 0.5
-    ulysses_attn_coeff = 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ulysses_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
-    return _CPVolumes(a2a_vol, a2a_vol * 2, comm_vol, 0, 2)
+    return _CPVolumes(a2a_vol, a2a_vol * 2, cp_traffic(ccfg, CPAlgo.ULYSSES_CP), 0, 2)
 
 
-def _ring_cp_volumes(ccfg, rec_factor, kv_dim):
+def _ring_cp_volumes(ccfg, kv_dim, cp_algo):
     """Ring CP volumes: cp-1 P2P steps of s/cp tokens of KV, both directions."""
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
-    t = max(1, ccfg.t)
     kv_bytes = 4
     kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
     total_kv = kv_vol_step * (cp - 1) * 2
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ring attention coeff = 2*0.5*rec_factor + 0.5 (extra /cp from (s/cp)^2)
-    ring_attn_coeff = 2 * 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ring_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
-    return _CPVolumes(kv_vol_step, total_kv, comm_vol, int(cp - 1), 2)
+    return _CPVolumes(kv_vol_step, total_kv, cp_traffic(ccfg, cp_algo), int(cp - 1), 2)
 
 
 def cp_traffic(ccfg: CostModelConfig, cp_algo: CPAlgo) -> float:
@@ -201,7 +182,11 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
         and receives the rest from other ranks.
         Per-All2All volume = s * b * (a/t) * bytes * (cp-1)/cp (head dims).
         Total volume = 2 * per-All2All volume.
+
+    *ctx* is not read: the exchange a recompute sends again is priced by
+    the walk that recomputes it (``_recomputed_comm``).
     """
+    del ctx
     if ccfg.cp <= 1:
         return _cp_comm_zero(ccfg)
 
@@ -213,13 +198,11 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
     cp_algo = _resolve_cp_algo(ccfg)
     topology, effective_bandwidth = _cp_resolve_topology(
         ccfg.cp, ccfg.device_per_node, ccfg.bw_intra, ccfg.bw_inter)
-    rec_factor = _cp_rec_factor(ccfg, ctx)
 
     if cp_algo == CPAlgo.ULYSSES_CP:
-        volumes = _ulysses_cp_volumes(ccfg, rec_factor)
+        volumes = _ulysses_cp_volumes(ccfg)
     else:
-        volumes = _ring_cp_volumes(ccfg, rec_factor, kv_dim)
-    volumes = volumes._replace(comm_volume=cp_traffic(ccfg, cp_algo))
+        volumes = _ring_cp_volumes(ccfg, kv_dim, cp_algo)
     return _cp_comm_cost_common(
         ccfg, volumes, attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
@@ -357,7 +340,7 @@ def estimate_op_bulk_comm(*args, **kwargs):
     fill_tp_table(param["cfg"], param["tables"])
     fill_ep_table(param["cfg"], param["tables"], param["device_type"])
 
-    lccfgs = get_layer_custom_configs(param["cfg"])
+    lccfgs = get_layer_group_configs(param["cfg"])
     logger.info(lccfgs)
     param["layer_count"] = 0
     param["idx_lccfg"] = 0
@@ -514,7 +497,7 @@ def _recomputed_comm(cfg, ctx, layer):
     """
     def _volumes(node):
         ctx.current_node = node
-        kept = EvalUtils.rec_coeff(node == LayerType.SEL_REC_LAYER, cfg.rec_op.gather)
+        kept = EvalUtils.rec_coeff(node == LayerType.SEL_REC_LAYER, EvalUtils.switch(cfg, ctx, "gather"))
         return (
             EvalLayerComm.tp_comm_layer(cfg, ctx, 1),
             EvalLayerComm.ep_comm_layer(cfg, ctx, 1),
@@ -557,7 +540,9 @@ def _fsdp_rounds(cfg) -> tuple:
     """
     micro = max(1, cfg.m)
     reshards = bool(getattr(cfg, "reshards", False))
-    shards = cfg.shard_p_os_non_exp_partial > cfg.t * cfg.cp
+    # Sharded beyond TP and whatever CP adds to the width (param_cp): with
+    # TP times CP, a HyperParallel shard no wider than CP read as none.
+    shards = cfg.shard_p_os_non_exp_partial > cfg.t * param_cp(cfg)
     return (2 if reshards else 1 / micro), (1 if reshards else 1 / micro), (1 / micro if shards else 1)
 
 
@@ -568,9 +553,9 @@ def _accumulate_stage_comm(param, stage, stage_id):
     recompute transfers again, the way the compute estimate counts a
     recomputed op twice.
 
-    A body layer is priced on the walk's config, after its group's hook; the
+    A body layer is priced on the walk's config, in its own kind; the
     embedding and the output layer on the model's config, as its family left
-    it, whichever layer the walk reached last.  Under FSDP (grads_as_params),
+    it, whichever layer the walk reached last.  Under FSDP (grad_shard_as_params),
     a layer's DP volume, and the root's, is the traffic its collectives
     move a micro-batch (:meth:`EvalLayerComm.fsdp_traffic`).
 
@@ -581,7 +566,7 @@ def _accumulate_stage_comm(param, stage, stage_id):
     """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
     reduced = 0.0
-    fsdp = bool(getattr(param["cfg"], "grads_as_params", False))
+    fsdp = bool(getattr(param["cfg"], "grad_shard_as_params", False))
     layer_gathers, root_gathers, reduces = _fsdp_rounds(param["cfg"]) if fsdp else (0, 0, 0)
     for chunk_id, chunk in enumerate(stage):
         for lay_id, layer in enumerate(chunk):
@@ -589,10 +574,12 @@ def _accumulate_stage_comm(param, stage, stage_id):
             position = (stage_id, chunk_id, lay_id)
             is_body = layer not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
             cfg = param["walk"] if is_body else param["cfg"]
-            if is_body and position in param["hooks"]:
-                custom_fun = param["hooks"][position]
-                if custom_fun:
-                    custom_fun(cfg)
+            # A layer's own recompute switches, where the config states several.
+            param["ctx"].switches = param["switches"].get(position) if is_body else None
+            if is_body and position in param["kinds"]:
+                kind = param["kinds"][position]
+                if kind is not None:
+                    apply_layer_kind(cfg, kind)
                 logger.info("is layer moe ? %s", cfg.n_exp > 1)
                 param["ctx"].current_node = LayerType.NOT_REC_LAYER
                 logger.info("param ctx %s", param["ctx"])
@@ -618,8 +605,6 @@ def _accumulate_stage_comm(param, stage, stage_id):
                     cfg, param["ctx"]
                 ).comm_volume
             # min(device_type.level_bound_number[0], param["cfg"].ep)
-            # comm_cp += EvalLayerComm.cp_comm_layer
-            # (param["cfg"], param["ctx"])
             if param["with_recomp"] and layer in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER):
                 tp_again, ep_again, cp_again = _recomputed_comm(cfg, param["ctx"], layer)
                 comm[Dim.TP] += tp_again
@@ -644,16 +629,14 @@ def estimate_from_mem_comm(*args, **kwargs):
         "with_recomp", args[4] if len(args) > 4 else False
     )
     param["ctx"] = prepare_context()
-    # The layers' hooks run on a copy: the model's config leaves the walk as
+    # The layers' kinds go on a copy: the model's config leaves the walk as
     # it entered it, for the next walk and every read after.
     param["walk"] = copy(param["cfg"])
 
-    # Each layer's group hook, in model order; layers past the declared
-    # counts get no entry, so no hook and no DP term.
-    flatten = sum(
-        [[f[1]] * f[0] for f in param["cfg"].layer_custom_config], []
-    )
-    param["hooks"] = dict(zip(get_model_order(param["cfg"], param["stages"]), flatten))
+    # Each layer's kind, in model order; layers past the stack get no entry,
+    # so no kind and no DP term.
+    param["kinds"] = dict(zip(get_model_order(param["cfg"], param["stages"]), layer_kinds(param["cfg"])))
+    param["switches"] = get_layer_switches_by_position(param["cfg"], param["stages"])
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
     # Each stage's all-reduce, the share of its DP time the copies of a shard
     # spend reducing it: estimate_pipeline takes it out of DP_COMM.

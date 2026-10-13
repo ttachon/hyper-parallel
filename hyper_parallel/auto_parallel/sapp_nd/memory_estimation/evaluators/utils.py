@@ -14,7 +14,7 @@
 # ============================================================================
 """Utility submodule"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping
 import operator
 import ast
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -91,6 +91,27 @@ class EvalUtils:
     def rec_coeff(rec_layer: bool, rec_op: bool) -> bool:
         """Masking coefficient for select recompute"""
         return int(not rec_layer) | rec_op
+
+    @staticmethod
+    def switches(ccfg: CostModelConfig, ctx: Context) -> Any:
+        """The switches of the layer *ctx* evaluates: the context's where it states them, else its config's."""
+        stated = getattr(ctx, "switches", None)
+        return stated if isinstance(stated, Mapping) else ccfg.rec_op
+
+    @staticmethod
+    def switch(ccfg: CostModelConfig, ctx: Context, name: str) -> Any:
+        """One recompute switch of the layer *ctx* evaluates, 1 to keep the op's activation and 0 to recompute it."""
+        return EvalUtils.state(EvalUtils.switches(ccfg, ctx), name)
+
+    @staticmethod
+    def state(stated: Any, name: str) -> Any:
+        """Switch *name* in *stated*, a mapping or a config's ``rec_op``: a switch it leaves out keeps its op.
+
+        Read from ``vars``, since a ``Config`` answers 0, recompute, for any
+        attribute it lacks.
+        """
+        values = stated if isinstance(stated, Mapping) else vars(stated) if stated is not None else {}
+        return values.get(name, 1)
 
     @classmethod
     def eval_expr_insight(cls, **kwargs):

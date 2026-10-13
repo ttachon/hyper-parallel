@@ -83,7 +83,7 @@ class EvalLayerComm:
         non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
         return (
             (non_exp, ccfg.t, ccfg.shard_p_os_non_exp_partial, ccfg.d * ccfg.cp * ccfg.t),
-            (routed / ccfg.ep, ccfg.t_exp, ccfg.shard_p_os_exp, ccfg.d_exp * ccfg.cp * ccfg.t_exp),
+            (routed / ccfg.ep, ccfg.t_exp, ccfg.shard_p_os_exp, max(1, int(ccfg.edp_group))),
             (shared, ccfg.t_exp, ccfg.shard_p_os_exp_partial, ccfg.d * ccfg.cp * ccfg.t_exp),
         )
 
@@ -137,7 +137,7 @@ class EvalLayerComm:
                 * ccfg.n_attMM
             )
         res = (
-            EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather)
+            EvalUtils.rec_coeff(rec_layer, EvalUtils.switch(ccfg, ctx, "gather"))
             * ccfg.comm_t
             * tp_comm_non_exp
             / ccfg.cp
@@ -163,7 +163,7 @@ class EvalLayerComm:
                 * (routed_comm + shared_comm)
             )
         res = (
-            EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather)
+            EvalUtils.rec_coeff(rec_layer, EvalUtils.switch(ccfg, ctx, "gather"))
             * ccfg.comm_t
             * tp_comm_exp
             / ccfg.cp
@@ -181,7 +181,7 @@ class EvalLayerComm:
     def cp_comm_non_exp(ccfg: CostModelConfig, ctx: Context) -> float:
         """CP comm for non-expert parameters"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        rec_factor = EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather) * int(
+        rec_factor = EvalUtils.rec_coeff(rec_layer, EvalUtils.switch(ccfg, ctx, "gather")) * int(
             ccfg.p == 1
         )  # [HYPOTHESIS]
         # hybird_cp is a known typo for hybrid_cp kept for backward compat

@@ -43,8 +43,7 @@ The output layer's census runs the final norm, the output projection and
 Transformers' causal-LM loss, which casts the logits to fp32, as
 HyperParallel's trainer runs them by default, dropping the model's logits
 before the backward as the trainer does; half the vocabulary tells the
-bytes a vocabulary-parallel loss splits.  A model spec states a census as
-:class:`KindActivations` records.
+bytes a vocabulary-parallel loss splits.
 
 Where a train.yaml replaces Transformers' modules with HyperParallel's
 fused ones (``plan_overrides`` with ``replace_module``: its RMSNorm, its
@@ -61,6 +60,13 @@ layer's eager indexer keeps 2.3 times what the layer keeps plain (F53).  The FLO
 recomputes (:func:`census_recomputed`) stay on Transformers' own modules:
 both count the arithmetic the time model prices, which fusing a module
 does not change, and a fused kernel runs matmuls no dispatch sees.
+
+A model whose layers cannot run alone is measured over its whole stack
+(:func:`census_stack`): DeepSeek-V4.1's layers read what earlier layers
+wrote in the same forward, and carry a hyper-connection dimension and a
+mixing state between them.  The model the trainer builds runs its own forward
+and backward once, each save counting toward the layer that makes it, and a
+kind's record is the mean of its layers'.
 
 A layer's parameters are counted by part, as ND prices its parts: the
 attention's, the norms', the dense feed-forward's, the routed experts', the
@@ -79,9 +85,9 @@ import copy
 import functools
 import importlib
 import inspect
+import itertools
 import logging
 import weakref
-from dataclasses import dataclass, fields
 from typing import (
     Any,
     Callable,
@@ -91,18 +97,19 @@ from typing import (
     Iterator,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
 )
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch._subclasses.fake_tensor import FakeTensorMode  # pylint: disable=forbidden-backend-import
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode  # pylint: disable=forbidden-backend-import
 from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
 from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
-from hyper_parallel.auto_parallel._op_records import OPS
 from hyper_parallel.core.activation_memory import api as activation_memory
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
@@ -113,105 +120,20 @@ class CensusUnavailable(RuntimeError):
     """A census cannot run here: this host cannot build the modules the run installs."""
 
 
-# The fields a census record states in pairs: what a layer keeps under
-# HyperParallel's selective activation checkpointing, the shares of its
-# matmul FLOPs that recomputes, and what it keeps for each op.
-_PAIRED = (("selective", "selective_tp"), ("selective_attention_mm", "selective_ffn_mm"), ("ops", "ops_tp"))
+class LayerTraffic(NamedTuple):
+    """What one forward of a layer moves, by part: its bytes, the parameters among them, and its ops.
 
-# The census record's fields that map ops to bytes per token.
-_BY_OP = ("ops", "ops_tp")
-
-
-@dataclass(frozen=True)
-class KindActivations:
-    """What one layer of a kind keeps for its backward, and the most its backward holds, per token.
-
-    Bytes per token at micro-batch 1, as the census measures them on one
-    layer at ``seq_length`` tokens under the runtime's kernels: the part no
-    tensor-parallel rank splits, and the part it splits, of which a layer at
-    TP 2 holds half.  The backward's working set leaves out the parameters
-    and their gradients, which the memory model counts on its own.
-    ``selective`` and ``selective_tp`` are what the layer keeps under
-    HyperParallel's selective activation checkpointing, whose backward
-    recomputes the rest and holds the same working set, and
-    ``selective_attention_mm`` and ``selective_ffn_mm`` the shares of the
-    FLOPs of its attention's projections and of the rest of its matmuls
-    that recomputes.  ``ops`` and ``ops_tp`` are what it keeps for each op
-    of :data:`~hyper_parallel.auto_parallel._op_records.OPS`, the two parts
-    of ``saved`` and ``saved_tp``, and ``other`` for its own code: the op
-    records of shared decision S1, as the census fills them.  A record
-    states each pair whole or not at all.
+    Bytes of the whole layer on a micro-batch of one sequence, as
+    :func:`census_flops` counts its FLOPs, so that the two quantities can be
+    set beside each other part by part.  ``parameter`` is the share of
+    ``moved`` that is the layer's own weights, which a strategy shards where
+    it leaves the activations alone, and ``launches`` is how many ops the
+    forward dispatches, views excluded.
     """
 
-    saved: float
-    saved_tp: float
-    working: float
-    working_tp: float
-    seq_length: int
-    selective: Optional[float] = None
-    selective_tp: Optional[float] = None
-    selective_attention_mm: Optional[float] = None
-    selective_ffn_mm: Optional[float] = None
-    ops: Optional[Mapping[str, float]] = None
-    ops_tp: Optional[Mapping[str, float]] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Return the record as a plain mapping, the selective part and the ops only when stated."""
-        out = {record_field.name: getattr(self, record_field.name) for record_field in fields(self)
-               if getattr(self, record_field.name) is not None}
-        for name in _BY_OP:
-            if name in out:
-                out[name] = dict(out[name])
-        return out
-
-    @staticmethod
-    def _check_keys(data: Mapping[str, Any], names: Sequence[str], where: str) -> None:
-        """Raise unless *data* states the fields of *names*, each of :data:`_PAIRED` whole or not at all."""
-        unknown = sorted(set(data) - set(names))
-        missing = [name for name in names if name not in data and all(name not in pair for pair in _PAIRED)]
-        if unknown or missing:
-            raise ValueError(f"{where} has unknown keys {unknown} and lacks {missing}")
-        for pair in _PAIRED:
-            if len({data.get(name) is None for name in pair}) > 1:
-                raise ValueError(f"{where} states one of {list(pair)} without the other")
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any], where: str = "activations") -> "KindActivations":
-        """Build a record, refusing a key it does not know, a missing one, a negative size or a share above 1."""
-        if not isinstance(data, Mapping):
-            raise ValueError(f"{where} must map the record's fields to their values, got {data!r}")
-        names = [record_field.name for record_field in fields(cls)]
-        cls._check_keys(data, names, where)
-        sizes = {name: float(data[name]) for name in names
-                 if name != "seq_length" and name not in _BY_OP and data.get(name) is not None}
-        if any(size < 0 for size in sizes.values()):
-            raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
-        if any(sizes.get(name, 0) > 1 for name in _PAIRED[1]):
-            raise ValueError(f"{where}: a share of FLOPs cannot exceed 1, got {sizes}")
-        seq_length = int(data["seq_length"])
-        if seq_length <= 0:
-            raise ValueError(f"{where}.seq_length must be positive, got {seq_length}")
-        by_op = {name: _op_bytes(data[name], f"{where}.{name}") for name in _BY_OP if data.get(name) is not None}
-        return cls(seq_length=seq_length, **sizes, **by_op)
-
-
-def _op_bytes(data: Any, where: str) -> Dict[str, float]:
-    """Parse ``{op: bytes per token}``, the ops of :data:`OPS` and ``other``, refusing a negative size."""
-    known = [*OPS, "other"]
-    if not isinstance(data, Mapping) or any(op not in known for op in data):
-        raise ValueError(f"{where} must map ops of {known} to bytes per token, got {data!r}")
-    sizes = {str(op): float(size) for op, size in data.items()}
-    if any(size < 0 for size in sizes.values()):
-        raise ValueError(f"{where}: bytes per token cannot be negative, got {sizes}")
-    return sizes
-
-
-def activations_from_dict(data: Any) -> Dict[str, KindActivations]:
-    """Parse a spec's ``activations``, a mapping of layer kind to its :class:`KindActivations`."""
-    if not isinstance(data, Mapping):
-        raise ValueError(f"activations must map layer kinds to their records, got {data!r}")
-    return {str(kind): KindActivations.from_dict(record, f"activations.{kind}") for kind, record in data.items()}
-
+    moved: Dict[str, float]
+    parameter: Dict[str, float]
+    launches: Dict[str, int]
 
 # The Transformers attention implementation the census registers its flash
 # attention under: a name Transformers does not take for a flash
@@ -228,6 +150,14 @@ _TP_FIELDS = (
 
 # The softmax statistics flash attention keeps per head and token.
 _FLASH_STATS = 8
+
+# The gated delta rules a run can take, named as the runtime names them
+# (``components/modules/gated_delta_net.py``): Transformers' own chunked
+# implementation, and HyperParallel's kernel, whose saved set the census holds
+# as a contract.  The runtime defaults to eager and so does the census.
+_EAGER_GDN = "eager"
+_HYPER_GDN = "triton"
+_GDN_BACKENDS = (_EAGER_GDN, _HYPER_GDN)
 
 # The census's attention kernels, which HyperParallel's selective policy
 # saves as it saves the runtime's: its own flash attention, and the contract
@@ -318,6 +248,12 @@ def _gated_delta_rule(modeling: Any) -> Callable[..., Tuple[torch.Tensor, None]]
     return run
 
 
+# Reading a scalar off a fake tensor raises, since it holds no data. Transformers'
+# grouped_mm fallback reads its group offsets so in its backward, and it takes that
+# fallback on CPU with torch 2.8 or older, the 910C's 2.7.1 among them.
+_SCALAR_READ = torch.ops.aten._local_scalar_dense.default  # pylint: disable=protected-access
+
+
 class _LiveBytes(TorchDispatchMode):
     """The storages the ops it sees allocate, and the bytes they hold while they live."""
 
@@ -350,6 +286,8 @@ class _LiveBytes(TorchDispatchMode):
             self.events.append((key, -size))
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        if func is _SCALAR_READ and isinstance(args[0], FakeTensor):
+            return 0  # shapes alone price the memory, whatever the scalar
         out = func(*args, **(kwargs or {}))
         for tensor in tree_flatten(out)[0]:
             if isinstance(tensor, torch.Tensor):
@@ -397,11 +335,15 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         shared: Tensors the model shares between its layers, which a
             checkpointed forward's count leaves out.
         ops: Where given, tells each storage the forward saves apart by
-            the op saving it, counting its bytes into ``ops.saved``.
+            the op that first saves it, counting its bytes into
+            ``ops.saved``, which then sums to the bytes returned.
 
     Returns:
-        The bytes the forward saves, its inputs included, and the bytes of
-        activations live when the backward peaks, its output left out.  A
+        The bytes the forward saves and still holds once it has run, its
+        inputs included, and the bytes of activations live when the
+        backward peaks, its output left out.  A graph the forward drops
+        before it ends, as a selection that keeps only the indices it picks
+        drops its scores, is freed then in a run and is no backward's.  A
         checkpointed forward keeps what is live once it has run, but for
         the *shared* tensors: its inputs and the outputs its policy saves.
         The parameters, which the forward's views of them bring into the
@@ -413,7 +355,14 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         then.
     """
     stored = {p.untyped_storage()._cdata for p in params}  # pylint: disable=protected-access
-    saved: Dict[int, int] = {}
+    # Counted by the storage in the lifetime it has now, as the tracker counts
+    # them: a fake tensor's storage is cheap and short lived, so one the
+    # forward has freed can hand its address to a later save, and counting by
+    # address alone lost whichever of the two it saw first.  Which pair
+    # collided depended on what had run before, so a layer did not measure the
+    # same twice.
+    saved: Dict[Tuple[int, int], int] = {}
+    saved_op: Dict[Tuple[int, int], str] = {}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
         """Count a tensor autograd saves, unless it is a parameter's, toward the op that first saves it."""
@@ -421,10 +370,17 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         op = ops.op(tensor) if ops is not None else None
         address = tensor.untyped_storage()._cdata  # pylint: disable=protected-access
         if address not in stored:
-            if op is not None and address not in saved:
-                ops.saved[op] = ops.saved.get(op, 0) + tensor.untyped_storage().nbytes()
-            saved[address] = tensor.untyped_storage().nbytes()
-        return tensor
+            key = live.key(tensor)
+            if op is not None:
+                saved_op.setdefault(key, op)
+            saved[key] = tensor.untyped_storage().nbytes()
+        # Detached, so a graph holds the bytes it saves and not the tensor: an
+        # op saving its own output would otherwise hold itself through that
+        # output's grad_fn, a cycle no collector sees, which kept every graph
+        # a forward drops alive into the backward.  On the DeepSeek-V4.1 crop
+        # at 4096 tokens that was the Indexer selection's scores, 8.9 GiB a
+        # rank a run frees as soon as the indices are taken (D16).
+        return tensor.detach()
 
     live = _LiveBytes()
     grads: List[Tuple[int, int]] = []
@@ -439,14 +395,22 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
             left_out = {live.key(out), *(live.key(p) for p in params)}
             not_kept = left_out | {live.key(tensor) for tensor in shared}
             kept = sum(size for key, size in live.sizes.items() if key not in not_kept)
+            held = {key: size for key, size in saved.items() if key in live.sizes}
             for tensor in grad_inputs:
                 live.track(tensor)
             backward(out)
     finally:
         for handle in handles:
             handle.remove()
+    # A storage's bytes count toward the op that first saved it, read from the
+    # same record as the total, so the two agree whatever a fake tensor does
+    # with a storage address it has freed.
+    for address, size in held.items():
+        op = saved_op.get(address)
+        if op is not None:
+            ops.saved[op] = ops.saved.get(op, 0) + size
     grads += [live.key(p.grad) for p in params if p.grad is not None]
-    return kept if checkpointed else sum(saved.values()), live.peak(start, left_out, grads)
+    return kept if checkpointed else sum(held.values()), live.peak(start, left_out, grads)
 
 
 # The ops a matmul runs as.
@@ -499,8 +463,9 @@ class _SavedOps(TorchDispatchMode):
         self.running.pop()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
-        # A tensor's metadata is read through prims, between an op and its saves.
-        if func.namespace != "prim":
+        # A tensor's metadata is read through prims, and _measure detaches
+        # each save, both between an op and its saves.
+        if func.namespace != "prim" and func is not torch.ops.aten.detach.default:
             self.func = func
         return func(*args, **(kwargs or {}))
 
@@ -531,8 +496,9 @@ class _SavedOps(TorchDispatchMode):
 
 def _matmul_flops(func: Any, args: Sequence[Any]) -> int:
     """The FLOPs of *func* on *args* where it is a matmul, and 0 otherwise."""
-    if func not in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default,
-                    torch.ops.aten._grouped_mm.default):  # pylint: disable=protected-access
+    matmuls = (torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default)
+    grouped = getattr(torch.ops.aten, "_grouped_mm", None)  # first shipped in torch 2.8
+    if func not in (matmuls if grouped is None else (*matmuls, grouped.default)):
         return 0
     first, second = args[1:3] if func is torch.ops.aten.addmm.default else args[:2]
     return 2 * first.numel() * second.shape[-1]
@@ -710,6 +676,96 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
         ) from exc
 
 
+# Model families whose attention a census cannot price here, by model type,
+# with what is missing.  Their layers build and run on this host, through
+# Transformers' own eager path, and that path is not the one the run takes:
+# measuring it prices a layer nobody runs, as a replacement this host cannot
+# build does (:func:`_replaced`, F53).  A family belongs here only while no
+# contract in :mod:`~hyper_parallel.auto_parallel._npu_contracts` states what
+# its kernels save; stating one is what takes it out again.
+_NO_ACTIVATION_CONTRACT: Dict[str, str] = {
+    # Empty while every family with kernels of its own has its contracts
+    # stated.  DeepSeek-V4 was the entry that forced this guard and now has
+    # them (:data:`_FAMILY_CONTRACTS`); the next family to arrive with a
+    # kernel and no contract belongs here rather than being priced from the
+    # path its run does not take.
+}
+
+# The families whose own modules call kernels this host has not got, with the
+# contracts their census runs under.  A family here is measured as its run
+# behaves; a family in :data:`_NO_ACTIVATION_CONTRACT` is refused instead.
+_FAMILY_CONTRACTS = ("deepseek_v4",)
+
+# The families whose layers a census cannot run one at a time, by model type,
+# with why.  Their census runs the model's own forward over the whole stack
+# (:func:`census_stack`), which calls each layer as the model calls it.
+_STACK_FAMILIES: Dict[str, str] = {
+    "deepseek_v4": (
+        "31 of the DeepSeek-V4.1 crop's 40 layers consume compressed keys and values, or an Indexer "
+        "key, that a source layer wrote earlier in the same forward and refuse to run without it; the "
+        "hidden state carries a hyper-connection dimension beside a mixing state; and the rotary "
+        "embedding is a pair of flavours the model picks between"
+    ),
+}
+
+
+@contextlib.contextmanager
+def _family_contracts(config: Any) -> Iterator[None]:
+    """The contracts the modules of *config*'s family run under, for what runs inside.
+
+    DeepSeek-V4.1's sparse attention is chosen on the device the tensors are
+    on, so a census, whose tensors are fake and on none, would take the
+    reference beside the kernel and measure a layer no run builds (F53): the
+    attention's contract stands in.  The Indexer's selection keeps nothing a
+    backward reads on either path, fused or reference, since a run frees its
+    scores' graph as soon as the indices are taken (D16); its contract runs
+    the selection without recording that graph, and the census measures the
+    same bytes with it as without.
+
+    Whether this tree builds the model at all is the stack census's to
+    refuse (:func:`_model_class`): a layer's parameters do not depend on
+    which kernel runs it and are counted from the same fake layer.
+    """
+    if str(getattr(config, "model_type", "")) not in _FAMILY_CONTRACTS:
+        yield
+        return
+    from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
+        v41_attention_contract,
+        v41_indexer_contract,
+    )
+    rope = int(getattr(config, "qk_rope_head_dim", 0) or 0)
+    with v41_attention_contract(rope), v41_indexer_contract():
+        yield
+
+
+def _no_contract(config: Any) -> None:
+    """Refuse a census of one layer of a model whose kernels no contract states, or whose layers cannot run alone.
+
+    Raises:
+        CensusUnavailable: If *config*'s family is one of
+            :data:`_NO_ACTIVATION_CONTRACT`, or one of
+            :data:`_STACK_FAMILIES`, whose census is the whole stack's
+            (:func:`census_stack`).  A layer's parameters do not depend on
+            which kernel runs it and are counted as ever
+            (:func:`census_parameters`); what it keeps for its backward
+            does, so this refuses rather than answer with the bytes of a
+            layer the run does not build.
+    """
+    family = str(getattr(config, "model_type", ""))
+    missing = _NO_ACTIVATION_CONTRACT.get(family)
+    if missing is not None:
+        raise CensusUnavailable(
+            f"no census of a {config.model_type} layer: {missing}; state the kernels' contracts, "
+            f"or drop context.census and read the formulas' memory as an estimate, not as a bound"
+        )
+    alone = _STACK_FAMILIES.get(family)
+    if alone is not None:
+        raise CensusUnavailable(
+            f"no census of one {family} layer, whose layers cannot be priced one at a time: {alone}. "
+            f"census_activations measures the whole stack instead (census_stack)"
+        )
+
+
 def _modeling(config: Any) -> Any:
     """The Transformers modeling module of *config*'s model."""
     model_type = str(config.model_type)
@@ -737,13 +793,30 @@ def _classes(modeling: Any) -> Tuple[type, type]:
 
 
 def tp_config(config: Any, tp: int) -> Any:
-    """*config* as one of *tp* tensor-parallel ranks holds its layers: heads and widths divided."""
+    """*config* as one of *tp* tensor-parallel ranks holds its layers: heads and widths divided.
+
+    Two of the fields divided can be one field.  A Transformers config class
+    may declare an ``attribute_map``, and DeepSeek-V4's maps
+    ``intermediate_size`` onto ``moe_intermediate_size``, so a model whose
+    feed-forward is all experts states one width under two names.  Dividing
+    each name in turn then divides that width by *tp* twice, and the layer
+    built as a rank's share is a quarter as wide at TP 2 rather than half,
+    which makes the split the census derives from the pair too large and ND
+    over-reward tensor parallelism.  Qwen3-MoE keeps the two apart, which is
+    why this stayed hidden.  Each underlying attribute is divided once.
+    """
     config = copy.deepcopy(config)
     config.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    aliases = getattr(type(config), "attribute_map", None) or {}
+    divided = set()
     for name in _TP_FIELDS:
+        target = aliases.get(name, name)
+        if target in divided:
+            continue
         value = getattr(config, name, None)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             setattr(config, name, max(1, value // tp))
+            divided.add(target)
     return config
 
 
@@ -841,17 +914,34 @@ def _delta_rule_held(modeling: Any, layer: Any, rule: Callable[..., Any]) -> Ite
 
 
 @contextlib.contextmanager
-def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
+def _fake_layer(config: Any, layer_index: int, gdn_backend: str = _EAGER_GDN,
                 replacements: Sequence[Any] = ()) -> Iterator[Tuple[Any, Any]]:
     """Layer *layer_index* of *config* and its model's rotary embedding, on fake tensors and the runtime's kernels.
 
-    The gated delta rule runs HyperParallel's kernel's contract, or, where
-    *contracts* is false, Transformers' own chunked implementation, its Python
-    rule, never a kernel a hub or the ``fla`` package would put in its place.
+    *gdn_backend* names the gated delta rule the layer runs, as the runtime
+    names it: ``"eager"`` for Transformers' own chunked implementation,
+    ``"triton"`` for HyperParallel's kernel's contract, which saves the rule's
+    inputs, the cumulated gates, beta and one chunk matrix and nothing more.
+    Eager is the default because it is the rule a run reaches: the runtime's
+    dispatcher defaults to it (``components/modules/gated_delta_net.py``,
+    ``chunk_gated_delta_rule``), the only caller that can select the kernel is
+    the context-parallel wrapper, which defaults to eager as well, and no
+    recipe states a backend.  The two are not interchangeable: a layer keeping
+    the kernel's saved set keeps less than half as much.
+
     Where *replacements* are given, the modules they name are HyperParallel's
     fused ones, running under the kernels' contracts for as long as the layer
-    does.
+    does.  Eager is Transformers' own Python rule, never a kernel a hub or the
+    ``fla`` package would put in its place.
+
+    Raises:
+        ValueError: If *gdn_backend* names no backend the runtime has.
     """
+    if gdn_backend not in _GDN_BACKENDS:
+        raise ValueError(
+            f"unsupported GDN backend {gdn_backend!r}; "
+            f"expected one of {sorted(_GDN_BACKENDS)}."
+        )
     modeling = _modeling(config)
     layer_cls, rotary_cls = _classes(modeling)
     config = copy.deepcopy(config)
@@ -859,6 +949,7 @@ def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
     config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
     modeling.ALL_ATTENTION_FUNCTIONS.register(_FLASH, _flash_attention)
     with npu_contracts() if replacements else contextlib.nullcontext(), \
+            _family_contracts(config), \
             FakeTensorMode(allow_non_fake_inputs=True):
         default = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
@@ -867,7 +958,7 @@ def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
             rotary = rotary_cls(config=config)
         finally:
             torch.set_default_dtype(default)
-        rule = (_gated_delta_rule(modeling) if contracts
+        rule = (_gated_delta_rule(modeling) if gdn_backend == _HYPER_GDN
                 else inspect.unwrap(getattr(modeling, _DELTA_RULE_FUNCTION, None) or (lambda: None)))
         with _delta_rule_held(modeling, layer, rule):
             if replacements:
@@ -878,13 +969,21 @@ def _fake_layer(config: Any, layer_index: int, contracts: bool = True,
             yield layer, rotary
 
 
-class _PartFlops(TorchDispatchMode):
-    """A layer's forward FLOPs by part: its matmuls' toward the part running them, flash attention's the scores'."""
+class _ByPart(TorchDispatchMode):
+    """A walk over a layer's forward that attributes each op to the part of the layer running it."""
 
-    def __init__(self, layer: Any) -> None:
-        """Follow which of *layer*'s modules runs, and which tensors are its parameters."""
+    def __init__(self, layer: Any, recurrent: bool = True) -> None:
+        """Follow which of *layer*'s modules runs, and which tensors are its parameters.
+
+        *recurrent* is whether an attention of this layer has a recurrence to
+        name: where it has none, an op of the attention that no weight takes
+        part in is the attention's own, its mask or its rotary.  A walk that
+        counts only matmuls leaves it at the default, because a weightless
+        matmul under an attention is a recurrence or a score, and a score is
+        counted on its own.
+        """
         super().__init__()
-        self.flops: Dict[str, int] = {}
+        self.recurrent = recurrent
         self.params = {param.untyped_storage()._cdata  # pylint: disable=protected-access
                        for param in layer.parameters()}
         self.running: List[str] = []
@@ -902,12 +1001,23 @@ class _PartFlops(TorchDispatchMode):
         self.running.pop()
 
     def _part(self, args: Sequence[Any]) -> str:
-        """The part a matmul on *args* runs for: its module's, or an attention's recurrence where no weight takes part."""
+        """The part an op on *args* runs for: its module's, or an attention's recurrence where no weight takes part."""
         part = _parameter_part(f"{self.running[-1]}.weight") if self.running else "ffn"
         weighted = any(isinstance(arg, torch.Tensor)
                        and arg.untyped_storage()._cdata in self.params  # pylint: disable=protected-access
                        for arg in args)
-        return "linrec" if part == "attention" and not weighted else part
+        if part == "attention" and not weighted and self.recurrent:
+            return "linrec"
+        return part
+
+
+class _PartFlops(_ByPart):
+    """A layer's forward FLOPs by part: its matmuls' toward the part running them, flash attention's the scores'."""
+
+    def __init__(self, layer: Any) -> None:
+        """Count no FLOPs yet, and follow *layer*'s modules."""
+        super().__init__(layer)
+        self.flops: Dict[str, int] = {}
 
     def _add(self, part: str, flops: int) -> None:
         """Count *flops* toward *part*."""
@@ -921,6 +1031,52 @@ class _PartFlops(TorchDispatchMode):
             self._add("scores", 2 * batch * heads * seq * key.shape[2] * (width + value.shape[-1]))
         elif flops := _matmul_flops(func, args):
             self._add(self._part(args), flops)
+        return out
+
+
+class _PartTraffic(_ByPart):
+    """The bytes a layer's forward moves by part, the parameters among them, and the ops it dispatches.
+
+    An op reads the tensors it is given and writes the tensors it returns.
+    A view writes nothing and reads nothing: it renames bytes its producer
+    already wrote, and no kernel runs for it, so it counts for neither.  A
+    tensor given to an op twice is read twice, as the count is of the op's
+    arguments rather than of the storages behind them.
+
+    The parameters are counted again on their own, because a strategy
+    divides their traffic where it leaves the activations' alone: the degree
+    sharding a parameter divides the bytes read of it, and the routed
+    experts' part is the one the expert-parallel degree divides.
+    """
+
+    def __init__(self, layer: Any, recurrent: bool = True) -> None:
+        """Move nothing yet, and follow *layer*'s modules."""
+        super().__init__(layer, recurrent=recurrent)
+        self.moved: Dict[str, float] = {}
+        self.parameter: Dict[str, float] = {}
+        self.launches: Dict[str, int] = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        kwargs = kwargs or {}
+        out = func(*args, **kwargs)
+        if func.namespace == "prim" or getattr(func, "is_view", False):
+            return out
+        part = ("scores" if func is torch.ops.nd_census.flash_attention.default
+                else self._part(args))
+        moved = parameter = 0
+        for tensor in tree_flatten((args, kwargs))[0]:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            size = tensor.numel() * tensor.element_size()
+            moved += size
+            if tensor.untyped_storage()._cdata in self.params:  # pylint: disable=protected-access
+                parameter += size
+        for tensor in tree_flatten(out)[0]:
+            if isinstance(tensor, torch.Tensor):
+                moved += tensor.numel() * tensor.element_size()
+        self.moved[part] = self.moved.get(part, 0.0) + moved
+        self.parameter[part] = self.parameter.get(part, 0.0) + parameter
+        self.launches[part] = self.launches.get(part, 0) + 1
         return out
 
 
@@ -938,7 +1094,7 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
         tokens (``scores``), a linear attention's recurrence (``linrec``),
         and the parts of the feed-forward :func:`_parameter_part` names.
     """
-    with _fake_layer(config, layer_index, contracts=False) as (layer, rotary):
+    with _fake_layer(config, layer_index) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         positions = _positions(rotary, hidden, seq_length)
         counter = _PartFlops(layer)
@@ -947,9 +1103,45 @@ def census_flops(config: Any, layer_index: int, seq_length: int) -> Dict[str, in
     return counter.flops
 
 
+def census_traffic(config: Any, layer_index: int, seq_length: int,
+                   gdn_backend: str = _EAGER_GDN) -> LayerTraffic:
+    """What one forward of layer *layer_index* of *config* moves, by the part of the layer moving it.
+
+    The quantity the time model counts is matmul FLOPs, and the cluster's
+    kernel tables put those at 6.3 to 7.1% of a profiled step of this model.
+    This counts the other quantity a step could be priced by, on the same
+    forward and with no device, so that a measured round can set each
+    beside the time it took.
+
+    Args:
+        config: The language model's Transformers config.
+        layer_index: The layer to build, which settles its kind.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+        gdn_backend: The gated delta rule the run takes (:func:`_fake_layer`).
+            It is the largest single choice here: Transformers' own chunked
+            rule runs a matmul a chunk and the kernel's contract is one op.
+
+    Returns:
+        A :class:`LayerTraffic` of the whole layer at tensor and context
+        parallelism 1, by the parts :func:`census_flops` prices
+        (:class:`_PartTraffic`).
+    """
+    with _fake_layer(config, layer_index, gdn_backend=gdn_backend) as (layer, rotary):
+        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
+        positions = _positions(rotary, hidden, seq_length)
+        # The rule's own module is what a layer has a recurrence by, as
+        # _fake_layer finds it to settle which rule the layer runs.
+        recurrent = any(delta_rule_module(module) for module in layer.modules())
+        counter = _PartTraffic(layer, recurrent=recurrent)
+        with counter:
+            _run(layer, hidden, positions)
+    return LayerTraffic(counter.moved, counter.parameter, counter.launches)
+
+
 def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool = False,
                  ops: Optional[Dict[str, int]] = None,
-                 replacements: Sequence[Any] = ()) -> Tuple[int, int]:
+                 replacements: Sequence[Any] = (),
+                 gdn_backend: str = _EAGER_GDN) -> Tuple[int, int]:
     """Bytes layer *layer_index* of *config* keeps for its backward, and the most its backward holds.
 
     Args:
@@ -962,14 +1154,21 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
             the bytes it saves by the op saving them (:class:`_SavedOps`).
         replacements: The module replacements a run installs
             (:func:`replacement_specs`).
+        gdn_backend: The gated delta rule the run takes (:func:`_fake_layer`).
 
     Returns:
         The bytes the forward keeps for the backward, its input included,
         and the bytes of activations the backward holds when it holds the
         most, its own gradients included, less the parameters and those
         gradients.
+
+    Raises:
+        CensusUnavailable: If no contract states what this model's kernels
+            save (:func:`_no_contract`).
     """
-    with _fake_layer(config, layer_index, replacements=replacements) as (layer, rotary):
+    _no_contract(config)
+    with _fake_layer(config, layer_index, gdn_backend=gdn_backend,
+                     replacements=replacements) as (layer, rotary):
         hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
         grad = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16)
         if replacements:
@@ -1100,6 +1299,9 @@ def census_output(config: Any, seq_length: int, replacements: Sequence[Any] = ()
     Args:
         config: The language model's Transformers config.
         seq_length: Tokens of the micro-batch of one sequence it runs.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`), of which the final norm's is the
+            one that reaches the output layer.
 
     Returns:
         As :func:`census_layer`: the final norm's input included, the
@@ -1138,6 +1340,8 @@ def census_output_activations(config: Any, seq_length: int = 4096,
     Args:
         config: The language model's Transformers config.
         seq_length: The tokens the census runs the layer at.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
 
     Returns:
         The layer's :class:`KindActivations`, whose TP part is the part a
@@ -1156,8 +1360,232 @@ def census_output_activations(config: Any, seq_length: int = 4096,
     )
 
 
-def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int = 4096,
+class _FakeScalars(TorchDispatchMode):
+    """A scalar read of a fake tensor answered with zero, as :class:`_LiveBytes` answers it.
+
+    A model can read a value out of a tensor while it builds, as
+    DeepSeek-V4.1's Engram reads its token map's pad entry to build its hash
+    mapping, which a fake tensor refuses.  The value settles a padding id,
+    never a shape the census counts.
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
+        if func is _SCALAR_READ and isinstance(args[0], FakeTensor):
+            return 0
+        return func(*args, **(kwargs or {}))
+
+
+def _model_class(config: Any) -> Tuple[Any, bool]:
+    """What the trainer builds *config* as, by its ``from_config``: its family's own class, else Transformers'.
+
+    The trainer's builder discovers the family's registration, asks the
+    model registry for a class registered by the architecture the config
+    names, and builds Transformers' own model where none is.
+
+    Returns:
+        The class, and whether it is Transformers' own.
+
+    Raises:
+        CensusUnavailable: If the config names an architecture neither the
+            registry nor Transformers builds, as a DeepSeek-V4.1 config does
+            on a tree that does not carry that model: Transformers'
+            DeepSeek-V4 in its place would price a different model.
+    """
+    import transformers  # pylint: disable=C0415
+    from hyper_parallel.models._transformers.config_resolver import get_is_hf_model  # pylint: disable=C0415
+    from hyper_parallel.models.registry import _resolve_custom_model_cls  # pylint: disable=C0415
+
+    architecture = (getattr(config, "architectures", None) or [""])[0] or ""
+    if not get_is_hf_model(config):
+        return _resolve_custom_model_cls(architecture), False
+    if architecture and not hasattr(transformers, architecture):
+        raise CensusUnavailable(
+            f"the config names {architecture}, which neither this tree's model registry nor Transformers "
+            f"builds; price it from a tree carrying the model, or drop context.census and read the "
+            f"formulas' memory as an estimate, not as a bound"
+        )
+    return transformers.AutoModelForCausalLM, True
+
+
+class _Stack:
+    """Which layer of a stack runs, forward and backward, and where in a tracker's log each backward runs."""
+
+    def __init__(self, layers: Sequence[Any], clock: Callable[[], int]) -> None:
+        """Follow *layers* through both passes, placing their backwards by *clock*."""
+        self.running: List[int] = []
+        self.windows: Dict[int, List[int]] = {}
+        self.clock = clock
+        self.handles: List[Any] = []
+        for index, layer in enumerate(layers):
+            self.handles += [
+                layer.register_forward_pre_hook(functools.partial(self._enter, index)),
+                layer.register_forward_hook(self._leave),
+                layer.register_full_backward_pre_hook(functools.partial(self._enter_backward, index)),
+                layer.register_full_backward_hook(self._leave_backward),
+            ]
+        self.backward: List[int] = []
+
+    # A hook's return replaces what the module takes or gives, so each of
+    # these returns None.
+
+    def _enter(self, index: int, *_: Any) -> None:
+        """Note that the layer at *index* runs its forward."""
+        self.running.append(index)
+
+    def _leave(self, *_: Any) -> None:
+        """Note that the innermost layer running its forward has returned."""
+        if self.running:
+            self.running.pop()
+
+    def _enter_backward(self, index: int, *_: Any) -> None:
+        """Open the window of the layer at *index*, whose backward starts."""
+        self.backward.append(index)
+        self.windows.setdefault(index, [self.clock(), self.clock()])
+
+    def _leave_backward(self, *_: Any) -> None:
+        """Close the window of the layer whose backward has returned."""
+        if self.backward:
+            index = self.backward.pop()
+            self.windows[index][1] = self.clock()
+
+    @property
+    def layer(self) -> Optional[int]:
+        """The outermost layer running its forward, or None."""
+        return self.running[0] if self.running else None
+
+    def remove(self) -> None:
+        """Remove every hook this placed."""
+        for handle in self.handles:
+            handle.remove()
+
+
+def census_stack(config: Any, seq_length: int, replacements: Sequence[Any] = ()) -> List[Tuple[int, int]]:
+    """What each layer of *config* keeps for its backward, and the most its backward holds, from one pass of the stack.
+
+    For a model whose layers cannot run alone (:data:`_STACK_FAMILIES`): the
+    model the trainer builds (:func:`_model_class`), on fake tensors and
+    under its family's contracts, runs its own forward over a micro-batch of
+    one sequence and then its backward, so each layer is called as its model
+    calls it, with what earlier layers wrote, its hidden and mixing states
+    and the rotary flavours the model computes.  Each save counts toward the
+    layer whose forward makes it first, and a layer keeps those of its saves
+    still live when the forward ends (:func:`_measure`'s rule).  Its backward
+    holds what it keeps and the most it holds beyond every layer's saves,
+    the parameters and their gradients while it runs.  The embedding's and
+    the final norm's saves count toward no layer: the output layer's census
+    prices the end of the model.
+
+    Args:
+        config: The language model's Transformers config.
+        seq_length: Tokens of the micro-batch of one sequence it runs.
+        replacements: The module replacements a run installs
+            (:func:`replacement_specs`).
+
+    Returns:
+        ``(kept, held)`` bytes of each decoder layer, in model order.
+
+    Raises:
+        CensusUnavailable: If this tree cannot build the model the config
+            names (:func:`_model_class`), or a module a replacement installs
+            (:func:`_replaced`).
+    """
+    model_cls, native = _model_class(config)
+    config = copy.deepcopy(config)
+    if native:
+        # Transformers' own model runs its attention through the interface,
+        # as _fake_layer's layer does, so it runs the kernel's contract.
+        config._attn_implementation = _FLASH  # pylint: disable=protected-access
+        _modeling(config).ALL_ATTENTION_FUNCTIONS.register(_FLASH, _flash_attention)
+    with npu_contracts() if replacements else contextlib.nullcontext(), _family_contracts(config), \
+            FakeTensorMode(allow_non_fake_inputs=True), _FakeScalars():
+        default = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            model = model_cls.from_config(config)
+        finally:
+            torch.set_default_dtype(default)
+        # The experts run as grouped matmuls, as every layer _fake_layer
+        # builds does.  Transformers falls back to its eager experts for a
+        # class whose module it does not know, a loop over the experts with
+        # token counts no fake tensor has; the experts read this per call.
+        model.config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
+        if replacements:
+            _replaced(model, replacements)
+        model.train()
+        backbone = model.get_decoder()
+        params = list(model.parameters())
+        stored = {p.untyped_storage()._cdata for p in params}  # pylint: disable=protected-access
+        live = _LiveBytes()
+        follow = _Stack(backbone.layers, lambda: len(live.events))
+        saved_by: Dict[Tuple[int, int], int] = {}
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            """Count a tensor autograd saves, unless it is a parameter's, toward the layer saving it first."""
+            if tensor.untyped_storage()._cdata not in stored and follow.layer is not None:  # pylint: disable=W0212
+                saved_by.setdefault(live.key(tensor), follow.layer)
+            # Detached, as _measure returns it: a graph the forward drops is freed.
+            return tensor.detach()
+
+        grads: List[Tuple[int, int]] = []
+        handles = [p.register_hook(lambda grad: grads.append(live.key(grad))) for p in params]
+        kept = [0] * len(backbone.layers)
+        try:
+            with live, torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                out = backbone(input_ids=torch.zeros(1, seq_length, dtype=torch.long)).last_hidden_state
+                for key, index in saved_by.items():
+                    kept[index] += live.sizes.get(key, 0)
+                out.sum().backward()
+        finally:
+            follow.remove()
+            for handle in handles:
+                handle.remove()
+        grads += [live.key(p.grad) for p in params if p.grad is not None]
+    # What every layer keeps, the gradients and the parameters left out, the
+    # rest is what a layer's backward holds beyond them while it runs.
+    excluded = set(saved_by) | set(grads) | {key for key, _ in live.events if key[0] in stored}
+    beyond = list(itertools.accumulate(0 if key in excluded else delta for key, delta in live.events))
+    held = []
+    for index, size in enumerate(kept):
+        begin, end = follow.windows.get(index, (0, 0))
+        held.append(size + max(beyond[begin:end], default=0))
+    return list(zip(kept, held))
+
+
+def _stack_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int,
                        replacements: Sequence[Any] = ()) -> Dict[str, KindActivations]:
+    """What a layer of each kind of *layers* keeps and holds, per token, from the stack at TP 1 and TP 2.
+
+    A kind's record is the mean of its layers', which is what the memory
+    model applies to each of them: with one record a kind, the stack's total
+    comes back whole.  The parts tensor parallelism splits follow from the
+    pair as :func:`census_activations` derives them.  No selective part is
+    stated: a selective layer of these kinds is priced by the formulas.
+    """
+    kinds = [str(group["kind"]) for group in layers if not group.get("mtp") for _ in range(int(group["count"]))]
+    logger.info("census of the whole stack of %d layers at %d tokens, at TP 1 and TP 2: a %s layer "
+                "cannot run alone", len(kinds), seq_length, config.model_type)
+    one, two = (census_stack(tp_config(config, tp), seq_length, replacements) for tp in (1, 2))
+    if len(one) != len(kinds):
+        raise ValueError(f"the model builds {len(one)} decoder layers, where its spec states {len(kinds)}")
+    out: Dict[str, KindActivations] = {}
+    for kind in dict.fromkeys(kinds):
+        members = [index for index, each in enumerate(kinds) if each == kind]
+        (kept_1, held_1), (kept_2, held_2) = (
+            tuple(sum(stack[index][part] for index in members) / len(members) for part in (0, 1))
+            for stack in (one, two))
+        out[kind] = KindActivations(
+            saved=max(0.0, 2 * kept_2 - kept_1) / seq_length,
+            saved_tp=max(0.0, 2 * (kept_1 - kept_2)) / seq_length,
+            working=max(0.0, 2 * held_2 - held_1) / seq_length,
+            working_tp=max(0.0, 2 * (held_1 - held_2)) / seq_length,
+            seq_length=int(seq_length),
+        )
+    return out
+
+
+def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_length: int = 4096,
+                       replacements: Sequence[Any] = (),
+                       gdn_backend: str = _EAGER_GDN) -> Dict[str, KindActivations]:
     """What a layer of each kind of *layers* keeps and holds, per token, at TP 1 and TP 2.
 
     Args:
@@ -1167,14 +1595,23 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
         seq_length: The tokens the census runs a layer at.
         replacements: The module replacements a run installs
             (:func:`replacement_specs`).
+        gdn_backend: The gated delta rule the run takes (:func:`_fake_layer`).
 
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
         holds, the part TP splits is half the part at TP 1; what it keeps
         under HyperParallel's selective activation checkpointing too, the
         shares of its matmul FLOPs that recomputes, and what it keeps for
-        each op, its records per op.
+        each op, its records per op.  A family whose layers cannot run
+        alone (:data:`_STACK_FAMILIES`) is measured over its whole stack
+        instead (:func:`census_stack`), and its records state the plain
+        layer's bytes only.
+
+    Raises:
+        CensusUnavailable: If this tree cannot build what the run builds.
     """
+    if str(getattr(config, "model_type", "")) in _STACK_FAMILIES:
+        return _stack_activations(config, layers, seq_length, replacements)
     firsts: Dict[str, int] = {}
     index = 0
     for group in layers:
@@ -1187,10 +1624,12 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
         ops_1: Dict[str, int] = {}
         ops_2: Dict[str, int] = {}
         (saved_1, working_1), (saved_2, working_2) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops, replacements=replacements)
+            census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops,
+                         replacements=replacements, gdn_backend=gdn_backend)
             for tp, ops in ((1, ops_1), (2, ops_2)))
         (kept_1, _), (kept_2, _) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True, replacements=replacements)
+            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True,
+                         replacements=replacements, gdn_backend=gdn_backend)
             for tp in (1, 2))
         attention_mm, ffn_mm = census_recomputed(config, layer_index, seq_length)
         out[kind] = KindActivations(

@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parser child class"""
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive
 
 
 class CostModelParserMindspeed(_CostModelParser):
@@ -30,6 +31,7 @@ class CostModelParserMindspeed(_CostModelParser):
         """MindSpeed format for multimodal"""
         self.ccfg.device_capacity = Memory.from_gb(55)  # 55 * 1024 * 1024 * 1024
         self.ccfg.model_name = self.config.model_id
+        self.config_op_counts(self.ccfg)
         # Assume it exists a hook module with the same name as model_name
         self.ccfg.n_lay = 0  # SUM ALL
         self.ccfg.pp_sched = "1f1b"
@@ -59,7 +61,7 @@ class CostModelParserMindspeed(_CostModelParser):
             self.ccfg.mm_ccfgs = ccfgs
             self.ccfg.mm_order = list(ccfgs.keys())
 
-            # Update each mod's offset, layer_custom_config, pp_partition
+            # Update each mod's offset and pp_partition
             for m in self.ccfg.mm_ccfgs:
                 cc = self.ccfg.mm_ccfgs[m]
                 num_layer_per_stage = max(1, cc.n_lay // self.ccfg.p // self.ccfg.vp)
@@ -175,8 +177,8 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.cp = self.config.tmp.cp
         cc.d = self.config.tmp.dp
         cc.ep = max(mod.expert_model_parallel_size, self.config.tmp.ep)
-        cc.sp = cc.t if mod.sequence_parallel else 1
-        if cc.cp > 1 and cc.sp > 1:
+        cc.sequence_parallel = bool(mod.sequence_parallel)
+        if cc.cp > 1 and cc.sequence_parallel and cc.t > 1:
             logger.warning(
                 "sequence parallelism and context parallelism are both enabled"
             )
@@ -207,7 +209,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.dc_kv = mod.k_lora_rank  # KV compression dimension #NOT SURE
         cc.dc_q = mod.q_lora_rank  # Q compression dimension
         cc.dhr = mod.qk_rope_head_dim  # decoupled QK per head dimension
-        self.state_qk_norm(cc, mod.qk_layernorm)  # Megatron's --qk-layernorm
+        cc.qk_norm = bool(mod.qk_layernorm)  # Megatron's --qk-layernorm
 
     def __config_parse_json_moe(self, cc, mod):
         """MindSpeed format for MoE infos"""
@@ -223,23 +225,6 @@ class CostModelParserMindspeed(_CostModelParser):
         # temporary
         cc.etp = self.config.tmp.etp  # ETP
 
-    def config_shard_emb(self, ccfg):
-        """Set how the embedding table is sharded, on *ccfg*: over TP and DP."""
-        ccfg.shard_embed = ccfg.t * ccfg.d
-
-    def __config_parse_json_op_recompute(self, cc):
-        """MindSpeed format for select recompute"""
-        cc.rec_op = Config(
-            {}
-        )  # recomputed operators (selective recompute only)
-        cc.rec_op.attBMM = 1
-        cc.rec_op.headCast = 1
-        cc.rec_op.dropout = 1
-        cc.rec_op.softmax = 1
-        cc.rec_op.normOp = 1
-        cc.rec_op.gather = 1
-        cc.rec_op.ffAct = 1
-
     def __config_parse_json(self, mod):
         """MindSpeed format for unimodal"""
         # def mod_hook(M) :
@@ -247,6 +232,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.parser = self
         cc.config_format = "json"
         cc.model_name = mod.model_id
+        self.config_op_counts(cc)
         cc.freeze = mod.freeze  # for later
         cc.has_fa = True
         cc.has_op = True  # mod.use_distributed_optimizer
@@ -256,13 +242,15 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.cp_algo = "colossalai_cp"
         cc.gmm = mod.moe_grouped_gemm
         cc.vocab_emb_dp = False
+        cc.emb_dp_sharded = True
 
         cc.offset = 0
         # Parallel dimensions
         self.__config_parse_json_parallelism(cc, mod)
 
         cc.full_rec = mod.recompute_num_layers
-        cc.sel_rec = False
+        cc.sel_rec = False  # selective recompute is not parsed
+        cc.sel_rec_rule = "hyperparallel"
         if mod.recompute_num_layers and isinstance(
             mod.recompute_num_layers, int
         ):
@@ -280,7 +268,6 @@ class CostModelParserMindspeed(_CostModelParser):
 
         # MoE infos
         self.__config_parse_json_moe(cc, mod)
-        self.config_dp_tp_exp(cc)
 
         # FP byte storages
         cc.bytes_p = self.ccfg.fp_bytes(mod.params_dtype)  # parameters
@@ -288,45 +275,13 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.bytes_softmax = (
             4 if mod.attention_softmax_in_fp32 else 2
         )  # softmax output
-        cc.bytes_grad = 4
-        cc.bytes_os = 4
-        cc.bytes_norm = 4
 
         # Optimizer parallel factors
         cc.os_max_shard = cc.d
-        self.config_optimizer_shard(cc)
 
-        # Other factors
-        self.config_shard_emb(cc)
-        cc.shard_output_activ = 1
-        cc.shard_recompute_input = 1
-        cc.s_fa = (
-            cc.s if not cc.has_fa else cc.s / cc.a
-        )  # flash attention factor [HYPOTHESIS]
-        cc.comm_d_non_exp = (
-            0
-            if ((cc.d == 1) or not cc.has_op)
-            else (2 if not cc.has_grad_shard else 3)
-        )  # data parallel comm factor
-        cc.comm_d_exp = (
-            0
-            if ((cc.d_exp == 1) or not cc.has_op)
-            else (2 if not cc.has_grad_shard else 3)
-        )  # data parallel comm factor
-        cc.comm_t = float(cc.t > 1)  # tensor parallel comm factor
-        cc.comm_ep = float(
-            cc.ep > 1 or cc.n_exp > 1
-        )  # expert parallel comm factor
-        cc.comm_cp = float(cc.cp > 1)  # context parallel comm factor
-        cc.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
-        cc.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
         cc.gbs = cc.b * cc.d * cc.m
         cc.n_mtp = mod.mtp_num_layers
-        # Recomputation
-        self.__config_parse_json_op_recompute(cc)
-        # One group of every layer, the MTP layers included, as under the
-        # other parsers: a partition that places an MTP layer prices it.
-        cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
-        # By default, 100% of layers use a unique custom config (if specified)
+        self.config_layer_stack(cc)
         cc.overwrite_eval_functions = {}
+        derive(cc)
         return cc  # mod_hook

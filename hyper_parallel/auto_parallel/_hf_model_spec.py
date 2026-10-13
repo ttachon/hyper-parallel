@@ -25,14 +25,26 @@ function-local because ``transformers`` is not a hard dependency of
 cost-model backends must keep working without it.
 """
 import copy
+import dataclasses
+import importlib
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from hyper_parallel.auto_parallel._layer_census import (
     CensusUnavailable,
     census_activations,
     census_output_activations,
 )
+from hyper_parallel.auto_parallel._layer_stack import spec_layer_stack, tower_layer_stack
+from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel._op_profiles import (
+    infer_arch,
+    infer_qk_norm,
+    infer_qkv_bias,
+    infer_shared_expert_gate,
+    resolve_ops,
+)
+from hyper_parallel.auto_parallel._spec_census import census_model_spec
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +61,26 @@ _CONFIG_KWARG_NAMES = (
 # through a factory (``_target_`` plus ``config_path``) and never loads a
 # checkpoint, so it carries no pretrained path.
 _MODEL_PATH_ALIASES = ("pretrained_model_name_or_path", "config_path")
+
+# The config a recipe's own factory builds, for the factories whose model
+# ``AutoConfig`` cannot resolve: the path beside ``_target_`` is then a
+# directory Transformers refuses, and the shape the run really trains is the
+# one this function returns.  DeepSeek-V4.1 is the case that forced it:
+# Transformers 5.14.1 has no ``deepseek_v41``, and the factory's arguments are
+# a recipe for deriving the shape (a divisor and an expert count) rather than
+# the canonical fields :func:`_explicit_overrides` can harvest, so nothing
+# short of calling it knows what the run builds.  A factory is consulted
+# BEFORE ``AutoConfig``, because where both answer they answer differently and
+# the factory is the one that says what the run trains: V4.1's crops the
+# released model eightfold, and the released config would price a model nobody
+# runs.  One line a family, and the entry is the declaration that the two are
+# a pair.
+_CONFIG_FACTORIES = {
+    "hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model."
+    "build_cropped_deepseek_v41":
+        "hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model."
+        "build_deepseek_v41_validation_config",
+}
 
 # Canonical text-tower fields, with the Transformers aliases that carry them.
 # First populated alias wins, so Hyper-internal names keep priority over the
@@ -93,6 +125,10 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "linear_num_value_heads": ("linear_num_value_heads",),
     "linear_value_head_dim": ("linear_value_head_dim",),
     "linear_conv_kernel_dim": ("linear_conv_kernel_dim",),
+    # The dtype the checkpoint's weights are saved in, which the runtime
+    # loads them in under its default torch_dtype of auto; newer
+    # Transformers name it dtype.
+    "torch_dtype": ("dtype", "torch_dtype"),
 }
 
 # Vision towers use their own spelling for the shared concepts.
@@ -110,69 +146,11 @@ _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 # Fallback when a vision tower declares no positional-embedding grid.
 _DEFAULT_VISUAL_SEQ_LEN = 1024
 
-
-# What a lower-cased model name contains when its attention normalizes each
-# head's queries and keys: the Qwen3 generation, Qwen3.5 and the Qwen3
-# vision-language models included.
-_QK_NORM_NAMES = ("qwen3",)
-
-
-def infer_qk_norm(name: Any) -> bool:
-    """Return whether a model named *name* normalizes each head's queries and keys.
-
-    For a producer whose config does not state it, as a Transformers config
-    does not: the Qwen3 generation does, and no other family the cost model
-    prices does.
-    """
-    lowered = str(name).lower()
-    return any(pattern in lowered for pattern in _QK_NORM_NAMES)
-
-
-# What a lower-cased model name contains when its attention projects queries,
-# keys and values with a bias and its output without, which its Transformers
-# config does not state: the Qwen2 generation.
-_QKV_BIAS_NAMES = ("qwen2",)
-
-# What a lower-cased model name contains when its MoE layer gates its shared
-# expert's output with a weight of its own: Qwen2-MoE, Qwen3.5 and Qwen3-Next.
-_SHARED_EXPERT_GATE_NAMES = ("qwen2_moe", "qwen3_5", "qwen3_next")
-
-
-def infer_qkv_bias(name: Any) -> bool:
-    """Return whether a model named *name* biases its query, key and value projections.
-
-    For a Transformers config that states no ``attention_bias``, as the
-    Qwen2 generation's, whose projections have one.
-    """
-    lowered = str(name).lower()
-    return any(pattern in lowered for pattern in _QKV_BIAS_NAMES)
-
-
-def infer_shared_expert_gate(name: Any) -> bool:
-    """Return whether a model named *name* gates its shared expert's output with a weight of its own."""
-    lowered = str(name).lower()
-    return any(pattern in lowered for pattern in _SHARED_EXPERT_GATE_NAMES)
-
-
-def _settle_facts(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Settle what the language model's config does not state, from its name where nothing states it.
-
-    Whether its attention normalizes queries and keys, and the biases and
-    norms its layers hold: a Transformers decoder layer holds two RMSNorms,
-    no bias unless its config states one or its family has one, and a
-    shared expert gated where its family gates it.
-    """
-    name = spec.get("name")
-    if spec.get("qk_norm") is None:
-        spec["qk_norm"] = infer_qk_norm(name)
-    if spec.get("qkv_bias") is None:
-        spec["qkv_bias"] = infer_qkv_bias(name)
-    for fact in ("o_bias", "mlp_bias", "norm_bias"):
-        spec[fact] = bool(spec.get(fact))
-    spec["layer_norms"] = spec.get("layer_norms") or 2
-    if spec.get("shared_expert_gate") is None:
-        spec["shared_expert_gate"] = infer_shared_expert_gate(name)
-    return spec
+# Keys of ``model.config_overrides`` that state the run, not the model.  The
+# model spec never sees them; the Hyper parser reads them into its ExecSpec.
+EXEC_OVERRIDE_KEYS = (
+    "offset", "full_rec", "sel_rec", "capacity_factor", "cap_fact", "use_gmm", "gmm", "seq_length",
+)
 
 
 def _declares_pretrained_path(mapping: Any) -> bool:
@@ -319,6 +297,51 @@ def _get_hf_config(model_raw: Mapping[str, Any]) -> Any:
     )
 
 
+def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
+    config = _get_hf_config(model_raw)
+    return config, _text_tower(config)
+
+
+def _factory_config(model_raw: Mapping[str, Any]) -> Any:
+    """The config the recipe's own factory builds, or None where it names none.
+
+    The model section's keys are offered to the factory by name, filtered to
+    the ones it accepts, so a recipe states its shape once and the cost model
+    reads the same statement the trainer does.  Anything the factory cannot
+    take, such as a dtype or a placement switch, is left out rather than
+    refused.
+
+    Returns:
+        A Transformers config, or None where ``_target_`` names no factory
+        this knows.
+
+    Raises:
+        ValueError: If the factory is known but cannot build its config, since
+            a recipe that names one and then fails is a broken recipe rather
+            than a model to price by formula.
+    """
+    import inspect  # pylint: disable=C0415
+
+    target = str(model_raw.get("_target_") or "")
+    path = _CONFIG_FACTORIES.get(target)
+    if path is None:
+        return None
+    module_path, _, name = path.rpartition(".")
+    try:
+        factory = getattr(importlib.import_module(module_path), name)
+        accepted = inspect.signature(factory).parameters
+        offered = {key: value for key, value in model_raw.items() if key in accepted}
+        logger.info("building the config %s states, through %s", target.rpartition(".")[2], name)
+        return factory(**offered)
+    except (ImportError, AttributeError, TypeError, OSError, KeyError, ValueError) as exc:
+        raise ValueError(
+            f"model._target_ names {target}, whose config factory {name} could not build its "
+            f"config ({exc}); the cost model prices what that factory builds, so fix the recipe "
+            f"rather than let the formulas price a different model"
+        ) from exc
+
+
 def _model_path(model_raw: Mapping[str, Any]) -> Optional[str]:
     """Return the model directory the section names, under any accepted key."""
     for alias in _MODEL_PATH_ALIASES:
@@ -328,28 +351,91 @@ def _model_path(model_raw: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def checkpoint_configs(model_raw: Mapping[str, Any]) -> Tuple[Any, Any]:
-    """The Transformers config of the checkpoint *model_raw* names, and its language model's."""
-    config = _get_hf_config(model_raw)
-    return config, _text_tower(config)
-
-
 def _explicit_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return the fields the model section states itself, as a plain dict.
+    """Return the model fields the model section states itself, as a plain dict.
 
-    ``config_overrides`` is the declared form. A from_config recipe instead
-    passes the shape it builds as factory arguments beside ``_target_``, such as
-    a ``num_hidden_layers`` that crops the released model; those name canonical
-    fields, so they are overrides too, and the released config must not win over
-    them. ``config_overrides`` keeps priority where both are present.
+    ``config_overrides`` is the declared form, less its run keys
+    (:data:`EXEC_OVERRIDE_KEYS`). A from_config recipe instead passes the shape
+    it builds as factory arguments beside ``_target_``, such as a
+    ``num_hidden_layers`` that crops the released model; those name canonical
+    fields, so they are overrides too, and the released config must not win
+    over them. ``config_overrides`` keeps priority where both are present. A
+    value of ``auto``, which ``torch_dtype`` takes to load the checkpoint's
+    own, states nothing over the checkpoint.
     """
     overrides = model_raw.get("config_overrides")
-    explicit = dict(overrides) if isinstance(overrides, Mapping) else {}
+    explicit = {}
+    if isinstance(overrides, Mapping):
+        explicit = {key: value for key, value in overrides.items() if key not in EXEC_OVERRIDE_KEYS}
     for field in _TEXT_FIELD_ALIASES:
         value = model_raw.get(field)
-        if value is not None:
+        if value is not None and value != "auto":
             explicit.setdefault(field, value)
     return explicit
+
+
+def exec_overrides(model_raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the run keys of the ``config_overrides`` fallback.
+
+    Args:
+        model_raw: The ``model`` section, as a plain mapping.
+
+    Returns:
+        The entries whose keys are in :data:`EXEC_OVERRIDE_KEYS`.
+    """
+    overrides = model_raw.get("config_overrides")
+    if not isinstance(overrides, Mapping):
+        return {}
+    return {key: value for key, value in overrides.items() if key in EXEC_OVERRIDE_KEYS}
+
+
+def _validated(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Check *spec* against the model IR before any consumer reads it.
+
+    Parsing and re-serialising is what makes the schema load-bearing rather
+    than advisory: a field the model declares but the IR does not know would
+    be dropped here, and an incoherent one raises by name.  The op profile
+    and the layer stack are settled here too, so the serialised spec states
+    what it will be priced with and which kind each layer is, even when the
+    family was only inferred from the model name and the stack from
+    ``layer_types`` or ``first_k_dense_replace``; and so is whether its
+    attention normalizes queries and keys, which a Transformers config does
+    not state, and the biases and norms its layers hold: a Transformers
+    decoder layer holds two RMSNorms, no bias unless its config states one
+    or its family has one, and a shared expert gated where its family
+    gates it.  ``layer_types`` is
+    consumed: ``layers`` says the same, checked against the profile.  A
+    vision tower states its stack likewise.
+    """
+    typed = ModelSpec.from_dict(spec)
+    typed = dataclasses.replace(
+        typed, arch=typed.arch or infer_arch(typed.name),
+        qk_norm=typed.qk_norm if typed.qk_norm is not None else infer_qk_norm(typed.name),
+        qkv_bias=typed.qkv_bias if typed.qkv_bias is not None else infer_qkv_bias(typed.name),
+        o_bias=bool(typed.o_bias), mlp_bias=bool(typed.mlp_bias), norm_bias=bool(typed.norm_bias),
+        layer_norms=typed.layer_norms or 2,
+        shared_expert_gate=(typed.shared_expert_gate if typed.shared_expert_gate is not None
+                            else infer_shared_expert_gate(typed.name)),
+    )
+    resolve_ops(typed.arch, typed.ops)
+    layers = spec_layer_stack(typed).to_layers()
+    vision = typed.vision
+    if vision is not None:
+        vision = dataclasses.replace(vision, layers=tower_layer_stack(vision).to_layers())
+    return dataclasses.replace(typed, layers=layers, vision=vision, layer_types=None).to_dict()
+# Canonical fields that say how a model is held, not what it is: a section
+# stating only these describes no model.
+_HOLDING_FIELDS = frozenset({"torch_dtype"})
+
+
+def _describes_a_model(explicit: Mapping[str, Any]) -> bool:
+    """Whether the fields a section states describe a model, beyond how it is held."""
+    return any(key not in _HOLDING_FIELDS for key in explicit)
+
+
+def _dtype_name(value: Any) -> Any:
+    """A dtype as its plain name, ``bfloat16`` for ``torch.bfloat16``; anything else as it is."""
+    return str(value).replace("torch.", "") if value is not None else None
 
 
 # The censuses this process has run, by config, layer stack and length: a
@@ -361,7 +447,7 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
     """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
     key = (
         text_config.to_json_string(),
-        tuple((group["kind"], int(group["count"])) for group in layers),
+        tuple((group["kind"], int(group["count"]), bool(group.get("mtp"))) for group in layers),
         int(seq_length),
         tuple(f"{spec.factory.__module__}.{spec.factory.__qualname__}" for spec in replacements),
     )
@@ -378,9 +464,21 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
             # The formulas price the layers, as they do without a census: a
             # census of Transformers' own modules would price a layer the run
             # does not build (F53).
-            logger.warning("no census of the layers: %s", exc)
+            logger.warning("%s", _NOT_A_BOUND % exc)
             _CENSUSES[key] = {}
     return copy.deepcopy(_CENSUSES[key])
+
+
+# What a run is told when a census it asked for did not happen.  Measured
+# without one, the formulas read 37 to 55% below Qwen3.5's peak and 49.9%
+# below the DeepSeek-V4.1 crop's, so a memory a search filters on is an
+# estimate and not an upper bound, and a strategy it calls feasible may not
+# be.  Said once, in the run's own log, where the number is read.
+_NOT_A_BOUND = (
+    "no census of the layers: %s. The formulas price them instead, and without a census they have "
+    "measured 37 to 55%% below a real peak, so this run's memory is an estimate and NOT a bound: a "
+    "strategy it reports as fitting may still run out of memory"
+)
 
 
 def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
@@ -390,34 +488,32 @@ def _no_census(census_seq_len: int, explicit: Mapping[str, Any]) -> None:
     ND a spec whose overrides state the records its reader measured.
     """
     if census_seq_len and not explicit.get("activations"):
-        logger.warning("no census of the layers: it needs the checkpoint's Transformers config")
+        logger.warning("%s", _NOT_A_BOUND % "it needs the checkpoint's Transformers config")
 
 
-def _census_layers(spec: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    """The groups of body layers a census tells apart, in model order, or None.
+def _stated_spec(model_raw: Mapping[str, Any], explicit: Dict[str, Any], census_seq_len: int) -> Dict[str, Any]:
+    """The spec of a model its section states by hand, derived and settled as a resolved one is.
 
-    The Hyper parser prices a hybrid model's layers by the attention flavour
-    its ``layer_types`` states, and any other model's as one kind; None
-    where the first layers are dense (``first_k_dense_replace``), a kind
-    the parser prices through the model's family.
+    A model no Transformers config describes, every model Transformers
+    cannot build, is stated field by field, and it takes the derivations a
+    resolved spec does: a shared expert stated by its width counts as that
+    many experts, and an all-MoE model's dense width is its shared
+    expert's.  Without them a hand-described all-MoE model kept no
+    ``intermediate_size``, the width its shared expert is priced at, and
+    its shared expert was dropped (I1).
     """
-    if spec.get("first_k_dense_replace"):
-        return None
-    count = int(spec.get("num_hidden_layers") or 0)
-    kinds = [str(kind) for kind in (spec.get("layer_types") or [])[:count]] or ["decoder"] * count
-    groups: List[Dict[str, Any]] = []
-    for kind in kinds:
-        if groups and groups[-1]["kind"] == kind:
-            groups[-1]["count"] += 1
-        else:
-            groups.append({"kind": kind, "count": 1})
-    return groups
+    explicit.setdefault("name", model_raw.get("name", "custom"))
+    _derive_shared_experts(explicit)
+    _derive_dense_ffn_width(explicit)
+    _no_census(census_seq_len, explicit)
+    return _validated(explicit)
 
 
 def resolve_hf_model_spec(
     model_raw: Mapping[str, Any],
     visual_seq_len: Optional[int] = None,
     census_seq_len: int = 0,
+    census_spec: bool = False,
     replacements: Tuple[Any, ...] = (),
 ) -> Dict[str, Any]:
     """Return canonical cost-model fields for a Trainer ``model`` section.
@@ -430,9 +526,9 @@ def resolve_hf_model_spec(
     ``model.config_overrides`` stays supported for standalone cost-model
     search files, and doubles as the fallback when the Transformers config
     cannot be reached (offline node, unreachable repository).  Explicit
-    overrides always win over resolved values.  Whether the language model
-    normalizes its queries and keys, which a Transformers config does not
-    state, is settled from its name when nothing states it.
+    overrides always win over resolved values.  Its run keys,
+    :data:`EXEC_OVERRIDE_KEYS`, are not the model's: :func:`exec_overrides`
+    returns them.
 
     Args:
         model_raw: The ``model`` section, as a plain mapping.
@@ -441,9 +537,20 @@ def resolve_hf_model_spec(
             the language model at, and of its output layer
             (:mod:`hyper_parallel.auto_parallel._layer_census`), which the
             spec states as ``"activations"`` and ``"output_activations"``;
-            0 runs none.  The census builds its layers from the checkpoint's
-            config: a spec from ``config_overrides`` alone gets none, and an
-            override of a model field does not reach it.
+            0 runs none.  The
+            census builds its layers from the checkpoint's config: a spec
+            from ``config_overrides`` alone gets none, and an override of a
+            model field does not reach it.
+        census_spec: Whether the language model's fields, its layer stack
+            and its op counts are the census's, measured on the layers
+            Transformers builds of the checkpoint
+            (:func:`~hyper_parallel.auto_parallel._spec_census.census_model_spec`),
+            rather than read from its config's fields.  A spec from
+            ``config_overrides`` alone is the overrides' either way.
+        replacements: The module replacements the run installs
+            (:func:`~hyper_parallel.auto_parallel._layer_census.replacement_specs`),
+            which the census runs its layers with, so it measures what the
+            trainer saves.
 
     Returns:
         A dict of canonical model fields, always carrying ``"name"``.
@@ -456,36 +563,45 @@ def resolve_hf_model_spec(
     model_path = _model_path(model_raw)
 
     if not model_path:
-        if explicit:
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len, explicit)
-            return _settle_facts(explicit)
+        if _describes_a_model(explicit):
+            return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             "AutoModels train.yaml requires model.pretrained_model_name_or_path, "
             "model.config_path or model.config_overrides for Auto Parallel search"
         )
 
+    # A recipe that builds its model through a factory is asked first: the
+    # path beside _target_ is a directory that factory reads, not a checkpoint
+    # to price, and where the two disagree the factory is what the run trains.
+    model_config = _factory_config(model_raw)
     try:
-        model_config = _get_hf_config(model_raw)
+        model_config = model_config if model_config is not None else _get_hf_config(model_raw)
     except (ImportError, OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
-        if explicit:
+        if _describes_a_model(explicit):
             logger.warning(
                 "Transformers config resolution failed (%s); "
                 "falling back to model.config_overrides", exc,
             )
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            _no_census(census_seq_len, explicit)
-            return _settle_facts(explicit)
+            return _stated_spec(model_raw, explicit, census_seq_len)
         raise ValueError(
             f"cannot resolve model.pretrained_model_name_or_path '{model_path}'; "
             "install transformers, set model.config_overrides, or make the config "
             "available offline (warm the HF_HOME cache, or pass local_files_only)"
         ) from exc
 
-    spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
-    _derive_shared_experts(spec)
-    _derive_dense_ffn_width(spec)
-    spec["name"] = str(getattr(model_config, "model_type", None) or model_path)
+    name = str(getattr(model_config, "model_type", None) or model_path)
+    if census_spec:
+        spec = census_model_spec(model_config, explicit.get("arch"), name)
+    else:
+        spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
+        _derive_shared_experts(spec)
+        _derive_dense_ffn_width(spec)
+        spec["name"] = name
+    # The dtype the checkpoint is saved in, by name, which the census's
+    # fields do not state (I12).
+    dtype = _first_attr(_text_tower(model_config), _TEXT_FIELD_ALIASES["torch_dtype"])
+    if dtype is not None:
+        spec["torch_dtype"] = _dtype_name(dtype)
 
     vision_config = getattr(model_config, "vision_config", None)
     if vision_config is not None:
@@ -495,12 +611,38 @@ def resolve_hf_model_spec(
         spec["vision"] = vision_spec
 
     spec.update(explicit)
-    spec = _settle_facts(spec)
+    resolved = _validated(spec)
     if census_seq_len:
-        layers = _census_layers(spec)
-        if layers is None:
-            logger.warning("no census of %s: its first layers are dense, a kind a census does not tell apart",
-                           spec["name"])
-        else:
-            spec.update(_census(_text_tower(model_config), layers, census_seq_len, replacements))
-    return spec
+        resolved.update(_census(_text_tower(model_config), resolved["layers"], census_seq_len, replacements))
+        resolved = ModelSpec.from_dict(resolved).to_dict()
+    return resolved
+
+
+def resolve_model_spec(
+    model_raw: Mapping[str, Any],
+    visual_seq_len: Optional[int] = None,
+    census_seq_len: int = 0,
+    census_spec: bool = False,
+    replacements: Tuple[Any, ...] = (),
+) -> ModelSpec:
+    """Return the typed :class:`ModelSpec` for a Trainer ``model`` section.
+
+    The typed entry point behind :func:`resolve_hf_model_spec`, which returns
+    the same facts as a plain mapping for callers that still read one.
+
+    Args:
+        model_raw: The ``model`` section, as a plain mapping.
+        visual_seq_len: Optional override for the encoder sequence length.
+        census_seq_len, census_spec, replacements: As
+            :func:`resolve_hf_model_spec` takes them.
+
+    Returns:
+        A validated spec.
+
+    Raises:
+        ModelSpecError: If the resolved fields are incomplete or incoherent.
+        ValueError: If neither a pretrained path nor overrides can supply
+            the model dimensions.
+    """
+    return ModelSpec.from_dict(
+        resolve_hf_model_spec(model_raw, visual_seq_len, census_seq_len, census_spec, replacements))

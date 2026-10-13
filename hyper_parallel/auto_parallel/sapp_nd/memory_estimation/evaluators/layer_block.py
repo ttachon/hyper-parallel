@@ -47,11 +47,10 @@ def _mlp_biases(ccfg: CostModelConfig, width: float) -> float:
     back to the hidden width, one of that; unstated, each projection one of
     the width.
     """
-    n_mm = max(ccfg.n_ffMM, ccfg.n_ffBMM)
     has_bias = getattr(ccfg, "mlp_bias", None)
     if has_bias is None:
-        return n_mm * width
-    return (n_mm - 1) * width + ccfg.h if has_bias else 0
+        return ccfg.n_ffMM * width
+    return (ccfg.n_ffMM - 1) * width + ccfg.h if has_bias else 0
 
 
 class EvalAttn:
@@ -153,13 +152,13 @@ class EvalFFn:
     def num_params_ffn(ccfg: CostModelConfig, _) -> float:
         """Parameters count"""
         return (ccfg.n_exp + ccfg.n_shared_exp) * (
-            max(ccfg.n_ffMM, ccfg.n_ffBMM) * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff))
+            ccfg.n_ffMM * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff))
 
     @staticmethod
     def num_params_routed_expert(ccfg: CostModelConfig, _) -> float:
         """Routed expert parameters count (with ETP correction)"""
         hff_sliced = ccfg.hff_exp / max(ccfg.etp, 1)
-        return ccfg.n_exp * (max(ccfg.n_ffMM, ccfg.n_ffBMM) * hff_sliced * ccfg.h + _mlp_biases(ccfg, hff_sliced))
+        return ccfg.n_exp * (ccfg.n_ffMM * hff_sliced * ccfg.h + _mlp_biases(ccfg, hff_sliced))
 
     @staticmethod
     def num_params_router(ccfg: CostModelConfig, _) -> float:
@@ -175,9 +174,8 @@ class EvalFFn:
         many.
         """
         gate = ccfg.h if ccfg.n_shared_exp and getattr(ccfg, "shared_expert_gate", None) else 0
-        n_mm = max(ccfg.n_ffMM, ccfg.n_ffBMM)
         width = ccfg.hff_exp
-        return ccfg.n_shared_exp * (n_mm * width * ccfg.h + _mlp_biases(ccfg, width)) + gate
+        return ccfg.n_shared_exp * (ccfg.n_ffMM * width * ccfg.h + _mlp_biases(ccfg, width)) + gate
 
     @staticmethod
     def ffn_activations(ccfg: CostModelConfig, ctx: Context, width: Optional[float] = None) -> float:
@@ -261,21 +259,21 @@ class EvalRecords:
                 layer's (``SEL_REC_LAYER``) dropping what its switches drop.
             slot: The slot.
             switches: A selective layer's switches, 1 to keep an op's
-                activations and 0 to drop them; the config's own where
-                omitted.
+                activations and 0 to drop them; where omitted, those the
+                context carries, else the config's own.
             overrides: Values that stand for the config's fields.
-            only: An op to price alone, whatever the switches say.
+            only: An op to price alone, its parts with it, or a part, whatever
+                the switches say.
         """
         records = load_op_records()
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        stated = ccfg.rec_op if switches is None else switches
+        stated = EvalUtils.switches(ccfg, ctx) if switches is None else switches
 
         def keep(op: str) -> Any:
-            switch = records.ops[op].switch
+            switch = records.record(op).switch
             if switch is None:
                 return 1
-            state = stated[switch] if isinstance(stated, Mapping) else getattr(stated, switch)
-            return EvalUtils.rec_coeff(rec_layer, state)
+            return EvalUtils.rec_coeff(rec_layer, EvalUtils.state(stated, switch))
 
         return records.evaluate(slot, EvalRecords.values(ccfg, ctx, overrides), keep, only)
 

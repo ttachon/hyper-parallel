@@ -165,6 +165,10 @@ class Context:
         # Whether the stage's dynamic memory counts what the node keeps for
         # the backward whose working set it is.
         self.working_on_saved = False
+        # The recompute switches of the layer evaluated, where they are not
+        # its config's rec_op: a layer priced under other switches.  None:
+        # the config's.
+        self.switches = None
         # The gradient bytes of the node evaluated last.
         self.node_grad = 0
         self.head_node, self.tail_node = None, None

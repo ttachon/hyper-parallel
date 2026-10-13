@@ -31,7 +31,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._hook_manager import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, Union
+    from typing import Any, Callable, Dict, Optional, Sequence, Union
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 
@@ -102,16 +102,86 @@ class EvaluatorV2(_Utils, _HookManager):
         return insights
 
     def estimate_layer_memory(
-        self, stages: list = None, ppb_format=1, device_type=Hard.Device_A2
+        self,
+        stages: list = None,
+        device_type=Hard.Device_A2,
+        layer_times: Optional[Callable] = None,
     ) -> Dict:
-        """PPB's input"""
+        """PPB's input
+
+        Args:
+            layer_times: Prices a layer as ``(forward, backward)`` from its
+                config, kind, layer type and recompute switches, such as
+                ``perf_estimation.estimate.LayerTimes``. With it, every layer
+                description carries its times, in units of the first body's
+                forward time, instead of a placeholder and offers the
+                selective recompute options worth pricing, and the result is
+                not cached.
+        """
         logger.info(device_type)
+        if layer_times is not None:
+            self._ppb_obj.layer_times = layer_times
+            try:
+                return self._estimate_on_copy(stages, False, True, -1, False)[1]
+            finally:
+                self._ppb_obj.layer_times = None
         if self.ppb:
             return self.ppb
-        res = self._estimate_on_copy(stages, False, ppb_format, -1, False)
+        res = self._estimate_on_copy(stages, False, True, -1, False)
         _, ppb = res
         self.ppb = ppb
         return ppb
+
+    def estimate_switch_profiles(
+        self,
+        layer_times: Callable,
+        stages: list = None,
+        most_in_flight: Optional[int] = None,
+        each_switch: bool = True,
+        in_flight: Sequence[int] = (),
+    ) -> Dict:
+        """What each recompute switch saves and costs, per model and layer kind.
+
+        Walks the stages as :meth:`estimate_layer_memory` does and measures
+        the first body layer of each kind: plain, with each op the switches
+        name recomputed alone, and fully recomputed. The config is left as it
+        was found.
+
+        Args:
+            layer_times: Prices a layer, as for :meth:`estimate_layer_memory`.
+            stages: The partition; the config's own when omitted.
+            most_in_flight: The most micro-batches any stage keeps in flight.
+                A buffer is split into what grows with the micro-batches in
+                flight and what is kept once by its size at one micro-batch
+                and at this many, so the split is exact at both. Under 1F1B
+                without interleaving, the least of the stages and the
+                micro-batches when omitted.
+            each_switch: Whether to measure each switch alone. Without, a
+                profile prices only the plain and the fully recomputed
+                layer, which is all one mode for every layer needs unless it
+                is selective.
+            in_flight: The counts of micro-batches in flight the stages
+                keep. At each between one and the most, a profile also
+                states what the split charges beyond the buffers kept, so
+                that an option's memory is exact at every count.
+
+        Returns:
+            ``{(model name, layer kind): SwitchProfile}``, in model order.
+        """
+        self._ppb_obj.layer_times = layer_times
+        self._ppb_obj.profiles = {}
+        self._ppb_obj.profile_in_flight = most_in_flight
+        self._ppb_obj.profile_each_switch = each_switch
+        self._ppb_obj.profile_counts = tuple(sorted(set(in_flight)))
+        try:
+            self._estimate_on_copy(stages, False, True, -1, False)
+            return self._ppb_obj.profiles
+        finally:
+            self._ppb_obj.layer_times = None
+            self._ppb_obj.profiles = None
+            self._ppb_obj.profile_in_flight = None
+            self._ppb_obj.profile_each_switch = True
+            self._ppb_obj.profile_counts = ()
 
     # Specific estimation
 
@@ -256,11 +326,6 @@ def main():
         help="Generate pipeline balancing layers description",
     )
     parser.add_argument(
-        "--ppb-new",
-        action="store_true",
-        help="Generate pipeline balancing layers description (New format)",
-    )
-    parser.add_argument(
         "--ctx", action="store_true", help="Show ctx variables"
     )
     parser.add_argument(
@@ -291,9 +356,6 @@ def main():
         e.print_ccfg()
     if args.ppb:
         ppb = e.estimate_layer_memory()
-        print(json.dumps(ppb, indent=2))
-    elif args.ppb_new:
-        ppb = e.estimate_layer_memory(ppb_format=2)
         print(json.dumps(ppb, indent=2))
     else:
         peak_mem = e.estimate_peak(
