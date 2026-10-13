@@ -145,6 +145,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
+| **strategy-agent** | Layout for a job on Ascend dies, every valid layout priced by ND: the pick, the next two, why | `$strategy-agent` (Codex), `/strategy-agent` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
@@ -175,6 +176,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **activation-dev** | Activation recompute/swap + LlamaFactory ordering (details in `activation-dev-guide.md`) |
 | **llamafactory-hp** | LlamaFactory integration surface (activation details → `activation-dev`) |
 | **parallel-strategy-analyzer** | Thin proxy → `skills/parallel-strategy-analyzer` |
+| **strategy-agent** | Thin proxy → `skills/strategy-agent` (layout advice priced by ND) |
 
 ### Rules (auto-applied by path)
 
