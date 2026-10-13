@@ -16,16 +16,39 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
+from hyper_parallel.trainer.runtime.distributed import get_global_rank_safe, get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
 
 from .base import Callback, TrainerState
+
+# Set to 1 to publish the caching allocator's own counters every step. Off by default:
+# it costs one all-reduce over every rank and a host copy of its result a step.
+ALLOCATOR_STATS_ENV = "HYPER_PARALLEL_MEMORY_STATS"
+# memory_stats() keys and the metric each one is published as. The first key picks
+# the rank that is reported; names ending in _gb are GiB, the others are counts.
+ALLOCATOR_COUNTERS = (
+    ("reserved_bytes.all.peak", "reserved_peak_gb"),
+    ("allocated_bytes.all.peak", "allocated_peak_gb"),
+    ("requested_bytes.all.peak", "requested_peak_gb"),
+    ("active_bytes.all.peak", "active_peak_gb"),
+    ("inactive_split_bytes.all.peak", "inactive_split_peak_gb"),
+    ("reserved_bytes.small_pool.peak", "small_pool_reserved_peak_gb"),
+    ("reserved_bytes.large_pool.peak", "large_pool_reserved_peak_gb"),
+    ("reserved_bytes.all.current", "reserved_gb"),
+    ("allocated_bytes.all.current", "allocated_gb"),
+    ("inactive_split_bytes.all.current", "inactive_split_gb"),
+    ("num_alloc_retries", "alloc_retries"),
+    ("num_ooms", "ooms"),
+)
+# Marks a counter this allocator does not provide; it is published as NaN.
+_MISSING_COUNTER = -1
 
 
 class EnvironMeterCallback(Callback):
@@ -48,6 +71,7 @@ class EnvironMeterCallback(Callback):
         self._local_step_samples = 0
         self._consumed_tokens = 0
         self._consumed_samples = 0
+        self._allocator_stats = os.getenv(ALLOCATOR_STATS_ENV, "0").lower() in ("1", "true")
         self.trainer.step_train_metrics = {}
         self.trainer.step_env_metrics = {}
 
@@ -224,7 +248,62 @@ class EnvironMeterCallback(Callback):
         return {
             "memory/device_max_allocated_gb": allocated / gibibyte,
             "memory/device_max_reserved_gb": reserved / gibibyte,
+            **self._allocator_metrics(device),
         }
+
+    @staticmethod
+    def _gather_rows(counters: list[int]) -> list[list[float]]:
+        """Return every rank's counters, one row a rank, in rank order.
+
+        Each rank writes its row into its own slot of a zeroed vector and one sum over
+        the default group fills every slot. The reduce runs in float32, which keeps a
+        byte count to a few KiB, far below the GiB the counters are published in.
+
+        Args:
+            counters: This rank's counters, the same length on every rank.
+
+        Returns:
+            One row a rank, the calling rank's included.
+        """
+        world_size = get_world_size_safe()
+        if world_size <= 1:
+            return [[float(value) for value in counters]]
+        width = len(counters)
+        start = get_global_rank_safe() * width
+        slots = [0] * (world_size * width)
+        slots[start:start + width] = counters
+        summed = all_reduce(slots, op="sum", group=None)
+        return [summed[index * width:(index + 1) * width] for index in range(world_size)]
+
+    def _allocator_metrics(self, device: Any) -> dict[str, float]:
+        """Publish the caching allocator's counters of the rank that reserved most.
+
+        Enabled by ``HYPER_PARALLEL_MEMORY_STATS=1``. Every counter comes from that
+        one rank, so its reserved, allocated and inactive split bytes describe a
+        single allocator, where the two maxima above may come from two ranks.
+
+        Args:
+            device: Torch device module that provides ``memory_stats()``.
+
+        Returns:
+            One ``memory/allocator_*`` metric for each counter, and the rank read.
+        """
+        if not self._allocator_stats:
+            return {}
+        stats = device.memory_stats()
+        rows = self._gather_rows([int(stats.get(key, _MISSING_COUNTER)) for key, _ in ALLOCATOR_COUNTERS])
+        # Ties go to the lowest rank, so every rank names the same one.
+        reported = max(range(len(rows)), key=lambda index: (rows[index][0], -index))
+        metrics = {"memory/allocator_rank": float(reported)}
+        gibibyte = 1024 ** 3
+        for (_, name), value in zip(ALLOCATOR_COUNTERS, rows[reported]):
+            if value == _MISSING_COUNTER:
+                metrics[f"memory/allocator_{name}"] = float("nan")
+            elif name.endswith("_gb"):
+                metrics[f"memory/allocator_{name}"] = value / gibibyte
+            else:
+                metrics[f"memory/allocator_{name}"] = float(value)
+        return metrics
 
     def state_dict(self) -> dict[str, int]:
         """Return cumulative metric state for future checkpoint integration."""
