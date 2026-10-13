@@ -34,11 +34,13 @@ plan tests did, and always takes it out again; each run records the allocator it
 
 ``classify`` turns the round's profiles into the classified CSV a calibration fits ND's ratios on. Each run
 profiles steps 3 and 4 into the sweep's folder for its strategy on the first node, which the next run of the same
-strategy empties, so a pick and its anchor share one: only the last run of each strategy still has its profile, and
-only if it finished. Those are copied here, classified with ``nd.trace_classify`` and merged into one CSV with the
-trainer's own step of each run and its recompute mode, which the step prints for pasting. ND's comparison
-(``run_nd --real_csv``) prices a run in one mode for the whole model, so it cannot price a plan that keeps some
-layers; fit the plans' rows against the parts ND's search priced for them.
+strategy empties first, so ``run`` moves each finished run's profile to a folder carrying the run's name as soon as
+it is over: a pick and its anchor, which are one strategy, then both keep theirs. ``classify`` reads a run's own
+folder where there is one and the strategy's where there is not, which is how the rounds before this kept theirs,
+classifies each with ``nd.trace_classify`` and merges them into one CSV with the trainer's own step of each run and
+its recompute mode, which the step prints for pasting. ND's comparison (``run_nd --real_csv``) prices a run in one
+mode for the whole model, so it cannot price a plan that keeps some layers; fit the plans' rows against the parts
+ND's search priced for them.
 
 The script needs nothing beyond the standard library, apart from PyYAML to write the plan yamls.
 
@@ -329,8 +331,8 @@ def _state(record: Dict[str, Any]) -> str:
             f"{_number(record.get('max_reserved_gb'), 2)} reserved")
 
 
-def launch(run: Run, again: bool, allocator: str = "default") -> None:
-    """Run one strategy through the sweep, unless it has run or a device is busy, and note the allocator it ran on."""
+def launch(run: Run, again: bool, allocator: str = "default", env: Optional[Dict[str, Any]] = None) -> None:
+    """Run one strategy through the sweep, unless it has run or a device is busy; keep its profile and allocator."""
     folder = OUT / run.folder
     kept = read_run(run)
     if kept is not None and not again:
@@ -346,6 +348,8 @@ def launch(run: Run, again: bool, allocator: str = "default") -> None:
     if folder.is_dir():
         (folder / "allocator.txt").write_text(allocator + "\n", encoding="utf-8")
     record = read_run(run)
+    if record is not None and env is not None:
+        keep_profile(run, env)
     print(f"{run.name}: {_state(record) if record else 'no record, so it did not run'}", flush=True)
 
 
@@ -358,13 +362,14 @@ def run_all(names: Sequence[str], again: bool, expandable: bool = False) -> None
     if not same_environment():
         raise SystemExit("the nodes do not answer the same torch versions: fix the odd node, or run setup again")
     allocator = "expandable segments" if expandable else "default"
+    env = load_sweep().read_cluster_env(CLUSTER_ENV)
     with _signals_stop_cleanly():
         set_allocator(expandable)
         try:
             for index, run in enumerate(chosen, 1):
                 print(f"\n##### {index} of {len(chosen)}: {run.name}, {run.strategy}, recompute {run.plan}, "
                       f"{allocator} allocator #####", flush=True)
-                launch(run, again, allocator)
+                launch(run, again, allocator, env)
         finally:
             if expandable:
                 set_allocator(False)
@@ -376,18 +381,53 @@ def profile_tag(run: Run) -> str:
     return f"ep{run.ep}_cp{run.cp}_op{run.op}_tp1_pp1"
 
 
+def kept_profile_tag(run: Run) -> str:
+    """The folder one run's profile is kept under once the run is over, which no later run empties."""
+    return f"{run.name}_{profile_tag(run)}"
+
+
+def remote_profiles(env: Dict[str, Any]) -> List[str]:
+    """What the first node holds under the sweep's profile directory, empty where it cannot be listed."""
+    listed = subprocess.run(
+        ["ssh", f"{env['ssh_user']}@{env['nodes'][0]}",
+         f"ls -1 {shlex.quote(env['repo_dir'] + '/' + REMOTE_PROFILES)}"],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout or ""
+    return [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def keep_profile(run: Run, env: Dict[str, Any]) -> None:
+    """Move a finished run's profile to its own folder on the first node, out of the strategy's.
+
+    The sweep profiles every run of a strategy into one folder and empties it
+    before each launch, so a pick and the anchor that repeats its strategy
+    cannot otherwise both be classified: whichever ran last owned the profile.
+    """
+    base = env["repo_dir"] + "/" + REMOTE_PROFILES
+    tag, kept = profile_tag(run), kept_profile_tag(run)
+    shell = (f"d={shlex.quote(base)}; if [ -d \"$d/{tag}\" ]; then rm -rf \"$d/{kept}\" && "
+             f"mv \"$d/{tag}\" \"$d/{kept}\"; fi")
+    moved = subprocess.run(["ssh", f"{env['ssh_user']}@{env['nodes'][0]}", shell],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    print(f"{run.name}: profile kept as {kept}" if moved else
+          f"{run.name}: its profile could not be moved, so the next run of {tag} will empty it", flush=True)
+
+
 def dims(run: Run) -> Dict[str, int]:
     """A run's degrees as the classifier labels them: one sequence a micro-batch, the batch the world size."""
     dp = WORLD // run.cp
     return {"DP": dp, "MP": 1, "PP": 1, "CP": run.cp, "EP": run.ep, "MB": WORLD // dp, "MBS": 1, "OP": run.op}
 
 
-def profile_owners() -> Dict[str, List[str]]:
-    """Which runs still have their profile on the node, and why the others do not.
+def profile_owners(listing: Sequence[str]) -> Dict[str, List[str]]:
+    """Which runs have a profile on the node, and why the others do not.
 
-    Every run of a strategy empties the strategy's folder before it profiles,
-    so the folder holds the last run's profile, the newest record decides, and
-    a run that failed leaves no profile to classify.
+    A run that finished under this script keeps its profile under its own name.
+    A round run before that has only the strategy's folder, which every run of
+    the strategy emptied before profiling, so there the newest record owns it.
+
+    Args:
+        listing: The folder names the first node holds, as ``remote_profiles``
+            returns them.
 
     Returns:
         ``{"classify": [...], <reason>: [...]}``, run names by what happens to them.
@@ -400,31 +440,36 @@ def profile_owners() -> Dict[str, List[str]]:
             last[profile_tag(run)], stamps[profile_tag(run)] = run, states.stat().st_mtime
     owners: Dict[str, List[str]] = {"classify": []}
     for run in RUNS:
-        record = read_run(run)
+        record, newer = read_run(run), last.get(profile_tag(run))
         if record is None:
             why = "not run"
-        elif last.get(profile_tag(run)) is not run:
-            why = f"profile replaced by {last[profile_tag(run)].name}, a later run of the strategy"
         elif record.get("failed"):
             why = "failed, so its profile is not whole"
-        else:
+        elif kept_profile_tag(run) in listing or (profile_tag(run) in listing and newer is run):
             why = "classify"
+        elif newer is not None and newer is not run:
+            why = f"profile replaced by {newer.name}, a later run of the strategy before this script kept them apart"
+        else:
+            why = "no profile on the node"
         owners.setdefault(why, []).append(run.name)
     return owners
 
 
 def classify_round(sweep: ModuleType, env: Dict[str, Any]) -> Optional[Path]:
     """Copy the round's profiles from the first node, classify each, merge them into one CSV and print it."""
-    owners = profile_owners()
+    listing = remote_profiles(env)
+    owners = profile_owners(listing)
     for why, names in owners.items():
         if why != "classify":
             print(f"left out, {why}: {', '.join(names)}", flush=True)
     runs = [run for run in RUNS if run.name in owners["classify"]]
     parts, steps, modes = [], {}, {}
     for run in runs:
-        local = OUT / "profiles" / profile_tag(run)
+        # Its own folder where the run kept one, the strategy's for a round run before this script did that.
+        remote = kept_profile_tag(run) if kept_profile_tag(run) in listing else profile_tag(run)
+        local = OUT / "profiles" / kept_profile_tag(run)
         local.mkdir(parents=True, exist_ok=True)
-        source = f"{env['ssh_user']}@{env['nodes'][0]}:{env['repo_dir']}/{REMOTE_PROFILES}/{profile_tag(run)}/"
+        source = f"{env['ssh_user']}@{env['nodes'][0]}:{env['repo_dir']}/{REMOTE_PROFILES}/{remote}/"
         # --delete applies to the local copy only, so a profile copied before cannot sit beside this one.
         if subprocess.run(["rsync", "-a", "--delete", source, f"{local}/"], check=False).returncode:
             print(f"{run.name}: could not copy {source}, left out", flush=True)

@@ -64,6 +64,21 @@ def _run(name: str):
     return next(run for run in Runner.RUNS if run.name == name)
 
 
+class _Sweep:
+    """Stands in for the strategy sweep, which the runner loads for the kit config and the rank correlation."""
+
+    def __init__(self, env: dict) -> None:
+        """Answer every kit config with *env*."""
+        self.env = env
+
+    def read_cluster_env(self, path: Path) -> dict:
+        """The kit config as the sweep reads it."""
+        del path
+        return self.env
+
+    spearman = staticmethod(Sweep.spearman)
+
+
 class TestRuns(unittest.TestCase):
     """The picks are ND's order of runnable strategies, each launched as the sweep would."""
 
@@ -306,6 +321,7 @@ class TestAllocator(unittest.TestCase):
                 patch.object(Runner, "OUT", Path(folder) / "out"),
                 patch.object(Runner, "plan_yaml", lambda run: Path(folder) / "plan.yaml"),
                 patch.object(Runner, "same_environment", lambda: True),
+                patch.object(Runner, "load_sweep", lambda: _Sweep(_ENV)),
                 patch.object(Runner.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0)),
                 patch.object(Runner, "stream", fake_stream),
                 contextlib.redirect_stdout(io.StringIO()),
@@ -371,28 +387,91 @@ class TestClassify(unittest.TestCase):
         self._record(out, "p02", 500.0, step_trainer=3567.1)
         self._record(out, "p08", 600.0, failed=True)
 
-    def test_the_last_run_of_a_strategy_owns_its_profile(self):
-        """A run whose strategy ran again later lost its profile; a failed run's is not whole."""
+    def test_a_run_that_kept_its_own_profile_owns_it_whatever_ran_after(self):
+        """With its own folder on the node, a pick keeps its profile although its anchor repeated the strategy."""
+        listing = [Runner.kept_profile_tag(_run(name)) for name in ("p01", "p05", "a2", "p02")]
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder)
             self._round(out)
             with patch.object(Runner, "OUT", out):
-                owners = Runner.profile_owners()
+                owners = Runner.profile_owners(listing)
 
-        self.assertEqual(owners["classify"], ["p02", "a2"])
-        self.assertEqual(owners["profile replaced by a1, a later run of the strategy"], ["p01"])
-        self.assertEqual(owners["profile replaced by a2, a later run of the strategy"], ["p05"])
+        self.assertEqual(owners["classify"], ["p01", "p02", "p05", "a2"])
         self.assertEqual(owners["failed, so its profile is not whole"], ["p08", "a1"])
         self.assertEqual(len(owners["not run"]), len(Runner.RUNS) - 6)
+
+    def test_without_its_own_folder_the_last_run_of_a_strategy_owns_the_profile(self):
+        """A round run before the runner kept them apart: the strategy's folder holds the newest run's profile."""
+        strategies = sorted({Runner.profile_tag(run) for run in Runner.RUNS})
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            self._round(out)
+            with patch.object(Runner, "OUT", out):
+                owners = Runner.profile_owners(strategies)
+
+        self.assertEqual(owners["classify"], ["p02", "a2"])
+        replaced = "profile replaced by {}, a later run of the strategy before this script kept them apart"
+        self.assertEqual(owners[replaced.format("a1")], ["p01"])
+        self.assertEqual(owners[replaced.format("a2")], ["p05"])
+        self.assertEqual(owners["failed, so its profile is not whole"], ["p08", "a1"])
+
+    def test_a_profile_the_node_does_not_hold_is_named_rather_than_classified(self):
+        """A run whose folder was cleared off the node is left out, not read from another run's."""
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            self._record(out, "p02", 100.0, step_trainer=3567.1)
+            with patch.object(Runner, "OUT", out):
+                owners = Runner.profile_owners([])
+
+        self.assertEqual(owners["classify"], [])
+        self.assertEqual(owners["no profile on the node"], ["p02"])
+
+    def test_a_finished_run_moves_its_profile_out_of_the_strategys_folder(self):
+        """The run stage renames the profile to the run's own folder, after the sweep and before the next launch."""
+        env = {"nodes": ["192.168.0.143"], "ssh_user": "root", "repo_dir": "/home/tt/hyper-parallel"}
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            self._record(out, "p01", 100.0, step_trainer=3252.6)
+            commands, printed = [], io.StringIO()
+
+            def fake_run(command: list, **kwargs: object) -> subprocess.CompletedProcess:
+                """Record the ssh move, and let the readiness check pass."""
+                del kwargs
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0)
+
+            def fake_stream(command: list, log: Path) -> int:
+                """Stand in for the sweep, which leaves the run's record behind."""
+                del log
+                self._record(out, "p01", 200.0, step_trainer=3252.6)
+                self.assertEqual(command[command.index("--out") + 1], str(out / _run("p01").folder))
+                return 0
+
+            with (patch.object(Runner, "OUT", out), patch.object(Runner.subprocess, "run", fake_run),
+                  patch.object(Runner, "stream", fake_stream), contextlib.redirect_stdout(printed)):
+                Runner.launch(_run("p01"), again=True, env=env)
+
+        moves = [command for command in commands if command[0] == "ssh"]
+        self.assertEqual(len(moves), 1, f"commands={commands}")
+        self.assertEqual(moves[0][1], "root@192.168.0.143")
+        self.assertIn("ep1_cp1_op64_tp1_pp1", moves[0][2])
+        self.assertIn("p01_ep1_cp1_op64_tp1_pp1", moves[0][2])
+        self.assertIn("p01: profile kept as p01_ep1_cp1_op64_tp1_pp1", printed.getvalue())
 
     def test_classify_copies_classifies_and_merges_the_owners_only(self):
         """Each owner's folder is copied from the first node and classified; the merge carries step and mode."""
         commands = []
 
+        kept = {"p05": Runner.kept_profile_tag(_run("p05"))}
+
         def fake_run(command: list, **kwargs: object) -> subprocess.CompletedProcess:
-            """Stand in for rsync and the classifier, which writes one row for the degrees it is given."""
+            """Stand in for the node listing, rsync, and the classifier, which writes one row per run."""
             del kwargs
             commands.append(command)
+            if command[0] == "ssh":
+                # p05 kept its own profile; the other strategies have only their shared folder.
+                folders = [kept["p05"]] + sorted({Runner.profile_tag(run) for run in Runner.RUNS})
+                return subprocess.CompletedProcess(command, 0, stdout="\n".join(folders) + "\n")
             if command[0] != "rsync":
                 labels = dict(item.split("=") for item in command[command.index("--dims") + 1].split(","))
                 Path(command[command.index("--csv") + 1]).write_text(
@@ -410,15 +489,20 @@ class TestClassify(unittest.TestCase):
             with open(merged, newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
 
+        remote = "root@192.168.0.143:/home/tt/hyper-parallel/output/sweep_profiles/"
         rsyncs = [command for command in commands if command[0] == "rsync"]
+        # p05 is read from its own folder, p02 and a2 from their strategy's, each into a folder of its own here.
         self.assertEqual([command[-2] for command in rsyncs],
-                         ["root@192.168.0.143:/home/tt/hyper-parallel/output/sweep_profiles/ep1_cp1_op32_tp1_pp1/",
-                          "root@192.168.0.143:/home/tt/hyper-parallel/output/sweep_profiles/ep2_cp1_op32_tp1_pp1/"])
+                         [f"{remote}ep1_cp1_op32_tp1_pp1/", f"{remote}p05_ep2_cp1_op32_tp1_pp1/",
+                          f"{remote}ep2_cp1_op32_tp1_pp1/"])
+        self.assertEqual([Path(command[-1]).name for command in rsyncs],
+                         ["p02_ep1_cp1_op32_tp1_pp1", "p05_ep2_cp1_op32_tp1_pp1", "a2_ep2_cp1_op32_tp1_pp1"])
         self.assertTrue(all("--delete" in command for command in rsyncs))
         self.assertEqual([(row["EP"], row["OP"], row["step_trainer"], row["recompute"]) for row in rows],
-                         [("1", "32", "3567.100", "full"), ("2", "32", "3601.800", "full")])
-        self.assertIn("left out, profile replaced by a1, a later run of the strategy: p01", printed.getvalue())
-        self.assertIn("2 run(s) classified", printed.getvalue())
+                         [("1", "32", "3567.100", "full"), ("2", "32", "3083.100", "full"),
+                          ("2", "32", "3601.800", "full")])
+        self.assertIn("left out, profile replaced by a1, a later run of the strategy", printed.getvalue())
+        self.assertIn("3 run(s) classified", printed.getvalue())
 
 
 if __name__ == "__main__":
