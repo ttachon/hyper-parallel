@@ -25,6 +25,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import set_strict
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
+from hyper_parallel.auto_parallel.sapp_nd.nd import _pool
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
@@ -483,13 +484,17 @@ if __name__ == "__main__":
         default=None,
         help="list of varying (output) dimensions",
     )
-    # parser.add_argument(
-    #     "-j",
-    #     "--threads_num",
-    #     type=int,
-    #     default=None,
-    #     help="Number of threads for the space generation",
-    # )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        help="Worker processes that price the search's candidates; 1 prices them in this one. "
+        "Default: ND_JOBS, else half the logical cores and at most 4, and 1 above -v 2, whose "
+        "line per estimate only this process prints. A search with -ar, --recompute, a recompute "
+        "dimension in its yaml or a multimodal model, every mode but the plain search, and a "
+        "search of fewer than 2000 candidates price them here",
+    )
     parser.add_argument(
         "-v",
         "--verbosity",
@@ -746,6 +751,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     set_strict(args.strict)
+    if args.jobs is not None and args.jobs < 1:
+        parser.error(f"-j/--jobs counts processes, at least 1, got {args.jobs}")
     if args.real_csv is not None and not os.path.isfile(args.real_csv):
         parser.error(f"real_csv not found: {args.real_csv}")
     if args.write_ratios is not None and args.real_csv is None:
@@ -860,6 +867,21 @@ if __name__ == "__main__":
     else:
         input_config = args.yaml_config
 
+    # The workers start now and import while this process parses the run; each
+    # rebuilds its runner from these values, so only the plain search takes them.
+    workers = args.jobs if args.jobs is not None else _pool.default_workers(args.verbosity)
+    pool = None
+    if workers > 1 and isinstance(input_config, str) and args.real_csv is None and not args.auto_recompute \
+            and recompute_modes is None:
+        pool = _pool.Workers(workers, {
+            "framework": args.framework, "yaml_config": input_config, "devices": args.devices,
+            "device_type": args.device_type or "A2", "global_batch_size": args.global_batch_size,
+            "dimensions": args.dimensions, "swap_os": args.swap_opt_state, "mppb": args.mppb,
+            "model": args.model, "max_mem": args.max_mem.strip() if args.max_mem is not None else None,
+            "mem_for_ppb": args.mem_for_ppb.strip(), "verbosity": args.verbosity,
+            "output_dir": args.output_dir, "strict": args.strict,
+        })
+
     nd_runner = Par.Parallelize(
         args.framework,
         input_config,
@@ -876,6 +898,7 @@ if __name__ == "__main__":
         max_mem=max_mem,
         mem_for_ppb=Memory.from_string(args.mem_for_ppb.strip()),
         # vpp_less_mem=args.less_memory,
+        workers=pool,
         **_recompute_kwargs(args.auto_recompute, recompute_modes),
     )
 
@@ -888,7 +911,7 @@ if __name__ == "__main__":
 
     space = nd_runner.run_generation_to_ordering(
         YAML_FOLDER,
-        threads_num=None,  # args.threads_num
+        threads_num=workers if pool is not None else None,
         top_num=args.top_config_number,
         cache_file=args.cache_file,
         ranking_csv=args.ranking_csv,

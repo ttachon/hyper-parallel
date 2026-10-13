@@ -15,10 +15,8 @@
 """find parallelization"""
 
 from collections import Counter
-from contextlib import nullcontext
 import time
 import copy
-import multiprocessing as proc
 import json
 import os
 import logging
@@ -45,7 +43,6 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_exec
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
-    CostModelConfig,
     arm_strategy_guard,
     detect_attention_type,
     unset_reads_report,
@@ -60,6 +57,12 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import (
 
 # logger = proc.log_to_stderr()
 # logger.setLevel(proc.SUBDEBUG)
+
+# The fewest candidates the workers of run_nd -j price; a search with fewer
+# prices them here.  Spawned workers that import torch and parse the run are
+# ready about 5 s after a warm search starts generating on a laptop, and four
+# of them save about 3 ms a candidate across generation and ordering.
+POOL_FROM = 2000
 
 
 def state_machine_links(ccfg: Any, device: Any) -> None:
@@ -94,6 +97,8 @@ class ParallelizeLayer:
     recompute_dimension = None
     _stated_mode = None
     auto_recompute = False
+    # No workers: the candidates are priced in this process (run_nd -j starts them).
+    workers = None
 
     def __init__(
         self,
@@ -389,7 +394,7 @@ class ParallelizeLayer:
         verbose = logger.level < logging.INFO
         self.mem_eval.set_config(self.priced())
         # self.mem_eval = EvaluatorV2(self.config)
-        logger.debug("ccfg = %s", str(self.config.ccfg))
+        logger.debug("ccfg = %s", self.config.ccfg)
         peak = self.mem_eval.estimate_peak(
             verbose=verbose
         )  # (logger.level>2))
@@ -431,54 +436,80 @@ class ParallelizeLayer:
 
         A candidate the memory budget drops is named with its peak, and the
         summary counts the candidates the checks refused apart from those the
-        budget dropped, each check by name.
+        budget dropped, each check by name.  With *threads_num* workers that
+        run_nd started, they price the candidates (:meth:`_pooled`).
         """
-        # With a pool the accumulator holds AsyncResult, which the direct
-        # branch's float values hide from static inference.
-        # pylint: disable=no-member
-        space = ({}, 0)
         configs = []
-        results = {}
         self.refused = Counter()
-        if threads_num:
-            with proc.Pool(processes=threads_num) as pool:
-                logger.debug("before loops")
-                results, size = self.device_loops(space, pool)
-                logger.debug("%d results", len(results))
-                for config, result in results.items():
-                    logger.debug("result = %s", str(result))
-                    logger.debug(
-                        "before get: is ready ? %s", str(result.ready())
-                    )
-                    peak_mem = result.get()
-                    logger.debug(
-                        "after get: is ready ? %s", str(result.ready())
-                    )
-                    logger.debug(
-                        "after get: is successful ? %s",
-                        str(result.successful()),
-                    )
-                    logger.debug("peak_mem = %s", str(peak_mem))
-                    if self.mem_eval.mem_fit(peak_mem):
-                        configs.append((config, peak_mem))
-                    else:
-                        self._drop(config, peak_mem)
-                pool.close()
-                pool.join()
+        if self._pooled(threads_num):
+            results, size = self._memory_pooled()
         else:
-            results, size = self.device_loops(space, None)
-            for config, peak_mem in results.items():
-                if self.mem_eval.mem_fit(peak_mem):
-                    configs.append((config, peak_mem))
-                    if folder:
-                        self.config.write(folder, config)
-                else:
-                    self._drop(config, peak_mem)
+            with Debug.holding_open():
+                results, size = self.device_loops(({}, 0), None)
+        for config, peak_mem in results.items():
+            if self.mem_eval.mem_fit(peak_mem):
+                configs.append((config, peak_mem))
+                if folder:
+                    self.config.write(folder, config)
+            else:
+                self._drop(config, peak_mem)
         self._summarise_search(size, len(results), len(configs))
 
         return configs
 
-    def device_loops(self, space: Any, pool: Any) -> Tuple[dict, int]:
+    def _pooled(self, threads_num: Any) -> bool:
+        """Whether the workers run_nd started price this search's candidates, rather than this process.
+
+        A search that chooses a recompute per layer (-ar), has a recompute
+        dimension or prices a multimodal model carries more than the command
+        line a worker rebuilds its runner from, so it prices here.
+        """
+        return (bool(threads_num) and threads_num > 1 and self.workers is not None
+                and not self.auto_recompute and self.recompute_dimension is None
+                and not self._priced_on_submodules())
+
+    def _memory_pooled(self) -> Tuple[dict, int]:
+        """device_loops, with each candidate's memory priced in a worker.
+
+        The loop nest runs here and refuses and sets each candidate as it does
+        in one process, collecting the rest; the workers price them, and the
+        debug rows are written here in the loop's order.  Fewer than
+        :data:`POOL_FROM` candidates are priced here instead, and the workers
+        stop unused.
+        """
+        collected = []
+        _, size = self.device_loops(({}, 0), collected)
+        if len(collected) >= POOL_FROM:
+            priced = self.workers.memory([(index, dims) for index, (_, dims) in enumerate(collected)])
+        else:
+            self.close_pool(abort=True)
+            priced = [self._memory_here(config) for config, _ in collected]
+        results = {}
+        with Debug.holding_open():
+            for (config, dims), (peak, info) in zip(collected, priced):
+                config.pool_dims = dims
+                if info is not None:
+                    debugger = Debug.Debug(config, info_type=Debug.MemParts, enable=True, output_file="debug_mem.csv")
+                    debugger.info = info
+                    debugger.write()
+                results[config] = peak
+        return results, size
+
+    def _memory_here(self, config: Any) -> Tuple[Any, Optional[dict]]:
+        """A collected candidate's peak and debug parts, priced in this process as a worker prices it."""
+        self.config.set_parallel_config(config)
+        if self.enable_debug:
+            debugger = Debug.Debug(config, info_type=Debug.MemParts, enable=True, output_file="debug_mem.csv")
+            return self.memory_estim(debugger), dict(debugger.info)
+        return self.memory_estim(), None
+
+    def close_pool(self, abort: bool = False) -> None:
+        """Stop the workers run_nd started for this search, at once where the search failed."""
+        workers, self.workers = self.workers, None
+        if workers is not None:
+            workers.close(abort)
+
+    def device_loops(self, space: Any, collect: Optional[list]) -> Tuple[dict, int]:
         """Exploration loop nest level 0: parallel dimensions dividing devices"""
         for tp in self.config.space(Dim.TP, self.machine.number):
             for pp in self.config.space(Dim.PP, self.machine.number // tp):
@@ -495,7 +526,7 @@ class ParallelizeLayer:
                     dp = self.machine.number // tp // cp // pp
                     if dp < 1:
                         break
-                    space = self.batch_loops(space, pool, (dp, tp, pp, cp))
+                    space = self.batch_loops(space, collect, (dp, tp, pp, cp))
         return space
 
     def batch_reachable(self) -> bool:
@@ -531,7 +562,7 @@ class ParallelizeLayer:
         )
         return False
 
-    def batch_loops(self, space: Any, pool: Any, dtpc_p: Any) -> Tuple[dict, int]:
+    def batch_loops(self, space: Any, collect: Optional[list], dtpc_p: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
         dp, _, pp, _ = dtpc_p
         # if pp > 1:
@@ -540,14 +571,14 @@ class ParallelizeLayer:
         ):
             logger.debug("mbn= %d / %d / %d", self.global_batch_size, dp, mbs)
             mbn = self.global_batch_size // dp // mbs
-            space = self.parallel_loops(space, pool, (dtpc_p, (mbs, mbn)))
+            space = self.parallel_loops(space, collect, (dtpc_p, (mbs, mbn)))
         # else:
         #     logger.debug("no pipeline so mbn = 1")
         #     mbs = self.global_batch_size // dp
         #     space = self.parallel_loops(space, pool, (dtpc_p, (mbs, 1)))
         return space
 
-    def parallel_loops(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
+    def parallel_loops(self, space: Any, collect: Optional[list], dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
         dp, tp, pp, cp = dtpc_p
@@ -561,70 +592,61 @@ class ParallelizeLayer:
                     for sp in self.config.bool_space(Dim.SP):
                         space = self.inside_loop_nest(
                             space,
-                            pool,
+                            collect,
                             (dtpc_p, mbsn, (ep, vpp, op, sp)),
                         )
         return space
 
-    def inside_loop_nest(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
-        """Exploration loop nest statements"""
+    def inside_loop_nest(self, space: Any, collect: Optional[list], dims: Any) -> Tuple[dict, int]:
+        """Exploration loop nest statements: price a candidate that passes the checks, or collect it.
+
+        With *collect*, a list, the candidate and its loop degrees are
+        appended for a worker to price (:meth:`_memory_pooled`), after the
+        same checks and the same setting of the config as here.
+        """
         dtpc_p, mbsn, evos_p = dims
         configs, size = space
         parallel_config = self.config.make_parallel_config(
             dtpc_p, mbsn, evos_p
         )
-        logger.info("test config %d : %s", size, str(parallel_config))
+        logger.info("test config %d : %s", size, parallel_config)
         size += 1
 
         if self.is_valid(parallel_config) and self.config.set_parallel_config(
             parallel_config
         ):
-            if pool is None:
-                if self.enable_debug:
-                    mem_debugger = Debug.Debug(
-                        parallel_config,
-                        info_type=Debug.MemParts,
-                        enable=self.enable_debug,
-                        output_file="debug_mem.csv",
-                    )
-                    # try:
-                    peak = self.memory_estim(mem_debugger)
-                    mem_debugger.write()
-                else:
-                    peak = self.memory_estim()
-                # except:
-                # logger.error()
-                # return (configs, size)
-            else:
-                # logger.debug("before evaluator copy")
-                # evaluator = copy.deepcopy(self.mem_eval)
-                logger.debug("before apply_async")
-                peak = pool.apply_async(
-                    pool_estimate_memory,
-                    args=(copy.deepcopy(self.priced()),),
-                    # args=(evaluator,),
-                    # self.memory_estim,
+            if collect is not None:
+                collect.append((parallel_config, dims))
+                return (configs, size)
+            if self.enable_debug:
+                mem_debugger = Debug.Debug(
+                    parallel_config,
+                    info_type=Debug.MemParts,
+                    enable=self.enable_debug,
+                    output_file="debug_mem.csv",
                 )
-                logger.debug("after apply_async")
+                peak = self.memory_estim(mem_debugger)
+                mem_debugger.write()
+            else:
+                peak = self.memory_estim()
             configs[parallel_config] = peak
 
         return (configs, size)
 
     def order_search_space(self, space: Any, threads_num: Any, cache_file: Any) -> Any:
-        """Sort the search space computed with performance estimation"""
+        """Sort the search space computed with performance estimation.
+
+        With *threads_num* workers that run_nd started, they price the
+        candidates (:meth:`_pooled`).
+        """
         if not space:
             return ([], [])
-        multiproc = False
-        if threads_num and threads_num > 5 * len(space):
-            multiproc = True
+        self.recompute_choices = {}
+        if self._pooled(threads_num):
+            return self._order_pooled(space, cache_file)
         scored_space = []
         debug_parts = []
-        self.recompute_choices = {}
-        with (
-            proc.Pool(processes=threads_num)
-            if multiproc
-            else nullcontext()
-        ) as pool:
+        with Debug.holding_open():
             for config, peak in space:
                 self.config.set_parallel_config(config)
                 values = []
@@ -636,63 +658,61 @@ class ParallelizeLayer:
                     if choice.score is not None:
                         # The whole model, with every submodule running the mode.
                         priced, savings = self.priced_with_mode(choice.mode), None
-                if multiproc:
-                    score = pool.apply_async(
-                        pool_estimate_performance,
-                        args=(
-                            copy.deepcopy(priced),
-                            self.machine.device,
-                            mem,
-                            cache_file,
-                            savings,
-                        ),
+                if self.enable_debug:
+                    debugger = Debug.Debug(
+                        config,
+                        info_type=Debug.PerfParts,
+                        enable=self.enable_debug,
                     )
+                    score = estimate_performance(
+                        priced,
+                        debugger=debugger,
+                        device_type=self.machine.device,
+                        memory=mem,
+                        cache_file=cache_file,
+                        stage_savings=savings,
+                    )
+                    debugger.write()
+                    debug_parts = list(debugger.info.keys())
+                    values = list(debugger.info.values())
+                    del values[-2:]
+                    del debug_parts[-2:]
                 else:
-                    if self.enable_debug:
-                        debugger = Debug.Debug(
-                            config,
-                            info_type=Debug.PerfParts,
-                            enable=self.enable_debug,
-                        )
-                        score = estimate_performance(
-                            priced,
-                            debugger=debugger,
-                            device_type=self.machine.device,
-                            memory=mem,
-                            cache_file=cache_file,
-                            stage_savings=savings,
-                        )
-                        debugger.write()
-                        debug_parts = list(debugger.info.keys())
-                        values = list(debugger.info.values())
-                        del values[-2:]
-                        del debug_parts[-2:]
-                    else:
-                        score = estimate_performance(
-                            priced,
-                            device_type=self.machine.device,
-                            memory=mem,
-                            cache_file=cache_file,
-                            stage_savings=savings,
-                        )
+                    score = estimate_performance(
+                        priced,
+                        device_type=self.machine.device,
+                        memory=mem,
+                        cache_file=cache_file,
+                        stage_savings=savings,
+                    )
                 scored_space.append((config, mem, score, values))
+                logger.info("config %s has score %f", config, score)
+        return (sorted(scored_space, key=lambda x: x[2]), debug_parts)
 
-                if not multiproc:
-                    logger.info("config %s has score %f", str(config), score)
+    def _order_pooled(self, space: Any, cache_file: Any) -> Any:
+        """order_search_space, with each candidate's score priced in a worker and written here in order.
 
-            if multiproc:
-                new_scored_space = []
-                for config, mem, score, values in scored_space:
-                    score_value = score.get()
-                    logger.info(
-                        "config %s has score %f", str(config), score_value
-                    )
-                    new_scored_space.append(
-                        (config, mem, score_value, values)
-                    )
-            else:
-                new_scored_space = scored_space
-        return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
+        A pooled search chooses no recompute (:meth:`_pooled`), so each
+        candidate is priced at the peak its generation found.
+        """
+        priced = self.workers.performance(
+            [(index, config.pool_dims, peak) for index, (config, peak) in enumerate(space)], cache_file)
+        scored_space = []
+        debug_parts = []
+        with Debug.holding_open():
+            for (config, peak), (score, info) in zip(space, priced):
+                values = []
+                if info is not None:
+                    debugger = Debug.Debug(config, info_type=Debug.PerfParts, enable=True)
+                    debugger.info = info
+                    debugger.write()
+                    debug_parts = list(info.keys())
+                    values = list(info.values())
+                    del values[-2:]
+                    del debug_parts[-2:]
+                scored_space.append((config, peak, score, values))
+                logger.info("config %s has score %f", config, score)
+        return (sorted(scored_space, key=lambda x: x[2]), debug_parts)
 
     def choose_recompute(self, parallel_config: Any) -> Optional[RecomputeChoice]:
         """Every layer's recompute option for the configuration just set, with auto_recompute.
@@ -958,11 +978,17 @@ class ParallelizeLayer:
         results per dimension. Otherwise, append at least ``force_exhaustive``
         and count those additions toward the ``exhaustive`` minimum.
         ``fforce_exhaustive`` takes precedence and reserves distinct additions
-        for each requested dimension.
+        for each requested dimension.  The workers run_nd started for the
+        search stop when it ends.
         """
-        scored_space, dbg, generation, ordering = self._search_and_order(
-            yaml_folder, threads_num, cache_file
-        )
+        try:
+            scored_space, dbg, generation, ordering = self._search_and_order(
+                yaml_folder, threads_num, cache_file
+            )
+        except BaseException:
+            self.close_pool(abort=True)
+            raise
+        self.close_pool()
         for rank, entry in enumerate(scored_space, start=1):
             entry[0].rank = rank
         if ranking_csv:
@@ -1262,12 +1288,17 @@ class Parallelize:  # pylint: disable=R0903
     """Main class instantiated by one of the above two"""
 
     def __init__(self, framework: Any, config: Any, machine: Any, **extra_config: Any) -> None:
-        """Dispatch to the unimodal or multimodal search driver."""
+        """Dispatch to the unimodal or multimodal search driver.
+
+        ``workers``, from run_nd -j, are the processes started to price the
+        search's candidates (:class:`~hyper_parallel.auto_parallel.sapp_nd.nd._pool.Workers`).
+        """
         if extra_config.get("recompute_dimension") is not None and framework not in HYPER_FRAMEWORKS:
             raise ValueError(
                 f"recompute_dimension states HyperParallel's activation checkpoint modes, and the {framework} "
                 f"parser states its own recompute: use one of {', '.join(HYPER_FRAMEWORKS)}"
             )
+        workers = extra_config.pop("workers", None)
         logger.debug("before evaluator init")
         if "model" in extra_config:
             model_name = extra_config.pop("model")
@@ -1305,6 +1336,7 @@ class Parallelize:  # pylint: disable=R0903
                 sub_model=None,
                 **extra_config,
             )
+        self.instance.workers = workers
 
     def __getattr__(self, name):
         return self.instance.__getattribute__(name)
@@ -1448,34 +1480,3 @@ def _fforce_exhaustive_plot_space(
         entry for entry in plot_space if entry[0].unique_name() not in normal_ids
     ]
     return plot_space, additions
-
-
-def pool_estimate_memory(config: CostModelConfig) -> float:
-    """Calls memory estimation for multiprocessing"""
-    logger.debug("estimate_peak")
-    # print("estimate_peak")
-    e = EvaluatorV2(None, ccfg=config)
-    return e.estimate_peak()
-
-
-# def pool_estimate_memory(evaluator):
-#     """Calls memory estimation for multiprocessing"""
-#     logger.debug("estimate_peak")
-#     return evaluator.estimate_peak()
-
-
-def pool_estimate_performance(
-    config: CostModelConfig,
-    device: Hard.Type,
-    memory: Optional[float] = None,
-    cache_file: Optional[str] = None,
-    stage_savings: Optional[Tuple[float, ...]] = None,
-) -> float:
-    """Calls performance estimation for multiprocessing"""
-    return estimate_performance(
-        config,
-        device_type=device,
-        memory=memory,
-        cache_file=cache_file,
-        stage_savings=stage_savings,
-    )

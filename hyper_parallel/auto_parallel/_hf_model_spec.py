@@ -26,8 +26,12 @@ cost-model backends must keep working without it.
 """
 import copy
 import dataclasses
+import hashlib
 import importlib
+import json
 import logging
+import os
+import sys
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from hyper_parallel.auto_parallel._layer_census import (
@@ -442,16 +446,105 @@ def _dtype_name(value: Any) -> Any:
 # harness pricing several runs of one model runs one.
 _CENSUSES: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
+# Where a census is kept between runs, which it then costs nothing:
+# ND_CENSUS_CACHE names another folder, or is "off" to keep none.
+_CENSUS_FOLDER = os.path.join(os.path.expanduser("~"), ".cache", "hyper_parallel", "census")
+# The package whose files a kept census is checked against.
+_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The search's own code, which runs after a census and hands it only what its
+# key holds: a change there leaves the kept censuses valid.
+_NOT_CENSUS_CODE = (
+    "hyper_parallel.auto_parallel.sapp_nd",
+    "hyper_parallel.auto_parallel.sapp_ppb",
+    "hyper_parallel.auto_parallel.config_adapter",
+)
+
+
+def _census_file(key: Tuple[Any, ...]) -> Optional[str]:
+    """The file a census of *key* is kept in, named by the key and the torch and Transformers it runs on.
+
+    ``None`` where ``ND_CENSUS_CACHE`` is ``off``.
+    """
+    folder = os.environ.get("ND_CENSUS_CACHE") or _CENSUS_FOLDER
+    if folder.lower() == "off":
+        return None
+    versions = [str(getattr(sys.modules.get(name), "__version__", None)) for name in ("torch", "transformers")]
+    name = hashlib.sha256(json.dumps([repr(key), *versions]).encode("utf-8")).hexdigest()
+    return os.path.join(folder, name[:32] + ".json")
+
+
+def _source_digest(path: str) -> str:
+    """The SHA-256 of the file at *path*, its line endings read as Python reads them.
+
+    Two checkouts of one commit can hold a file with Windows line endings in
+    one and Unix ones in the other, which is the same code.
+    """
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _census_sources() -> Dict[str, str]:
+    """The digest of each file of the package this process has loaded, the search's left out, by its path.
+
+    A census runs on them: its own code, the kernels' contracts, the
+    checkpoint policy and the modules a run's replacements build.
+    """
+    sources = {}
+    for name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if path and name.split(".")[0] == "hyper_parallel" and not name.startswith(_NOT_CENSUS_CODE):
+            sources[os.path.relpath(path, _PACKAGE_ROOT).replace(os.sep, "/")] = _source_digest(path)
+    return sources
+
+
+def _kept_census(path: str) -> Optional[Dict[str, Any]]:
+    """The census kept in *path*, or ``None`` where there is none or a file it ran on has changed since."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            kept = json.load(handle)
+        if all(_source_digest(os.path.join(_PACKAGE_ROOT, source)) == digest
+               for source, digest in kept["sources"].items()):
+            return kept["census"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _keep_census(path: str, census: Dict[str, Any]) -> None:
+    """Keep *census* in *path* with the digest of each file it ran on; failing costs the next run a census."""
+    partial = f"{path}.{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(partial, "w", encoding="utf-8") as handle:
+            json.dump({"sources": _census_sources(), "census": census}, handle)
+        os.replace(partial, path)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("the census could not be kept in %s: %s", path, exc)
+
 
 def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[Any, ...] = ()) -> Dict[str, Any]:
-    """The spec's census of each layer kind of *layers* and of the output layer, once per config and length."""
+    """The spec's census of each layer kind of *layers* and of the output layer, once per config and length.
+
+    A census is kept on disk (:func:`_census_file`) and read back by a later
+    run of the same model, length and replacements, on the same torch and
+    Transformers, while no file of the package it ran on has changed.
+    """
     key = (
         text_config.to_json_string(),
         tuple((group["kind"], int(group["count"]), bool(group.get("mtp"))) for group in layers),
         int(seq_length),
-        tuple(f"{spec.factory.__module__}.{spec.factory.__qualname__}" for spec in replacements),
+        tuple((f"{spec.factory.__module__}.{spec.factory.__qualname__}",
+               f"{spec.module_type.__module__}.{spec.module_type.__qualname__}",
+               tuple(spec.match), bool(spec.exact_type)) for spec in replacements),
     )
     if key not in _CENSUSES:
+        path = _census_file(key)
+        kept = _kept_census(path) if path is not None else None
+        if kept is not None:
+            logger.info("census of each layer kind and of the output layer at %d tokens read from %s",
+                        seq_length, path)
+            _CENSUSES[key] = kept
+            return copy.deepcopy(kept)
         logger.info("census of each layer kind and of the output layer at %d tokens%s", seq_length,
                     f", {len(replacements)} module replacements installed" if replacements else "")
         try:
@@ -466,6 +559,9 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
             # does not build (F53).
             logger.warning("%s", _NOT_A_BOUND % exc)
             _CENSUSES[key] = {}
+        else:
+            if path is not None:
+                _keep_census(path, _CENSUSES[key])
     return copy.deepcopy(_CENSUSES[key])
 
 

@@ -113,6 +113,10 @@ class LayerKind:
     attention: str = "full"
     ffn: Optional[str] = None
 
+    def __deepcopy__(self, _memo: Dict[int, Any]) -> "LayerKind":
+        """Frozen and made of immutable fields: a deep copy is the record itself."""
+        return self
+
 
 @dataclass(frozen=True)
 class OpProfile:

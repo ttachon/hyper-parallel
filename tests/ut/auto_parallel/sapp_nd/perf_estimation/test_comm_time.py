@@ -126,6 +126,31 @@ class TestRecomputedComm(unittest.TestCase):
         once, again = _comm(stages, False), _comm(stages, True)
         self.assertTrue(all(more > less for more, less in zip(again, once)), f"once {once}, again {again}")
 
+    def test_one_walk_prices_both_as_two_walks_do(self):
+        """
+        Feature: estimate_comm both.
+        Description: The fixture's stages fully recomputed, with every other layer selective, and
+            plain, on A2 and A3, each priced by one walk returning both sums and by the two walks
+            it replaces.
+        Expectation: The same numbers to the last bit.
+        """
+        custom = CustomConfig()
+        stages = self.ccfg.generate_partitions_vpp()
+
+        def _layout(odd: LayerType, even: LayerType) -> list:
+            """The stages with each recomputed layer turned to *odd* or *even* by its place in its chunk."""
+            return [[[(odd if i % 2 else even) if layer == LayerType.FULL_REC_LAYER else layer
+                      for i, layer in enumerate(chunk)] for chunk in stage] for stage in stages]
+
+        layouts = (stages, _layout(LayerType.SEL_REC_LAYER, LayerType.FULL_REC_LAYER),
+                   _layout(LayerType.NOT_REC_LAYER, LayerType.NOT_REC_LAYER))
+        for index, layout in enumerate(layouts):
+            for device in (Hard.Device_A2, Hard.Device_A3):
+                one = estimate_comm(copy.deepcopy(self.ccfg), custom, layout, device, both=True)
+                two = (estimate_comm(copy.deepcopy(self.ccfg), custom, layout, device),
+                       estimate_comm(copy.deepcopy(self.ccfg), custom, layout, device, with_recomp=True))
+                self.assertEqual(one, two, f"layout {index} on {device.name}")
+
 
 class TestRecomputePricing(unittest.TestCase):
     """The search prices a recompute with the communication it runs again."""

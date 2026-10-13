@@ -1593,6 +1593,35 @@ class TestSappNDRunND(unittest.TestCase):
                 mock_search.assert_not_called()
                 self.assertEqual(cluster_spec["num_nodes"], 4, f"{flags}: num_nodes {cluster_spec['num_nodes']}")
 
+    def test_debug_rows_held_open_reach_the_file_when_the_block_ends(self) -> None:
+        """
+        Feature: Debug.holding_open.
+        Description: Write two rows of one CSV inside the block, as a search writes a row a
+            candidate, then one row of another CSV outside any block.
+        Expectation: The held CSV is opened once and holds its titles and both rows once the block
+            ends; the row outside a block is on disk at once; and the folder can be deleted, so no
+            file is left open.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 4)], all_dims=[Dim.DP, Dim.MBS])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def row(name: str, total: int) -> Any:
+                """A row of *total* for the CSV *name* in the folder."""
+                debug = Debug.Debug(dims, [Debug.PerfParts.TOTAL])
+                debug.output_file = os.path.join(tmp_dir, name)
+                debug.info[Debug.PerfParts.TOTAL] = total
+                return debug
+
+            first, second, single = row("held.csv", 9), row("held.csv", 10), row("single.csv", 11)
+            with patch("builtins.open", wraps=open) as opened:
+                with Debug.holding_open():
+                    first.write()
+                    second.write()
+            self.assertEqual(opened.call_count, 1)
+            single.write()
+            for name, rows in (("held.csv", (first, second)), ("single.csv", (single,))):
+                with open(os.path.join(tmp_dir, name), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), first.column_titles() + "".join(r.values() for r in rows))
+
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1688,7 +1717,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
         runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
-        runner.memory_estim = lambda: 32
+        runner.memory_estim = lambda debugger=None: 32
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
             """Fill two parts the way estimate_performance does and return the score."""
@@ -2024,7 +2053,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=lambda config: True)
         runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
-        runner.memory_estim = lambda: 2048
+        runner.memory_estim = lambda debugger=None: 2048
 
         def fake_estimate(_ccfg: Any, debugger: Any = None, **_kwargs: Any) -> float:
             """Fill one part the way estimate_performance does and return the score."""
@@ -2074,7 +2103,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
         runner.config = SimpleNamespace(ccfg=SimpleNamespace(), set_parallel_config=set_parallel_config)
         runner.mem_eval = SimpleNamespace(ccfg=runner.config.ccfg)
-        runner.memory_estim = lambda: 32
+        runner.memory_estim = lambda debugger=None: 32
         with tempfile.TemporaryDirectory() as tmp_dir:
             csv_path = os.path.join(tmp_dir, "real.csv")
             with open(csv_path, "w", encoding="utf-8") as csv_file:
@@ -2446,9 +2475,16 @@ class TestSappNDRunND(unittest.TestCase):
         debugger.info.update({part: 1.0 for part in Debug.PerfParts})
         self.assertGreater(PerfEstimate.apply_regression_coefficients(coeffs, debugger, 10.0), 0)
 
+        def walk(per_stage: list) -> Any:
+            """A walk giving *per_stage*, plain and recomputed alike; both from one walk with ``both``."""
+            def priced(*_: Any, both: bool = False, **__: Any) -> Any:
+                """The walk's sums, plain then recomputed with ``both``."""
+                return (list(per_stage), list(per_stage)) if both else list(per_stage)
+            return priced
+
         with tempfile.TemporaryDirectory() as tmp_dir, \
-                patch.object(PerfEstimate, "estimate_comp", return_value=[10.0, 20.0]), \
-                patch.object(PerfEstimate, "estimate_comm", return_value=[1.0, 2.0]):
+                patch.object(PerfEstimate, "estimate_comp", side_effect=walk([10.0, 20.0])), \
+                patch.object(PerfEstimate, "estimate_comm", side_effect=walk([1.0, 2.0])):
             cfg_for_perf = object.__new__(PerfEstimate.CostModelConfig)
             cfg_for_perf.__dict__.update(vars(cfg))
             perf_debugger = Debug.Debug(
@@ -3208,12 +3244,6 @@ class TestSappNDRunND(unittest.TestCase):
         wrapper.instance = SimpleNamespace(marker="delegated")
         self.assertEqual(wrapper.marker, "delegated")
 
-        with patch.object(Par, "EvaluatorV2") as evaluator_cls:
-            evaluator_cls.return_value.estimate_peak.return_value = 7
-            self.assertEqual(Par.pool_estimate_memory("config"), 7)
-        with patch.object(Par, "estimate_performance", return_value=9):
-            self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
-
     def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
         """
         Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
@@ -3414,7 +3444,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         runner.mem_eval = SimpleNamespace(get_strategy=lambda: {"dp": 2})
         runner.priced = lambda: runner.config.ccfg
-        runner.memory_estim = lambda: 32
+        runner.memory_estim = lambda debugger=None: 32
 
         class _FakeDebug:
             """Debug facade with stable accounting entries."""

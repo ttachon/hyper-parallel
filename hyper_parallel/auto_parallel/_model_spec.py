@@ -141,6 +141,10 @@ class OpCounts:
         """Return the vector as ``{op name: count}``, in declaration order."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
+    def __deepcopy__(self, _memo: Dict[int, Any]) -> "OpCounts":
+        """Frozen and made of immutable fields: a deep copy is the record itself."""
+        return self
+
 
 def ops_from_dict(data: Any) -> Dict[str, OpCounts]:
     """Parse ``{layer kind: {op: count}}``, the serialised form of ``ModelSpec.ops``."""

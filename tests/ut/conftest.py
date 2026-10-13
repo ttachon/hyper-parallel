@@ -38,6 +38,16 @@ os.environ.setdefault("USE_TF", "0")
 # test order. No test shows a window: draw to files.
 os.environ.setdefault("MPLBACKEND", "Agg")
 
+# A layer census is kept on disk between runs (``ND_CENSUS_CACHE``).  A test
+# that read a census an earlier run kept, or kept one in the user's cache,
+# would test the folder rather than the census: none is kept, and the cache's
+# own tests name a folder of their own.
+os.environ["ND_CENSUS_CACHE"] = "off"
+
+# run_nd prices a search in worker processes unless told otherwise (-j); a test
+# that runs run_nd prices in its own process, and the pool's tests bring theirs.
+os.environ["ND_JOBS"] = "1"
+
 
 class NoAcceleratorGuard:
     """Fail fast when a CPU-gated test accidentally reaches for a device.
