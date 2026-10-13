@@ -24,7 +24,8 @@ The skill sits in the repository at `.agent/skills/strategy-agent/`, where no as
 - Any other assistant, or Windows without links: tell it to read and follow `.agent/skills/strategy-agent/SKILL.md`.
 
 Work in a checkout of nd/main, the branch with ND's current version, with the Python environment
-that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU.
+that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU. For DeepSeek-V4.1, work
+in a checkout of nd/strategy-agent-v41, which adds the V4.1 model to the same ND.
 
 ## Answer a request
 
@@ -32,14 +33,16 @@ that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU.
    the tokens a sequence, the global batch, the micro-batch, the recompute mode if stated, the total
    dies, the cluster and a memory budget if stated. Where a value is missing, use the template's and
    say so. Templates: `templates/qwen3_5_moe.yaml` (Qwen3.5-35B-A3B and its layer crops) and
-   `templates/deepseek_v41.yaml` (the DeepSeek-V4.1 validation crop, described inline).
+   `templates/deepseek_v41.yaml` (the DeepSeek-V4.1 validation crop as its launcher builds it, 40
+   layers, which a request cannot change; ND measures its memory with the census). In a checkout without
+   the V4.1 model, `ask.py` prices the crop described by hand instead, by formulas, and says so.
 2. **Check what can be trusted.** `references/trust.json` says, for each template on each cluster, how
    far ND was checked against timed runs; `references/status.md` explains it. `ask.py` applies it: it
    prints the status line, uses the cluster's calibration only where it holds for the family, leaves
    out of an open search the recompute modes ND misprices, and checks the pick against the region
    that was timed.
    - No template and no yaml from the asker: ask for their trainer yaml; nothing can be priced.
-   - A yaml of a family with no record: run the model reader (step 5) before ranking, and say the
+   - A yaml of a family with no record: check the model (step 5) before ranking, and say the
      ranking is not validated.
 3. **Run ND once**, through the script beside this file. It finds the checkout it belongs to and runs ND
    there, so it works from any folder, also through a link to this skill:
@@ -65,10 +68,12 @@ that has its dependencies (torch, Transformers, PyYAML). ND runs on the CPU.
    the best one inside it**, which the answer names; give ND's pick as the candidate worth timing, with
    the reason the answer quotes. With no region at all, recommend nothing ND alone decides: say what
    fits, and which layouts are worth timing.
-5. **The model reader**, for a model ND has not been checked on:
-   `python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd -f hyper_v2 -y <yaml> -V` sets, for each
-   layer kind, the parameters and FLOPs ND prices beside what the model's own layers hold. Report every
-   part that differs; a part ND prices at zero is a part the ranking ignores.
+5. **Check the model**, for a model ND has not been checked on, or when asked what ND prices of it:
+   `python <this skill's folder>/scripts/check.py` with `--family` or `--yaml` as for `ask.py`. It sets
+   the parameters ND prices for each part of a layer beside what the model's own layers hold (DeepSeek-V4.1
+   through its own tool, against the crop's tensors, and the blocks no ND field carries; any other model
+   through ND's verify mode, FLOPs too), and keeps the check in a run folder. Report every part that
+   differs; a part ND prices at zero is a part the ranking ignores.
 6. **Named candidates**: `python <this skill's folder>/scripts/answer.py <run>/nd_rank.csv
    --calibrated --compare "EP=2,OP=32;EP=1,OP=64"` gives each one's place, step and peak. A candidate
    with no row did not fit the budget or is outside ND's search; say which you cannot tell apart.

@@ -1,5 +1,5 @@
 {
-  "_about": "How far ND's ranking was checked against timed runs, per template and cluster; '*' matches any. scripts/ask.py prints 'status. may_say' at the top of every answer, applies the cluster's ratios only where calibrated is true, and leaves exclude_modes out of a search that leaves the recompute mode open. scripts/answer.py checks the pick against region, the degree values the check covered (ND's column names, MP is tensor parallel); null means no region was checked. checked_with names the library versions the region was checked with; ND's census follows the installed Transformers, so ask.py warns when the asker's differs. per_layer says how far a plan of recompute per layer was checked, for scripts/plan.py.",
+  "_about": "How far ND's ranking was checked against timed runs, per template and cluster; '*' matches any. scripts/ask.py prints 'status. may_say' at the top of every answer, applies the cluster's ratios only where calibrated is true, and leaves exclude_modes out of a search that leaves the recompute mode open. scripts/answer.py checks the pick against region, the degree values the check covered (ND's column names, MP is tensor parallel); null means no region was checked. checked_with names the library versions the region was checked with; ND's census follows the installed Transformers, so ask.py warns when the asker's differs. per_layer says how far a plan of recompute per layer was checked, for scripts/plan.py. described_note is what ask.py adds when the checkout cannot build the template's model and the family's model described by hand is priced instead.",
   "qwen3_5_moe/a3": {
     "status": "Back-tested",
     "may_say": "The order of the layouts and which fit, inside the checked region. Not the size of a gain: ND said 14.4% for a recompute plan that measured 6.0%.",
@@ -53,7 +53,11 @@
     "may_say": "Which layouts fit. No recommendation on the expert degree, which ND prices backwards on this model, and no step time: the A3 ratios were fitted on Qwen3.5-MoE.",
     "calibrated": false,
     "region": null,
-    "outside_note": "Seven layouts timed on 16 dies: ND's order -0.39 against the measured steps; it priced EP2 22% and EP16 41% slower than EP1, where the runs measured them 4.7% and 1.2% faster."
+    "outside_note": "Seven layouts timed on 16 dies: ND's order -0.39 against the measured steps, with the census as without; it priced EP2 22% and EP16 41% slower than EP1, where the runs measured them 4.7% and 1.2% faster. Its memory, from the census, came within -2.6% to +1.1% of each one's measured peak.",
+    "described_note": "On the one V4.1 layout that run measured, EP1 OP1, those formulas priced 15,524 MiB where it allocated 38.5 GiB, 60.6% low, so a layout said to fit may not.",
+    "checked_with": {
+      "transformers": "5.14.1"
+    }
   },
   "*/*": {
     "status": "Never timed",

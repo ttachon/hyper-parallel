@@ -52,6 +52,10 @@ FIELDS = {
     "micro_batch": ("training", "micro_batch_size"),
     "dies": ("context", "device_num"),
 }
+# Where a trainer yaml states the tokens a sequence, in the order ND reads them.
+SEQ_PLACES = (("dataset", "data_transform", "max_seq_len"), ("dataset", "data_config", "seq_length"))
+# <family>_description.yaml: the family's model described by hand, for a checkout that cannot build the template's.
+DESCRIBED = "_description"
 # ND log lines the answer must pass on: a part it did not price, a field it priced as 0, what it refused.
 NOTICES = ("MTP layer", "no parser set", "priced fully recomputed", "refus", "Error", "WARNING")
 
@@ -80,31 +84,84 @@ def _get(doc: Dict[str, Any], path: Sequence[str]) -> Any:
     return doc
 
 
-def describe(args: argparse.Namespace) -> Dict[str, Any]:
-    """The trainer yaml ND reads: the template or the asker's yaml, with every field the request states."""
+def _states(doc: Dict[str, Any], path: Sequence[str]) -> bool:
+    """Whether the yaml states the field at *path*, a null included."""
+    parent = _get(doc, path[:-1])
+    return isinstance(parent, dict) and path[-1] in parent
+
+
+def _in_checkout(repo: Path, module: str) -> bool:
+    """Whether the dotted *module* is a file or a package of the checkout ND runs from."""
+    base = repo.joinpath(*module.split("."))
+    return base.with_suffix(".py").is_file() or (base / "__init__.py").is_file()
+
+
+def template_for(family: str, repo: Path) -> Tuple[Path, Optional[str]]:
+    """The family's template, and the module this checkout lacks when the model described by hand stands in for it.
+
+    A template whose model a factory builds needs the factory's module in the checkout ND runs from. Where the
+    module is missing and the family ships ``<family>_description.yaml``, that model, described by hand, is priced.
+    """
+    template = SKILL / "templates" / f"{family}.yaml"
+    if not template.is_file():
+        known = sorted(path.stem for path in (SKILL / "templates").glob("*.yaml") if not path.stem.endswith(DESCRIBED))
+        raise SystemExit(f"no template for {family!r} (templates: {known}); "
+                         "pass the asker's trainer yaml with --yaml, after the model reader checked it")
+    model = yaml.safe_load(template.read_text(encoding="utf-8"))["model"]
+    module = str(model.get("_target_") or "").rpartition(".")[0]
+    described = template.with_name(f"{family}{DESCRIBED}.yaml")
+    if module and not _in_checkout(repo, module) and described.is_file():
+        return described, module
+    return template, None
+
+
+def _resolve_paths(model: Dict[str, Any], folder: Path) -> None:
+    """Point each relative ``*_path`` of a template's model section at the file shipped beside the template."""
+    for key, value in model.items():
+        if key.endswith("_path") and isinstance(value, str) and not Path(value).is_absolute():
+            shipped = folder / value
+            if not shipped.exists():
+                raise SystemExit(f"the template's model.{key} names {value}, which is not shipped in {folder}")
+            model[key] = shipped.as_posix()
+
+
+def describe(args: argparse.Namespace, notes: Optional[List[str]] = None) -> Dict[str, Any]:
+    """The trainer yaml ND reads: the template or the asker's yaml, with every field the request states.
+
+    When this checkout cannot build the template's model and the family's model described by hand is priced
+    instead, a note saying so, with the trust record's measure of what that costs, goes to *notes*.
+    """
     if args.yaml:
         doc = yaml.safe_load(Path(args.yaml).read_text(encoding="utf-8"))
     else:
-        template = SKILL / "templates" / f"{args.family}.yaml"
-        if not template.is_file():
-            known = sorted(path.stem for path in (SKILL / "templates").glob("*.yaml"))
-            raise SystemExit(f"no template for {args.family!r} (templates: {known}); "
-                             "pass the asker's trainer yaml with --yaml, after the model reader checked it")
+        template, missing = template_for(args.family, repo_root())
         doc = yaml.safe_load(template.read_text(encoding="utf-8"))
-        if "config_path" in doc["model"]:  # a template may describe its model inline instead
-            doc["model"]["config_path"] = (template.parent / doc["model"]["config_path"]).as_posix()
+        _resolve_paths(doc["model"], template.parent)
+        if missing and notes is not None:
+            cost = answer.trust_entry(args.family, args.cluster).get("described_note", "")
+            notes.append(f"This checkout has no {missing}, so ND prices the model described by hand in "
+                         f"{template.name}, its memory by formulas alone. {cost}".strip())
+    target = _get(doc, ("model", "_target_"))
     for name, path in FIELDS.items():
-        if getattr(args, name) is not None:
-            _set(doc, _where(doc, path), getattr(args, name))
+        if getattr(args, name) is None:
+            continue
+        where = _where(doc, path)
+        if where[0] == "model" and target and not _states(doc, where):
+            raise SystemExit(f"--{name.replace('_', '-')}: {target} builds this model and the yaml gives it no "
+                             f"{where[-1]}, so the factory decides it and the request cannot change it here")
+        _set(doc, where, getattr(args, name))
     if len(args.recompute) == 1 and args.recompute[0] in MODES:
         _set(doc, ("activation_checkpoint", "mode"), args.recompute[0])
     return doc
 
 
 def _where(doc: Dict[str, Any], path: Sequence[str]) -> Sequence[str]:
-    """Where this yaml states a field: a model described inline states its shape under config_overrides."""
+    """Where this yaml states a field: a model described inline states its shape under config_overrides, and the
+    tokens a sequence go where ND reads them first."""
     if path[0] == "model" and _get(doc, ("model", "config_overrides", *path[1:])) is not None:
         return ("model", "config_overrides", *path[1:])
+    if tuple(path) == FIELDS["seq"]:
+        return next((place for place in SEQ_PLACES if _states(doc, place)), path)
     return path
 
 
@@ -310,7 +367,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     trust = answer.trust_entry(args.family or "*", args.cluster)
     cluster = cluster_record(args.cluster, trust, args.budget)
     args.recompute, notes = _modes(args.recompute, trust)
-    doc = describe(args)
+    doc = describe(args, notes)
     run = run_folder(args, repo, doc)
     command = _command(doc, run, args.recompute, cluster)
     versions = library_versions(repo, cluster["ratios"])

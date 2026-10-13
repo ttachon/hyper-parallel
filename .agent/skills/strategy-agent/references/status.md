@@ -23,8 +23,10 @@ What the records hold today:
   below its measured step. A gain's size is never quoted from ND: it said 14.4% for a recompute plan
   that measured 6.0%.
 - **DeepSeek-V4.1 on the A3, timed and not validated.** ND prices the expert degree backwards (order
-  -0.39 over seven timed layouts), so the answer says what fits and recommends no expert degree.
-- **Any other family or cluster, never timed.** A ranking labelled not validated, after the model reader
+  -0.39 over seven timed layouts, with the census as without), so the answer says what fits and
+  recommends no expert degree. What fits is now measured: through the census, ND's memory came within
+  -2.6% to +1.1% of each of the seven layouts' peaks, where the crop described by hand reads 60.6% low.
+- **Any other family or cluster, never timed.** A ranking labelled not validated, after `scripts/check.py`
   has checked what ND prices for each layer kind; on a cluster with no calibration, relative scores only.
 
 To change a record, measure first: a status moves only with timed runs on our own cluster, and the
