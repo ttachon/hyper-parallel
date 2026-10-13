@@ -32,6 +32,14 @@ room the budget above does not leave. ``run --expandable-segments`` runs the rou
 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True in the kit config's REMOTE_ENV_SETUP, as block B of the recompute
 plan tests did, and always takes it out again; each run records the allocator it ran on, and the results say it.
 
+``classify`` turns the round's profiles into the classified CSV a calibration fits ND's ratios on. Each run
+profiles steps 3 and 4 into the sweep's folder for its strategy on the first node, which the next run of the same
+strategy empties, so a pick and its anchor share one: only the last run of each strategy still has its profile, and
+only if it finished. Those are copied here, classified with ``nd.trace_classify`` and merged into one CSV with the
+trainer's own step of each run and its recompute mode, which the step prints for pasting. ND's comparison
+(``run_nd --real_csv``) prices a run in one mode for the whole model, so it cannot price a plan that keeps some
+layers; fit the plans' rows against the parts ND's search priced for them.
+
 The script needs nothing beyond the standard library, apart from PyYAML to write the plan yamls.
 
 Usage, from the repository root on the control node:
@@ -40,6 +48,7 @@ Usage, from the repository root on the control node:
     python examples/training_demo/nd_top_plans.py run p08 a1   # only these; --again runs a kept one anew
     python examples/training_demo/nd_top_plans.py run --expandable-segments   # the same on that allocator
     python examples/training_demo/nd_top_plans.py results
+    python examples/training_demo/nd_top_plans.py classify     # profiles to one classified CSV, printed
     python examples/training_demo/nd_top_plans.py reset        # only after a run with the setting was killed outright
 """
 import argparse
@@ -82,6 +91,9 @@ LOGGED_RULE = "delta_rule=hyperparallel: [0-9]+ linear-attention layers switched
 FAILURE = r"Tried to allocate [^)]*\)|EL0004[^.]*|cannot import name '[^']*'"
 ALLOCATOR = "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True"
 OFF_3_7 = {"3-7": "off"}
+WORLD = 64
+# Where the sweep profiles each strategy on the node that holds profiling rank 0, the first one.
+REMOTE_PROFILES = "output/sweep_profiles"
 
 
 @dataclass(frozen=True)
@@ -359,6 +371,87 @@ def run_all(names: Sequence[str], again: bool, expandable: bool = False) -> None
     print(f"\ndone: python {Path(__file__).relative_to(REPO_ROOT).as_posix()} results", flush=True)
 
 
+def profile_tag(run: Run) -> str:
+    """The sweep's profile folder for a run's strategy, which every run of that strategy writes."""
+    return f"ep{run.ep}_cp{run.cp}_op{run.op}_tp1_pp1"
+
+
+def dims(run: Run) -> Dict[str, int]:
+    """A run's degrees as the classifier labels them: one sequence a micro-batch, the batch the world size."""
+    dp = WORLD // run.cp
+    return {"DP": dp, "MP": 1, "PP": 1, "CP": run.cp, "EP": run.ep, "MB": WORLD // dp, "MBS": 1, "OP": run.op}
+
+
+def profile_owners() -> Dict[str, List[str]]:
+    """Which runs still have their profile on the node, and why the others do not.
+
+    Every run of a strategy empties the strategy's folder before it profiles,
+    so the folder holds the last run's profile, the newest record decides, and
+    a run that failed leaves no profile to classify.
+
+    Returns:
+        ``{"classify": [...], <reason>: [...]}``, run names by what happens to them.
+    """
+    last: Dict[str, Run] = {}
+    stamps: Dict[str, float] = {}
+    for run in RUNS:
+        states = OUT / run.folder / "run_states.json"
+        if states.is_file() and states.stat().st_mtime > stamps.get(profile_tag(run), float("-inf")):
+            last[profile_tag(run)], stamps[profile_tag(run)] = run, states.stat().st_mtime
+    owners: Dict[str, List[str]] = {"classify": []}
+    for run in RUNS:
+        record = read_run(run)
+        if record is None:
+            why = "not run"
+        elif last.get(profile_tag(run)) is not run:
+            why = f"profile replaced by {last[profile_tag(run)].name}, a later run of the strategy"
+        elif record.get("failed"):
+            why = "failed, so its profile is not whole"
+        else:
+            why = "classify"
+        owners.setdefault(why, []).append(run.name)
+    return owners
+
+
+def classify_round(sweep: ModuleType, env: Dict[str, Any]) -> Optional[Path]:
+    """Copy the round's profiles from the first node, classify each, merge them into one CSV and print it."""
+    owners = profile_owners()
+    for why, names in owners.items():
+        if why != "classify":
+            print(f"left out, {why}: {', '.join(names)}", flush=True)
+    runs = [run for run in RUNS if run.name in owners["classify"]]
+    parts, steps, modes = [], {}, {}
+    for run in runs:
+        local = OUT / "profiles" / profile_tag(run)
+        local.mkdir(parents=True, exist_ok=True)
+        source = f"{env['ssh_user']}@{env['nodes'][0]}:{env['repo_dir']}/{REMOTE_PROFILES}/{profile_tag(run)}/"
+        # --delete applies to the local copy only, so a profile copied before cannot sit beside this one.
+        if subprocess.run(["rsync", "-a", "--delete", source, f"{local}/"], check=False).returncode:
+            print(f"{run.name}: could not copy {source}, left out", flush=True)
+            continue
+        part = OUT / "classified" / f"real_{run.name}.csv"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        command = [sys.executable, "-m", "hyper_parallel.auto_parallel.sapp_nd.nd.trace_classify", str(local),
+                   "--dims", ",".join(f"{name}={value}" for name, value in dims(run).items()),
+                   "--csv", str(part), "--detail", str(part.with_name(f"detail_{run.name}.csv"))]
+        if subprocess.run(command, check=False, cwd=REPO_ROOT).returncode:
+            print(f"{run.name}: classification failed, left out", flush=True)
+            continue
+        parts.append((run.name, part))
+        steps[run.name] = (read_run(run) or {}).get("step_trainer")
+        modes[run.name] = run.mode
+    merged = OUT / "classified" / "real_all.csv"
+    count = sweep.merge_csv(parts, merged, {name: step for name, step in steps.items() if step}, modes)
+    if not count:
+        print("no profile classified", flush=True)
+        return None
+    print(f"\n{count} run(s) classified into {merged}, in this order: {', '.join(name for name, _ in parts)}; "
+          "a plan's recompute column says its base mode, and its plan is the run's in this script. "
+          "Paste what follows:\n", flush=True)
+    print(merged.read_text(encoding="utf-8"), end="", flush=True)
+    return merged
+
+
 def load_sweep() -> ModuleType:
     """The strategy sweep, loaded by path, for its kit config reader and rank correlation."""
     spec = importlib.util.spec_from_file_location("sweep_qwen3_5_moe", SWEEP)
@@ -526,6 +619,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                           help="run with PYTORCH_NPU_ALLOC_CONF=expandable_segments:True, taken out after")
     steps.add_parser("results", help="one line per run, then the verdict")
     steps.add_parser("reset", help="take the allocator setting out of the kit config")
+    steps.add_parser("classify", help="the round's profiles, classified and merged into one CSV, printed")
     args = parser.parse_args(argv)
     if args.step == "setup":
         setup(args.pool)
@@ -533,6 +627,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         run_all(args.names, args.again, args.expandable_segments)
     elif args.step == "reset":
         set_allocator(False)
+    elif args.step == "classify":
+        sweep = load_sweep()
+        classify_round(sweep, sweep.read_cluster_env(CLUSTER_ENV))
     else:
         sweep = load_sweep()
         results(sweep.read_cluster_env(CLUSTER_ENV), sweep)
