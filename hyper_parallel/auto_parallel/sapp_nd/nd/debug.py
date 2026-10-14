@@ -27,6 +27,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 from matplotlib.font_manager import FontProperties
+from matplotlib.backends.backend_pdf import PdfPages
 from scipy.stats import pearsonr
 import yaml
 
@@ -654,6 +655,172 @@ def plot_nd(
 
     plot.make_table()
     plot.close(output_path, "results")
+
+
+def plot_recompute(
+    groups: list,
+    output_path: str,
+    debug_parts: list,
+    filename: str,
+    title: Optional[str] = None,
+    columns_per_page: int = 12,
+) -> None:
+    """Write a summary of every selected recompute plan, then a detail page per strategy.
+
+    Each bar is the cost model's estimate of the step under that plan, split
+    into its parts, so the step between two bars is what the cost model
+    expects the extra recomputed layer to cost.
+
+    Args:
+        groups: The ranked parallel configurations and the records of their
+            selected plans, as ``recompute_plot_data`` prepares them.
+        output_path: Directory in which to save the PDF.
+        debug_parts: The performance components in each record's parts.
+        filename: The PDF's basename, without its extension.
+        title: Optional description of the model and the selection.
+        columns_per_page: The most plans on one detail page. The summary
+            holds every selected plan, with a divider between strategies.
+
+    Raises:
+        ValueError: The page size is not positive, or a record's score parts
+            do not cover every component.
+    """
+    if columns_per_page <= 0:
+        raise ValueError("columns_per_page must be positive")
+    if not groups:
+        return
+    os.makedirs(output_path, exist_ok=True)
+    heading = title or "ND recompute"
+    with PdfPages(os.path.join(output_path, filename + ".pdf")) as document:
+        _save_page(document, _recompute_summary(groups, debug_parts, heading))
+        for config, records in groups:
+            _save_detail_pages(document, config, records, debug_parts, heading, columns_per_page)
+
+
+def _save_page(document: Any, figure: Any) -> None:
+    """Add one figure to the PDF and release it."""
+    document.savefig(figure, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _recompute_summary(groups: list, debug_parts: list, heading: str) -> Any:
+    """The page that holds every selected plan, the strategies it covers named where it has none."""
+    plans = [(config, record) for config, records in groups for record in records]
+    labels = [f"{config.rank}.{index + 1}" for config, records in groups for index in range(len(records))]
+    page_title = f"{heading}\nSummary | {len(plans)} plans across {len(groups)} configurations"
+    if not plans:
+        return _empty_recompute_page([config for config, _ in groups], page_title)
+    figure = _recompute_page(plans, debug_parts, page_title, labels)
+    empty = [str(config.rank) for config, records in groups if not records]
+    if empty:
+        figure.text(0.5, 0.01, "No qualifying plans for TOP " + ", ".join(empty), ha="center", fontsize=8)
+    return figure
+
+
+def _save_detail_pages(
+    document: Any, config: Any, records: list, debug_parts: list, heading: str, columns_per_page: int
+) -> None:
+    """Add one strategy's plans to the PDF, paginated, or a page saying it has none."""
+    if not records:
+        _save_page(document, _empty_recompute_page([config], f"{heading}\nTOP {config.rank}"))
+        return
+    for start in range(0, len(records), columns_per_page):
+        page = records[start:start + columns_per_page]
+        page_title = (
+            f"{heading}\n"
+            f"TOP {config.rank} | plans {start + 1}-{start + len(page)} of {len(records)}"
+        )
+        labels = [str(start + index + 1) for index in range(len(page))]
+        _save_page(document, _recompute_page([(config, record) for record in page], debug_parts, page_title, labels))
+
+
+def _empty_recompute_page(configs: list, title: str) -> Any:
+    """Say that a selection is empty, and name the strategies it covers."""
+    figure = plt.figure(figsize=(12, max(5, 3 + 0.3 * len(configs))))
+    figure.text(0.5, 0.8, title, ha="center", fontsize=12)
+    figure.text(0.5, 0.6, "No recompute plan satisfies the selection for these configurations.", ha="center")
+    descriptions = [
+        f"TOP {config.rank}: " + "  ".join(f"{dim}={value}" for dim, value in config.dims_val.items())
+        for config in configs
+    ]
+    figure.text(0.5, 0.45, "\n".join(descriptions), ha="center", va="top")
+    return figure
+
+
+def _recompute_page(plans: list, debug_parts: list, title: str, labels: list) -> Any:
+    """Draw one page of plans, with a layer table under the chart and a divider between strategies."""
+    if any(len(record["parts"]) != len(debug_parts) for _, record in plans):
+        raise ValueError("recompute plot records must include every performance component")
+    rows = ["TOP"] + plans[0][0].keys() + ["RFULL", MODE_ROW, LAYER_ROW, "MEM", "SCORE"]
+    cells = list(map(list, zip(*[_recompute_column(config, record) for config, record in plans])))
+    lines = [max(str(text).count("\n") + 1 for text in row) for row in cells]
+    heights = [0.20] + [0.18 * count + 0.06 for count in lines]
+    table_height = sum(heights)
+    figure = plt.figure(figsize=(max(12, 1.3 * len(plans) + 3), 4.5 + table_height))
+    grid = figure.add_gridspec(2, 1, height_ratios=[3.5, table_height], hspace=0.10)
+    axis = _recompute_chart(figure.add_subplot(grid[0]), plans, debug_parts, title, labels)
+    table_axis = figure.add_subplot(grid[1])
+    _recompute_table(table_axis, rows, cells, labels, heights)
+    for index in range(1, len(plans)):
+        if plans[index][0] != plans[index - 1][0]:
+            axis.axvline(index - 0.5, color="black", linewidth=1.5)
+            table_axis.axvline(index / len(plans), color="black", linewidth=1.5, zorder=10)
+    figure.subplots_adjust(left=0.09, right=0.84, top=0.88, bottom=0.035)
+    return figure
+
+
+def _recompute_column(config: Any, record: dict) -> list:
+    """One plan's column: its strategy, how many layers it fully recomputes, its plan, memory and estimate."""
+    layers = record["layers"]
+    return [str(config.rank)] + config.values() + [
+        str(record["full_layers"]) if record["full_layers"] is not None else "-",
+        record["mode"].upper() if record["mode"] else "-",
+        yaml.safe_dump(layers, default_flow_style=False, sort_keys=False).strip() if layers is not None else "-",
+        f"{record['memory']:.0f} MB",
+        f"{record['score']:.6g}",
+    ]
+
+
+def _recompute_chart(axis: Any, plans: list, debug_parts: list, title: str, labels: list) -> Any:
+    """Stack each plan's estimated parts on one bar, and return the axis."""
+    parts = list(map(str, debug_parts))
+    frame = pd.DataFrame([record["parts"] for _, record in plans], columns=parts, index=labels)
+    frame.plot.bar(ax=axis, stacked=True, color=gen_colors(parts), width=0.65, rot=0)
+    axis.set_xlim(-0.5, len(plans) - 0.5)
+    axis.set_ylim(
+        min(0, float(frame.clip(upper=0).sum(axis=1).min()) * 1.05),
+        max(1, float(frame.clip(lower=0).sum(axis=1).max()) * 1.05),
+    )
+    axis.set_ylabel("Estimated step (lower is better)")
+    axis.set_xlabel("")
+    axis.legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=8)
+    axis.set_title(title, fontsize=11)
+    return axis
+
+
+def _recompute_table(table_axis: Any, rows: list, cells: list, labels: list, heights: list) -> None:
+    """Draw the table of plans under the chart, each row shaded like its dimension."""
+    table_height = sum(heights)
+    table_axis.axis("off")
+    table = table_axis.table(cellText=cells, rowLabels=list(map(str, rows)), colLabels=labels,
+                             cellLoc="center", loc="center", bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_height(heights[row] / table_height)
+        cell.set_edgecolor("white")
+        if row == 0:
+            cell.set_facecolor("#eeeeee")
+            continue
+        row_title = rows[row - 1]
+        if column == -1:
+            cell.get_text().set_color(dim_color(row_title))
+            cell.get_text().set_fontweight("bold")
+        else:
+            cell.set_facecolor(near_white(pastel(dim_color(row_title)), 0.9))
+            if row_title == LAYER_ROW:
+                cell.get_text().set_fontfamily("monospace")
+                cell.get_text().set_ha("center" if cells[row - 1][column] == "{}" else "left")
 
 
 def _score_parts() -> list:

@@ -31,6 +31,7 @@ from unittest.mock import patch
 import yaml
 
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel import _hf_model_spec
 from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS, ExecSpec, RecomputeRange
@@ -1673,6 +1674,44 @@ class TestAutoRecomputeSearch(unittest.TestCase):
             self.assertLessEqual(score, own[str(config)])
             self.assertTrue(runner.mem_eval.mem_fit(memory))
         self.assertLess(auto[0][2], full[0][2])
+
+    def test_the_potential_sequence_recomputes_one_more_layer_a_step(self):
+        """
+        Feature: ParallelizeLayer.recompute_potential_sequence.
+        Description: The best candidate of a search choosing off or full for
+            each layer, then the same search choosing one mode for the whole
+            model.
+        Expectation: The sequence starts at the candidate's own plan and
+            fully recomputes one more layer at each step, keeping its
+            degrees and fitting the device, with the cost model's estimate
+            and its parts on every step. A search that chose no plan per
+            layer refuses to extend one.
+        """
+        set_verbose_level(1)
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        runner = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"),
+                                 dimensions=[Dim.TP, Dim.PP], auto_recompute=True,
+                                 recompute_modes=("off", "full"), recompute_mode_per_layer=True).instance
+        results, _ = runner.device_loops(({}, 0), None)
+        space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+        scored, _ = runner.order_search_space(space, None, None)
+        config, _, score, _ = scored[0]
+        sequence = runner.recompute_potential_sequence(config, base_score=score)
+        self.assertGreater(len(sequence), 1)
+        fulls = [sum(item.count for item in choice.ranges if item.mode == "full") for choice in sequence]
+        self.assertEqual(fulls, list(range(fulls[0], fulls[0] + len(sequence))))
+        for choice in sequence:
+            self.assertEqual(choice.dimensions, sequence[0].dimensions)
+            self.assertEqual(len(choice.score_parts), len(Debug.PerfParts) - 2)
+            self.assertIsNotNone(choice.score)
+            self.assertTrue(runner.mem_eval.mem_fit(choice.memory))
+        self.assertEqual(runner.recompute_potentials[config], sequence)
+        self.assertGreaterEqual(len(runner.recompute_results[config]), len(sequence))
+        whole = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"),
+                                dimensions=[Dim.TP], auto_recompute=True).instance
+        with self.assertRaises(ValueError):
+            whole.recompute_potential_sequence(config)
 
     def test_offload_needs_a_choice_per_layer_and_takes_the_device_link(self):
         """
