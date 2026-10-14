@@ -31,3 +31,15 @@ What the records hold today:
 
 To change a record, measure first: a status moves only with timed runs on our own cluster, and the
 record names the runs and the ND commit that priced them.
+
+## Timing layouts, and the rounds already timed
+
+`timers.json` says how a template's layouts are timed on a cluster: the script that times them, the launcher
+yaml it reads, the degrees it varies and those it fixes, and the seconds a launch took. `scripts/launch.py` reads
+it to plan a round and refuses to write a command when the launcher would run another job than the one ND
+priced. `timed/` keeps the rounds already timed: a new round leaves their layouts out, apart from ND's best of
+them and the fastest, which it times again first, and `scripts/readback.py` reads them with every new round.
+
+- **DeepSeek-V4.1 on the A3:** `examples/training_demo/deepseek_v41/repeat_deepseek_v41_runs.sh` on one node of
+  16 dies, expert degree and FSDP shard width varied, TP, CP and PP at 1; one round kept, seven layouts of the
+  25 the script can launch, three runs each.

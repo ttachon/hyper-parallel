@@ -29,6 +29,10 @@ in a checkout of nd/strategy-agent-v41, which adds the V4.1 model to the same ND
 
 ## Answer a request
 
+A question about the fastest layout runs as a loop: check the model (step 5), rank the layouts (steps 1 to 4),
+time the layouts worth timing (step 8), then read the runs back and pick (step 9). Steps 8 and 9 are what make
+an answer trustworthy where ND's order was never checked against timed runs.
+
 1. **Read the request.** Collect the model (a template name, or the asker's trainer yaml), the layers,
    the tokens a sequence, the global batch, the micro-batch, the recompute mode if stated, the total
    dies, the cluster and a memory budget if stated. Where a value is missing, use the template's and
@@ -82,6 +86,20 @@ in a checkout of nd/strategy-agent-v41, which adds the V4.1 model to the same ND
    budget from the cluster's measured reserve, since ND prices allocated memory and a run dies on reserved,
    lets ND choose each layer's mode, and writes the plan into `launch.yaml` (`activation_checkpoint.layers`).
    Give the plan, the budget and how it was derived, and the allocator note it prints; never the gain.
+8. **Time the layouts worth timing**, when the asker wants the fastest layout and the status line says ND's order
+   was not checked, or a near tie needs a round: `python <this skill's folder>/scripts/launch.py <run folder>`,
+   the run folder of step 3. It chooses the layouts by the trust record's rule, never by hand: where ND's order
+   was never checked, every layout that fits, that the template's timer launches and that no round has timed;
+   where it was, the layout to launch and those one round cannot tell from it. It times again first the layouts
+   earlier rounds measured, ND's best of them and the fastest, so the new round can be set beside them. It writes
+   a trainer yaml a layout and one command for the cluster (`launch/` in the run folder). Give the layouts and
+   why, the launches and the time it states, and the command verbatim: a person runs it on the cluster and
+   brings back `runs.csv` and `steps.csv`. `--layouts "EP=2,OP=4;EP=4,OP=1"` times named layouts instead.
+9. **Read the runs back and pick**, once a round has run: `python <this skill's folder>/scripts/readback.py
+   <run folder> <round folder>`; with no round folder it reads the rounds kept with this skill. Answer in this
+   order: the pick and whether one more round could change it, the table, ND's order over the timed layouts and
+   what following ND costs, ND's memory against the measured peaks, failed launches, what the plan still has to
+   time, and the trainer yaml of the pick (`readback/` in the run folder). The pick is the measured one.
 
 ND's degrees, as the answer names them: DP data parallel, TP tensor parallel, CP context parallel,
 PP pipeline stages (VPP virtual stages), EP expert parallel, OP the FSDP shard group of the
@@ -99,6 +117,8 @@ paths for their cluster; a virtual pipeline degree, when one is picked, is not w
 - Every figure in the answer is one the scripts printed. No differences, ratios or memory sums of your own.
 - One ND run a question; run again only when the request changes, and say why.
 - Never change ND, a template or a calibration to make an answer come out differently.
+- Once layouts are timed, the layout to launch is the fastest measured, never ND's pick: ND's order is reported
+  as a check on ND. Never choose which layouts to time yourself; `launch.py` applies the rule.
 - Quote the order, never the size of a gain: the status line says how far each ranking was checked.
 - Pass ND's notices on verbatim. A part it says it does not price is a part the ranking ignores.
 - Name the run folder: it holds the request, the yaml, the command, the versions, ND's log and

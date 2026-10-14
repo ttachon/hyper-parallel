@@ -242,12 +242,15 @@ def cluster_record(name: str, trust: Dict[str, Any], budget: Optional[str]) -> D
 
 
 def run_folder(args: argparse.Namespace, repo: Path, doc: Dict[str, Any]) -> Path:
-    """The folder that keeps this answer, with the yaml ND reads and the request."""
+    """The folder that keeps this answer, with the yaml ND reads, the request, and the template and cluster whose
+    records launch.py and readback.py read for it."""
     stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"  # two askers in one second stay apart
     run = Path(args.out) if args.out else repo / "output" / "strategy-agent" / stamp
     run.mkdir(parents=True, exist_ok=False)
     (run / "run.yaml").write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
     (run / "request.md").write_text(args.request + "\n", encoding="utf-8")
+    asked = {"family": args.family, "cluster": args.cluster, "yaml": args.yaml}
+    (run / "ask.json").write_text(json.dumps(asked, indent=2) + "\n", encoding="utf-8")
     return run
 
 

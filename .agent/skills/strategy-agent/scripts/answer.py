@@ -83,12 +83,12 @@ def layout(row: Dict[str, str], degrees: Sequence[str]) -> str:
     return " ".join(words)
 
 
-def _gib(row: Dict[str, str]) -> float:
+def peak_gib(row: Dict[str, str]) -> float:
     """The row's peak memory per die in GiB (ND's MB are MiB)."""
     return float(row["memory_mb"]) / 1024.0
 
 
-def _versus(row: Dict[str, str], pick: Dict[str, str]) -> float:
+def versus(row: Dict[str, str], pick: Dict[str, str]) -> float:
     """How much slower than the pick the row's step is, in percent."""
     return 100.0 * (float(row["score"]) / float(pick["score"]) - 1.0)
 
@@ -131,7 +131,7 @@ def trust_entry(family: str, cluster: str) -> Dict[str, Any]:
             "region": None}
 
 
-def _inside(row: Dict[str, str], region: Dict[str, Sequence[str]]) -> bool:
+def inside(row: Dict[str, str], region: Dict[str, Sequence[str]]) -> bool:
     """Whether every degree the region names has one of the values it covers."""
     return all(row.get(name) in values for name, values in region.items() if name in row)
 
@@ -139,9 +139,9 @@ def _inside(row: Dict[str, str], region: Dict[str, Sequence[str]]) -> bool:
 def recommended(rows: Sequence[Dict[str, str]], trust: Optional[Dict[str, Any]]) -> Dict[str, str]:
     """The layout to launch: ND's pick, or the best inside the timed region when the pick lies outside it."""
     region = (trust or {}).get("region")
-    if region is None or _inside(rows[0], region):
+    if region is None or inside(rows[0], region):
         return rows[0]
-    return next((row for row in rows if _inside(row, region)), rows[0])
+    return next((row for row in rows if inside(row, region)), rows[0])
 
 
 def _trust_lines(ranking: Ranking, rows: Sequence[Dict[str, str]], trust: Dict[str, Any],
@@ -153,18 +153,18 @@ def _trust_lines(ranking: Ranking, rows: Sequence[Dict[str, str]], trust: Dict[s
                 f"validated. {trust.get('outside_note', '')}".strip()]
     pick = rows[0]
     checked = ", ".join(f"{_NAMES.get(name, name)} {' or '.join(values)}" for name, values in region.items())
-    if _inside(pick, region):
+    if inside(pick, region):
         return [f"The pick is inside the region checked against timed runs ({checked}). "
                 f"{trust.get('region_note', '')}".strip()]
     lines = [f"ND's pick is OUTSIDE the region checked against timed runs ({checked}). "
              f"{trust.get('outside_note', '')}".strip()]
-    inside = next((row for row in rows if _inside(row, region)), None)
-    if inside is None:
+    best = next((row for row in rows if inside(row, region)), None)
+    if best is None:
         lines.append("No layout that fits lies inside that region.")
     else:
-        step = f"{float(inside['score']):.1f} ms" if calibrated else f"score {float(inside['score']):.4g}"
-        lines.append(f"The best layout inside it, the safer launch: {layout(inside, ranking.degrees)}, {step}, "
-                     f"{_versus(inside, pick):+.2f}% on ND's price, peak {_gib(inside):.1f} GiB.")
+        step = f"{float(best['score']):.1f} ms" if calibrated else f"score {float(best['score']):.4g}"
+        lines.append(f"The best layout inside it, the safer launch: {layout(best, ranking.degrees)}, {step}, "
+                     f"{versus(best, pick):+.2f}% on ND's price, peak {peak_gib(best):.1f} GiB.")
     return lines
 
 
@@ -179,11 +179,11 @@ def card(ranking: Ranking, calibrated: bool, spread: Optional[float], budget: Op
     head = f"| | Layout | Step ({unit}) | vs the pick | Peak per die (GiB) |"
     lines += [head, "|---|---|---|---|---|"]
     for place, row in zip(("Pick", "2nd", "3rd"), rows[:3]):
-        versus = "" if row is pick else f"{_versus(row, pick):+.2f}%"
+        slower = "" if row is pick else f"{versus(row, pick):+.2f}%"
         score = f"{float(row['score']):.1f}" if calibrated else f"{float(row['score']):.4g}"
-        lines.append(f"| {place} | {layout(row, ranking.degrees)} | {score} | {versus} | {_gib(row):.1f} |")
+        lines.append(f"| {place} | {layout(row, ranking.degrees)} | {score} | {slower} | {peak_gib(row):.1f} |")
     if budget:
-        lines += ["", f"Budget: {budget} a die. The pick's peak is {_gib(pick):.1f} GiB."]
+        lines += ["", f"Budget: {budget} a die. The pick's peak is {peak_gib(pick):.1f} GiB."]
     if trust is not None:
         lines += [""] + _trust_lines(ranking, rows, trust, calibrated)
     if spread is not None and calibrated:
@@ -203,8 +203,8 @@ def _near_tie(rows: Sequence[Dict[str, str]], degrees: Sequence[str], spread: fl
     """
     anchor = recommended(rows, trust)
     region = (trust or {}).get("region")
-    pool = rows if anchor is rows[0] or region is None else [row for row in rows if _inside(row, region)]
-    close = [row for row in pool if _versus(row, anchor) < spread]
+    pool = rows if anchor is rows[0] or region is None else [row for row in rows if inside(row, region)]
+    close = [row for row in pool if versus(row, anchor) < spread]
     if len(close) < 2:
         return []
     which = "the pick" if anchor is rows[0] else "the layout to launch"
@@ -232,11 +232,11 @@ def _why(ranking: Ranking, rows: Sequence[Dict[str, str]], calibrated: bool) -> 
         moves = _part_moves(other, pick, ranking.parts, calibrated)
         lines.append(f"| {', '.join(_NAMES.get(name, name) for name in names)} "
                      f"| {' '.join(pick[name] for name in names)} | {' '.join(other[name] for name in names)} "
-                     f"| {layout(other, ranking.degrees)} | {_versus(other, pick):+.2f}% | {moves} |")
+                     f"| {layout(other, ranking.degrees)} | {versus(other, pick):+.2f}% | {moves} |")
     return lines
 
 
-def _wanted(spec: str) -> List[Tuple[str, str]]:
+def wanted(spec: str) -> List[Tuple[str, str]]:
     """``EP=2,OP=32`` as ``[("EP", "2"), ("OP", "32")]``, TP accepted for MP."""
     pairs = []
     for item in spec.split(","):
@@ -252,20 +252,20 @@ def compare(ranking: Ranking, specs: str, calibrated: bool) -> str:
     pick = rows[0] if rows else None
     lines = ["| Candidate | Place | Layout | Step | vs ND's pick | Peak per die (GiB) |", "|---|---|---|---|---|---|"]
     for spec in [part for part in specs.split(";") if part.strip()]:
-        wanted = _wanted(spec)
-        unknown = [name for name, _ in wanted if name not in ranking.degrees + [_RECOMPUTE]]
+        pairs = wanted(spec)
+        unknown = [name for name, _ in pairs if name not in ranking.degrees + [_RECOMPUTE]]
         if unknown:
             lines.append(f"| {spec} | | unknown degree {unknown} | | | |")
             continue
         found = [(place, row) for place, row in enumerate(rows, start=1)
-                 if all(row.get(name) == value for name, value in wanted)]
+                 if all(row.get(name) == value for name, value in pairs)]
         if not found:
             lines.append(f"| {spec} | none | no row: it does not fit the budget or is outside ND's search | | | |")
             continue
         place, row = found[0]
         step = f"{float(row['score']):.1f} ms" if calibrated else f"{float(row['score']):.4g}"
         lines.append(f"| {spec} | {place} of {len(rows)} | {layout(row, ranking.degrees)} | {step} "
-                     f"| {_versus(row, pick):+.2f}% | {_gib(row):.1f} |")
+                     f"| {versus(row, pick):+.2f}% | {peak_gib(row):.1f} |")
     return "\n".join(lines) + "\n"
 
 
