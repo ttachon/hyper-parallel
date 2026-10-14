@@ -982,6 +982,9 @@ def _trim_offload(
     if cost_per_byte <= 0:
         return chosen
     stage_layers, fronts, own = stage
+    # Trimmed to the byte, a stage would fill a budget of a fraction of a megabyte to that fraction, and the
+    # search's result, reported in whole megabytes, would read over the budget its own fit check accepted.
+    capacity = math.floor(capacity / MEGABYTE) * MEGABYTE
     slack = capacity - _stage_memory(stage_layers, held, chosen, fronts, own)
     chosen = dict(chosen)
     for position in range(len(offloading) - 1, -1, -1):
