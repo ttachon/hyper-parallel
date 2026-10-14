@@ -65,6 +65,9 @@ DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
 )
 
+# The parallel degrees a fixed analysis reports on each of its alternatives.
+_DEGREES = (("DP", 4), ("TP", 2), ("PP", 2), ("EP", 2))
+
 # A dense model, from its config overrides alone, at TP 4 and PP 2.
 _DENSE = {
     "model": {"name": "nonexistent", "config_overrides": {
@@ -1350,6 +1353,117 @@ class TestOneMode(unittest.TestCase):
             self.assertEqual(whole_modes(configs(("dense",)), modes, policy), ("off", "full"))
             self.assertEqual(whole_modes(configs(()), modes, policy), ("off", "full"))
             self.assertEqual(whole_modes(configs(()), modes, None), modes)
+
+
+class TestRecomputeAnalysis(unittest.TestCase):
+    """The plans one more fully recomputed layer reaches, at one fixed strategy."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Seven DeepSeek layers over two stages."""
+        cls.folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        cls.path = _small_deepseek(cls.folder.name, 1)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Remove the config."""
+        cls.folder.cleanup()
+
+    def _tight(self) -> Tuple[EvaluatorV2, float]:
+        """An evaluator whose plain stages a little overfill the device, and that capacity in MB."""
+        evaluator = EvaluatorV2(self.path, framework="mindformers", log_level=0)
+        capacity = max(_stage_peaks(evaluator, full_rec=False)) - 64
+        _with_capacity(evaluator, capacity)
+        return evaluator, capacity
+
+    def _analysis(self, evaluator: EvaluatorV2) -> Candidate.RecomputeAnalysis:
+        """An analysis of *evaluator*'s strategy, choosing between off and full."""
+        return Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ("off", "full"), dimensions=_DEGREES)
+
+    def test_every_alternative_recomputes_one_more_layer_and_fits(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: A plan per layer on a device the plain stages overfill.
+        Expectation: Each alternative keeps the plan's kinds and degrees,
+            runs exactly one more layer full, fits the device and carries no
+            score, which only a caller's estimate gives it.
+        """
+        evaluator, capacity = self._tight()
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        fulls = sum(item.count for item in plan.ranges if item.mode == "full")
+        results = self._analysis(evaluator).alternatives(plan)
+        self.assertTrue(results)
+        for result in results:
+            self.assertIsNone(result.score)
+            self.assertIsNone(result.mode)
+            self.assertEqual(result.dimensions, _DEGREES)
+            self.assertEqual(sum(item.count for item in result.ranges if item.mode == "full"), fulls + 1)
+            self.assertEqual(sum(item.count for item in result.ranges), sum(item.count for item in plan.ranges))
+            self.assertLessEqual(result.memory, capacity)
+            self.assertLessEqual(result.memory, plan.memory)
+
+    def test_equivalent_layers_give_one_alternative_each(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: The same plan, whose stages hold several layers of one kind.
+        Expectation: Swapping which of a group's layers runs full gives one
+            alternative, so there are fewer of them than there are layers
+            still to turn up, and no two state the same plan.
+        """
+        evaluator, _ = self._tight()
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        off_layers = sum(item.count for item in plan.ranges if item.mode != "full")
+        results = self._analysis(evaluator).alternatives(plan)
+        plans = [tuple(sorted((item.first, item.count, item.mode) for item in result.ranges))
+                 for result in results]
+        self.assertEqual(len(plans), len(set(plans)))
+        self.assertLess(len(results), off_layers)
+
+    def test_a_plan_of_one_mode_for_every_layer_has_no_alternative(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: A choice of one mode for the whole model.
+        Expectation: No alternative: the analysis extends a plan per layer.
+        """
+        evaluator, _ = self._tight()
+        whole = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        self.assertIsNotNone(whole.mode)
+        self.assertEqual(self._analysis(evaluator).alternatives(whole), [])
+
+    def test_a_plan_of_other_degrees_or_other_layers_is_refused(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: A plan priced at other degrees, one leaving a body layer
+            out, and one naming a layer twice.
+        Expectation: Each is refused rather than silently scored against the
+            wrong strategy or the wrong model.
+        """
+        evaluator, _ = self._tight()
+        analysis = self._analysis(evaluator)
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        with self.assertRaises(ValueError):
+            analysis.alternatives(dataclasses.replace(plan, dimensions=(("DP", 8),)))
+        with self.assertRaises(ValueError):
+            analysis.alternatives(dataclasses.replace(plan, ranges=plan.ranges[:-1]))
+        with self.assertRaises(ValueError):
+            analysis.alternatives(dataclasses.replace(plan, ranges=plan.ranges + (plan.ranges[0],)))
+
+    def test_the_analysis_refuses_modes_it_cannot_price(self):
+        """
+        Feature: RecomputeAnalysis.
+        Description: No mode at all, a mode that is not one of MODES, and
+            modes without full.
+        Expectation: The first two are refused; without full there is
+            nothing to turn a layer up to, so the analysis offers nothing.
+        """
+        evaluator, _ = self._tight()
+        with self.assertRaises(ValueError):
+            Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ())
+        with self.assertRaises(ValueError):
+            Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ("off", "nonexistent"))
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        off_only = Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ("off",), dimensions=_DEGREES)
+        self.assertEqual(off_only.alternatives(plan), [])
 
 
 class TestNoChoice(unittest.TestCase):
