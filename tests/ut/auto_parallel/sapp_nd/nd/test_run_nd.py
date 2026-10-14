@@ -2211,6 +2211,95 @@ class TestSappNDRunND(unittest.TestCase):
             plt.close(figure)
         self.assertEqual(plot.cell_text, [["8"], ["True"], [128]])
 
+    def test_the_plot_states_the_recompute_mode_and_the_plan_per_layer(self) -> None:
+        """
+        Feature: ND's plot of a search that chose a recompute mode per layer.
+        Description: One configuration whose plan fully recomputes every
+            layer but its last five, then the same plot without a plan, then
+            a configuration of a search with a recompute dimension.
+        Expectation: The table gains a mode row and a plan row, the mode in
+            capitals and the plan as the trainer's yaml states it; without a
+            plan neither row is drawn; a configuration that states a mode of
+            its own shows the mode row alone.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        configs = [(dims, 128, 10.0, [10.0])]
+        drawn = []
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Debug.Plot, "make_table",
+                             lambda self: drawn.append((list(self.row_title), list(self.cell_text)))), \
+                patch.object(Debug.Plot, "close", lambda self, output_path, filename: None):
+            Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE],
+                          recompute_plans={dims: ("full", {"3-7": "off"})})
+            Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE])
+            searched = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP],
+                                      recompute="selective")
+            Debug.plot_nd([(searched, 128, 10.0, [10.0])], tmp_dir, [Debug.PerfParts.FW_COMPUTE])
+        plt.close("all")
+        self.assertEqual([str(row) for row in drawn[0][0]],
+                         ["TOP", "DP", "PP", Debug.MODE_ROW, Debug.LAYER_ROW, "MEM"])
+        self.assertEqual(drawn[0][1], [[1, "8", "2", "FULL", "3-7: 'off'", 128]])
+        self.assertEqual([str(row) for row in drawn[1][0]], ["TOP", "DP", "PP", "MEM"])
+        self.assertEqual(drawn[1][1], [[1, "8", "2", 128]])
+        self.assertEqual([str(row) for row in drawn[2][0]], ["TOP", "DP", "PP", Debug.MODE_ROW, "MEM"])
+        self.assertEqual(drawn[2][1], [[1, "8", "2", "SELECTIVE", 128]])
+
+    def test_the_degree_table_is_drawn_with_a_plan_of_several_lines(self) -> None:
+        """
+        Feature: the degree table under ND's plot of a search.
+        Description: A plan naming two ranges, which the plan row states on
+            one line each.
+        Expectation: The table is drawn, the plan row holding both lines.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        plot.row_title.insert(-1, Debug.MODE_ROW)
+        plot.row_title.insert(-1, Debug.LAYER_ROW)
+        plot.parse_data([(dims, 128, 10.0, [10.0])],
+                        recompute_plans={dims: ("full", {"0": "selective", "3-7": "off"})})
+        figure = plt.figure()
+        try:
+            plot.make_table()
+        finally:
+            plt.close(figure)
+        self.assertEqual(plot.cell_text[-3], ["FULL"])
+        self.assertEqual(plot.cell_text[-2], ["'0': selective\n3-7: 'off'"])
+
+    def test_the_recompute_plot_is_written_for_every_configuration(self) -> None:
+        """
+        Feature: Debug.plot_recompute.
+        Description: Two configurations, the first with two plans and the
+            second with none, then an empty selection, a non-positive page
+            size and a record missing a score component.
+        Expectation: A PDF is written for the configurations; nothing is
+            written for an empty selection, and the other two are refused.
+        """
+        parts = [Debug.PerfParts.FW_COMPUTE, Debug.PerfParts.DP_COMM]
+        first = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        second = Dim.Dimensions([(Dim.DP, 4), (Dim.PP, 4)], all_dims=[Dim.DP, Dim.PP])
+        first.rank, second.rank = 1, 2
+        records = [
+            {"score": 10.0, "parts": (6.0, 4.0), "memory": 1024.0, "mode": "full",
+             "layers": {"3-7": "off"}, "full_layers": 3},
+            {"score": 11.0, "parts": (7.0, 4.0), "memory": 1000.0, "mode": "full",
+             "layers": {}, "full_layers": 8},
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                Debug.plot_recompute([(first, records), (second, [])], tmp_dir, parts, "recompute",
+                                     title="unit", columns_per_page=1)
+                written = os.path.join(tmp_dir, "recompute.pdf")
+                self.assertTrue(os.path.isfile(written))
+                self.assertGreater(os.path.getsize(written), 1000)
+                Debug.plot_recompute([], tmp_dir, parts, "empty")
+                self.assertFalse(os.path.exists(os.path.join(tmp_dir, "empty.pdf")))
+                with self.assertRaises(ValueError):
+                    Debug.plot_recompute([(first, records)], tmp_dir, parts, "bad", columns_per_page=0)
+                with self.assertRaises(ValueError):
+                    Debug.plot_recompute([(first, [dict(records[0], parts=(6.0,))])], tmp_dir, parts, "short")
+        finally:
+            plt.close("all")
+
     def test_the_ranking_keeps_nd_order_and_every_digit(self) -> None:
         """
         Feature: the CSV of a search's configurations in ND's order.
@@ -2292,6 +2381,51 @@ class TestSappNDRunND(unittest.TestCase):
                 self.assertEqual(run_kwargs["exhaustive"], exhaustive)
                 self.assertEqual(run_kwargs["force_exhaustive"], force_exhaustive)
                 self.assertEqual(run_kwargs["fforce_exhaustive"], fforce_exhaustive)
+
+    def test_run_nd_cli_asks_for_the_recompute_potentials_only_when_told_to(self) -> None:
+        """
+        Feature: run_nd -rp/--recompute_potentials.
+        Description: The CLI search on a fake Parallelize, with the short and
+            the long form of the flag and without it.
+        Expectation: The search is asked for the report only with the flag,
+            so a plain search does none of that work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "2", "-ar", "--recompute", "off", "full"]
+            for extra, expected in (([], False), (["-rp"], True), (["--recompute_potentials"], True)):
+                with patch.object(sys, "argv", argv + extra):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                run_kwargs = _FakeParallelize.instances[-1].last_run_kwargs()
+                self.assertEqual(run_kwargs["recompute_potentials"], expected)
+
+    def test_run_nd_cli_refuses_the_recompute_potentials_without_a_plan_per_layer(self) -> None:
+        """
+        Feature: run_nd -rp/--recompute_potentials.
+        Description: The flag without -ar, without the modes each layer
+            chooses among, below the verbosity that writes files, and with
+            --real_csv.
+        Expectation: Each is refused, rather than running a longer search
+            that writes nothing or extends a plan that does not exist.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            real_csv = os.path.join(tmp_dir, "real.csv")
+            with open(real_csv, "w", encoding="utf-8") as handle:
+                handle.write("DP,time\n8,100\n")
+            refused = [
+                ["-rp", "--recompute", "off", "full"],
+                ["-rp", "-ar"],
+                ["-rp", "-ar", "--recompute", "off", "full", "-v", "1"],
+                ["-rp", "-ar", "--recompute", "off", "full", "--real_csv", real_csv],
+            ]
+            for extra in refused:
+                argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "2"] + extra
+                with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as refusal:
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(refusal.exception.code, 2, extra)
 
     def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
         """
