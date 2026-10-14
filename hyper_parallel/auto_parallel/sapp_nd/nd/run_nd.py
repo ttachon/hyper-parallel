@@ -341,7 +341,7 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     _check_train_yaml(cli_parser, cli_args)
 
     set_verbose_level(cli_args.verbosity)
-    Debug.set_output_dir(cli_args.output_dir)
+    Debug.set_output_dir(cli_args.output_dir, fresh=True)
 
     search_cfg = read_search_config(cli_args.search_config)
     try:
@@ -851,7 +851,7 @@ if __name__ == "__main__":
         )
 
     set_verbose_level(args.verbosity)
-    Debug.set_output_dir(args.output_dir)
+    Debug.set_output_dir(args.output_dir, fresh=True)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
     machine = Hard.Machine(args.devices, args.device_type or "A2")

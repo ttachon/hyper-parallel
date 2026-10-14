@@ -1650,6 +1650,34 @@ class TestSappNDRunND(unittest.TestCase):
                 with open(os.path.join(tmp_dir, name), encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), first.column_titles() + "".join(r.values() for r in rows))
 
+    def test_a_run_starts_its_debug_csvs_afresh_and_its_workers_append(self) -> None:
+        """
+        Feature: Debug.set_output_dir.
+        Description: An earlier run left debug.csv and debug_mem.csv in the output folder, beside
+            another file. A new run sets the folder with fresh=True and writes a row, then a pool
+            worker sets the same folder without it.
+        Expectation: The run removes the two CSVs and nothing else, so its row sits under new
+            column titles, and the worker's call keeps what the run wrote.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 4)], all_dims=[Dim.DP, Dim.MBS])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for name in (*Debug.DEBUG_CSVS, "resolved.yaml"):
+                with open(os.path.join(tmp_dir, name), "w", encoding="utf-8") as handle:
+                    handle.write("from an earlier run\n")
+            try:
+                Debug.set_output_dir(tmp_dir, fresh=True)
+                left = sorted(os.listdir(tmp_dir))
+                debug = Debug.Debug(dims, [Debug.PerfParts.TOTAL])
+                debug.info[Debug.PerfParts.TOTAL] = 9
+                debug.write()
+                Debug.set_output_dir(tmp_dir)
+                with open(os.path.join(tmp_dir, "debug.csv"), encoding="utf-8") as handle:
+                    written = handle.read()
+            finally:
+                Debug.set_output_dir(None)
+        self.assertEqual(left, ["resolved.yaml"], f"files left by a fresh start: {left}")
+        self.assertEqual(written, debug.column_titles() + debug.values(), f"debug.csv after the run: {written!r}")
+
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.

@@ -59,14 +59,29 @@ def _has_recompute(entries: list) -> bool:
 # which is unwritable in an installed package and mixes consecutive runs
 # together, so ``run_nd -o`` overrides it.
 _OUTPUT_DIR = None
+# The CSVs Debug.write appends a row a candidate to.
+DEBUG_CSVS = ("debug.csv", "debug_mem.csv")
 
 
-def set_output_dir(path: Optional[str]) -> None:
-    """Send the debug artifacts to *path* instead of the package directory."""
+def set_output_dir(path: Optional[str], fresh: bool = False) -> None:
+    """Send the debug artifacts to *path* instead of the package directory.
+
+    Args:
+        path: the run's output folder, or None for the package's own.
+        fresh: remove the debug CSVs an earlier run left there. ``Debug.write`` appends and writes the column
+            titles only into a new file, so a run into a folder another run wrote would add its rows under that
+            run's. The process that starts a run passes True; the pool's workers, which append to the files
+            the run started, do not.
+    """
     global _OUTPUT_DIR  # pylint: disable=global-statement
     _OUTPUT_DIR = str(path) if path else None
     if _OUTPUT_DIR:
         os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    if fresh:
+        for name in DEBUG_CSVS:
+            stale = os.path.join(output_dir(), name)
+            if os.path.isfile(stale):
+                os.remove(stale)
 
 
 def output_dir() -> str:
