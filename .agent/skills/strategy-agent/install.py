@@ -121,6 +121,17 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def installed_state(target: Target, source: Path) -> str:
+    """What ``--check`` says about one target: a link to the skill, a copy of it, or something else."""
+    if _linked(target.path, source):
+        return "installed"
+    if _our_copy(target.path):
+        return "installed as a copy"
+    if target.path.exists() or target.path.is_symlink():
+        return "something else is there"
+    return "not installed"
+
+
 def install_one(target: Target, source: Path, root: Path, copy: bool, force: bool) -> str:
     """Install the skill at one target. Returns what was done, for the report."""
     path = target.path
@@ -206,7 +217,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     lines = []
     for target in targets(chosen(arguments.assistants), arguments.scope, root):
-        state = ("installed" if _already(target.path, SKILL) else "not installed") if arguments.check \
+        state = installed_state(target, SKILL) if arguments.check \
             else install_one(target, SKILL, root, arguments.copy, arguments.force)
         lines.append(f"{target.assistant} ({target.scope}): {state}")
         lines.append(f"    {target.path}")
