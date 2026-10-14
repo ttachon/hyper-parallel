@@ -55,8 +55,13 @@ def _plan(
     kind: Any = None,
     link: float = 0.0,
 ) -> RecomputeChoice:
-    """A plan whose layers run *modes*, one letter a layer: f for full, o for off, s for selective."""
+    """A plan whose layers run *modes*, one letter a layer: f for full, o for off, s for selective.
+
+    The letters may be separated by spaces, which read better and keep a plan of three
+    layers from spelling a word.
+    """
     names = {"f": "full", "o": "off", "s": "selective"}
+    modes = modes.replace(" ", "")
     ranges = tuple(
         LayerRange(index, 1, kind, _option(link), names[letter])
         for index, letter in enumerate(modes)
@@ -75,9 +80,9 @@ class TestSortRecomputeResults(unittest.TestCase):
         Expectation: Ascending score, the lighter of the tied pair first,
             and the input sequence is left alone.
         """
-        slow = _plan("ooo", score=3.0)
-        tied_heavy = _plan("oof", score=1.0, memory=90.0)
-        tied_light = _plan("ofo", score=1.0, memory=80.0)
+        slow = _plan("o o o", score=3.0)
+        tied_heavy = _plan("o o f", score=1.0, memory=90.0)
+        tied_light = _plan("o f o", score=1.0, memory=80.0)
         results = [slow, tied_heavy, tied_light]
         self.assertEqual(sort_recompute_results(results), [tied_light, tied_heavy, slow])
         self.assertEqual(results, [slow, tied_heavy, tied_light])
@@ -89,9 +94,9 @@ class TestSortRecomputeResults(unittest.TestCase):
         Expectation: Both are refused, rather than sorted anywhere.
         """
         with self.assertRaises(ValueError):
-            sort_recompute_results([_plan("oo", score=None)])
+            sort_recompute_results([_plan("o o", score=None)])
         with self.assertRaises(ValueError):
-            sort_recompute_results([_plan("oo", score=float("inf"))])
+            sort_recompute_results([_plan("o o", score=float("inf"))])
 
 
 class TestKeepRecomputePotential(unittest.TestCase):
@@ -105,9 +110,9 @@ class TestKeepRecomputePotential(unittest.TestCase):
         Expectation: The fastest of the one-more-full plans is appended and
             returned; the two-more-full plan is left for a later step.
         """
-        current = _plan("oo", score=5.0)
-        quick = _plan("fo", score=2.0)
-        results = [_plan("of", score=3.0), quick, _plan("ff", score=1.0)]
+        current = _plan("o o", score=5.0)
+        quick = _plan("f o", score=2.0)
+        results = [_plan("o f", score=3.0), quick, _plan("f f", score=1.0)]
         kept = [current]
         self.assertIs(keep_recompute_potential(current, kept, results), quick)
         self.assertEqual(kept, [current, quick])
@@ -121,10 +126,10 @@ class TestKeepRecomputePotential(unittest.TestCase):
         Expectation: Only the remaining plan of this strategy is appended,
             and a step with nothing left to turn up returns None.
         """
-        current = _plan("foo", score=4.0)
-        kept = [_plan("ooo", score=5.0), current]
-        results = [_plan("ffo", score=1.0, degrees=_OTHER), _plan("foo", score=2.0),
-                   _plan("fof", score=2.5, link=8.0), _plan("ffo", score=3.0)]
+        current = _plan("f o o", score=4.0)
+        kept = [_plan("o o o", score=5.0), current]
+        results = [_plan("f f o", score=1.0, degrees=_OTHER), _plan("f o o", score=2.0),
+                   _plan("f o f", score=2.5, link=8.0), _plan("f f o", score=3.0)]
         appended = keep_recompute_potential(current, kept, results)
         self.assertEqual([item.mode for item in appended.ranges], ["full", "full", "off"])
         self.assertEqual(appended.score, 3.0)
@@ -138,9 +143,9 @@ class TestKeepRecomputePotential(unittest.TestCase):
             turn two layers up at once, and that turn one down instead.
         Expectation: None of them qualifies, so nothing is appended.
         """
-        current = _plan("oos", score=5.0, kind="dense")
-        results = [_plan("fos", score=1.0, kind="moe"), _plan("ffs", score=2.0, kind="dense"),
-                   _plan("ooo", score=3.0, kind="dense")]
+        current = _plan("o o s", score=5.0, kind="dense")
+        results = [_plan("f o s", score=1.0, kind="moe"), _plan("f f s", score=2.0, kind="dense"),
+                   _plan("o o o", score=3.0, kind="dense")]
         kept = [current]
         self.assertIsNone(keep_recompute_potential(current, kept, results))
         self.assertEqual(kept, [current])
@@ -171,8 +176,8 @@ class TestRecomputeNextPlotGroups(unittest.TestCase):
         configs = self._configs(2)
         first, second = configs[0][0], configs[1][0]
         results = {
-            first: [_plan("oo", score=10.0), _plan("fo", score=15.0), _plan("ff", score=25.0)],
-            second: [_plan("oo", score=20.0), _plan("fo", score=22.0), _plan("ff", score=24.0)],
+            first: [_plan("o o", score=10.0), _plan("f o", score=15.0), _plan("f f", score=25.0)],
+            second: [_plan("o o", score=20.0), _plan("f o", score=22.0), _plan("f f", score=24.0)],
         }
         groups = recompute_next_plot_groups(configs, results)
         self.assertEqual([config for config, _ in groups], [first, second])
@@ -189,8 +194,8 @@ class TestRecomputeNextPlotGroups(unittest.TestCase):
         configs = self._configs(2)
         first, second = configs[0][0], configs[1][0]
         results = {
-            first: [_plan("oo", score=20.0), _plan("fo", score=21.0)],
-            second: [_plan("oo", score=20.0)],
+            first: [_plan("o o", score=20.0), _plan("f o", score=21.0)],
+            second: [_plan("o o", score=20.0)],
         }
         groups = recompute_next_plot_groups(configs, results)
         self.assertEqual([choice.score for choice in groups[0][1]], [20.0, 21.0])
@@ -204,7 +209,7 @@ class TestRecomputeNextPlotGroups(unittest.TestCase):
         Expectation: The limit holds, and nothing is selected without one.
         """
         configs = self._configs(3)
-        results = {config: [_plan("oo", score=score)] for config, _, score, _ in configs}
+        results = {config: [_plan("o o", score=score)] for config, _, score, _ in configs}
         self.assertEqual(len(recompute_next_plot_groups(configs, results, top_num=2)), 2)
         self.assertEqual(recompute_next_plot_groups(configs, results, top_num=0), [])
         self.assertEqual(recompute_next_plot_groups([], results), [])
@@ -228,7 +233,7 @@ class TestRecomputePlotData(unittest.TestCase):
                                 score=2.0, dimensions=_DEGREES, score_parts=(2.0, 0.0))
         missing = RecomputeChoice(ranges=(), stage_memory=(90.0,), stage_savings=(), score=3.0,
                                   dimensions=_DEGREES, score_parts=(3.0, 0.0))
-        records = recompute_plot_data([(dims, [_plan("ffooo", score=1.0), whole, missing])])[0][1]
+        records = recompute_plot_data([(dims, [_plan("f f o o o", score=1.0), whole, missing])])[0][1]
         self.assertEqual(records[0]["mode"], "full")
         self.assertEqual(records[0]["layers"], {"2-4": "off"})
         self.assertEqual(records[0]["full_layers"], 2)
@@ -255,7 +260,7 @@ class TestWriteRecomputeCsv(unittest.TestCase):
         """
         dims = Dim.Dimensions([(Dim.DP, 4), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
         dims.rank = 3
-        sequence = [_plan("ooo", score=5.0), _plan("foo", score=4.0), _plan("ffo", score=3.0)]
+        sequence = [_plan("o o o", score=5.0), _plan("f o o", score=4.0), _plan("f f o", score=3.0)]
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "nested", "recompute_potentials.csv")
             write_recompute_csv({dims: sequence}, path)
@@ -288,8 +293,8 @@ class TestWriteRecomputeCsv(unittest.TestCase):
                                   dimensions=_DEGREES)
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "recompute_potentials.csv")
-            write_recompute_csv({dims: [_plan("oo", score=9.0)] * 4}, path)
-            write_recompute_csv({dims: [_plan("oo", score=1.0, link=8.0), whole, missing]}, path)
+            write_recompute_csv({dims: [_plan("o o", score=9.0)] * 4}, path)
+            write_recompute_csv({dims: [_plan("o o", score=1.0, link=8.0), whole, missing]}, path)
             with open(path, newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
         self.assertEqual([row["plan_scope"] for row in rows], ["offload", "whole_model", "unavailable"])
