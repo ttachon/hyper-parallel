@@ -188,8 +188,8 @@ def verdict(best: Measured, others: Sequence[Measured], timer: Dict) -> str:
     rival = min(others, key=lambda item: item.fastest)
     margin = rival.fastest - best.slowest
     if margin > 0:
-        return (f"Its slowest run beats every other layout's fastest run, by {margin:.1f} ms "
-                f"({timing.name_of(rival.key, timer)}): no choice of statistic changes the pick.")
+        return (f"Among the layouts timed, its slowest run beats every other's fastest run, by {margin:.1f} ms "
+                f"({timing.name_of(rival.key, timer)}): no choice of statistic changes the pick among them.")
     close = ", ".join(timing.name_of(item.key, timer) for item in others if item.fastest <= best.slowest)
     return f"Not separated: its runs overlap those of {close}. One more round of these decides."
 
@@ -297,8 +297,12 @@ def source_of(run: Path, args: argparse.Namespace) -> Source:
                   ranking=answer.Ranking(str(run / "nd_rank.csv")), folders=folders)
 
 
-def _head_lines(source: Source, finished: Sequence[Measured], best: Measured, notes: Sequence[str]) -> List[str]:
-    """The record's status, what was read, the pick and whether one more round could change it."""
+def _head_lines(source: Source, finished: Sequence[Measured], best: Measured, notes: Sequence[str],
+                untimed: int) -> List[str]:
+    """The record's status, what was read, the pick and whether one more round could change it.
+
+    *untimed* is how many layouts the run's launch plan names that no round read has timed yet.
+    """
     timer = source.timer
     lines = [f"ND's record for {source.family} on {source.cluster}: {source.trust['status']}. The pick below is "
              "measured, not ND's.", "",
@@ -306,7 +310,11 @@ def _head_lines(source: Source, finished: Sequence[Measured], best: Measured, no
              *notes, "",
              f"The pick, measured: {timing.name_of(best.key, timer)}, {best.mean:.1f} ms a step over "
              f"{_runs(len(best.runs))} ({best.fastest:.1f} to {best.slowest:.1f}).",
-             verdict(best, [item for item in finished if item is not best], timer), ""]
+             verdict(best, [item for item in finished if item is not best], timer)]
+    if untimed:
+        lines.append(f"The launch plan still has {untimed} layouts no round has timed, and any of them could be "
+                     "faster: the pick holds among the layouts timed.")
+    lines.append("")
     if best.nd_row is not None:
         fixed = answer.layout(best.nd_row, [name for name in source.ranking.degrees if name not in timer["varies"]])
         lines += [f"Every layout here is {fixed}.", ""]
@@ -351,7 +359,9 @@ def report(run: Path, args: argparse.Namespace) -> List[str]:
     out = run / "readback"
     out.mkdir(exist_ok=True)
     write_csv(out / "measured.csv", finished, source.timer)
-    lines = _head_lines(source, finished, best, notes) + _table(finished, rows, source.timer) + [""]
+    measured = {item.key for item in finished}
+    untimed = sum(1 for key in _planned(run, source.timer) if key not in measured)
+    lines = _head_lines(source, finished, best, notes, untimed) + _table(finished, rows, source.timer) + [""]
     lines += _nd_lines(finished, best, rows, source.timer, source.ranking.degrees)
     lines += _closing_lines(run, source, items, best)
     (out / "readback.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

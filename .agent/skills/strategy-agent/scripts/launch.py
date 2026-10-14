@@ -31,7 +31,7 @@ import copy
 import statistics
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import yaml
@@ -219,8 +219,9 @@ def _duration(seconds: float) -> str:
 
 def command_lines(timer: Dict[str, Any], points: str, repeats: int, root: str, doc: Dict[str, Any]) -> List[str]:
     """The lines to paste on a node, from the root of a checkout of this branch: find the model, check the node,
-    time the round."""
+    then time the round detached from the shell, so that a dropped connection does not end it."""
     training = doc.get("training") or {}
+    log = f"{root}.log"
     lines = [
         # A path nobody has read on that node is a guess, so derive it, show it, and let the timer refuse a wrong
         # one. Homes there can be links to another disk, hence -L.
@@ -229,12 +230,15 @@ def command_lines(timer: Dict[str, Any], points: str, repeats: int, root: str, d
         '[ -n "$M" ] || echo "NO MODEL DIRECTORY FOUND under /home: set M to it by hand"',
         'M=$(dirname "${M:-.}"); echo "model directory: $M"',
     ]
+    # Through bash rather than ./, since an archive can lose a script's executable bit.
     if timer.get("preflight"):
-        lines.append(f'./{timer["preflight"]} "$M"')
+        lines.append(f'bash {timer["preflight"]} "$M"')
     lines += [
-        f'POINTS="{points}" REPEATS={repeats} GLOBAL_BATCH={training.get("global_batch_size")} '
+        f"mkdir -p {PurePosixPath(root).parent}",
+        f'nohup env POINTS="{points}" REPEATS={repeats} GLOBAL_BATCH={training.get("global_batch_size")} '
         f'MICRO_BATCH={training.get("micro_batch_size")} RUN_ROOT={root} \\',
-        f'    ./{timer["script"]} "$M"',
+        f'    bash {timer["script"]} "$M" > {log} 2>&1 &',
+        f"tail -f {log}",
     ]
     return lines
 
@@ -430,12 +434,14 @@ class Plan:
             f"The round: {len(round_rows)} layouts, {self.repeats} runs each, {launches} launches, about "
             f"{_duration(launches * self.timer['seconds_a_run'])} at the {self.timer['seconds_a_run']} s a launch "
             "earlier rounds measured, plus a one-off preparation of the model's assets and data. It goes round "
-            "the layouts once before it repeats any, so a window that closes early still times each one once, "
-            "and it skips what already succeeded when launched again with the same RUN_ROOT.",
+            "the layouts once before it repeats any, so a window that closes early still times each one once. "
+            "It runs detached from the shell, so a dropped connection does not end it, and tail only follows its "
+            "log; if it stops, run the nohup line again: with the same RUN_ROOT it skips what already succeeded.",
             "",
             f"On one node of {self.timer['dies']} dies, from the root of a checkout of this branch, with the "
-            "model's files on the node. The model directory it prints must be the one meant, and the preflight "
-            "must end with no FAIL:",
+            "model's files on the node and PYTHON_BIN set to the Python that has the checkout's dependencies when "
+            "it is not the first one on PATH. The model directory it prints must be the one meant, and the "
+            "preflight must end with no FAIL:",
             "",
             "```bash",
             *command_lines(self.timer, points, self.repeats, root, self.doc),

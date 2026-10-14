@@ -168,12 +168,14 @@ class LauncherTest(unittest.TestCase):
         """
         Feature: the one command that times a round.
         Description: two layouts, three repeats, the run's batch.
-        Expectation: the preflight runs before the timer, which gets the points, repeats, batch and run root.
+        Expectation: the preflight runs before the timer, which runs detached with the points, repeats, batch and
+            run root, its log beside the run root.
         """
         lines = launch.command_lines(TIMER, "1:1 2:4", 3, "output/rounds/r", self.doc)
         text = "\n".join(lines)
-        for part in ('POINTS="1:1 2:4"', "REPEATS=3", "GLOBAL_BATCH=16", "MICRO_BATCH=1",
-                     "RUN_ROOT=output/rounds/r", './examples/x/repeat.sh "$M"'):
+        for part in ('POINTS="1:1 2:4"', "REPEATS=3", "GLOBAL_BATCH=16", "MICRO_BATCH=1", "nohup env",
+                     "RUN_ROOT=output/rounds/r", 'bash examples/x/repeat.sh "$M" > output/rounds/r.log 2>&1 &',
+                     "mkdir -p output/rounds"):
             self.assertIn(part, text, f"command lacks {part}: got={text}")
         self.assertLess(text.index("preflight.sh"), text.index("repeat.sh"),
                         f"the preflight runs first: got={text}")
