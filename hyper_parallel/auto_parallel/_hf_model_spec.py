@@ -212,6 +212,29 @@ def _text_tower(model_config: Any) -> Any:
     return getattr(model_config, "text_config", None) or model_config
 
 
+def _at_stated_depth(model_config: Any, explicit: Mapping[str, Any]) -> Any:
+    """*model_config* at the depth the model section states, as a crop of the released model is built.
+
+    A ``num_hidden_layers`` stated beside the checkpoint crops it to its first layers. The formulas read that
+    count as stated, but the census builds its layers from the config, so the config it builds from has to
+    carry the crop too, its ``layer_types`` cut to the same layers; otherwise the census lists the release's
+    layers against the crop's count.
+
+    Returns:
+        *model_config* itself where the section states no depth or the release's own, else a copy at that depth.
+    """
+    depth = explicit.get("num_hidden_layers")
+    if depth is None or getattr(_text_tower(model_config), "num_hidden_layers", None) == int(depth):
+        return model_config
+    cropped = copy.deepcopy(model_config)
+    text = _text_tower(cropped)
+    text.num_hidden_layers = int(depth)
+    layer_types = getattr(text, "layer_types", None)
+    if isinstance(layer_types, (list, tuple)):
+        text.layer_types = list(layer_types)[:int(depth)]
+    return cropped
+
+
 def _spec_from_aliases(config: Any, aliases: Dict[str, Tuple[str, ...]]) -> Dict[str, Any]:
     """Collect the canonical fields declared by *config*."""
     spec = {}
@@ -687,7 +710,7 @@ def resolve_hf_model_spec(
 
     name = str(getattr(model_config, "model_type", None) or model_path)
     if census_spec:
-        spec = census_model_spec(model_config, explicit.get("arch"), name)
+        spec = census_model_spec(_at_stated_depth(model_config, explicit), explicit.get("arch"), name)
     else:
         spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
         _derive_shared_experts(spec)
