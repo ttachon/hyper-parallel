@@ -240,7 +240,10 @@ def build_crop(model_dir: str, assets: str, divisor: int, experts: int) -> Any:
     Returns:
         The model the trainer would build, on the CPU.
     """
-    import torch
+    # Imported here, not at the top: describing a crop reads config.json alone, and must
+    # work in a checkout or an environment where neither torch nor the model is installed.
+    # pylint: disable=import-outside-toplevel
+    import torch  # pylint: disable=forbidden-backend-import
     from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
         build_cropped_deepseek_v41,
     )
@@ -309,7 +312,9 @@ def nd_layer_parameters(spec_yaml: str) -> Tuple[Dict[str, float], Dict[str, flo
         a description that states layers the run does not build.
     """
     # verify first: importing the cost model's own modules in another order
-    # leaves _cost_model_variables partly initialized (a circular import).
+    # leaves _cost_model_variables partly initialized (a circular import).  Imported here
+    # for the same reason as above, and in this order.
+    # pylint: disable=import-outside-toplevel
     from hyper_parallel.auto_parallel.sapp_nd.nd.verify import nd_parameters
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail

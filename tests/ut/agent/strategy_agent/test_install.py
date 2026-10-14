@@ -15,6 +15,7 @@
 """UT for the one command that installs the strategy agent: where it puts the skill, and what it refuses."""
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -80,12 +81,14 @@ class TargetsTest(unittest.TestCase):
 class InstallOneTest(unittest.TestCase):
     """What one install does, and what it leaves alone."""
 
-    def setUp(self):
-        # Every case here installs by copy: a link into the sandbox would be followed when the
-        # sandbox is removed, and that walks into the skill itself.
-        self.temp = tempfile.TemporaryDirectory()
-        self.home = Path(self.temp.name)
-        self.addCleanup(self.temp.cleanup)
+    def setUp(self) -> None:
+        """A sandbox to install into.
+
+        Every case here installs by copy: a link into the sandbox would be followed when the
+        sandbox is removed, and that walks into the skill itself.
+        """
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, True)
 
     def _target(self):
         """The codex target inside the sandbox."""
@@ -125,10 +128,10 @@ class InstallOneTest(unittest.TestCase):
 class CheckStateTest(unittest.TestCase):
     """What the report says about a target without changing it."""
 
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.folder = Path(self.temp.name)
+    def setUp(self) -> None:
+        """A folder to put a target in."""
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.folder, True)
 
     def test_the_skill_itself_counts_as_installed(self):
         """A target that resolves to the skill is an install, which is what a link gives."""
@@ -156,15 +159,15 @@ class CheckStateTest(unittest.TestCase):
 class CheckoutTest(unittest.TestCase):
     """How the scripts find the checkout to run ND in."""
 
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.folder = Path(self.temp.name)
+    def setUp(self) -> None:
+        """A folder to point at, with the environment and the skill's own folder put back after."""
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.folder, True)
         self.stated = os.environ.get("HYPER_PARALLEL_ROOT")
         self.skill = ask.SKILL
         self.addCleanup(self._restore)
 
-    def _restore(self):
+    def _restore(self) -> None:
         ask.SKILL = self.skill
         if self.stated is None:
             os.environ.pop("HYPER_PARALLEL_ROOT", None)
