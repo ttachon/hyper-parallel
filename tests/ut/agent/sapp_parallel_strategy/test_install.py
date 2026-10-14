@@ -122,6 +122,37 @@ class InstallOneTest(unittest.TestCase):
         self.assertFalse((target.path / "keep.txt").is_file())
 
 
+class CheckStateTest(unittest.TestCase):
+    """What the report says about a target without changing it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+
+    def test_the_skill_itself_counts_as_installed(self):
+        """A target that resolves to the skill is an install, which is what a link gives."""
+        self.assertEqual(install.installed_state(install.Target("codex", "user", _SKILL), _SKILL), "installed")
+
+    def test_a_copy_is_named_as_one(self):
+        """A copy answers requests too, and the report says which of the two is there."""
+        target = self.folder / "copied"
+        target.mkdir()
+        (target / "SKILL.md").write_text("", encoding="utf-8")
+        (target / "checkout.txt").write_text(f"{self.folder}", encoding="utf-8")
+        self.assertEqual(install.installed_state(install.Target("codex", "user", target), _SKILL),
+                         "installed as a copy")
+
+    def test_something_else_is_not_read_as_an_install(self):
+        """A folder somebody else put there is reported, not counted."""
+        target = self.folder / "theirs"
+        target.mkdir()
+        self.assertEqual(install.installed_state(install.Target("codex", "user", target), _SKILL),
+                         "something else is there")
+        self.assertEqual(install.installed_state(install.Target("codex", "user", self.folder / "none"), _SKILL),
+                         "not installed")
+
+
 class CheckoutTest(unittest.TestCase):
     """How the scripts find the checkout to run ND in."""
 
