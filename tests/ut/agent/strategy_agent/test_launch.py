@@ -13,8 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """UT for the strategy agent's launch step: which layouts a round times, and what each timed run reads."""
+import json
 import unittest
 
+import yaml
+
+import ask
 import launch
 import timing
 
@@ -194,6 +198,35 @@ class LaunchableTest(unittest.TestCase):
         doc = {"training": {"micro_batch_size": 1}, "activation_checkpoint": {"mode": "off"}}
         got = [_key(row) for row in timing.launchable(rows, TIMER, doc)]
         self.assertEqual(got, [("1", "2"), ("2", "2")], f"launchable: expected=[('1', '2'), ('2', '2')], got={got}")
+
+
+class ShippedLauncherTest(unittest.TestCase):
+    """Every template with a timer must ship a launcher that states the job the cost model prices."""
+
+    def test_each_timer_launcher_states_what_nd_prices(self) -> None:
+        """
+        Feature: the launcher a timer reads, as the checkout ships it.
+        Description: read each timer record, its template and the launcher it names, and compare them
+                     the way the launch step does, ignoring what the timer sets per run.
+        Expectation: no difference, so the round times the job that was priced and a command is written.
+        """
+        skill = ask.SKILL
+        timers = json.loads((skill / "references" / "timers.json").read_text(encoding="utf-8"))
+        checked = 0
+        for name, timer in timers.items():
+            if name.startswith("_"):
+                continue
+            family = name.split("/")[0]
+            template = skill / "templates" / f"{family}.yaml"
+            launcher = ask.repo_root() / timer["launcher"]
+            if not template.is_file() or not launcher.is_file():
+                continue
+            priced = yaml.safe_load(template.read_text(encoding="utf-8"))
+            states = yaml.safe_load(launcher.read_text(encoding="utf-8"))
+            self.assertEqual(launch.launcher_differences(priced, timer, states), [],
+                             f"{timer['launcher']} does not state what {template.name} prices")
+            checked += 1
+        self.assertGreater(checked, 0, "no timer record could be checked in this checkout")
 
 
 if __name__ == "__main__":
