@@ -902,23 +902,39 @@ class TestOffloadWindow(unittest.TestCase):
     def test_the_copies_cost_time_and_only_what_the_stage_needs_moves(self):
         """
         Feature: the choice of a stage whose first layers may offload, the copies costing time.
-        Description: The three layers in 7.5 MB, a link that carries 2 MB in
+        Description: The three layers in 8 MB, a link that carries 2 MB in
             the two forwards after the first, and copies that cost 0.1 a MB
             moved; then 0.3 a MB.
         Expectation: At 0.1 the first layer runs plain and offloads only the
-            1.5 MB the stage needs to fit, its time 3 and 0.1 for each MB out
-            and back, 3.3, and the stage fills its 7.5 MB. At 0.3 the 2 MB
+            1 MB the stage needs to fit, its time 3 and 0.1 for each MB out
+            and back, 3.2, and the stage fills its 8 MB. At 0.3 the 2 MB
             the third layer's plain run needs cost 1.2, more than the 1 it
             saves, and nothing offloads.
         """
-        chosen, transit = self._offload_stage(3, 7.5, 1.0, cost=0.1)
+        chosen, transit = self._offload_stage(3, 8, 1.0, cost=0.1)
         self.assertEqual(transit, 0.0)
-        self.assertEqual(chosen[0].link_bandwidth, 1.5 * MEGABYTE)
-        self.assertAlmostEqual(chosen[0].forward_time + chosen[0].backward_time, 3.3)
+        self.assertEqual(chosen[0].link_bandwidth, 1 * MEGABYTE)
+        self.assertAlmostEqual(chosen[0].forward_time + chosen[0].backward_time, 3.2)
         self.assertEqual([chosen[index].recompute for index in range(3)], [frozenset(), None, frozenset()])
-        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 7.5 * MEGABYTE)
-        chosen, _ = self._offload_stage(3, 7.5, 1.0, cost=0.3)
+        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 8 * MEGABYTE)
+        chosen, _ = self._offload_stage(3, 8, 1.0, cost=0.3)
         self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
+
+    def test_a_budget_of_a_fraction_of_a_megabyte_is_filled_to_its_whole_megabytes(self):
+        """
+        Feature: the choice of a stage whose first layers may offload, the copies costing time.
+        Description: The three layers in 7.5 MB, with copies that cost 0.1 a
+            MB moved, so the stage gives back what it does not need.
+        Expectation: The stage keeps 7 MB, the whole megabytes of its budget,
+            and offloads the 2 MB that takes: filled to the byte, it would
+            keep 7.5 MB, which a result reported in whole megabytes reads as
+            8, over the budget its own fit check accepted.
+        """
+        chosen, _ = self._offload_stage(3, 7.5, 1.0, cost=0.1)
+        kept = sum(chosen[index].memory(1) for index in range(3))
+        self.assertEqual(kept, 7 * MEGABYTE, f"kept {kept / MEGABYTE} MB in a 7.5 MB budget")
+        self.assertEqual(chosen[0].link_bandwidth, 2 * MEGABYTE,
+                         f"offloaded {chosen[0].link_bandwidth / MEGABYTE} MB, expected 2")
 
     def test_a_layer_offloads_the_part_its_window_carries(self):
         """
