@@ -2211,6 +2211,53 @@ class TestSappNDRunND(unittest.TestCase):
             plt.close(figure)
         self.assertEqual(plot.cell_text, [["8"], ["True"], [128]])
 
+    def test_the_plot_states_the_recompute_mode_and_the_plan_per_layer(self) -> None:
+        """
+        Feature: ND's plot of a search that chose a recompute mode per layer.
+        Description: One configuration whose plan fully recomputes every
+            layer but its last five, then the same plot without a plan.
+        Expectation: The table gains a mode row and a plan row, the mode in
+            capitals and the plan as the trainer's yaml states it; without a
+            plan neither row is drawn.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        configs = [(dims, 128, 10.0, [10.0])]
+        drawn = []
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Debug.Plot, "make_table",
+                             lambda self: drawn.append((list(self.row_title), list(self.cell_text)))), \
+                patch.object(Debug.Plot, "close", lambda self, output_path, filename: None):
+            Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE],
+                          recompute_plans={dims: ("full", {"3-7": "off"})})
+            Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE])
+        plt.close("all")
+        self.assertEqual([str(row) for row in drawn[0][0]],
+                         ["TOP", "DP", "PP", Debug.MODE_ROW, Debug.LAYER_ROW, "MEM"])
+        self.assertEqual(drawn[0][1], [[1, "8", "2", "FULL", "3-7: 'off'", 128]])
+        self.assertEqual([str(row) for row in drawn[1][0]], ["TOP", "DP", "PP", "MEM"])
+        self.assertEqual(drawn[1][1], [[1, "8", "2", 128]])
+
+    def test_the_degree_table_is_drawn_with_a_plan_of_several_lines(self) -> None:
+        """
+        Feature: the degree table under ND's plot of a search.
+        Description: A plan naming two ranges, which the plan row states on
+            one line each.
+        Expectation: The table is drawn, the plan row holding both lines.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        plot.row_title.insert(-1, Debug.MODE_ROW)
+        plot.row_title.insert(-1, Debug.LAYER_ROW)
+        plot.parse_data([(dims, 128, 10.0, [10.0])],
+                        recompute_plans={dims: ("full", {"0": "selective", "3-7": "off"})})
+        figure = plt.figure()
+        try:
+            plot.make_table()
+        finally:
+            plt.close(figure)
+        self.assertEqual(plot.cell_text[-3], ["FULL"])
+        self.assertEqual(plot.cell_text[-2], ["'0': selective\n3-7: 'off'"])
+
     def test_the_ranking_keeps_nd_order_and_every_digit(self) -> None:
         """
         Feature: the CSV of a search's configurations in ND's order.
