@@ -200,6 +200,33 @@ class LaunchableTest(unittest.TestCase):
         self.assertEqual(got, [("1", "2"), ("2", "2")], f"launchable: expected=[('1', '2'), ('2', '2')], got={got}")
 
 
+class MissingScriptsTest(unittest.TestCase):
+    """A checkout without the round's own scripts must say so, not hand over a command that fails."""
+
+    def test_a_checkout_without_the_scripts_is_named(self) -> None:
+        """
+        Feature: the check that this checkout can run the round it is about to print.
+        Description: a timer naming a script and a preflight no checkout holds.
+        Expectation: both are reported, by path.
+        """
+        problems = launch.missing_scripts(TIMER)
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn(TIMER["script"], problems[0])
+        self.assertIn(TIMER["preflight"], problems[1])
+
+    def test_the_shipped_timers_name_scripts_this_checkout_has(self) -> None:
+        """
+        Feature: the same check against the timer records as shipped.
+        Description: every recorded timer names a script and a preflight in this checkout.
+        Expectation: nothing missing, so a round's command is written.
+        """
+        timers = json.loads((ask.SKILL / "references" / "timers.json").read_text(encoding="utf-8"))
+        for name, timer in timers.items():
+            if name.startswith("_"):
+                continue
+            self.assertEqual(launch.missing_scripts(timer), [], name)
+
+
 class ShippedLauncherTest(unittest.TestCase):
     """Every template with a timer must ship a launcher that states the job the cost model prices."""
 

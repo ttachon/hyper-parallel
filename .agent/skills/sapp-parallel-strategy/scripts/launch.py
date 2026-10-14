@@ -181,6 +181,18 @@ def launcher_differences(doc: Dict[str, Any], timer: Dict[str, Any], launcher: O
     return list(_differences(priced, launched, ""))
 
 
+def missing_scripts(timer: Dict[str, Any]) -> List[str]:
+    """The timer's own scripts that this checkout does not have.
+
+    The command names them by path, so a checkout without them would hand over a command that
+    fails on the node. Say so here instead, as with a launcher that states another job.
+    """
+    root = ask.repo_root()
+    return [f"this checkout has no {timer[field]}, the {field} the round runs"
+            for field in ("script", "preflight")
+            if timer.get(field) and not (root / timer[field]).is_file()]
+
+
 def timed_yaml(doc: Dict[str, Any], row: Dict[str, str], timer: Optional[Dict[str, Any]],
                launcher: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The trainer yaml one timed run reads: the run's own with the layout's degrees, as ``ask.py`` writes it.
@@ -419,12 +431,12 @@ class Plan:
 
     def _command_lines(self, round_rows: Chosen, folder: Path) -> List[str]:
         """How long the round takes, the command that times it, and what to send back."""
-        problems = launcher_differences(self.doc, self.timer, self.launcher)
+        problems = missing_scripts(self.timer) + launcher_differences(self.doc, self.timer, self.launcher)
         dies = (self.doc.get("context") or {}).get("device_num")
         if dies is not None and int(dies) != int(self.timer["dies"]):
             problems.append(f"the run is priced on {dies} dies and the timer launches {self.timer['dies']}")
         if problems:
-            return ["", "No command: the timer would run another job than the one ND priced, because"] + [
+            return ["", "No command: this checkout cannot time the job ND priced, because"] + [
                 f"- {problem}" for problem in problems]
         points = _points([row for row, _ in round_rows], self.timer)
         (folder / "points.txt").write_text(points + "\n", encoding="utf-8")
