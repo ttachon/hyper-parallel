@@ -56,7 +56,7 @@ _OPS = ("attMM", "attBMM", "ffMM", "softmax", "dropout", "normOp", "gather")
 # The literal op counts each arch hook assigned before the counts became
 # profiles, in _OPS order, except that mixtral's three expert projections
 # were counted as batched matmuls and now count as the matmuls they are, and
-# its softmaxes and norms are those its Transformers layers run (F51).
+# its softmaxes and norms are those its Transformers layers run.
 # headCast and ffAct were pinned to 1 by the estimator for every family.
 _LEGACY_OPS = {
     "default": {"decoder": (4, 2, 3, 1, 0, 2, 4)},

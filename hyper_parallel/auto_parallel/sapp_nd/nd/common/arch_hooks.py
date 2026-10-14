@@ -267,7 +267,7 @@ def apply_family(ccfg: Any) -> None:
     counts it carries from its language model.  Each layer of a stack takes
     its own kind's counts; the default kind's are the ones the model's
     config prices its embedding and output layer with, so t5 names its
-    encoder (I15).  A family that names none gives the model no counts.
+    encoder.  A family that names none gives the model no counts.
     """
     derive_family(ccfg)
     arch = getattr(ccfg, "arch", None)

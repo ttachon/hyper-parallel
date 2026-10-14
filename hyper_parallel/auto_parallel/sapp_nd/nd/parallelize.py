@@ -77,7 +77,7 @@ POOL_FROM = 2000
 
 
 def state_machine_links(ccfg: Any, device: Any) -> None:
-    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths (B5).
+    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths.
 
     The CP check, its topology penalty and the CP cost read them off the
     config, where nothing assigned them, so they held the config's defaults,
@@ -215,7 +215,7 @@ class ParallelizeLayer:
             )
         # Choose every layer's recompute option for each candidate, rather
         # than score it fully recomputed. A multimodal model, whose
-        # candidates are priced on every submodule (F2), gets one mode for
+        # candidates are priced on every submodule, gets one mode for
         # every layer, priced whole, and no option per layer: the options are
         # built for one submodule's layers, whose budgets would leave the
         # others out.
@@ -395,7 +395,7 @@ class ParallelizeLayer:
         The search drives one submodule's strategy (:class:`GlobalConfig`
         gives the others the same degrees), and a candidate is priced on the
         model the run trains: a vision tower's parameters, activations and
-        compute count toward the stage that holds them (F2).
+        compute count toward the stage that holds them.
         """
         return self.mem_eval.ccfg
 
@@ -1129,7 +1129,7 @@ class ParallelizeLayer:
                 and stated_mode not in (None, "full")):
             # The balancing gives every candidate full recompute without
             # -mppb, whatever the run's mode, which cost an hour twice
-            # because nothing said so (H1).
+            # because nothing said so.
             logger.output(
                 "The run's activation checkpoint mode is %s, and every candidate above is priced fully "
                 "recomputed: pass --recompute %s, or -mppb, to price the run's own",
@@ -1581,14 +1581,14 @@ def _log_priced_caveats(priced: Any) -> None:
     """Log what qualifies every number of the table: the length it prices, MTP layers unpriced, fields never set."""
     if not getattr(priced, "seq_len_stated", True):
         # A warning at parse time scrolls past a search's lines; this one
-        # sits under the table it qualifies (I11).
+        # sits under the table it qualifies.
         logger.output(
             "Every number above is priced at %d tokens, the model's context limit: the config states no "
             "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
             priced.s,
         )
     if getattr(priced, "mtp_unpriced", 0):
-        # A stated MTP depth looked priced and was not (I2).
+        # A stated MTP depth looked priced and was not.
         logger.output(
             "The model states %d MTP layer(s), which the AutoModels trainer does not build: no number above "
             "prices them",

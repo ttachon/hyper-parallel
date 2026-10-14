@@ -268,7 +268,7 @@ def infer_arch(name: Any) -> str:
     default profile, said once a name.  Matched anywhere in the name, in a
     fixed order, as the cost model matched names before the family became
     data, ``cm`` took any name holding those two letters and a family listed
-    earlier won over the one the name opens with (I8).  Only a producer with
+    earlier won over the one the name opens with.  Only a producer with
     no better source should use it; a spec that declares ``arch`` never gets
     here.
     """

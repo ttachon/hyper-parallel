@@ -146,7 +146,7 @@ def param_cp(ccfg: Any) -> float:
     spans the DP x CP domain, its dense FSDP mesh being
     ``(dp_replicate, dp_shard, tp)`` over ``dp * cp`` ranks
     (``MeshContext.build_meshs``), and the table it gathers is whole: so 1
-    there (``shard_spans_cp``), CP elsewhere (C1).
+    there (``shard_spans_cp``), CP elsewhere.
     """
     return 1 if getattr(ccfg, "shard_spans_cp", False) else ccfg.cp
 
@@ -269,7 +269,7 @@ def derive_comm_flags(ccfg: Any) -> None:
     )  # data parallel comm factor
     # Whether another rank holds the same slice of a routed expert, as a
     # shard or a copy, so that its gradient is reduced: d_exp left CP's
-    # ranks out and read 1 where they reduce it (X3).
+    # ranks out and read 1 where they reduce it.
     ccfg.comm_d_exp = (
         0
         if ((expert_dp_ranks(ccfg) == 1) or not ccfg.has_op)

@@ -1791,8 +1791,8 @@ class TestAutoRecomputeSearch(unittest.TestCase):
         Description: Order the space on a 2.5 GB device, choosing off or
             full for every layer, then for each layer. The candidates use
             the whole machine, the search holding DP at the config's own
-            (M6), and the model, stating no dtype, is held in bfloat16
-            (I12): at 2.5 GB one of them fits only fully recomputed.
+, and the model, stating no dtype, is held in bfloat16
+: at 2.5 GB one of them fits only fully recomputed.
         Expectation: The same candidates; every one gets a mode per layer,
             each range naming its mode, fits and scores no worse than with
             one mode for every layer, and one that one mode must recompute

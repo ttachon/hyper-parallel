@@ -579,7 +579,7 @@ def _census(text_config: Any, layers: Any, seq_length: int, replacements: Tuple[
         except CensusUnavailable as exc:
             # The formulas price the layers, as they do without a census: a
             # census of Transformers' own modules would price a layer the run
-            # does not build (F53).
+            # does not build.
             logger.warning("%s", _NOT_A_BOUND % exc)
             _CENSUSES[key] = {}
         else:
@@ -619,7 +619,7 @@ def _stated_spec(model_raw: Mapping[str, Any], explicit: Dict[str, Any], census_
     many experts, and an all-MoE model's dense width is its shared
     expert's.  Without them a hand-described all-MoE model kept no
     ``intermediate_size``, the width its shared expert is priced at, and
-    its shared expert was dropped (I1).
+    its shared expert was dropped.
     """
     explicit.setdefault("name", model_raw.get("name", "custom"))
     _derive_shared_experts(explicit)
@@ -717,7 +717,7 @@ def resolve_hf_model_spec(
         _derive_dense_ffn_width(spec)
         spec["name"] = name
     # The dtype the checkpoint is saved in, by name, which the census's
-    # fields do not state (I12).
+    # fields do not state.
     dtype = _first_attr(_text_tower(model_config), _TEXT_FIELD_ALIASES["torch_dtype"])
     if dtype is not None:
         spec["torch_dtype"] = _dtype_name(dtype)

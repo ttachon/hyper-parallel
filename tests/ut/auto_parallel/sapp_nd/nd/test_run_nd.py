@@ -765,7 +765,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(global_config.bool_space(Dim.SP), [False, True])
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
         # HyperParallel's shard spans DP x CP, so under CP it reaches that
-        # domain; a legacy schema's stays within DP (C1).
+        # domain; a legacy schema's stays within DP.
         got = []
         for spans in (True, False):
             fake_ccfg.shard_spans_cp = spans
@@ -2445,7 +2445,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_field_no_parser_set_is_reported_or_refused(self) -> None:
         """
-        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict (I9).
+        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict.
         Description: A config no parser filled, read directly for an op count
             twice and for its hooks, then through getattr with a default, with
             and without the strict mode run_nd --strict sets.
@@ -2531,7 +2531,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_t5_states_the_tp_gathers_its_embedding_and_output_run(self) -> None:
         """
-        Feature: apply_family on t5, the model's own config (I15).
+        Feature: apply_family on t5, the model's own config.
         Description: A T5 config through its family, then each kind of its
             stack applied in turn.
         Expectation: The model states the 4 TP gathers of its default kind,
@@ -3262,7 +3262,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_the_search_states_its_machines_links(self) -> None:
         """
-        Feature: state_machine_links (B5).
+        Feature: state_machine_links.
         Description: A config and a multimodal one with a submodule, given
             the A3 machine, then a config given no machine.
         Expectation: Each config takes A3's 16 ranks a node and its 200 and
@@ -3281,7 +3281,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_strategy_keeps_the_runs_sequence_parallelism(self) -> None:
         """
-        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor (T1).
+        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor.
         Description: The DeepSeek MindFormers yaml at TP 4 without sequence
             parallelism and with it, each moved to TP 2; then a searched
             candidate at TP 2 stating SP off and on.
@@ -3436,7 +3436,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
         """
-        Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
+        Feature: GlobalConfig.make_parallel_config, the micro-batch count.
         Description: A config at DP 2, PP 2, micro-batches of 4 and two of
             them, searched over EP and OP alone, so -l names neither MB nor PP,
             given a candidate whose loop counted four micro-batches.
@@ -3455,7 +3455,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_search_no_candidate_of_which_makes_the_batch_stops_with_one_line(self) -> None:
         """
-        Feature: ParallelizeLayer.batch_reachable (M6).
+        Feature: ParallelizeLayer.batch_reachable.
         Description: 64 devices searched over EP and OP alone, so every
             candidate is DP 64 with micro-batches of 1, for a batch of 16, then
             of 128.
@@ -3485,7 +3485,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_ranking_priced_at_a_length_nobody_stated_says_so_under_its_table(self) -> None:
         """
-        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length (I11).
+        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length.
         Description: A search over one configuration of a model whose config
             states no training length, so the parser costed its context
             limit of 32768; then the same model with a stated length.
@@ -3511,7 +3511,7 @@ class TestSappNDRunND(unittest.TestCase):
                 self.assertEqual(len(lines), said)
                 if said:
                     self.assertIn("priced at 32768 tokens", lines[0])
-        # A field the estimate read unset is named under the table too (I9).
+        # A field the estimate read unset is named under the table too.
         reads = PreProcess.defaultdict(PreProcess.Counter, {"n_gather": PreProcess.Counter({"comm.py:tp": 2})})
         with patch.object(PreProcess, "UNSET_READS", reads), patch.object(Par.logger, "output") as output:
             runner.run_generation_to_ordering(None)
@@ -3519,7 +3519,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_ranking_says_when_it_prices_another_recompute_than_the_runs(self) -> None:
         """
-        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute (H1).
+        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute.
         Description: A search whose balancing gives every candidate full
             recompute, for a run training selective, off and full; then the
             selective run searched with -mppb, over a recompute dimension,
@@ -3557,7 +3557,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_ranking_names_the_mtp_layers_it_does_not_price(self) -> None:
         """
-        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth (I2).
+        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth.
         Description: A search over one configuration of a model stating 3 MTP
             layers the AutoModels trainer does not build, then of one stating
             none.

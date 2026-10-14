@@ -158,7 +158,7 @@ class TestKindsAndFlavours(unittest.TestCase):
         Feature: default kind.
         Description: A family with one kind, and t5 with two.
         Expectation: The one kind, and the encoder t5 names, whose TP
-            gathers the model's embedding and output layer run (I15).
+            gathers the model's embedding and output layer run.
         """
         self.assertEqual(load_op_profile("qwen").default, "decoder")
         self.assertEqual(load_op_profile("t5").default, "encoder")
@@ -279,7 +279,7 @@ class TestInferArch(unittest.TestCase):
 
     def test_the_family_a_name_opens_with_wins(self):
         """A name holding two families takes the one it opens with, and one
-        holding a family's letters further in takes none (I8): matched
+        holding a family's letters further in takes none: matched
         anywhere, in list order, qwen2_deepseek_distill took DeepSeek's and
         acme_lm took cm's."""
         self.assertEqual(infer_arch("deepseek_qwen_distill"), "deepseek")

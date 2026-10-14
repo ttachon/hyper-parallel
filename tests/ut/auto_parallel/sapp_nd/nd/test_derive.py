@@ -204,7 +204,7 @@ class TestOptimizerSharding(unittest.TestCase):
 
     def test_a_shard_spanning_dp_and_cp_is_the_runs(self):
         """
-        Feature: optimizer_ranks, HyperParallel's shard over DP times CP (C1).
+        Feature: optimizer_ranks, HyperParallel's shard over DP times CP.
         Description: DP 4 and CP 2 with a stated shard of 8 ranks, for a run
             whose shard spans CP's ranks and for one of the legacy schemas.
         Expectation: 8, the whole domain HyperParallel shards over, where a
