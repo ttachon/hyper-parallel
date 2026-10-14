@@ -56,6 +56,9 @@ venv/
 .idea/
 .vscode/
 .trae/
+# where a coding assistant reads skills from, which install.py may link into
+.claude/
+.agents/
 .DS_Store
 *.swp
 
