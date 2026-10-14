@@ -47,7 +47,6 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
-OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
 PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 # A device holding more than this is somebody else's run, not driver overhead.

@@ -70,6 +70,10 @@ released indices, their parts and their widths. `verify` compares that descripti
 tensors the factory actually builds, which is the check that the two agree before any layout is
 priced. Run it whenever the recipe changes.
 
+`nd_deepseek_v41_crop.yaml` is that description kept as a file, beside the run it mirrors, for a
+checkout where Transformers cannot resolve the released checkpoint. Its own header carries the three
+commands that describe the crop, check the description and rank the layouts from it.
+
 ## Asking for a layout instead
 
 The strategy agent skill wraps the cost model, this launcher and these tools, so an assistant can
