@@ -157,7 +157,7 @@ SAMPLES=$(( TRAIN_ITERS * GLOBAL_BATCH + GLOBAL_BATCH ))
 DATA_PATH="${OUTPUT_DIR}/online_${SEQ_LEN}_${SAMPLES}.jsonl"
 
 mkdir -p "${RUN_ROOT}" "${OUTPUT_DIR}"
-cd "${PROJECT_ROOT}"
+cd "${PROJECT_ROOT}" || { echo "cannot enter ${PROJECT_ROOT}" >&2; exit 1; }
 
 if [[ ! -s "${ASSETS_PATH}" ]]; then
     echo "Preparing the Engram assets once"
@@ -246,7 +246,7 @@ for entry in "${order[@]}"; do
     elapsed=$(( $(date +%s) - started ))
     left=""
     if (( done_count )); then
-        left=", about $(duration $(( elapsed / done_count * (total - done_count) ))) left"
+        left=", about $(duration $(( elapsed * (total - done_count) / done_count ))) left"
     fi
     echo "===== run $(( done_count + 1 ))/${total}, $(duration "${elapsed}") elapsed${left}: ${tag}"
 
