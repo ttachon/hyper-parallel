@@ -2215,10 +2215,12 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: ND's plot of a search that chose a recompute mode per layer.
         Description: One configuration whose plan fully recomputes every
-            layer but its last five, then the same plot without a plan.
+            layer but its last five, then the same plot without a plan, then
+            a configuration of a search with a recompute dimension.
         Expectation: The table gains a mode row and a plan row, the mode in
             capitals and the plan as the trainer's yaml states it; without a
-            plan neither row is drawn.
+            plan neither row is drawn; a configuration that states a mode of
+            its own shows the mode row alone.
         """
         dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
         configs = [(dims, 128, 10.0, [10.0])]
@@ -2230,12 +2232,17 @@ class TestSappNDRunND(unittest.TestCase):
             Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE],
                           recompute_plans={dims: ("full", {"3-7": "off"})})
             Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE])
+            searched = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP],
+                                      recompute="selective")
+            Debug.plot_nd([(searched, 128, 10.0, [10.0])], tmp_dir, [Debug.PerfParts.FW_COMPUTE])
         plt.close("all")
         self.assertEqual([str(row) for row in drawn[0][0]],
                          ["TOP", "DP", "PP", Debug.MODE_ROW, Debug.LAYER_ROW, "MEM"])
         self.assertEqual(drawn[0][1], [[1, "8", "2", "FULL", "3-7: 'off'", 128]])
         self.assertEqual([str(row) for row in drawn[1][0]], ["TOP", "DP", "PP", "MEM"])
         self.assertEqual(drawn[1][1], [[1, "8", "2", 128]])
+        self.assertEqual([str(row) for row in drawn[2][0]], ["TOP", "DP", "PP", Debug.MODE_ROW, "MEM"])
+        self.assertEqual(drawn[2][1], [[1, "8", "2", "SELECTIVE", 128]])
 
     def test_the_degree_table_is_drawn_with_a_plan_of_several_lines(self) -> None:
         """
