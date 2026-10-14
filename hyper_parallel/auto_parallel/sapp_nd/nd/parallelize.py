@@ -1084,8 +1084,25 @@ class ParallelizeLayer:
                         len(plot_space) - len(exhaustive_additions)
                         if exhaustive_additions else None
                     ),
+                    recompute_plans=self._plotted_plans(plot_space),
                 )
         return scored_space
+
+    def _plotted_plans(self, plot_space: list) -> Optional[dict]:
+        """The plan per layer of each plotted configuration, as the trainer states it.
+
+        Returns:
+            ``{configuration: (mode, layers)}`` where the search chose among
+            named modes per layer; ``None`` where it chose no such plan, so
+            the plot leaves the plan row out.
+        """
+        if not getattr(self, "recompute_mode_per_layer", False):
+            return None
+        return {
+            entry[0]: trainer_plan(self.recompute_choices[entry[0]])
+            for entry in plot_space
+            if entry[0] in self.recompute_choices
+        }
 
     def _log_recompute(self, scored_space: Any) -> None:
         """Log how the recompute was chosen, and the best configuration's, as the trainer states it where it can.

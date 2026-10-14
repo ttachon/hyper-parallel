@@ -20,15 +20,15 @@ import csv
 from contextlib import contextmanager
 from enum import Enum, auto
 from pathlib import Path
-from functools import partial
 from math import isnan, sqrt
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 from matplotlib.font_manager import FontProperties
 from scipy.stats import pearsonr
+import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -37,6 +37,13 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_rec
 # The column a configuration's activation checkpoint mode goes in, written by a
 # search with a recompute dimension and read from a measured CSV that states it.
 RECOMPUTE_COLUMN = "recompute"
+
+# The results table's recompute rows: the activation checkpoint mode a
+# configuration runs, and the plan per layer that names the exceptions to it.
+MODE_ROW = "RMOD"
+LAYER_ROW = "RLAYER"
+# Rows whose cells hold text, which carries no shading and no largest value.
+_TEXT_ROWS = (MODE_ROW, LAYER_ROW)
 
 
 def _recompute_of(row: dict) -> Optional[str]:
@@ -446,9 +453,16 @@ class Plot:
         self.data = []
 
     def make_table(self):
-        """Make table below plot with each parallelism degree"""
+        """Make the table below the plot with each parallelism degree and the recompute rows.
+
+        A recompute row holds text rather than a degree, so it keeps one
+        shade and its cells grow with the lines its plan takes.
+        """
         self.cell_text = list(map(list, zip(*self.cell_text)))  # transpose
-        max_rows = list(map(max, map(partial(map, _cell_number), self.cell_text)))
+        max_rows = [
+            None if title in _TEXT_ROWS else max(map(_cell_number, cells))
+            for title, cells in zip(self.row_title, self.cell_text)
+        ]
         the_table = plt.table(
             cellText=self.cell_text,
             rowLabels=self.row_title,
@@ -458,31 +472,50 @@ class Plot:
         )
         row_colors = list(map(dim_color, self.row_title))
         for row in range(len(self.row_title)):
+            lines = max(str(text).count("\n") + 1 for text in self.cell_text[row])
             cell = the_table[row + 1, -1]
             cell.set_edgecolor("none")
             cell.get_text().set_color(row_colors[row])
             cell.set_text_props(fontproperties=FontProperties(weight="bold"))
+            cell.set_height(cell.get_height() * lines)
             for col in range(len(self.cell_text[0])):
-                cell = the_table[row + 1, col]
-                value = _cell_number(str(cell.get_text().get_text()))
-                try:
-                    ratio = 1 - (value / max_rows[row])
-                except ZeroDivisionError:
-                    ratio = 0
-                logger.debug(
-                    "tmax = %s, ratio = %f, col=%s, newcolor=%s",
-                    str(max_rows[row]),
-                    ratio,
-                    str(mc.to_rgb(row_colors[row])),
-                    str(near_white(row_colors[row], ratio)),
-                )
-                cell.set_facecolor(near_white(pastel(row_colors[row]), ratio))
-                cell.set_edgecolor("none")
+                self._shade_cell(the_table[row + 1, col], row, max_rows[row], lines, row_colors[row])
 
         for col in range(len(self.cell_text[0])):
             the_table[0, col].set_edgecolor("none")
 
         the_table.scale(xscale=1, yscale=1.2)  # +len(rows)/5)
+
+    def _shade_cell(self, cell: Any, row: int, largest: Optional[float], lines: int, color: Any) -> None:
+        """Shade one cell of the table by its value against the row's largest.
+
+        Args:
+            cell: The cell to shade.
+            row: Its row, which names the degree or the recompute setting.
+            largest: The largest value the row holds; ``None`` for a row of
+                text, which keeps the row's lightest shade.
+            lines: The lines the row's tallest cell takes.
+            color: The row's colour.
+        """
+        cell.set_height(cell.get_height() * lines)
+        if largest is None:
+            ratio = 1
+        else:
+            try:
+                ratio = 1 - (_cell_number(str(cell.get_text().get_text())) / largest)
+            except ZeroDivisionError:
+                ratio = 0
+        if self.row_title[row] == LAYER_ROW:
+            cell.set_text_props(ha="center", fontfamily="monospace")
+        logger.debug(
+            "tmax = %s, ratio = %f, col=%s, newcolor=%s",
+            str(largest),
+            ratio,
+            str(mc.to_rgb(color)),
+            str(near_white(color, ratio)),
+        )
+        cell.set_facecolor(near_white(pastel(color), ratio))
+        cell.set_edgecolor("none")
 
     def close(self, output_path, filename):
         """Plot closing statements"""
@@ -505,10 +538,11 @@ class Plot:
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
         include_all = kwargs.get("include_all", False)
+        recompute_plans = kwargs.get("recompute_plans")
         min_e = configs_estimated[0][2]
         i = 0
         for index, cfg_e in enumerate(configs_estimated):
-            cells = cfg_e[0].values() + [cfg_e[1]]
+            cells = cfg_e[0].values() + self._recompute_cells(cfg_e[0], recompute_plans) + [cfg_e[1]]
             if self.row_title[0] == "TOP":
                 cells.insert(0, cfg_e[0].rank or index + 1)
             self.cell_text.append(cells)
@@ -529,6 +563,29 @@ class Plot:
                     break
                 self.data.append(tuple([cfg_e[0], score] + cfg_e[3]))
                 i += 1
+
+    def _recompute_cells(self, config: Any, recompute_plans: Optional[dict]) -> list:
+        """The recompute cells of one configuration's column, empty where the table has no such row.
+
+        Args:
+            config: The configuration the column states.
+            recompute_plans: ``{configuration: (mode, layers)}`` from a
+                choice among named modes per layer; ``None`` where the search
+                made none.
+
+        Returns:
+            The mode alone, the mode and its plan per layer, or nothing.
+        """
+        if MODE_ROW not in self.row_title:
+            return []
+        mode, layers = (recompute_plans or {}).get(config, (getattr(config, "recompute", None), None))
+        cells = [mode.upper() if mode else "-"]
+        if LAYER_ROW in self.row_title:
+            cells.append(
+                yaml.safe_dump(layers, default_flow_style=False, sort_keys=False).strip()
+                if layers is not None else "-"
+            )
+        return cells
 
 
 def top_plot_configs(configs_estimated: list, max_num: Optional[int] = None) -> list:
@@ -555,8 +612,9 @@ def plot_nd(
     max_num: Optional[int] = None,
     include_all: bool = False,
     top_result_count: Optional[int] = None,
+    recompute_plans: Optional[dict] = None,
 ) -> None:
-    """Plot estimation with a divider before any additional configurations.
+    """Plot estimation with optional recompute rows and a divider before additions.
 
     Args:
         configs_estimated: Ranked configurations with memory, score and its parts.
@@ -568,12 +626,20 @@ def plot_nd(
         max_num: Maximum number of configurations in the normal plot.
         include_all: Include every supplied configuration without normal plot limits.
         top_result_count: Number of normal results preceding the additions.
+        recompute_plans: ``{configuration: (mode, layers)}``, the activation
+            checkpoint mode and the plan per layer a choice among named modes
+            made. ``None`` omits the plan row; a configuration that states a
+            mode of its own still shows it.
     """
     plot = Plot(
         title, configs_estimated[0][0].keys(), debug_parts,
         top=max_num, show_top=True,
     )
-    plot.parse_data(configs_estimated, include_all=include_all)
+    if _has_recompute(configs_estimated) or recompute_plans is not None:
+        plot.row_title.insert(-1, MODE_ROW)
+    if recompute_plans is not None:
+        plot.row_title.insert(-1, LAYER_ROW)
+    plot.parse_data(configs_estimated, include_all=include_all, recompute_plans=recompute_plans)
 
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "estim"] + plot.dbg_cols)
