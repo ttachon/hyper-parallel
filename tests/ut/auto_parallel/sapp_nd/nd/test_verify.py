@@ -1,0 +1,458 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Tests for verify mode: the parameters ND prices beside the census's, and run_nd -V."""
+import os
+import runpy
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import yaml
+
+from hyper_parallel.auto_parallel._layer_census import census_final_norm, census_parameters, census_saved_ops
+from hyper_parallel.auto_parallel._model_spec import ModelSpec
+from hyper_parallel.auto_parallel.sapp_nd.nd.verify import (
+    census_spec_yaml,
+    report,
+    report_spec,
+    traffic_report,
+    verify_activations,
+    verify_estimate,
+    verify_flops,
+    verify_parameters,
+    verify_spec,
+    verify_traffic,
+)
+
+_HF_CONFIG = "hyper_parallel.auto_parallel._hf_model_spec._get_hf_config"
+_RUN_ND = "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd"
+
+
+def _qwen35_text(tie: bool = False):
+    """A two-layer Qwen3.5-MoE text config of width 64, one layer of each attention kind."""
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
+        Qwen3_5MoeTextConfig,
+    )
+    return Qwen3_5MoeTextConfig.from_dict({
+        "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "head_dim": 16, "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 32, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
+        "linear_num_value_heads": 4, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
+        "vocab_size": 128, "max_position_embeddings": 256, "layer_types": ["linear_attention", "full_attention"],
+        "tie_word_embeddings": tie, "attn_output_gate": True,
+    })
+
+
+def _deepseek_v3(q_lora_rank=32):
+    """A two-layer DeepSeek-V3 config of width 64, one dense layer and one of 4 experts, its MLA heads 12, 4 and 8 wide."""
+    from transformers import DeepseekV3Config  # pylint: disable=C0415
+    return DeepseekV3Config(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        q_lora_rank=q_lora_rank, kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=8,
+        n_routed_experts=4, num_experts_per_tok=2, moe_intermediate_size=16, n_shared_experts=1,
+        first_k_dense_replace=1, intermediate_size=32, vocab_size=128, n_group=1, topk_group=1)
+
+
+def _one_kind(config_cls, **fields):
+    """A two-layer config of *config_cls* of width 64, its layers of one kind."""
+    return config_cls(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                      intermediate_size=128, vocab_size=128, **fields)
+
+
+def _train_yaml(folder: str, census: bool = False) -> str:
+    """A train yaml of the model on two ranks at DP shard 2, stating a census of its layers where asked."""
+    config = {
+        "model": {"_target_": "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained",
+                  "pretrained_model_name_or_path": "local/qwen3_5_moe", "torch_dtype": "bfloat16"},
+        "training": {"global_batch_size": 4, "micro_batch_size": 1},
+        "accelerator": {"tp_size": 1, "pp_size": 1, "ep_size": 1, "cp_size": 1},
+        "fsdp_config": {"dp_shard_size": 2},
+        "activation_checkpoint": {"mode": "off"},
+        "dataset": {"data_transform": {"max_seq_len": 4096}},
+        "context": {"device_num": 2, "census": census},
+    }
+    path = os.path.join(folder, "train.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle)
+    return path
+
+
+def _verify(config):
+    """verify_parameters of the train yaml of *config*."""
+    with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+        return verify_parameters(_train_yaml(folder))
+
+
+def _verify_flops(config):
+    """verify_flops of the train yaml of *config*."""
+    with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+        return verify_flops(_train_yaml(folder))
+
+
+def _verify_traffic(config):
+    """verify_traffic of the train yaml of *config*."""
+    with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+        return verify_traffic(_train_yaml(folder))
+
+
+class TestVerifyParameters(unittest.TestCase):
+    """Verify mode sets what ND prices of each part beside the census's."""
+
+    def test_each_part_beside_its_census(self):
+        """
+        Feature: verify_parameters.
+        Description: The hybrid model, one layer of each kind, untied.
+        Expectation: A row per part of each kind, whose census is the
+            layer's; the embedding's and the output layer's tables, the
+            output layer's final norm with it; and the model's whole, the
+            sum of the rest.
+        """
+        config = _qwen35_text()
+        rows = _verify(config)
+        by = {(row.where, row.part): row for row in rows}
+        for index, kind in enumerate(("linear_attention", "full_attention")):
+            for part, count in census_parameters(config, index).items():
+                self.assertEqual(by[(f"{kind} x1", part)].census, count)
+            self.assertGreater(by[(f"{kind} x1", "attention")].nd, 0)
+        table = 128 * 64
+        self.assertEqual((by[("embedding", "table")].nd, by[("embedding", "table")].census), (table, table))
+        self.assertEqual(by[("output", "table, norm")].census, table + census_final_norm(config))
+        total = by[("model", "total")]
+        self.assertEqual(total.census, sum(row.count * row.census for row in rows[:-1]))
+        self.assertEqual(total.nd, sum(row.count * row.nd for row in rows[:-1]))
+        self.assertEqual(len(report(rows)), len(rows) + 1)
+
+    def test_a_tied_table_is_counted_at_the_output(self):
+        """
+        Feature: verify_parameters of a tied model.
+        Description: The hybrid model with its embedding and output tied,
+            on one stage.
+        Expectation: ND prices the one table at the output, and so does the
+            census: the embedding holds none.
+        """
+        by = {(row.where, row.part): row for row in _verify(_qwen35_text(tie=True))}
+        self.assertEqual((by[("embedding", "table")].nd, by[("embedding", "table")].census), (0, 0))
+        self.assertGreater(by[("output", "table, norm")].census, 128 * 64)
+
+    def test_a_moe_layers_router_matches_its_census(self):
+        """
+        Feature: verify_parameters of a MoE layer's router.
+        Description: The hybrid model's two kinds and DeepSeek-V3's expert
+            layer, each of 4 experts at width 64.
+        Expectation: ND prices the weight per expert the router holds.
+        """
+        for config, kinds in ((_qwen35_text(), ("linear_attention x1", "full_attention x1")),
+                              (_deepseek_v3(), ("moe x1",))):
+            rows = {(row.where, row.part): row for row in _verify(config)}
+            for kind in kinds:
+                self.assertEqual((rows[(kind, "router")].nd, rows[(kind, "router")].census), (64 * 4, 64 * 4), kind)
+
+    def test_mla_attention_matches_its_census(self):
+        """
+        Feature: verify_parameters of an MLA model.
+        Description: DeepSeek-V3's attention at width 64, with a query
+            latent and without, its non-rotary key heads wider than its
+            value heads.
+        Expectation: ND prices exactly the attention Transformers builds,
+            in the dense layer and in the expert one.
+        """
+        for q_lora_rank in (32, None):
+            rows = {(row.where, row.part): row for row in _verify(_deepseek_v3(q_lora_rank))}
+            for kind in ("dense x1", "moe x1"):
+                self.assertEqual(rows[(kind, "attention")].nd, rows[(kind, "attention")].census, kind)
+
+    def test_each_model_is_priced_as_it_is_built(self):
+        """
+        Feature: verify_parameters of whole models.
+        Description: A Llama biasing its projections and feed-forward, a
+            Qwen2 biasing its query, key and value projections, both of one
+            layer kind; the Qwen3.5 hybrid; DeepSeek-V3.
+        Expectation: ND prices every part exactly as Transformers builds it.
+        """
+        from transformers import LlamaConfig, Qwen2Config  # pylint: disable=C0415
+        for config in (_one_kind(LlamaConfig, attention_bias=True, mlp_bias=True), _one_kind(Qwen2Config),
+                       _qwen35_text(), _deepseek_v3()):
+            for row in _verify(config):
+                self.assertEqual(row.nd, row.census, (type(config).__name__, row.where, row.part))
+
+    def test_a_train_yaml_without_a_checkpoint_is_refused(self):
+        """
+        Feature: verify_parameters' input.
+        Description: A yaml that names no Transformers checkpoint.
+        Expectation: A ValueError naming the file.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "mf.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump({"model": {"model_config": {"hidden_size": 64}}}, handle)
+            with self.assertRaisesRegex(ValueError, "mf.yaml"):
+                verify_parameters(path)
+
+
+class TestVerifyFlops(unittest.TestCase):
+    """Verify mode sets the forward FLOPs the time model prices beside the census's."""
+
+    def test_a_dense_layer_is_priced_as_it_runs(self):
+        """
+        Feature: verify_flops.
+        Description: A Llama of one layer kind, width 64, 4 query heads of
+            16 and 2 key heads, a feed-forward 128 wide.
+        Expectation: Its projections, its scores and its feed-forward are
+            priced as the census counts them, and so is the layers' whole.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        rows = _verify_flops(_one_kind(LlamaConfig))
+        self.assertEqual([row.part for row in rows], ["attention", "scores", "ffn", "total"])
+        for row in rows:
+            self.assertEqual(row.nd, row.census, row.part)
+
+    def test_each_kind_beside_its_census(self):
+        """
+        Feature: verify_flops.
+        Description: The hybrid model, a linear-attention layer and a
+            full-attention one, on 4096 tokens.
+        Expectation: A row per part each kind runs, the recurrence for the
+            linear kind and the scores for the full one; the feed-forward's
+            census sums the routed experts, the shared expert and its gate,
+            and the router; the total sums the rows by their layer counts.
+        """
+        rows = _verify_flops(_qwen35_text())
+        self.assertEqual([(row.where, row.part) for row in rows], [
+            ("linear_attention x1", "attention"), ("linear_attention x1", "linrec"), ("linear_attention x1", "ffn"),
+            ("full_attention x1", "attention"), ("full_attention x1", "scores"), ("full_attention x1", "ffn"),
+            ("layers", "total")])
+        self.assertEqual(rows[5].census, 2 * 4096 * (2 * 3 * 64 * 32 + 3 * 64 * 32 + 64 + 64 * 4))
+        self.assertEqual((rows[-1].nd, rows[-1].census),
+                         (sum(row.nd for row in rows[:-1]), sum(row.census for row in rows[:-1])))
+
+
+class TestVerifyActivations(unittest.TestCase):
+    """Verify mode sets what the op records price a layer keeping for each op beside the census's."""
+
+    def test_each_op_beside_its_census(self):
+        """
+        Feature: verify_activations.
+        Description: A Llama of one layer kind, width 64, on 4096 tokens.
+        Expectation: A row per op either prices or measures, in bytes a
+            token of the whole layer: the census's the layer's own, the
+            records' those of its slots, such as the score cast the census
+            never sees; then the layer's whole, the sum of the rows.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        config = _one_kind(LlamaConfig)
+        with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+            rows = verify_activations(_train_yaml(folder))
+        census = census_saved_ops(config, 0, 4096)
+        by = {row.part: row for row in rows}
+        for part, row in by.items():
+            if part != "total":
+                self.assertEqual(row.census, census.get(part, 0.0), part)
+        self.assertLessEqual({op for op, size in census.items() if size}, set(by))
+        self.assertEqual(by["ffAct"].nd, 2 * 128)
+        self.assertEqual((by["total"].nd, by["total"].census),
+                         (sum(row.nd for row in rows[:-1]), sum(census.values())))
+        self.assertEqual({row.where for row in rows}, {"decoder x2"})
+
+
+class TestVerifySpec(unittest.TestCase):
+    """Verify mode sets the census's model spec beside the resolver's, and prices the run with each."""
+
+    def test_the_census_spec_beside_the_resolvers(self):
+        """
+        Feature: verify_spec and report_spec.
+        Description: The hybrid model, whose fields the resolver reads and
+            the census measures alike.
+        Expectation: A row per field, each op count of each kind one, and
+            the layer stack as its groups; every field agrees, and the
+            report says so.
+        """
+        with patch(_HF_CONFIG, return_value=_qwen35_text()), tempfile.TemporaryDirectory() as folder:
+            rows = verify_spec(_train_yaml(folder))
+        fields = {row.field: row for row in rows}
+        self.assertEqual(fields["layers"].census, (("linear_attention", 1), ("full_attention", 1)))
+        self.assertEqual((fields["ops.linear_attention.linrec"].census, fields["ops.full_attention.attBMM"].census),
+                         (1, 2))
+        self.assertTrue(all(row.resolved == row.census for row in rows))
+        lines = report_spec(rows)
+        self.assertEqual(lines[-1], f"{len(rows)} fields agree, 0 differ")
+        self.assertTrue(any("2 groups: linear_attention x1, full_attention x1" in line for line in lines))
+
+    def test_a_field_that_differs_is_marked_and_priced(self):
+        """
+        Feature: verify_spec and verify_estimate of an all-MoE Qwen2-MoE.
+        Description: A Qwen2-MoE whose every layer routes its tokens to 4
+            experts 32 wide and a shared expert 64 wide, its config stating
+            a dense width of 128 that no layer runs.
+        Expectation: The dense width differs, the census stating the shared
+            expert's as the resolver does for a model that states none, and
+            the report marks it; the run priced with either spec keeps the
+            same memory and takes the same time, to rounding.
+        """
+        from transformers import Qwen2MoeConfig  # pylint: disable=C0415
+        config = _one_kind(Qwen2MoeConfig, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
+                           shared_expert_intermediate_size=64)
+        with patch(_HF_CONFIG, return_value=config), tempfile.TemporaryDirectory() as folder:
+            path = _train_yaml(folder)
+            rows = verify_spec(path)
+            peak, time = verify_estimate(path)
+        differ = {row.field: (row.resolved, row.census) for row in rows if row.resolved != row.census}
+        self.assertEqual(differ, {"intermediate_size": (128, 64)})
+        self.assertEqual(sum("<- differs" in line for line in report_spec(rows)), 1)
+        self.assertEqual(peak.census, peak.nd)
+        self.assertAlmostEqual(time.census / time.nd, 1.0, places=12)
+
+    def test_the_run_priced_with_each_spec(self):
+        """
+        Feature: verify_estimate.
+        Description: The hybrid model's run, with and without a census of
+            its layers' activations.
+        Expectation: The resolver's spec and the census's price the run's
+            peak memory and its step's time alike, to the bit.
+        """
+        for census in (False, True):
+            with patch(_HF_CONFIG, return_value=_qwen35_text()), tempfile.TemporaryDirectory() as folder:
+                rows = verify_estimate(_train_yaml(folder, census))
+            self.assertEqual([row.part for row in rows], ["peak MB", "time score"])
+            for row in rows:
+                self.assertEqual(row.nd, row.census, (census, row.part))
+                self.assertGreater(row.nd, 0)
+
+    def test_the_census_spec_is_written(self):
+        """
+        Feature: census_spec_yaml.
+        Description: The hybrid model's train yaml, with and without a
+            census of its layers' activations.
+        Expectation: model_spec.yaml in the folder given, a model spec
+            carrying the census's stack and op counts, and its records where
+            the run states a census.
+        """
+        for census in (False, True):
+            with patch(_HF_CONFIG, return_value=_qwen35_text()), tempfile.TemporaryDirectory() as folder:
+                path = census_spec_yaml(_train_yaml(folder, census), os.path.join(folder, "out"))
+                with open(path, encoding="utf-8") as handle:
+                    data = yaml.safe_load(handle)
+            self.assertEqual(os.path.basename(path), "model_spec.yaml")
+            spec = ModelSpec.from_dict(data)
+            self.assertEqual(sorted(spec.ops), ["full_attention", "linear_attention"])
+            self.assertEqual(spec.activations is not None, census)
+
+
+class TestVerifyTraffic(unittest.TestCase):
+    """Verify mode sets the bytes a forward moves beside the FLOPs ND prices of it."""
+
+    def test_each_parts_traffic_beside_its_flops(self):
+        """
+        Feature: verify_traffic and traffic_report.
+        Description: The hybrid model, a linear-attention layer and a
+            full-attention one, on 4096 tokens.
+        Expectation: A row per part that either moves bytes or runs a
+            matmul, the census's feed-forward parts summed as the op table
+            prices them, so that row's parameters are the experts'; each
+            kind's total the sum of its rows, and the layers' total those by
+            their layer counts.  The recurrence moves the most of a
+            linear-attention layer and moves the most for each FLOP the
+            table prices of it, and the report prints bytes for each FLOP
+            only where the part runs one.
+        """
+        rows = _verify_traffic(_qwen35_text())
+        self.assertEqual([(row.where, row.part) for row in rows], [
+            ("linear_attention x1", "attention"), ("linear_attention x1", "ffn"),
+            ("linear_attention x1", "linrec"), ("linear_attention x1", "norm"),
+            ("linear_attention x1", "total"),
+            ("full_attention x1", "attention"), ("full_attention x1", "ffn"),
+            ("full_attention x1", "norm"), ("full_attention x1", "scores"),
+            ("full_attention x1", "total"), ("layers", "total")])
+        by = {(row.where, row.part): row for row in rows}
+        linear = [row for row in rows if row.where == "linear_attention x1" and row.part != "total"]
+        self.assertEqual(by[("linear_attention x1", "total")].moved, sum(row.moved for row in linear))
+        self.assertEqual(by[("linear_attention x1", "total")].launches, sum(row.launches for row in linear))
+        self.assertEqual(by[("layers", "total")].moved,
+                         sum(row.count * row.moved for row in rows
+                             if row.part == "total" and row.where != "layers"))
+        self.assertEqual(max(linear, key=lambda row: row.moved).part, "linrec")
+        self.assertEqual(max((row for row in linear if row.flops),
+                             key=lambda row: row.moved / row.flops).part, "linrec")
+        self.assertEqual(by[("linear_attention x1", "ffn")].parameter,
+                         2.0 * sum(census_parameters(_qwen35_text(), 0)[part]
+                                   for part in ("routed", "shared", "router")))
+        lines = traffic_report(rows)
+        self.assertEqual(len(lines), len(rows) + 1)
+        self.assertIn("bytes/FLOP", lines[0])
+        recurrence = by[("linear_attention x1", "linrec")]
+        self.assertTrue(lines[3].rstrip().endswith(f"{recurrence.moved / recurrence.flops:.4f}"))
+        self.assertTrue(lines[4].rstrip().endswith("0"))
+
+
+    def test_a_dense_and_an_mla_model_report_their_own_parts(self):
+        """
+        Feature: verify_traffic on a model with no recurrence.
+        Description: A Llama of one layer kind and a DeepSeek-V3 of a dense
+            layer and an expert one, both of width 64 on 4096 tokens.
+        Expectation: Each kind reports the parts it runs and no recurrence,
+            since the rename of a weightless attention op belongs to a layer
+            that has a rule; the scores are one op, the attention kernel's,
+            and every part reads its own parameters once.
+        """
+        from transformers import LlamaConfig  # pylint: disable=C0415
+        for config, kinds in ((_one_kind(LlamaConfig), {"decoder x2"}),
+                              (_deepseek_v3(), {"dense x1", "moe x1"})):
+            rows = _verify_traffic(config)
+            self.assertEqual({row.where for row in rows}, kinds | {"layers"})
+            for row in rows:
+                self.assertNotEqual(row.part, "linrec")
+                self.assertGreater(row.moved, 0)
+            scores = [row for row in rows if row.part == "scores"]
+            self.assertEqual({row.launches for row in scores}, {1})
+
+
+class TestRunNdVerify(unittest.TestCase):
+    """run_nd -V prints the verify report and exits."""
+
+    def test_the_flag_prints_the_report(self):
+        """
+        Feature: run_nd -V.
+        Description: The hybrid model's train yaml under -f hyper_v2, and
+            under the default framework.
+        Expectation: With hyper_v2, the parameters' report, a row per part,
+            then the FLOPs', the model spec's and the run's priced with each
+            spec, the census's spec written in the -o folder, and exit 0;
+            otherwise the parser refuses the flag.
+        """
+        with tempfile.TemporaryDirectory() as folder, patch(_HF_CONFIG, return_value=_qwen35_text()):
+            path = _train_yaml(folder)
+            argv = ["run_nd.py", "-f", "hyper_v2", "-y", path, "-V", "-o", folder]
+            with patch.object(sys, "argv", argv), self.assertLogs("ND", level="CRITICAL") as logs, \
+                    self.assertRaises(SystemExit) as done:
+                runpy.run_module(_RUN_ND, run_name="__main__")
+            self.assertEqual(done.exception.code, 0)
+            self.assertIn("Parameters", logs.output[0])
+            self.assertIn("census", logs.output[1])
+            self.assertTrue(any("linear_attention x1" in line and "router" in line for line in logs.output))
+            self.assertTrue(any("Forward FLOPs" in line for line in logs.output))
+            self.assertTrue(any("linear_attention x1" in line and "linrec" in line for line in logs.output))
+            self.assertTrue(any("fields agree, 0 differ" in line for line in logs.output))
+            self.assertTrue(any("Bytes a forward" in line for line in logs.output))
+            self.assertTrue(any("bytes/FLOP" in line for line in logs.output))
+            self.assertTrue(any("full_attention x1" in line and "attBMM" in line for line in logs.output))
+            self.assertTrue(any("peak MB" in line for line in logs.output))
+            self.assertTrue(os.path.isfile(os.path.join(folder, "model_spec.yaml")))
+            with patch.object(sys, "argv", ["run_nd.py", "-y", path, "-V"]), self.assertRaises(SystemExit) as done:
+                runpy.run_module(_RUN_ND, run_name="__main__")
+            self.assertEqual(done.exception.code, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

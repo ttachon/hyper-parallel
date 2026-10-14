@@ -1,0 +1,221 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Tests for the communication a recomputed layer transfers again.
+
+How to run this:
+    pytest tests/ut/auto_parallel/sapp_nd/perf_estimation/test_comm_time.py -v
+"""
+import copy
+import os
+import unittest
+from types import SimpleNamespace
+
+import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
+from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    apply_layer_kind,
+    check_and_apply_custom_hook,
+    layer_groups,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import (
+    _fsdp_rounds,
+    _recomputed_comm,
+    estimate_comm,
+    prepare_context,
+)
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig, RecType
+
+DEEPSEEK_YAML = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
+)
+_SWITCHES = ("attBMM", "headCast", "dropout", "softmax", "normOp", "gather", "ffAct")
+
+
+class TestRecomputedComm(unittest.TestCase):
+    """DeepSeek at TP 4 and EP 8: a recompute transfers again what its memory drops."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """The fixture's config, its family hook applied, and the kinds of its layers."""
+        cls.ccfg = CostModelConfig(DEEPSEEK_YAML)
+        check_and_apply_custom_hook(cls.ccfg)
+        cls.groups = [kind for kind, _ in layer_groups(cls.ccfg)]
+
+    def _moe_layer(self, **switches: int) -> CostModelConfig:
+        """A MoE layer's config, every op kept but for *switches*."""
+        cfg = copy.deepcopy(self.ccfg)
+        apply_layer_kind(cfg, self.groups[1])
+        cfg.rec_op = Config(dict(dict.fromkeys(_SWITCHES, 1), **switches))
+        return cfg
+
+    @staticmethod
+    def _plain(cfg: CostModelConfig) -> tuple:
+        """TP, EP and CP volume of the layer run once."""
+        ctx = prepare_context()
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        return (EvalLayerComm.tp_comm_layer(cfg, ctx, 1), EvalLayerComm.ep_comm_layer(cfg, ctx, 1), 0)
+
+    def test_a_selective_layer_that_keeps_its_gathers_sends_nothing_again(self):
+        """
+        Feature: _recomputed_comm.
+        Description: A selective layer whose gather switch keeps the gathered tensors.
+        Expectation: Nothing is transferred again.
+        """
+        again = _recomputed_comm(self._moe_layer(softmax=0), prepare_context(), LayerType.SEL_REC_LAYER)
+        self.assertEqual(again, (0, 0, 0))
+
+    def test_recomputed_gathers_resend_the_tensor_parallel_volume(self):
+        """
+        Feature: _recomputed_comm.
+        Description: A selective layer that recomputes its gathers.
+        Expectation: Its whole TP volume is sent again, the buffer its memory
+            no longer keeps; the expert all-to-all is not.
+        """
+        cfg = self._moe_layer(gather=0)
+        tp, ep, cp = _recomputed_comm(cfg, prepare_context(), LayerType.SEL_REC_LAYER)
+        self.assertGreater(tp, 0)
+        self.assertEqual((tp, ep, cp), (self._plain(cfg)[0], 0, 0))
+
+    def test_full_recompute_resends_every_activation_collective(self):
+        """
+        Feature: _recomputed_comm.
+        Description: A fully recomputed MoE layer.
+        Expectation: Its TP and EP volume are sent again; CP is off in this
+            config, so none of it.
+        """
+        cfg = self._moe_layer()
+        again = _recomputed_comm(cfg, prepare_context(), LayerType.FULL_REC_LAYER)
+        self.assertGreater(again[1], 0)
+        self.assertEqual(again, self._plain(cfg))
+
+    def test_only_recomputed_layers_add_communication(self):
+        """
+        Feature: estimate_comm with_recomp.
+        Description: The fixture's stages, fully recomputed, then the same
+            stages with every layer plain.
+        Expectation: Plain stages send nothing again; every recomputed stage
+            sends more.
+        """
+        custom = CustomConfig()
+        stages = self.ccfg.generate_partitions_vpp()
+        plain = [[[LayerType.NOT_REC_LAYER if layer == LayerType.FULL_REC_LAYER else layer for layer in chunk]
+                  for chunk in stage] for stage in stages]
+
+        def _comm(layout: list, with_recomp: bool) -> list:
+            return estimate_comm(copy.deepcopy(self.ccfg), custom, layout, Hard.Device_A2, with_recomp=with_recomp)
+
+        self.assertEqual(_comm(plain, True), _comm(plain, False))
+        once, again = _comm(stages, False), _comm(stages, True)
+        self.assertTrue(all(more > less for more, less in zip(again, once)), f"once {once}, again {again}")
+
+    def test_one_walk_prices_both_as_two_walks_do(self):
+        """
+        Feature: estimate_comm both.
+        Description: The fixture's stages fully recomputed, with every other layer selective, and
+            plain, on A2 and A3, each priced by one walk returning both sums and by the two walks
+            it replaces.
+        Expectation: The same numbers to the last bit.
+        """
+        custom = CustomConfig()
+        stages = self.ccfg.generate_partitions_vpp()
+
+        def _layout(odd: LayerType, even: LayerType) -> list:
+            """The stages with each recomputed layer turned to *odd* or *even* by its place in its chunk."""
+            return [[[(odd if i % 2 else even) if layer == LayerType.FULL_REC_LAYER else layer
+                      for i, layer in enumerate(chunk)] for chunk in stage] for stage in stages]
+
+        layouts = (stages, _layout(LayerType.SEL_REC_LAYER, LayerType.FULL_REC_LAYER),
+                   _layout(LayerType.NOT_REC_LAYER, LayerType.NOT_REC_LAYER))
+        for index, layout in enumerate(layouts):
+            for device in (Hard.Device_A2, Hard.Device_A3):
+                one = estimate_comm(copy.deepcopy(self.ccfg), custom, layout, device, both=True)
+                two = (estimate_comm(copy.deepcopy(self.ccfg), custom, layout, device),
+                       estimate_comm(copy.deepcopy(self.ccfg), custom, layout, device, with_recomp=True))
+                self.assertEqual(one, two, f"layout {index} on {device.name}")
+
+
+class TestRecomputePricing(unittest.TestCase):
+    """The search prices a recompute with the communication it runs again."""
+
+    def test_the_default_prices_recomputed_communication(self):
+        """
+        Feature: CustomConfig.
+        Description: DeepSeek, fully recomputed at TP 4 and EP 8, priced with
+            the default options and with compute only.
+        Expectation: The default includes the communication, and costs more.
+        """
+        self.assertEqual(CustomConfig().retype, RecType.WITH)
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        default = estimate_performance(ccfg, device_type=Hard.Device_A2)
+        compute_only = estimate_performance(
+            ccfg, ccfg=CustomConfig(retype=RecType.COMPUTE_ONLY), device_type=Hard.Device_A2)
+        self.assertGreater(default, compute_only)
+
+    def test_resent_communication_is_recompute_not_a_communication_part(self):
+        """
+        Feature: estimate_performance's parts.
+        Description: DeepSeek, fully recomputed at TP 4 and EP 8 on one
+            pipeline stage, priced with a debugger under the default options
+            and with compute only.
+        Expectation: Both record the plain walk's communication parts; the
+            communication the default sends again is in its RECOMPUTE, and
+            its parts add up to its score with no bubble.
+        """
+        ccfg = CostModelConfig(DEEPSEEK_YAML)
+        ccfg.set_strategy(pp=1, offset=0)
+        priced = {}
+        for retype in (RecType.WITH, RecType.COMPUTE_ONLY):
+            debugger = Debug.Debug(Dim.Dimensions([(Dim.DP, ccfg.d)], all_dims=[Dim.DP]), Debug.PerfParts)
+            score = estimate_performance(
+                ccfg, ccfg=CustomConfig(retype=retype), debugger=debugger, device_type=Hard.Device_A2)
+            priced[retype] = (score, debugger.info)
+        (score, parts), (_, compute_only) = priced[RecType.WITH], priced[RecType.COMPUTE_ONLY]
+        comm = (Debug.PerfParts.DP_COMM, Debug.PerfParts.MP_COMM, Debug.PerfParts.EP_COMM, Debug.PerfParts.CP_COMM)
+        self.assertGreater(parts[Debug.PerfParts.EP_COMM], 0)
+        self.assertEqual([parts[part] for part in comm], [compute_only[part] for part in comm])
+        self.assertGreater(parts[Debug.PerfParts.RECOMPUTE], compute_only[Debug.PerfParts.RECOMPUTE])
+        self.assertAlmostEqual(parts[Debug.PerfParts.BUBBLE] / score, 0.0, places=12)
+
+
+class TestFsdpRounds(unittest.TestCase):
+    """How often FSDP gathers, and how often the copies of a shard all-reduce."""
+
+    def test_a_shard_no_wider_than_cp_still_shards(self):
+        """
+        Feature: _fsdp_rounds, the all-reduce of a shard's copies.
+        Description: 4 micro-batches at CP 2 and TP 1 with a width of 2: a
+            HyperParallel shard over 2 ranks, then a legacy schema's width,
+            which is CP's alone.
+        Expectation: The HyperParallel shard is one, so its copies all-reduce
+            once a step, a quarter a micro-batch, where a width no wider than
+            TP times CP read as none; the legacy width shards nothing beyond
+            CP, so its copies all-reduce every micro-batch.
+        """
+        got = [
+            _fsdp_rounds(SimpleNamespace(m=4, reshards=True, shard_p_os_non_exp_partial=2, t=1, cp=2,
+                                         shard_spans_cp=spans))[2]
+            for spans in (True, False)
+        ]
+        self.assertEqual(got, [0.25, 1])
+
+
+if __name__ == "__main__":
+    unittest.main()

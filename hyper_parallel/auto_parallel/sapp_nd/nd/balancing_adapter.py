@@ -15,6 +15,7 @@
 """Utilities for adapting balancing for a given pipeline configuration"""
 from dataclasses import dataclass
 import copy
+from typing import List, Union
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 
@@ -36,6 +37,27 @@ class Pipeline:
     def chunk_stage(self):
         """Product of chunks and stages"""
         return self.pp * self.vpp
+
+
+def front_loaded_offset(layers: int, pp: int, vpp: int) -> Union[List[int], List[List[int]]]:
+    """An offset placing every one of *layers* on the first pipeline stage.
+
+    A vision tower runs before the language model and on the stage that
+    holds the model's first layers, so its layers stay there whatever
+    pipeline depth is priced.  The shape is the one
+    ``is_consistent_pp_config`` wants: a list per stage, or one per chunk
+    and stage under interleaving, of each stage's layers beyond an even
+    share.
+    """
+    per_stage = max(0, layers // max(1, pp) // max(1, vpp))
+    head = layers - per_stage
+    if vpp > 1:
+        chunks = [[-per_stage] * pp for _ in range(vpp)]
+        chunks[0][0] = head
+        return chunks
+    stages = [-per_stage] * pp
+    stages[0] = head
+    return stages
 
 
 def infer_pp_and_vpp(offset):
@@ -60,6 +82,10 @@ class BalancingAdapter:
         self.prev_offset = offset
         self.prev_recompute = recompute
         self.from_config = manual_ppb
+        # The full recompute a recompute dimension states for every
+        # candidate, while the search prices one of its modes; None leaves
+        # each candidate the recompute derived below.
+        self.stated_recompute = None
         logger.debug(
             "init: layers = %d, from_config = %s, offset = %s, recompute = %s",
             layers,
@@ -170,6 +196,8 @@ class BalancingAdapter:
     def treat_recompute(self, new_pp, new_vpp):
         """Treat recompute config for the new given Pipeline config"""
         new_pip = Pipeline(new_pp, new_vpp)
+        if self.stated_recompute is not None:
+            return self.stated_recompute
         if not self.from_config:
             return self.default_recompute(
                 new_pip, copy.deepcopy(self.prev_recompute)

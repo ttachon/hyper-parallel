@@ -22,7 +22,7 @@ configuration stub.
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml  # type: ignore[import-untyped]
 
@@ -153,8 +153,136 @@ def _check_batch_derivation(data: Dict[str, Any], resolved: Dict[str, Any]) -> N
         )
 
 
+def _inject_activation_checkpoint(data: Dict[str, Any], mode: str,
+                                  layers: Optional[Dict[str, str]] = None) -> None:
+    """Set the activation checkpoint mode the search chose for every layer.
+
+    The AutoModels schema states it as ``activation_checkpoint.mode``
+    (``off``, ``full`` or ``selective``), the older one as
+    ``train.gradient_checkpointing.activation_checkpoint``, where ``off``
+    is spelled ``none``. The layers *layers* names run another mode, which
+    the AutoModels schema states as ``activation_checkpoint.layers`` where
+    the installed trainer declares that field; a plan the train yaml states
+    gives way to the search's, which it was not priced with. A trainer that
+    declares no such field refuses it, so there the yaml runs every layer
+    *mode*, the mode the plan runs most layers of those that recompute, and
+    the plan is logged as advice.
+
+    Raises:
+        ValueError: For *layers* in the older schema, which has no field
+            for them.
+    """
+    if is_auto_models_schema(data):
+        section = data.get("activation_checkpoint")
+        if not isinstance(section, dict):
+            section = data["activation_checkpoint"] = {}
+        before = section.get("mode", "off")
+        section["mode"] = mode
+        stated = section.pop("layers", None)
+        written = _runnable_plan(mode, layers)
+        if written:
+            section["layers"] = dict(written)
+        if stated and stated != written:
+            logger.info("activation_checkpoint.layers %s in the train yaml, %s in the resolved yaml",
+                        stated, written or "none")
+    else:
+        if layers:
+            raise ValueError(
+                "the search chose a mode per layer, which only the AutoModels schema's activation_checkpoint.layers "
+                "states; the train yaml uses train.gradient_checkpointing"
+            )
+        checkpointing = data["train"].get("gradient_checkpointing")
+        if not isinstance(checkpointing, dict):
+            checkpointing = data["train"]["gradient_checkpointing"] = {}
+        before = checkpointing.get("activation_checkpoint", "none")
+        checkpointing["activation_checkpoint"] = "none" if mode == "off" else mode
+    if {"none": "off"}.get(before, before) != mode:
+        logger.info(
+            "activation checkpoint mode %s in the train yaml, %s in the search: writing the searched mode",
+            before, mode,
+        )
+
+
+def _trainer_runs_layer_plans() -> bool:
+    """Whether the installed trainer runs a recompute mode per layer (:func:`trainer_runs_layer_plans`).
+
+    ND's recompute module loads the memory model, as long to import as the
+    rest of this package, so it loads only where a plan per layer is written.
+    """
+    # pylint: disable=import-outside-toplevel
+    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import trainer_runs_layer_plans
+    return trainer_runs_layer_plans()
+
+
+def _runnable_plan(mode: str, layers: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """*layers*, the search's plan per layer, where the installed trainer runs one; else None, with a warning.
+
+    A trainer whose ``activation_checkpoint`` declares no ``layers`` refuses
+    a yaml stating them, so it runs every layer *mode*, and the plan is
+    advice it cannot run.
+    """
+    if not layers or _trainer_runs_layer_plans():
+        return layers or None
+    logger.warning("the search chose activation_checkpoint mode %s with layers %s, and the installed trainer's "
+                   "activation_checkpoint has no layers field: the resolved yaml runs every layer %s, and the "
+                   "plan per layer is advice the trainer cannot run", mode, layers, mode)
+    return None
+
+
+def _drop_cost_model_context(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Leave out the cost model's own ``context`` section, which the trainer's AutoModels schema refuses.
+
+    A train.yaml the search reads states its pricing options there, such as
+    ``context.census``; the trainer has no such section and refuses the
+    whole file over it.
+
+    Returns:
+        The section left out, empty when there was none: some of its options
+        decide what else the resolved yaml must state.
+    """
+    if not is_auto_models_schema(data):
+        return {}
+    context = data.pop("context", None)
+    if context is not None:
+        logger.info("context states how the cost model prices the run, and the trainer refuses it: "
+                    "left out of the resolved yaml")
+    return context if isinstance(context, dict) else {}
+
+
+def _inject_expert_shard(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
+    """Shard each routed expert over the whole expert data-parallel group, as the search priced it.
+
+    A train.yaml stating ``context.expert_shard: group`` is priced with each
+    strategy's routed experts sharded, under expert parallelism, over its
+    whole expert data-parallel group: the stage's DP x CP x TP ranks over EP,
+    as the sweep launches it. The trainer shards an expert over
+    ``fsdp_config.edp_shard_size`` ranks of that group and replicates it over
+    the rest, so the value the train.yaml states for its own EP would launch
+    another sharding than the one priced. Without expert parallelism the
+    trainer builds no expert mesh, and the stated value is left as it is.
+    """
+    accelerator = data["accelerator"]
+    expert_parallel = int(accelerator.get("ep_size") or 1)
+    if expert_parallel <= 1:
+        return
+    if "dp" not in resolved:
+        logger.warning("context.expert_shard is group but the search states no DP: "
+                       "fsdp_config.edp_shard_size left as the train yaml states it")
+        return
+    ranks = int(resolved["dp"]) * int(accelerator.get("cp_size") or 1) * int(accelerator.get("tp_size") or 1)
+    group = ranks // expert_parallel
+    stated = data["fsdp_config"].get("edp_shard_size")
+    if stated is not None and int(stated) != group:
+        logger.info("edp_shard_size %s in the train yaml, the whole expert group of %d in the search: "
+                    "writing the group", stated, group)
+    data["fsdp_config"]["edp_shard_size"] = group
+
+
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
+    if resolved.get("activation_checkpoint"):
+        _inject_activation_checkpoint(data, resolved["activation_checkpoint"],
+                                      resolved.get("activation_checkpoint_layers"))
     if is_auto_models_schema(data):
         accelerator = data["accelerator"]
         for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
@@ -360,6 +488,39 @@ def write_ppb_config(
     logger.info("PPB config stub written to %s", output_path)
 
 
+def _apply_searched_batch_size(data: Dict[str, Any], config: NormalizedConfig) -> None:
+    """Write the global batch size the search actually optimised for.
+
+    ``-b`` and ``constraint.global_batch_size`` override the train.yaml for
+    the search, so leaving the original value in place would either emit a
+    config the trainer derives a different schedule from, or fail the batch
+    check below with two numbers and no hint of where either came from.
+    """
+    searched = int(config.constraint.get("global_batch_size", 0) or 0)
+    if not searched:
+        return
+    section = data.get("training") if is_auto_models_schema(data) else data.get("train")
+    if not isinstance(section, dict):
+        return
+    # Only when the strategy really was scored at that batch size; otherwise
+    # the check below is the right place for the disagreement to surface.
+    resolved = config.resolved_strategy or {}
+    implied = (
+        int(resolved.get("micro_batch_num", 0) or 0)
+        * int(section.get("micro_batch_size", 1) or 1)
+        * int(resolved.get("dp", 0) or 0)
+    )
+    if implied != searched:
+        return
+    current = section.get("global_batch_size")
+    if current is not None and int(current) != searched:
+        logger.info(
+            "global_batch_size %s in the train yaml, %s in the search: "
+            "writing the searched value", current, searched,
+        )
+    section["global_batch_size"] = searched
+
+
 def write_resolved_yaml(
     config: NormalizedConfig,
     original_yaml_path: str,
@@ -370,12 +531,19 @@ def write_resolved_yaml(
 
     Copies the original ``train.yaml`` and replaces the parallel
     dimension fields with the resolved strategy values.  This produces
-    a complete, immediately launchable training configuration.
+    a complete, immediately launchable training configuration: an
+    AutoModels one leaves out the cost model's ``context`` section, which
+    the trainer refuses.
 
     The resolved strategy is read from ``config.resolved_strategy``.
     Supported keys: ``dp_shard``, ``dp_replicate``, ``tp_degree``,
     ``pipeline_parallel_degree``, ``context_parallel_degree``,
-    ``expert_parallel_degree``, ``global_batch_size``.
+    ``expert_parallel_degree``, ``global_batch_size``,
+    ``activation_checkpoint``, the mode every layer runs but those
+    ``activation_checkpoint_layers`` gives another, where the installed
+    trainer declares ``activation_checkpoint.layers``. An AutoModels
+    train.yaml stating ``context.expert_shard: group`` also gets the
+    ``fsdp_config.edp_shard_size`` its experts were priced with.
 
     Args:
         config: NormalizedConfig with ``resolved_strategy`` set.
@@ -390,7 +558,11 @@ def write_resolved_yaml(
     """
     _validate_strategy_and_yaml(config, original_yaml_path)
     data = _load_yaml_to_inject(original_yaml_path)
+    context = _drop_cost_model_context(data)
+    _apply_searched_batch_size(data, config)
     _inject_resolved_strategy(data, config.resolved_strategy)
+    if context.get("expert_shard") == "group":
+        _inject_expert_shard(data, config.resolved_strategy)
     _write_output_yaml(data, output_path, overwrite, original_yaml_path)
 
 

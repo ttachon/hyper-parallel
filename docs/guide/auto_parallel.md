@@ -56,6 +56,20 @@ ND 的输出会给出满足内存约束的候选配置和排序结果，并生�
 
 图中展示候选并行配置的性能排序和对比结果。
 
+可以在 `-t` 指定的前若干个结果之外，补充 `-l` 中各维度取值大于 1 的配置：
+
+| 参数 | 行为 |
+| --- | --- |
+| `-e N` / `--exhaustive N` | 将前若干个结果计入，每个维度至少展示 N 个符合条件的配置 |
+| `-ee N` / `--force_exhaustive N` | 每个维度强制补充 N 个配置；如果同时指定更大的 `-e`，继续补足其数量要求 |
+| `-eee N` / `--fforce-exhaustive N` | 每个维度补充 N 个独立配置，补充配置不在不同维度间重复分配；正值优先于 `-e` 和 `-ee` |
+
+三个参数均接受非负整数，默认值为 0。`-e` 和 `-ee` 的同一个补充配置可以满足多个维度，因此最终图中的新增配置数可能小于维度数乘以 N。`-eee` 按 `-l` 的顺序选择尚未使用的配置，候选不足时返回可用的配置。
+
+例如 `-t 5 -l DP EP MP CP OP -eee 2 -o output/nd_perf` 展示前 5 个结果，并在候选充足时增加 10 个独立配置。默认 verbosity 为 2，图写入 `output/nd_perf/results.pdf`；有补充结果时，黑色竖线分隔前若干个结果和补充结果。
+
+这些参数用于标准 ND 搜索，非零值不能与 `--real_csv`、`--search-config` 或 `--verify` 同时使用。完整的优先级、计数示例和输出说明见 [ND 参数文档](../../hyper_parallel/auto_parallel/sapp_nd/README.md#exhaustive-plot-selection)。
+
 ---
 
 ## SAPP-PPB：Pipeline Parallelism Balancing

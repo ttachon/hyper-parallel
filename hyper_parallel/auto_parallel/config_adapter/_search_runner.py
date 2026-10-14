@@ -14,31 +14,19 @@
 # ============================================================================
 """Search runner -- bridges NormalizedConfig to the ND search engine.
 
-Converts a :class:`NormalizedConfig` into a temporary HyperParallel
-``train.yaml``, runs the ND search via :class:`Parallelize`,
-post-filters by user candidate lists, and returns the optimal strategy.
+Hands a :class:`NormalizedConfig` to the ND search as the mapping
+``Parallelize`` parses directly, post-filters by user candidate lists and
+memory budget, and returns the optimal strategy.
 """
 
+import copy
 import logging
-import os
-import tempfile
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
-import yaml  # type: ignore[import-untyped]
-
+from hyper_parallel.auto_parallel._hf_model_spec import EXEC_OVERRIDE_KEYS
+from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
-
-CONFIG_OVERRIDE_FIELDS = [
-    "hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size",
-    "intermediate_size", "num_key_value_heads", "max_position_embeddings",
-    "num_experts", "num_experts_per_tok", "num_shared_experts",
-    "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
-    "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
-    "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
-    "head_dim", "vision",
-    "param_init_type", "compute_dtype", "softmax_compute_type",
-]
 
 if TYPE_CHECKING:
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
@@ -46,6 +34,18 @@ if TYPE_CHECKING:
     import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 
 logger = logging.getLogger(__name__)
+
+# The activation_checkpoint modes HyperParallel's trainer runs every layer
+# with, that recompute "auto" chooses among. Its selective mode recomputes
+# every other matmul, which the cost model's formulas do not price; a census
+# of the layers measures it (IR phase 5), so a run that states one offers it
+# too, where the census priced it.
+TRAINER_RECOMPUTE_MODES = ("off", "full")
+TRAINER_CENSUS_MODES = ("off", "selective", "full")
+# The search config's recompute values that choose among those modes: "auto"
+# one for every layer, "per_layer" one for each layer, which the trainer runs
+# as activation_checkpoint.layers.
+CHOSEN_RECOMPUTE = ("auto", "per_layer")
 
 
 def _get_dim_module():
@@ -110,9 +110,10 @@ def _validate_before_search(config: NormalizedConfig) -> None:
 def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     """Build the ``model`` section of the HP YAML from *model* spec.
 
-    All ``config_overrides`` field names in *model* already match the
-    HP YAML convention, so they are passed through directly without
-    any name mapping.
+    The model's fields go through the model spec, whose names are the HP
+    YAML's, and the run keys the parser reads from ``config_overrides``
+    pass through as they are.  The adapter's own keys, such as the
+    micro-batch size, reach the HP YAML through their own sections.
 
     Args:
         model: The ``model_spec`` dict from :class:`NormalizedConfig`.
@@ -120,22 +121,95 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         A dict suitable for the ``model`` key of a HP ``train.yaml``.
     """
-    model_dict: Dict[str, Any] = {
-        "name": model.get("name", "custom"),
-        "config_overrides": {},
-    }
-    overrides = model_dict["config_overrides"]
-    for key in CONFIG_OVERRIDE_FIELDS:
-        val = model.get(key)
-        if val is not None:
-            overrides[key] = val
-
-    return model_dict
+    spec = ModelSpec.from_dict(model_fields(model))
+    overrides = spec.to_dict()
+    overrides.pop("name", None)
+    overrides.update({key: model[key] for key in EXEC_OVERRIDE_KEYS if key in model})
+    return {"name": spec.name, "config_overrides": overrides}
 
 
-def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Build the ``accelerator`` and ``fsdp_config`` sections of the HP YAML."""
-    accel: Dict[str, Any] = {}
+# The strategy, under every name the cost model reads it by, in the sections
+# a train.yaml states its run in: the search sets it, from its candidates or
+# its own config, so the train.yaml's values give way.  The rest of each
+# section is the run's.
+_STRATEGY_KEYS: Dict[str, FrozenSet[str]] = {
+    "accelerator": frozenset({
+        "dp_replicate", "dp_shard", "tp_size", "tp_degree", "pp_size", "pipeline_parallel_degree",
+        "cp_size", "context_parallel_degree", "ep_size", "expert_parallel_degree",
+        "expert_tensor_parallel_degree", "micro_batch_num", "optimizer_weight_shard_size",
+        "pipeline_scheduler", "pp_interleave_num",
+    }),
+    "fsdp_config": frozenset({"dp_shard_size"}),
+    "training": frozenset({"global_batch_size", "micro_batch_size", "micro_batch_num"}),
+}
+
+
+def _stated_run(config: NormalizedConfig) -> Dict[str, Any]:
+    """Return the run the train.yaml states, less the strategy the search sets.
+
+    Args:
+        config: The normalized config whose ``run`` the train.yaml filled.
+
+    Returns:
+        A copy of ``config.run``, its sections without the strategy's keys.
+    """
+    run = copy.deepcopy(config.run)
+    for section, strategy in _STRATEGY_KEYS.items():
+        stated = run.get(section)
+        if isinstance(stated, dict):
+            run[section] = {key: value for key, value in stated.items() if key not in strategy}
+    return run
+
+
+def _memory_budget_gb(config: NormalizedConfig) -> float:
+    """Return the per-device memory budget in GB, or ``0.0`` if unconstrained.
+
+    ``constraint.memory_limit_gb`` is the budget the user asked for and
+    ``cluster_spec.device_memory_gb`` the hardware ceiling, so the search
+    must respect whichever of the two is tighter.
+
+    Args:
+        config: The normalized config carrying constraint and cluster spec.
+
+    Returns:
+        The tighter positive budget in GB, or ``0.0`` when neither is set.
+    """
+    limit = float(config.constraint.get("memory_limit_gb", 0.0) or 0.0)
+    device = float(config.cluster_spec.get("device_memory_gb", 0.0) or 0.0)
+    budgets = [value for value in (limit, device) if value > 0]
+    return min(budgets) if budgets else 0.0
+
+
+def _pinned_or_first(config: NormalizedConfig, constraint_key: str, space_key: str,
+                     default: List[Any]) -> Any:
+    """Return the degree *constraint_key* pins, else the first candidate.
+
+    Args:
+        config: The normalized config carrying constraint and search space.
+        constraint_key: The ``constraint`` entry that pins the degree.
+        space_key: The ``search_space`` entry listing its candidates.
+        default: The candidates when the search space lists none.
+
+    Returns:
+        The pinned degree when it is positive, else the first candidate,
+        a placeholder the search replaces.
+    """
+    pinned = config.constraint.get(constraint_key)
+    if pinned is not None and pinned > 0:
+        return pinned
+    return config.search_space.get(space_key, default)[0]
+
+
+def _build_strategy_dicts(
+    config: NormalizedConfig, run: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build the ``accelerator`` and ``fsdp_config`` sections of the HP YAML.
+
+    The strategy goes over the sections the train.yaml states, which this
+    takes out of *run*.
+    """
+    accel: Dict[str, Any] = dict(run.pop("accelerator", None) or {})
+    fsdp: Dict[str, Any] = dict(run.pop("fsdp_config", None) or {})
 
     # Fixed dimensions -- write actual value.
     fixed_map = {
@@ -147,12 +221,17 @@ def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dic
         "fixed_etp_degree": ("expert_tensor_parallel_degree", "expert_tensor_parallel_degree", [0]),
     }
     for constraint_key, (accel_key, space_key, default) in fixed_map.items():
-        fixed_val = config.constraint.get(constraint_key)
-        if fixed_val is not None and fixed_val > 0:
-            accel[accel_key] = fixed_val
-        else:
-            candidates = config.search_space.get(space_key, default)
-            accel[accel_key] = candidates[0]
+        accel[accel_key] = _pinned_or_first(config, constraint_key, space_key, default)
+
+    # micro_batch_num has no accelerator entry of its own, so a fixed value
+    # would be dropped and the global-batch-size check would then reject the
+    # only config the user asked for.
+    accel["micro_batch_num"] = int(
+        _pinned_or_first(config, "fixed_micro_batch_num", "micro_batch_num", [1])
+    )
+    fsdp["dp_shard_size"] = int(
+        _pinned_or_first(config, "fixed_fsdp_degree", "data_parallel_shard_degree", [1])
+    )
 
     # CP algorithm: propagate to yaml so CostModelParserHyperV2 can read it.
     cp_algo = config.estimator.get("cp_algo")
@@ -166,14 +245,6 @@ def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dic
 
     use_sp = config.model_spec.get("use_seq_parallel", True)
     accel.setdefault("sequence_parallel", bool(use_sp))
-    fixed_fsdp = config.constraint.get("fixed_fsdp_degree")
-    fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
-    fsdp = {
-        "dp_shard_size": int(
-            fixed_fsdp if fixed_fsdp is not None and fixed_fsdp > 0
-            else fsdp_candidates[0]
-        )
-    }
     return accel, fsdp
 
 
@@ -183,19 +254,25 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     Fixed dimensions (``constraint.fixed_*_degree``) are written directly
     into the strategy sections. Dimensions with search-space candidates
     use the first candidate as a placeholder -- the actual search is driven
-    by the ``dimensions`` parameter passed to :class:`Parallelize`.
+    by the ``dimensions`` parameter passed to :class:`Parallelize`.  The
+    strategy goes over the run the train.yaml states, which stays as stated.
     """
     model = config.model_spec
     constraint = config.constraint
-    accel, fsdp = _build_strategy_dicts(config)
+    run = _stated_run(config)
+    accel, fsdp = _build_strategy_dicts(config, run)
 
     recompute = config.estimator.get("recompute_strategy", "none")
 
     cluster = config.cluster_spec
-    device_mem_gb = cluster.get("device_memory_gb", 0)
-    context: Dict[str, Any] = {}
-    if device_mem_gb > 0:
-        context["max_device_memory"] = f"{device_mem_gb}GB"
+    # The train.yaml's pricing options, beneath the search's own device count
+    # and memory budget.
+    context: Dict[str, Any] = dict(run.pop("context", None) or {})
+    # ND prunes the space against ccfg.device_capacity, which the parser reads
+    # from this field, so the user's memory_limit_gb has to reach it here.
+    budget_gb = _memory_budget_gb(config)
+    if budget_gb > 0:
+        context["max_device_memory"] = f"{budget_gb}GB"
     device_num = cluster.get("num_nodes", 0) * cluster.get("cards_per_node", 0)
     if device_num > 0:
         context["device_num"] = int(device_num)
@@ -203,7 +280,10 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if visual_seq_len:
         context["visual_seq_len"] = int(visual_seq_len)
 
-    gc_dict: Dict[str, Any] = {"mode": "off" if recompute == "none" else recompute}
+    # Choosing the recompute, the search keeps what fits fully recomputed:
+    # describe it so.
+    stated_mode = "full" if recompute in CHOSEN_RECOMPUTE else {"none": "off"}.get(recompute, recompute)
+    gc_dict: Dict[str, Any] = {"mode": stated_mode}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
         gc_dict["recompute_slice_activation"] = bool(recompute_slice)
@@ -211,8 +291,10 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     model_dict = _build_model_dict(model)
 
     hp_yaml: dict = {
-        "model": model_dict,
+        **run,
+        "model": {**run.get("model", {}), **model_dict},
         "training": {
+            **run.get("training", {}),
             "global_batch_size": constraint.get("global_batch_size", 0),
             "micro_batch_size": model.get("local_batch_size", 1),
             "micro_batch_num": accel.pop("micro_batch_num", 1),
@@ -233,15 +315,15 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     return hp_yaml
 
 
-def _write_temp_hp_yaml(config: NormalizedConfig) -> str:
-    """Write a temp ``train.yaml`` and return its absolute path."""
-    data = _build_hp_yaml_dict(config)
-    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="hp_search_")
-    os.close(fd)
-    with open(path, "w", encoding="utf-8") as fh:
-        yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
-    logger.debug("Temp HP YAML written to %s", path)
-    return path
+
+# The names a search config may give its devices, and the sapp_nd device
+# codes they mean: the Ascend 910B is the Atlas A2 series' chip, and the
+# 910C, CANN's ascend910_93, the A3's.  A generic "ascend" stays A2.
+_DEVICE_CODES: Dict[str, str] = {
+    "a2": "A2", "a3": "A3", "v100": "V100",
+    "ascend": "A2", "ascend910": "A2", "ascend910b": "A2",
+    "ascend910c": "A3", "ascend910_93": "A3",
+}
 
 
 def _build_machine(config: NormalizedConfig) -> Any:
@@ -251,11 +333,8 @@ def _build_machine(config: NormalizedConfig) -> Any:
     nodes = max(1, cluster.get("num_nodes", 1))
     cards_per_node = max(1, cluster.get("cards_per_node", 8))
     total_devices = nodes * cards_per_node
-    device_type = cluster.get("device_type", "A2")
-    # Map generic names to sapp_nd device codes.
-    device_code_map = {"ascend": "A2", "ascend910": "A2", "ascend910b": "A3"}
-    device_type = device_code_map.get(str(device_type).lower(), device_type)
-    return hw_mod.Machine(total_devices, device_type)
+    device_type = str(cluster.get("device_type", "A2"))
+    return hw_mod.Machine(total_devices, _DEVICE_CODES.get(device_type.lower(), device_type))
 
 
 def _resolve_search_dimensions(config: NormalizedConfig) -> Tuple[List[Any], Set[Any]]:
@@ -285,6 +364,35 @@ def _resolve_search_dimensions(config: NormalizedConfig) -> Tuple[List[Any], Set
     return dims, candidate_dims
 
 
+def _filter_by_memory(scored_space: list, budget_gb: float) -> list:
+    """Drop entries whose peak-memory estimate exceeds *budget_gb*.
+
+    ND already prunes against the device capacity while it generates the
+    space; this is the gate that holds when a strategy is scored under a
+    capacity looser than the budget the caller asked for.
+
+    Args:
+        scored_space: Scored entries ``(strategy, memory_mb, score, ...)``.
+        budget_gb: Per-device budget in GB; ``0`` disables the gate.
+
+    Returns:
+        The entries that fit.  May be empty, which means the budget rules
+        out every strategy the search found.
+    """
+    if budget_gb <= 0:
+        return list(scored_space)
+    budget_mb = budget_gb * 1024.0
+    kept = [entry for entry in scored_space if float(entry[1]) <= budget_mb]
+    if len(kept) < len(scored_space):
+        logger.info(
+            "Memory filter dropped %d of %d strategies above %.1f GB.",
+            len(scored_space) - len(kept),
+            len(scored_space),
+            budget_gb,
+        )
+    return kept
+
+
 def _post_filter(
     scored_space: list,
     config: NormalizedConfig,
@@ -300,8 +408,9 @@ def _post_filter(
             set is derived from *config* (backward-compatible).
 
     Returns:
-        A filtered list.  May be empty if no entry satisfies all
-        candidate constraints -- the caller decides how to handle this.
+        The entries that fit the memory budget and sit in every list.  Empty
+        when none does: a strategy outside the lists is never returned in
+        their place, and the caller refuses the search.
     """
     space = config.search_space
     if candidate_dims is None:
@@ -319,8 +428,10 @@ def _post_filter(
         if candidates is not None:
             candidate_map[dim_obj] = candidates
 
+    feasible = _filter_by_memory(scored_space, _memory_budget_gb(config))
+
     filtered = []
-    for entry in scored_space:
+    for entry in feasible:
         dims_val = entry[0].dims_val  # type: ignore[index]
         keep = True
         for dim_obj, allowed in candidate_map.items():
@@ -330,15 +441,56 @@ def _post_filter(
                 break
         if keep:
             filtered.append(entry)
-
-    if not filtered and scored_space:
-        logger.warning(
-            "Post-filter removed ALL %d candidates; "
-            "no strategy matches the user's candidate constraints.",
-            len(scored_space),
-        )
-        return scored_space[:1]
     return filtered
+
+
+def _no_candidate_match(feasible: list, config: NormalizedConfig, candidate_dims: Set[Any]) -> str:
+    """Say why no strategy that fits the budget is in the candidate lists.
+
+    ND searches each dimension within its own bounds and the lists only
+    filter what it found, so a list can ask for degrees the search never
+    reached.  Naming the degrees it did reach shows which.
+
+    Args:
+        feasible: The scored entries that fit the memory budget.
+        config: The normalized config whose ``search_space`` holds the lists.
+        candidate_dims: The dimensions that have a list of their own.
+
+    Returns:
+        The refusal, naming each list no fitting strategy meets.
+    """
+    unmet = []
+    for space_key, dim_obj in _search_dim_map().items():
+        if dim_obj not in candidate_dims:
+            continue
+        asked = list(config.search_space.get(space_key, []))
+        found = sorted({entry[0].dims_val.get(dim_obj) for entry in feasible} - {None})
+        if not set(found) & set(asked):
+            unmet.append(f"{space_key} asks {asked}, the strategies that fit take {found}")
+    why = "; ".join(unmet) if unmet else "each list is met by some of them, but never all at once"
+    return (
+        f"None of the {len(feasible)} strategies that fit the memory budget is in the candidate "
+        f"lists: {why}. ND searches each dimension within its own bounds and the lists only "
+        "filter what it finds: widen the lists, or the budget."
+    )
+
+
+def _pinned_degree(config: NormalizedConfig, constraint_key: str, space_key: str) -> int:
+    """Return the degree of a dimension the search did not vary.
+
+    Args:
+        config: The normalized config carrying constraint and search space.
+        constraint_key: The ``constraint`` entry that pins the degree.
+        space_key: The ``search_space`` entry listing its candidates.
+
+    Returns:
+        The pinned degree, else the only candidate, else 1.
+    """
+    pinned = config.constraint.get(constraint_key)
+    if not pinned:
+        candidates = config.search_space.get(space_key) or []
+        pinned = candidates[0] if len(candidates) == 1 else 1
+    return int(pinned)
 
 
 def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any]:
@@ -361,8 +513,19 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
     for dim_obj, key in dim_to_key.items():
         if dim_obj in dims_val:
             result[key] = int(dims_val[dim_obj])
-    result.setdefault("cp", 1)
-    result.setdefault("ep", 1)
+    # A pinned dimension is absent from dims_val, so fill it from what pinned
+    # it: the searcher never varied it, but every consumer still reads it.
+    fixed_from = {
+        "dp": ("fixed_dp_degree", "data_parallel_replicate_degree"),
+        "tp": ("fixed_tp_degree", "tensor_parallel_degree"),
+        "pp": ("fixed_pp_degree", "pipeline_parallel_degree"),
+        "cp": ("fixed_cp_degree", "context_parallel_degree"),
+        "ep": ("fixed_ep_degree", "expert_parallel_degree"),
+        "micro_batch_num": ("fixed_micro_batch_num", "micro_batch_num"),
+    }
+    for key, (constraint_key, space_key) in fixed_from.items():
+        if key not in result:
+            result[key] = _pinned_degree(config, constraint_key, space_key)
     total_dp = result.get("dp", 1)
     if "dp_shard" not in result:
         # OP absent from the searched dimensions: fall back to the declared
@@ -370,20 +533,77 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
         fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
         configured_fsdp = config.constraint.get("fixed_fsdp_degree")
         result["dp_shard"] = int(configured_fsdp or fsdp_candidates[0])
-    dp_shard = max(1, min(int(result["dp_shard"]), total_dp))
+    # The yaml the search prices is AutoModels-shaped, whose FSDP domain is
+    # DP times CP: the shard may span it, and the trainer replicates the rest
+    # (MeshContext.build_meshs).  Bounded by DP, a shard the search priced
+    # under CP was cut back and its replicas undercounted.
+    domain = total_dp * max(1, int(result.get("cp") or 1))
+    dp_shard = max(1, min(int(result["dp_shard"]), domain))
     result["dp_shard"] = dp_shard
-    result["dp_replicate"] = max(1, total_dp // dp_shard)
+    result["dp_replicate"] = max(1, domain // dp_shard)
     return result
 
 
-def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
+def _recompute_result(nd_runner: Any, best_entry: tuple) -> Dict[str, Any]:
+    """The recompute the search chose for the best configuration, for the result.
+
+    Args:
+        nd_runner: The search, run with recompute "auto" or "per_layer".
+        best_entry: The best scored entry.
+
+    Returns:
+        ``activation_checkpoint``, the mode the trainer runs every layer
+        with: the chosen one, or ``full``, the policy the configuration was
+        scored with when there was nothing to choose. Under "per_layer",
+        ``activation_checkpoint_layers`` gives the layers that run another
+        mode, as the trainer's ``activation_checkpoint.layers`` states them,
+        where there are any: the resolved yaml writes them where the
+        installed trainer declares that field, and else runs every layer the
+        mode and logs them as advice (``_strategy_output``). With a choice
+        per layer possible,
+        ``recompute_per_layer`` also gives each layer's own fastest option of
+        its kind's front and the score and memory it would reach: what the
+        trainer would gain from running each layer its own way, switch by
+        switch. ``offloaded_layers`` names the layers a choice offloads, as
+        ``"first"`` or ``"first-last"``, where it offloads any: the plan
+        states them off, the trainer running no offload yet.
+        ``offloaded_gib`` gives, by the same names, the GiB each of those
+        layers moves to the host per micro-batch, and ``offloaded_share``
+        the share of what it keeps that is.
+    """
+    # pylint: disable=C0415
+    from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import offloaded_share, to_records, trainer_plan
+    choice = nd_runner.recompute_choices.get(best_entry[0])
+    mode, layers = trainer_plan(choice) if choice is not None else ("full", {})
+    result: Dict[str, Any] = {"activation_checkpoint": mode}
+    if layers:
+        result["activation_checkpoint_layers"] = layers
+    # Only a choice per layer offloads; one mode for every layer states no ranges of its own.
+    offloaded = [item for item in getattr(choice, "ranges", ()) if item.option.link_bandwidth]
+    if offloaded:
+        names = [str(item.first) if item.count == 1 else f"{item.first}-{item.first + item.count - 1}"
+                 for item in offloaded]
+        result["offloaded_layers"] = names
+        result["offloaded_gib"] = {name: item.option.link_bandwidth / 2 ** 30 for name, item in zip(names, offloaded)}
+        result["offloaded_share"] = {name: offloaded_share(item.option) for name, item in zip(names, offloaded)}
+    per_layer, score = nd_runner.recompute_per_layer(best_entry[0])
+    if per_layer is not None:
+        result["recompute_per_layer"] = {
+            "score": float(score),
+            "memory_estimate_mb": float(per_layer.memory),
+            "ranges": to_records(per_layer),
+        }
+    return result
+
+
+def search_strategies(config: NormalizedConfig, offload: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Run the ND strategy search and return the optimal strategy.
 
     This is the main entry point for end-to-end strategy search:
 
     1. Validates required model fields.
-    2. Converts the ``NormalizedConfig`` to a temporary HyperParallel
-       ``train.yaml`` and writes it to disk.
+    2. Shapes the ``NormalizedConfig`` into the cost-model config ND
+       parses, as a mapping rather than a file.
     3. Launches the ND search engine (:class:`Parallelize`).
     4. Post-filters results against the user's candidate lists.
     5. Returns the best strategy as a flat dictionary.
@@ -391,51 +611,96 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     Args:
         config: A fully populated ``NormalizedConfig`` from
             :func:`read_search_config` or :func:`read_hp_yaml_config`.
+            ``config.estimator["ratios_file"]``, when set, names the ratios
+            file ``run_nd --write_ratios`` fits, which ND scores with
+            (``run_nd -s ... -c`` sets it); without it ND scores raw.
+        offload: With a choice of a recompute mode per layer, let each
+            stage's first layers run off and offload what they keep, over the
+            device's host link with these of its figures replaced
+            (:meth:`HostLink.of`), ``None`` for one left as the device states
+            it. ``None`` offloads nothing.
 
     Returns:
         A dict with keys ``dp``, ``tp``, ``pp``, ``cp``, ``ep``,
         ``micro_batch_num``, ``memory_estimate_mb``, and ``score``.
 
     Raises:
-        ValueError: If required fields are missing or no strategy is found.
-        ImportError: If PyYAML is not installed.
+        ValueError: If required fields are missing or no strategy is found,
+            or for *offload* without a choice of a mode per layer.
     """
     _validate_before_search(config)
 
-    yaml_path = _write_temp_hp_yaml(config)
+    hp_config = _build_hp_yaml_dict(config)
     machine = _build_machine(config)
     dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
-    try:
-        nd_runner = _Par.Parallelize(
-            "hyper_v2",
-            yaml_path,
-            machine,
-            global_batch_size=config.constraint.get("global_batch_size", 0),
-            dimensions=dims,
-        )
-        scored_space = nd_runner.run_generation_to_ordering(
-            yaml_folder=None,
-            threads_num=None,
-            top_num=None,
-        )
-    finally:
-        try:
-            os.remove(yaml_path)
-        except OSError:
-            pass
+    from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (  # pylint: disable=C0415
+        HYPER_SELECTIVE_REC_OP,
+    )
+    strategy = config.estimator.get("recompute_strategy")
+    auto = strategy in CHOSEN_RECOMPUTE
+    census = bool((hp_config.get("context") or {}).get("census"))
+    trainer = {
+        "auto_recompute": True,
+        # The search config may narrow the modes, as to leave out a mode the
+        # estimate prices faster than the device runs it.
+        "recompute_modes": tuple(config.estimator.get("recompute_modes")
+                                 or (TRAINER_CENSUS_MODES if census else TRAINER_RECOMPUTE_MODES)),
+        # The trainer's selective mode runs its policy, whatever switches
+        # the mode the model is described with sets.
+        "recompute_selective": dict(HYPER_SELECTIVE_REC_OP),
+        "recompute_mode_per_layer": strategy == "per_layer",
+    }
+    if offload is not None:
+        if strategy != "per_layer":
+            raise ValueError("offload is priced in a choice of a recompute mode per layer: give the search config "
+                             "recompute: per_layer")
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import HostLink  # pylint: disable=C0415
+        trainer.update(auto_offload=True, host_link=HostLink.of(machine.device.host_link, offload))
+    nd_runner = _Par.Parallelize(
+        "hyper_v2",
+        hp_config,
+        machine,
+        global_batch_size=config.constraint.get("global_batch_size", 0),
+        dimensions=dims,
+        **(trainer if auto else {}),
+    )
+    scored_space = nd_runner.run_generation_to_ordering(
+        yaml_folder=None,
+        threads_num=None,
+        top_num=None,
+        cache_file=config.estimator.get("ratios_file"),
+    )
 
     if not scored_space:
         raise ValueError("ND search returned no valid strategies.")
 
     filtered = _post_filter(scored_space, config, candidate_dims)
+    if not filtered:
+        feasible = _filter_by_memory(scored_space, _memory_budget_gb(config))
+        if feasible:
+            raise ValueError(_no_candidate_match(feasible, config, candidate_dims))
+        lightest_gb = min(float(entry[1]) for entry in scored_space) / 1024.0
+        raise ValueError(
+            "No strategy fits the memory budget of "
+            f"{_memory_budget_gb(config):.1f} GB; the lightest strategy "
+            f"found needs {lightest_gb:.1f} GB. Raise "
+            "constraint.memory_limit_gb or widen the search space."
+        )
     best = filtered[0]
     result = _format_result(best, config)
+    if auto:
+        result.update(_recompute_result(nd_runner, best))
+    else:
+        # Without "auto" the search prices every candidate fully recomputed,
+        # whatever the search yaml says, so the trainer runs what was priced.
+        result["activation_checkpoint"] = "full"
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
         "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
+        "recompute=%(activation_checkpoint)s "
         "mem=%(memory_estimate_mb).0f MB score=%(score).2e",
         result,
     )

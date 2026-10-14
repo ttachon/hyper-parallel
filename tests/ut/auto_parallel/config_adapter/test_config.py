@@ -46,6 +46,9 @@ from hyper_parallel.auto_parallel.config_adapter._strategy_output import (
     write_strategy_config,
 )
 
+# Whether the installed trainer runs a plan per layer, as the yaml writer asks it.
+_TRAINER_RUNS_PLANS = "hyper_parallel.auto_parallel.config_adapter._strategy_output._trainer_runs_layer_plans"
+
 
 def _make_dense_model_spec(**overrides) -> Dict[str, Any]:
     """Create a default dense model spec dict for testing."""
@@ -436,6 +439,81 @@ recompute: "full"
         _write_yaml(path, content)
         config = read_search_config(path)
         self.assertEqual(config.estimator["recompute_strategy"], "full")
+        self.assertNotIn("recompute_modes", config.estimator)
+
+    def test_recompute_modes_narrow_the_trainers(self) -> None:
+        """
+        Feature: recompute_modes in a search config.
+        Description: A search choosing a mode per layer among off and full,
+            off unquoted as YAML reads it; then a mode the trainer does not
+            run, and no mode at all.
+        Expectation: The modes reach the estimator, off spelled as the
+            trainer spells it; the other two are refused.
+        """
+        model = """
+model:
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
+  vocab_size: 32000
+recompute: per_layer
+"""
+        path = os.path.join(self.tmpdir, "recompute_modes.yaml")
+        _write_yaml(path, model + "recompute_modes: [off, full]\n")
+        config = read_search_config(path)
+        self.assertEqual(config.estimator["recompute_strategy"], "per_layer")
+        self.assertEqual(config.estimator["recompute_modes"], ("off", "full"))
+        for stated in ("[off, sometimes]", "[]"):
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + f"recompute_modes: {stated}\n")
+                with self.assertRaises(ValueError):
+                    read_search_config(path)
+
+    def test_recompute_as_a_parallelism_dimension(self) -> None:
+        """
+        Feature: parallelism.recompute in a search config.
+        Description: Recompute stated as a degree is: a list, one mode, auto,
+            then with a mode per layer; then stated twice, and a mode the
+            trainer does not run.
+        Expectation: The search chooses among the stated modes for each
+            strategy, or each layer under recompute: per_layer, and auto
+            leaves the modes to the search's defaults; the summary says so.
+            Stating recompute a second time, or a mode the trainer does not
+            run, is refused.
+        """
+        model = """
+model:
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
+  vocab_size: 32000
+"""
+        path = os.path.join(self.tmpdir, "recompute_dimension.yaml")
+        cases = (
+            ("parallelism:\n  recompute: [off, full]\n", "auto", ("off", "full"),
+             "recompute=chosen among ['off', 'full']"),
+            ("parallelism:\n  recompute: full\n", "auto", ("full",), "recompute=chosen among ['full']"),
+            ("parallelism:\n  recompute: auto\n", "auto", None, "recompute=chosen among every mode it can price"),
+            ("parallelism:\n  recompute: [off, full]\nrecompute: per_layer\n", "per_layer", ("off", "full"),
+             "recompute=chosen per layer among ['off', 'full']"),
+        )
+        for stated, strategy, modes, summary in cases:
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + stated)
+                config = read_search_config(path)
+                self.assertEqual(config.estimator["recompute_strategy"], strategy)
+                self.assertEqual(config.estimator.get("recompute_modes"), modes)
+                self.assertTrue(config.parallelism_summary.endswith(summary), config.parallelism_summary)
+        refused = (
+            ("parallelism:\n  recompute: [off, full]\nrecompute_modes: [full]\n", "stated twice"),
+            ("parallelism:\n  recompute: [off, full]\nrecompute: selective\n", "fixes selective"),
+            ("parallelism:\n  recompute: [off, swap]\n", "expected some of off, selective and full"),
+        )
+        for stated, message in refused:
+            with self.subTest(stated=stated):
+                _write_yaml(path, model + stated)
+                with self.assertRaisesRegex(ValueError, message):
+                    read_search_config(path)
 
     def test_fsdp_dimension_mapped(self) -> None:
         """fsdp short name maps to data_parallel_shard_degree."""
@@ -506,6 +584,36 @@ data:
         self.assertEqual(config.constraint["global_batch_size"], 64)
 
 
+    def test_train_yaml_run_reaches_the_search(self) -> None:
+        """The train.yaml's run rides along, and the search config's model dtype wins."""
+        train_yaml = {
+            "model": {
+                "name": "llama",
+                "torch_dtype": "bfloat16",
+                "config_overrides": {
+                    "hidden_size": 2048, "num_hidden_layers": 16, "num_attention_heads": 16, "vocab_size": 50000,
+                },
+            },
+            "training": {"global_batch_size": 64, "micro_batch_size": 1, "max_grad_norm": 1.0},
+            "fsdp_config": {"dp_shard_size": 8, "reshard_after_backward": False},
+        }
+        train_path = os.path.join(self.tmpdir, "train.yaml")
+        _write_yaml(train_path, train_yaml)
+        search_path = os.path.join(self.tmpdir, "search.yaml")
+        _write_yaml(search_path, {
+            "train_yaml": train_path,
+            "model": {"torch_dtype": "float32"},
+            "cluster": {"num_nodes": 2, "cards_per_node": 8},
+            "parallelism": {"tp": [1, 2, 4]},
+        })
+
+        run = read_search_config(search_path).run
+
+        self.assertEqual(run["model"], {"torch_dtype": "float32"})
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertFalse(run["fsdp_config"]["reshard_after_backward"])
+
+
 class TestHpYamlReader(unittest.TestCase):
     """Unit tests for the HyperParallel train.yaml reader (read_hp_yaml_config)."""
 
@@ -563,6 +671,28 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(config.pp_config["micro_batch_num"], 8)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_reads_an_indexed_dataset_length(self, mock_get_hf_config) -> None:
+        """An Indexed Dataset's data_config.seq_length is the length, below the Online path's."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=32, hidden_size=4096, intermediate_size=11008,
+            num_attention_heads=32, num_key_value_heads=8, vocab_size=128256,
+            max_position_embeddings=262144, num_experts=1,
+        )
+        indexed = _auto_models_hp_yaml_content().replace(
+            "  data_transform:\n    max_seq_len: 2048\n", "  data_config:\n    seq_length: 8192\n")
+        both = _auto_models_hp_yaml_content().replace(
+            "  data_transform:\n", "  data_config:\n    seq_length: 8192\n  data_transform:\n")
+        for name, content, expected in (("indexed", indexed, 8192), ("both", both, 2048)):
+            with self.subTest(dataset=name):
+                path = os.path.join(self.tmpdir, f"auto_models_{name}.yaml")
+                _write_yaml(path, content)
+
+                config = read_hp_yaml_config(path)
+
+                length = config.model_spec["max_position_embeddings"]
+                self.assertEqual(length, expected, f"dataset={name}, length={length}")
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_spec_carries_head_dim_and_mtp(self, mock_get_hf_config) -> None:
         """Loader resolves head_dim and the Transformers MTP spelling."""
         mock_get_hf_config.return_value = SimpleNamespace(
@@ -609,14 +739,20 @@ class TestHpYamlReader(unittest.TestCase):
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_offline_falls_back_to_overrides(self, mock_get_hf_config) -> None:
-        """An unreachable Transformers config falls back to config_overrides."""
+        """An unreachable Transformers config falls back to config_overrides.
+
+        The overrides are the whole spec on this path, with no resolved
+        config to complete them, so they carry every required field.
+        """
         mock_get_hf_config.side_effect = OSError("no network")
         content = _auto_models_hp_yaml_content().replace(
             "  local_files_only: true",
             "  local_files_only: true\n"
             "  config_overrides:\n"
             "    hidden_size: 1024\n"
-            "    num_hidden_layers: 4",
+            "    num_hidden_layers: 4\n"
+            "    num_attention_heads: 16\n"
+            "    vocab_size: 32000",
         )
         path = os.path.join(self.tmpdir, "auto_models_offline.yaml")
         _write_yaml(path, content)
@@ -625,6 +761,28 @@ class TestHpYamlReader(unittest.TestCase):
 
         self.assertEqual(config.model_spec["hidden_size"], 1024)
         self.assertEqual(config.model_spec["num_hidden_layers"], 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_offline_partial_overrides_raise(self, mock_get_hf_config) -> None:
+        """A fallback that cannot supply the model is refused, not carried.
+
+        Without the resolved config there is nothing to complete a partial
+        override set, so letting one through is how a missing dimension
+        reaches the cost model as a zero.
+        """
+        mock_get_hf_config.side_effect = OSError("no network")
+        content = _auto_models_hp_yaml_content().replace(
+            "  local_files_only: true",
+            "  local_files_only: true\n"
+            "  config_overrides:\n"
+            "    hidden_size: 1024\n"
+            "    num_hidden_layers: 4",
+        )
+        path = os.path.join(self.tmpdir, "auto_models_partial_offline.yaml")
+        _write_yaml(path, content)
+
+        with self.assertRaisesRegex(ValueError, "num_attention_heads"):
+            read_hp_yaml_config(path)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_offline_without_overrides_raises(self, mock_get_hf_config) -> None:
@@ -652,6 +810,54 @@ class TestHpYamlReader(unittest.TestCase):
         config = read_hp_yaml_config(path)
 
         self.assertEqual(config.model_spec["device_num"], 32)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_yaml_states_its_run(self, mock_get_hf_config) -> None:
+        """The run's dtypes, FSDP, optimizer and clipping ride in ``run``, as stated."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="llama", num_hidden_layers=32, hidden_size=4096, intermediate_size=11008,
+            num_attention_heads=32, num_key_value_heads=8, vocab_size=128256, max_position_embeddings=8192,
+        )
+        raw = yaml.safe_load(_auto_models_hp_yaml_content())
+        raw["model_init_dtype"] = "bfloat16"
+        raw["training"]["max_grad_norm"] = 1.0
+        raw["fsdp_config"]["reshard_after_forward"] = False
+        raw["accelerator"]["context_parallel_algo"] = "ulysses_cp"
+        raw["optimizer"] = {"_target_": "hyper_parallel.optim.AdamW", "fp32_main_params": True}
+        raw["context"] = {"visual_seq_len": 2304, "device_num": 32}
+        path = os.path.join(self.tmpdir, "auto_models.yaml")
+        _write_yaml(path, raw)
+
+        run = read_hp_yaml_config(path).run
+
+        self.assertEqual(run["model"], {
+            "_target_": "hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained",
+            "torch_dtype": "bfloat16",
+        })
+        self.assertEqual(run["model_init_dtype"], "bfloat16")
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertFalse(run["fsdp_config"]["reshard_after_forward"])
+        self.assertEqual(run["accelerator"]["context_parallel_algo"], "ulysses_cp")
+        self.assertTrue(run["optimizer"]["fp32_main_params"])
+        self.assertNotIn("activation_checkpoint", run)
+        self.assertEqual(run["context"], {"visual_seq_len": 2304})
+
+    def test_legacy_yaml_states_its_run_under_train(self) -> None:
+        """A legacy train.yaml's run comes from its model section and ``train``."""
+        raw = yaml.safe_load(_dense_hp_yaml_content())
+        raw["model"].update(param_init_type="float32", compute_dtype="bfloat16")
+        raw["train"]["max_grad_norm"] = 1.0
+        raw["train"]["optimizer"] = {"type": "AdamW"}
+        path = os.path.join(self.tmpdir, "train.yaml")
+        _write_yaml(path, raw)
+
+        run = read_hp_yaml_config(path).run
+
+        self.assertEqual(run["model"], {"param_init_type": "float32", "compute_dtype": "bfloat16"})
+        self.assertEqual(run["training"]["max_grad_norm"], 1.0)
+        self.assertEqual(run["optimizer"], {"type": "AdamW"})
+        self.assertEqual(run["accelerator"]["tp_degree"], 4)
+        self.assertNotIn("gradient_checkpointing", run["training"])
 
     def test_hp_yaml_empty_accelerator_defaults(self) -> None:
         """Empty accelerator section produces default search_space (single-element lists)."""
@@ -1223,6 +1429,185 @@ class TestWriter(unittest.TestCase):
         self.assertNotIn("train", data)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_sets_the_chosen_checkpoint_mode(self) -> None:
+        """The activation checkpoint mode the search chose reaches both schemas, in their own spelling."""
+        legacy = os.path.join(self.tmpdir, "legacy_ac.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {},
+                       "gradient_checkpointing": {"activation_checkpoint": "full"}}}, fh)
+        auto_models = os.path.join(self.tmpdir, "auto_models_ac.yaml")
+        with open(auto_models, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "full", "swap_inputs": True}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "off"}
+        written = {}
+        for name, path in (("legacy", legacy), ("auto_models", auto_models)):
+            out = os.path.join(self.tmpdir, f"resolved_{name}.yaml")
+            with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+                write_resolved_yaml(config, path, out)
+            self.assertIn("full in the train yaml, off in the search", " ".join(logs.output))
+            with open(out, "r", encoding="utf-8") as fh:
+                written[name] = yaml.safe_load(fh)
+        self.assertEqual(written["legacy"]["train"]["gradient_checkpointing"]["activation_checkpoint"], "none")
+        self.assertEqual(written["auto_models"]["activation_checkpoint"], {"mode": "off", "swap_inputs": True})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    @patch(_TRAINER_RUNS_PLANS, return_value=True)
+    def test_write_resolved_yaml_sets_the_chosen_plan_per_layer(self, runs_plans: Any) -> None:
+        """
+        Feature: write_resolved_yaml, activation_checkpoint_layers, for a
+            trainer whose activation_checkpoint declares layers.
+        Description: A search that chose full recompute with layers 3 to 7
+            off, written over an AutoModels train.yaml stating a plan of its
+            own and over one stating none; then over the older schema; then a
+            search that chose one mode for every layer, written over the
+            train.yaml with a plan.
+        Expectation: The plan is written as activation_checkpoint.layers,
+            replacing the train.yaml's, whose replacement is logged, with
+            the mode and the train.yaml's other options kept; YAML reads it
+            back with off a string. The older schema has no field for it and
+            is refused. One mode for every layer leaves no plan.
+        """
+        with_plan = os.path.join(self.tmpdir, "auto_models_plan.yaml")
+        with open(with_plan, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "full", "swap_inputs": False, "layers": {"6-7": "off"}}}, fh)
+        without = os.path.join(self.tmpdir, "auto_models_no_plan.yaml")
+        with open(without, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}}, fh)
+        legacy = os.path.join(self.tmpdir, "legacy_plan.yaml")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"name": "test"}, "train": {"accelerator": {}}}, fh)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full",
+                                    "activation_checkpoint_layers": {"3-7": "off"}}
+        out = os.path.join(self.tmpdir, "resolved_plan.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            write_resolved_yaml(config, with_plan, out)
+        self.assertIn("activation_checkpoint.layers {'6-7': 'off'} in the train yaml", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"],
+                             {"mode": "full", "swap_inputs": False, "layers": {"3-7": "off"}})
+        write_resolved_yaml(config, without, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "layers": {"3-7": "off"}})
+        with self.assertRaisesRegex(ValueError, "activation_checkpoint.layers"):
+            write_resolved_yaml(config, legacy, out)
+
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full"}
+        write_resolved_yaml(config, with_plan, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "swap_inputs": False})
+        runs_plans.assert_called()
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    @patch(_TRAINER_RUNS_PLANS, return_value=False)
+    def test_write_resolved_yaml_advises_a_plan_the_trainer_cannot_run(self, runs_plans: Any) -> None:
+        """
+        Feature: write_resolved_yaml, activation_checkpoint_layers, for a
+            trainer whose activation_checkpoint declares no layers.
+        Description: A search that chose full recompute with layers 3 to 7
+            off, written over an AutoModels train.yaml stating a plan of its
+            own; then a search that chose one mode for every layer.
+        Expectation: The yaml runs every layer the plan's mode, full, with
+            no layers, which that trainer refuses: the train.yaml's own plan
+            is dropped too, and a warning gives the search's plan as advice
+            the trainer cannot run. One mode for every layer is written as
+            ever, with no warning.
+        """
+        with_plan = os.path.join(self.tmpdir, "auto_models_plan.yaml")
+        with open(with_plan, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {},
+                       "activation_checkpoint": {"mode": "off", "swap_inputs": False, "layers": {"6-7": "full"}}}, fh)
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "full",
+                                    "activation_checkpoint_layers": {"3-7": "off"}}
+        out = os.path.join(self.tmpdir, "resolved_advice.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "WARNING") as logs:
+            write_resolved_yaml(config, with_plan, out)
+        self.assertIn("mode full with layers {'3-7': 'off'}", " ".join(logs.output))
+        self.assertIn("has no layers field", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "full", "swap_inputs": False})
+
+        config.resolved_strategy = {"tp": 2, "activation_checkpoint": "selective"}
+        with self.assertNoLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "WARNING"):
+            write_resolved_yaml(config, with_plan, out)
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["activation_checkpoint"], {"mode": "selective", "swap_inputs": False})
+        # Asked for the plan, not for one mode.
+        self.assertEqual(runs_plans.call_count, 1)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_leaves_out_the_cost_models_context(self) -> None:
+        """
+        Feature: write_resolved_yaml, context.
+        Description: An AutoModels train.yaml asking the cost model for a
+            census, which the trainer has no section for.
+        Expectation: The resolved yaml leaves the section out, and says so;
+            the train.yaml keeps it.
+        """
+        path = os.path.join(self.tmpdir, "auto_models_census.yaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump({"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                       "accelerator": {}, "fsdp_config": {}, "context": {"census": True}}, fh)
+        config = _make_full_config()
+        config.resolved_strategy = {"tp": 2}
+        out = os.path.join(self.tmpdir, "resolved_census.yaml")
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            write_resolved_yaml(config, path, out)
+        self.assertIn("left out of the resolved yaml", " ".join(logs.output))
+        with open(out, "r", encoding="utf-8") as fh:
+            self.assertNotIn("context", yaml.safe_load(fh))
+        with open(path, "r", encoding="utf-8") as fh:
+            self.assertEqual(yaml.safe_load(fh)["context"], {"census": True})
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_yaml_shards_experts_over_the_priced_group(self) -> None:
+        """
+        Feature: write_resolved_yaml, context.expert_shard.
+        Description: The Qwen3.5 template's shape, EP 8 with an expert shard
+            of 2 and context.expert_shard: group, resolved to DP 16, CP 2,
+            TP 2 and EP 2 on 64 dies; then to EP 1; then the EP 2 search over
+            the same train.yaml stating no rule.
+        Expectation: Under expert parallelism edp_shard_size becomes the
+            group the search priced, DP x CP x TP / EP = 32, and the change
+            is logged; at EP 1 the trainer builds no expert mesh and the
+            stated shard is kept; without the rule the stated shard is what
+            was priced, and is kept too.
+        """
+        template = {"model": {"pretrained_model_name_or_path": "local/model"}, "training": {},
+                    "accelerator": {"ep_size": 8}, "fsdp_config": {"dp_shard_size": 16, "edp_shard_size": 2}}
+        with_rule = os.path.join(self.tmpdir, "auto_models_expert_group.yaml")
+        with open(with_rule, "w", encoding="utf-8") as fh:
+            yaml.dump({**template, "context": {"expert_shard": "group"}}, fh)
+        without = os.path.join(self.tmpdir, "auto_models_expert_shard.yaml")
+        with open(without, "w", encoding="utf-8") as fh:
+            yaml.dump(template, fh)
+        config = _make_full_config()
+        out = os.path.join(self.tmpdir, "resolved_expert_group.yaml")
+
+        def written(path: str, **strategy: int) -> Dict[str, Any]:
+            """The fsdp_config the resolved yaml states for *path*, under a search that chose *strategy*."""
+            config.resolved_strategy = {"dp": 16, "dp_shard": 32, "tp": 2, "pp": 1, "cp": 2, **strategy}
+            write_resolved_yaml(config, path, out)
+            with open(out, "r", encoding="utf-8") as fh:
+                return yaml.safe_load(fh)["fsdp_config"]
+
+        with self.assertLogs("hyper_parallel.auto_parallel.config_adapter._strategy_output", "INFO") as logs:
+            self.assertEqual(written(with_rule, ep=2), {"dp_shard_size": 32, "edp_shard_size": 32})
+        self.assertIn("edp_shard_size 2 in the train yaml, the whole expert group of 32", " ".join(logs.output))
+        self.assertEqual(written(with_rule, ep=1)["edp_shard_size"], 2)
+        self.assertEqual(written(without, ep=2)["edp_shard_size"], 2)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
         """A strategy that contradicts the trainer batch derivation is refused."""
         original_yaml_path = os.path.join(self.tmpdir, "auto_models_batch.yaml")
@@ -1345,6 +1730,31 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(summary["model"]["num_hidden_layers"], 32)
         self.assertEqual(summary["cluster"]["total_cards"], 32)
 
+
+
+class TestRecomputeDimension(unittest.TestCase):
+    """parallelism.recompute states the recompute dimension the way a degree is stated."""
+
+    @staticmethod
+    def _read(**replace: Any) -> NormalizedConfig:
+        """Read the dense search config with *replace* applied to its raw YAML."""
+        raw = yaml.safe_load(_dense_search_yaml_content())
+        raw.pop("recompute")
+        for key, value in replace.items():
+            if key == "parallelism_recompute":
+                raw["parallelism"]["recompute"] = value
+            else:
+                raw[key] = value
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "search.yaml")
+            _write_yaml(path, raw)
+            return read_search_config(path)
+
+    def test_without_it_nothing_changes(self) -> None:
+        """No parallelism.recompute: no modes for the search, and the summary has no recompute part."""
+        config = self._read()
+        self.assertNotIn("recompute_modes", config.estimator)
+        self.assertNotIn("recompute=", config.parallelism_summary)
 
 if __name__ == "__main__":
     unittest.main()
