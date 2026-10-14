@@ -1474,6 +1474,13 @@ def trainer_plan(choice: RecomputeChoice) -> Tuple[str, Dict[str, str]]:
     recomputes; the plan names the other layers, consecutive layers of one
     mode in one entry whatever their kinds.
 
+    The mode is a mode that recomputes, rather than off with the recomputed
+    layers named, because the trainer accepts an entry equal to the mode: a
+    runner that states the mode itself, as a sweep forcing its own full
+    default does, then still runs the layers this plan states off. Named the
+    other way round, the same run would recompute every layer and invert the
+    choice without a word.
+
     The indices are the choice's, which count the body layers in model order,
     MTP's after the decoder's: the indices of the trainer's blocks, for a
     model without MTP layers.

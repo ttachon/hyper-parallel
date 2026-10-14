@@ -1558,6 +1558,32 @@ class TestDescribe(unittest.TestCase):
 class TestTrainerPlan(unittest.TestCase):
     """A choice of a mode per layer, as HyperParallel's trainer states it."""
 
+    def test_the_mode_is_one_that_recomputes_so_a_forced_mode_cannot_invert_the_plan(self):
+        """
+        Feature: trainer_plan.
+        Description: Plans in which a minority of the layers recompute, one
+            of them fully and one selectively; then the same plan stated the
+            other way round.
+        Expectation: The mode is the one that recomputes, and the entries
+            name the layers that do not. The trainer takes an entry equal to
+            the mode, so a runner that states the recompute mode itself, as a
+            sweep forcing its own full default does, still runs the layers
+            the plan states off. Reported the other way round, as off with
+            the recomputed layers as entries, the same run would recompute
+            every layer and invert the search's choice without a word, so
+            the plan is never written that way.
+        """
+        few_full = _per_layer((0, 1, None, "full"), (1, 7, None, "off"))
+        mode, layers = trainer_plan(few_full)
+        self.assertEqual((mode, layers), ("full", {"1-7": "off"}))
+        self.assertEqual(_plan_modes(mode, layers, 8), ["full"] + ["off"] * 7)
+        self.assertEqual(_plan_modes("full", layers, 8), ["full"] + ["off"] * 7)
+        inverted = {"0": "full"}
+        self.assertEqual(_plan_modes("off", inverted, 8), ["full"] + ["off"] * 7)
+        self.assertEqual(_plan_modes("full", inverted, 8), ["full"] * 8)
+        self.assertEqual(trainer_plan(_per_layer((0, 1, None, "selective"), (1, 7, None, "off"))),
+                         ("selective", {"1-7": "off"}))
+
     def test_the_layers_that_do_not_run_the_mode_by_range_whatever_their_kinds(self):
         """
         Feature: trainer_plan.
