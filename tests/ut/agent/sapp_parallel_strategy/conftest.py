@@ -55,10 +55,16 @@ _FOLDER = _scripts_folder()
 _HERE = os.path.normcase(os.path.dirname(os.path.abspath(__file__))) + os.sep
 if _FOLDER:
     _load(_FOLDER)
+else:
+    # Without the scripts there is nothing to import, and every test module here imports one at its
+    # top. Keep them out of collection: a module imported anyway raises ImportError, which is a
+    # collection error and fails a run, where this folder should simply have nothing to say. The
+    # gate runs the tests from a copy of this tree beside the installed package, which is that case.
+    collect_ignore_glob = ["test_*.py"]
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: List[pytest.Item]) -> None:
-    """Skip every collected item when the skill's scripts are not in this checkout."""
+    """Skip whatever was collected anyway when the skill's scripts are not in this checkout."""
     del config
     if _FOLDER:
         return
