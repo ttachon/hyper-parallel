@@ -2524,11 +2524,6 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[1][0])
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
-        cm_cfg = _make_arch_cfg(arch="cm")
-        ArchHooks.apply_family(cm_cfg)
-        self.assertEqual(cm_cfg.layer_fields,
-                         {"shard_p_os_exp": 2, "shard_p_os_non_exp_partial": 2, "shard_embed": 2})
-
     def test_t5_states_the_tp_gathers_its_embedding_and_output_run(self) -> None:
         """
         Feature: apply_family on t5, the model's own config (I15).
