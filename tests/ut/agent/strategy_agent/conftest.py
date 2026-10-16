@@ -52,6 +52,7 @@ def _load(folder: str) -> None:
 
 
 _FOLDER = _scripts_folder()
+_HERE = os.path.normcase(os.path.dirname(os.path.abspath(__file__))) + os.sep
 if _FOLDER:
     _load(_FOLDER)
 else:
@@ -63,10 +64,16 @@ else:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: List[pytest.Item]) -> None:
-    """Skip whatever was collected anyway when the skill's scripts are not in this checkout."""
+    """Skip this folder's tests collected anyway when the skill's scripts are not in this checkout.
+
+    The hook sees every item of the run, the other folders' included, so it marks only the
+    items under this folder: a run over the whole tests tree keeps its other tests.
+    """
     del config
     if _FOLDER:
         return
     skip_marker = pytest.mark.skip(reason="the strategy agent's scripts are not in this checkout")
     for item in items:
-        item.add_marker(skip_marker)
+        where = os.path.normcase(os.path.abspath(str(getattr(item, "path", None) or item.fspath)))
+        if where.startswith(_HERE):
+            item.add_marker(skip_marker)
